@@ -23,6 +23,7 @@ CLIENT_IDS = {
     "paperbot": 30,                 # paperbot: the paper execution engine
     "paperbot_accounts": 31,        # paperbot: read-only multi-account discovery probe
     "paperbot_recon": 32,           # paperbot: read-only multi-account reconciliation report
+    "paperbot_fa": 33,              # paperbot: read-only FA allocation-config probe (requestFA)
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.

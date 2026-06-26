@@ -54,6 +54,27 @@ def build(approved, account: str, as_of, ib=None) -> list[BuiltOrder]:
     return built
 
 
+def build_fa_block(symbol: str, side: str, quantity: int, limit_price: float,
+                   fa_group: str, fa_method: str, as_of, ib=None) -> BuiltOrder:
+    """Construct ONE FA group (block) order: the master executes it as a single block
+    at one average price and allocates across the group's accounts by fa_method. No
+    single `account` is set — that is what makes it a group order rather than a direct
+    one. transmit stays False (this module never arms)."""
+    contract = Stock(symbol, "SMART", "USD")
+    order = LimitOrder(side, quantity, limit_price)
+    order.faGroup = fa_group        # the allocation group defined on the gateway
+    order.faMethod = fa_method      # e.g. "NetLiq" (proportional to each acct's net liq)
+    order.tif = "DAY"
+    order.orderRef = f"paperbot:{fa_group}:{as_of}:{side}:{symbol}"
+    order.transmit = False
+    if ib is not None:
+        try:
+            ib.qualifyContracts(contract)   # read-only validation
+        except Exception:
+            pass
+    return BuiltOrder(symbol, contract, order, order.orderRef)
+
+
 def transmit_guard(armed: bool) -> tuple[bool, str]:
     """Whether transmission is permitted. Fails CLOSED (any reason -> blocked)."""
     if config.DRY_RUN:

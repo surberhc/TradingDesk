@@ -189,5 +189,25 @@ Risk ladders correctly (Conservative smoothest → Growth most equity); every ve
 - **Then tested a "sharper" proxy, HYG/LQD** (HY vs investment-grade corporate, which cancels the rate component to isolate credit) — generalized the credit denominator to `config.CREDIT_PROXY` so it's swappable. **Result: WORSE across the board** — full-period CAGR 7.6%→7.0%, maxDD −10.7%→−12.0%, Calmar 0.71→0.58, **2008 +3.4%→+1.4%**, 2022 −8.7%→−9.8%.
 - **Conclusion: the deflation filter *wants* the rate component that HYG/LQD removes.** Credit stress arrives with a flight-to-quality; HYG/IEF (HY vs Treasury) captures both at once. In 2008 investment-grade blew out *too*, so HY-vs-IG barely widened while HY-vs-Treasury crashed cleanly. **Reverted to HYG/IEF.** Kept the configurable-denominator plumbing. 89 tests pass.
 
-### Status: feature-complete + fully tail-tested + regime-adaptive real-asset cap (L1). Equity-rotation tested + rejected. Credit signal investigated — HYG/IEF proxy confirmed best available. 89 tests, 0 skipped.
+### 2026-06-26 — 200d MA fragility RESOLVED (regime early-exit margin) + shared-brain gate refactor
+- **The one fragile knob (200d MA, VALIDATION §4.1) is fixed.** Diagnosed in two steps: (1) split the
+  overloaded knob into TREND vs STRESS roles (`config.TREND_MA_DAYS`/`STRESS_MA_DAYS`) → fragility is
+  entirely in the trend role; (2) per-engine localization → it lives ONLY in the regime engine's trend
+  gates. Fix: a **one-sided early-exit margin scoped to the regime engine**, `config.REGIME_TREND_MARGIN
+  = 0.03` (price must clear its MA by 3% to read "in trend"). MA sweep spread 42%→11% (plateau, also
+  flat across 3–5% margins); all 3 versions improve (Balanced Calmar 0.71→0.73, maxDD −10.7%→−10.2%);
+  holds out-of-sample. Rejected: ensemble (no help), EMA (worse), symmetric deadband (worse), duration/
+  real-asset/sector margins (no effect or harmful — proven 2008/2022 duration rules left untouched).
+- **Shared-brain refactor (`strategies/parts/`):** all trend gates now route through a new
+  `parts/_gates.py` (modes sma/ensemble/ema + per-engine margins via `config.trend_margin(scope)`).
+  Verified BYTE-IDENTICAL to prior production at default margins (89 tests pass; baseline unchanged
+  before the margin was switched on). **Paperbot byte-parity must be re-proven** before paper use.
+- Added `REGIME_TREND_MARGIN` to `src/robustness.py`'s sweep grid. Research scripts: `ma_experiment*.py`.
+- ⚠️ **DATA INSTABILITY observed:** `data/` (price parquet, under Google Drive) was overwritten by Drive
+  sync mid-session — the 2005-extended GFC dataset reverted to 2010-start and runs drifted at the 3rd
+  decimal. 2015–26 results are stable; **the 2008 GFC tables (VALIDATION §2/§5) need a clean re-run
+  once data is restored.** RECOMMENDED: move `data/` off Drive (e.g. `C:\TradingDesk-Local\bt_data`)
+  to stop the churn, mirroring the venv/warehouse "data local, code in Drive" rule.
+
+### Status: feature-complete + fully tail-tested + regime-adaptive real-asset cap (L1). 200d-MA fragility resolved (regime early-exit margin, REGIME_TREND_MARGIN=0.03). Equity-rotation tested + rejected. Credit signal investigated — HYG/IEF proxy confirmed best available. 89 tests, 0 skipped.
 Only optional future work remains: full per-engine return/drawdown attribution; expand parameter-sweep presets. (Credit-signal upgrade is closed: real OAS isn't freely available, and the proxy is the right choice on the merits.) To run: `python -m src.run` (set `config.ACTIVE_VERSION`).

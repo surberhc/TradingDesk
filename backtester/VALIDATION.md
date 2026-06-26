@@ -56,6 +56,10 @@ explicitly accepts this.
 
 ## 2. The same strategy including the 2008 GFC (2007-01 → 2026-06)
 
+> _Numbers below are PRE-margin. Spot-checks with the regime margin (§4.1) preserved the 2008
+> behavior (≈ Calmar 0.82 / maxDD −10% vs pre-margin 0.84 / −10.7%), but the full table needs a clean
+> re-run — the 2005–2009 history is currently missing from `data/` (Drive-sync revert; see §3 note)._
+
 | Metric | Strategy | SPY | 60/40 |
 |---|---|---|---|
 | CAGR | **9.0%** | 10.8% | 8.2% |
@@ -76,14 +80,24 @@ Calendar 2022 return: **strategy −8.7%**, SPY −18.2%, 60/40 −15.6%.
 
 ## 3. Client versions (the risk dial), 2015–26
 
+_With the regime early-exit margin (§4.1). Figures to ~2 d.p.; regenerate on stabilized data (see note below)._
+
 | Version | CAGR | Max drawdown | Sortino | Calmar | Down capture vs SPY |
 |---|---|---|---|---|---|
-| Conservative | 6.9% | −10.3% | 0.90 | 0.67 | 35% |
-| Balanced | 7.6% | −10.7% | 0.86 | 0.71 | 46% |
-| Growth | 7.9% | −10.9% | 0.88 | 0.73 | 49% |
+| Conservative | 6.5% | −8.9% | 0.90 | 0.73 | 31% |
+| Balanced | 7.5% | −10.2% | 0.91 | 0.74 | 40% |
+| Growth | 7.9% | −10.4% | 0.92 | 0.76 | 43% |
 
 Ordering is intuitive: Conservative = lowest return / smoothest / least downside capture; Growth =
-most return / most exposure. (An earlier design inverted this via accidental gold concentration;
+most return / most exposure. The margin improved Calmar and shallowed drawdown for all three vs the
+pre-fix figures (Conservative 0.67→0.73, Balanced 0.71→0.74, Growth 0.73→0.76).
+
+> **Data-stability note (2026-06-26).** The local `data/` price files live under the Google Drive
+> root and were observed being overwritten by Drive sync mid-session (the 2005-extended GFC dataset
+> reverted to a 2010-start snapshot, and successive runs drifted at the 3rd decimal). The 2015–26
+> numbers here are stable to 2 d.p. and reproduced across runs; the **2008 GFC figures (§2, §5) need a
+> clean re-run once the data is restored and `data/` is moved off Drive** (recommended: alongside the
+> venv at `C:\TradingDesk-Local`). (An earlier design inverted this via accidental gold concentration;
 that was diagnosed and fixed — see §6.)
 
 ---
@@ -94,8 +108,9 @@ The strategy has ~40 parameters across six engines and a short tradeable history
 overfitting risk we treated as the central concern, not an afterthought. Evidence:
 
 ### 4.1 Parameter-robustness sweep (one knob at a time, wide ranges; metric = Calmar)
-A robust strategy shows broad PLATEAUS (not lucky spikes). Result: **7 of 8 key parameters are
-plateaus.** Most parameters are industry-standard values we did NOT optimize.
+A robust strategy shows broad PLATEAUS (not lucky spikes). Result: **8 of 8 key parameters are now
+plateaus** — the one historically fragile knob (the 200-day MA) was diagnosed and fixed (see below).
+Most parameters are industry-standard values we did NOT optimize.
 
 | Parameter | Calmar across the swept range | Verdict |
 |---|---|---|
@@ -106,17 +121,33 @@ plateaus.** Most parameters are industry-standard values we did NOT optimize.
 | REGIME_CONFIRMATION_DAYS (2→4) | 0.71–0.72 | robust |
 | REGIME_MIN_THRESHOLD_CROSS (2→6) | 0.63–0.71 | robust |
 | LONG_TSY_PERMISSION_MIN_PASSES (3→5) | 0.71 flat | robust |
-| **MA_LONG_DAYS (150→250)** | **0.58 / 0.71 / 0.61 / 0.45** | **FRAGILE — sharp peak at 200** |
+| MA_LONG_DAYS (150→250), pre-fix | 0.58 / 0.71 / 0.61 / 0.45 | was FRAGILE (sharp peak at 200) |
+| **MA_LONG_DAYS (150→250), with regime margin** | **0.69 / 0.71 / 0.73 / 0.73 / 0.65** | **robust plateau (spread 11%)** |
+| REGIME_TREND_MARGIN (0→5%) | flat 0.71–0.73 for 3–5% | robust plateau |
 
-**Disclosed weakness (stated precisely).** The **200-day moving average is a fragile parameter** —
-Calmar peaks sharply at 200 and falls to 0.58 (at 175), 0.61 (at 225), and 0.45 (at 250). The honest
-framing is NOT "one fragile knob among eight robust ones." It is **"seven robust knobs PLUS one
-fragile knob that is LOAD-BEARING across every engine"** — a single point of failure threaded through
-the whole system. The 200d MA drives the trend component, breadth, the duration trend/ban rules, the
-defensive ranking, the real-asset gate, and the sector gate — so its sensitivity is *systemic*, not
-isolated to one signal. Mitigation: 200 is the single most widely-used trend value in finance — the
-canonical number, not one we fished for — but that defense does not change the risk statement: a
-buyer/auditor should treat the 200d MA as the strategy's main parameter-risk concentration.
+**The fix — a regime-engine early-exit margin (adopted 2026-06-26).** The 200-day MA *was* the
+strategy's one fragile, load-bearing knob: Calmar peaked sharply at 200 and fell to 0.58 (175) /
+0.61 (225) / 0.45 (250) — a single point of failure threaded through every engine. We diagnosed it
+in two steps (scripts: `ma_experiment*.py`):
+1. **The overloaded knob does two jobs** — price>MA *trend gates* and series-vs-own-MA *stress
+   baselines*. Splitting them (config `TREND_MA_DAYS` / `STRESS_MA_DAYS`) showed the fragility is
+   **entirely in the trend role**; the stress baselines are already a robust plateau.
+2. **Per-engine localization** showed the fragility lives **only in the REGIME engine's** trend
+   gates (trend / breadth / RS-leadership). The same margin on the duration ban rules does nothing
+   (so the proven 2008/2022 logic is left untouched); on the real-asset/sector gates it is harmful.
+
+The fix is a **one-sided early-exit margin scoped to the regime engine** (`REGIME_TREND_MARGIN =
+0.03`): price must clear its MA by 3% to read "in trend," so the regime de-risks early and the exact
+lookback stops mattering. This flattens the MA sweep from a 42% spread to **11%** (a plateau), is
+itself a plateau across 3–5% margins, **improves all three versions** (Calmar up, drawdown
+shallower), and **holds out-of-sample** (walk-forward OOS Calmar improved). Rejected alternatives
+(all tested): a multi-lookback **ensemble** (no help), an **EMA** gate (flattened but cratered the
+level), and a **symmetric** hold-in-band deadband (worse and non-robust — it de-risks late; the
+asymmetry is the load-bearing feature for a drawdown-first mandate).
+
+**Residual note.** The margin de-concentrates the parameter risk (the goal), but the strategy still
+rests on a limited history — see §8. The regime engine is now the place where trend-lookback choices
+are made; that is by design (the regime decision is the dominant risk lever) and is now robust to it.
 
 ### 4.2 Walk-forward (out-of-sample)
 The one parameter we actually *tuned* (the immediate-de-risk threshold, 10→20) was walk-forward
@@ -240,7 +271,10 @@ The strategy's thesis is that it adapts the KIND of defense to the regime. Teste
 3. **The actual history was a favorable draw.** Expect ~−18% typical / ~−32% bad-case drawdown, not
    the −10.7% we realized. True tail risk is likely WORSE than the Monte Carlo shows (it cannot
    fabricate a 2008 or 1970s; the strategy's worst bootstrapped path is deeper than 60/40's).
-4. **The 200-day MA is a fragile parameter** (§4.1) and is used pervasively.
+4. **The 200-day MA fragility is RESOLVED** (§4.1) — a regime-engine early-exit margin turned the
+   sharp peak at 200 into a plateau (sweep spread 42%→11%), validated out-of-sample. ~~Was the
+   strategy's main parameter-risk concentration.~~ (Residual: the margin de-concentrates the risk but
+   does not add new history.)
 5. **Stagflation tested only synthetically** (weakest evidence). Nothing — including this — protects
    real purchasing power in a 1970s-style inflation.
 6. **Return depends on a real-asset (gold/commodity) concentration** (§6). Remove it and the
