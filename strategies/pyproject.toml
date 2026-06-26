@@ -1,0 +1,15 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "strategies"
+version = "0.1.0"
+description = "The shared strategy brain — one decision codebase driven by BOTH the backtester and the paperbot. What we test is exactly what we trade."
+requires-python = ">=3.11"
+# Pure decision logic over pandas frames. No data access, no simulation, no broker
+# I/O — those live in the runners (backtester, paperbot), never here.
+dependencies = ["pandas>=2.0", "numpy>=1.24"]
+
+[tool.setuptools.packages.find]
+include = ["strategies*"]

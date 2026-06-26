@@ -1,0 +1,33 @@
+# What git should NOT track. This repo tracks CODE + small text/config only; large
+# research data and regenerable outputs are skipped so history stays fast and clean.
+# (Trading data, runtime state, and the venv already live on local C:\TradingDesk-Local,
+# outside this Drive folder, so they're not here to begin with.)
+
+# --- Python build/cache ---
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ipynb_checkpoints/
+
+# --- Generated reports / outputs (regenerable; large) ---
+backtester/output/
+*.html
+
+# --- Research data & binaries (not code) ---
+*.pdf
+*.parquet
+*.csv
+*.xlsx
+*.xls
+*.zip
+*.png
+*.jpg
+
+# --- Local tooling / editor ---
+.claude/
+.vscode/
+.idea/
+*.log

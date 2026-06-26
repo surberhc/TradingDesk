@@ -1,0 +1,147 @@
+
+========================================================================
+PART A — VENDOR 281-ROW LABELLED SET (in-sample, one bull regime)
+========================================================================
+rows=281  2025-05-01 -> 2026-06-18
+data-quality: gex_throttle outliers (treated as errors): [('2025-07-16', 669.0), ('2025-11-20', 66.0), ('2025-12-17', 620.0)]
+
+[A1] sample drift (mean forward return, all days):
+   fwd_ 1d  mean=+0.106%  hit=57.5%  n=280
+   fwd_ 5d  mean=+0.528%  hit=64.5%  n=276
+   fwd_10d  mean=+1.024%  hit=68.6%  n=271
+   fwd_20d  mean=+2.038%  hit=78.2%  n=261
+
+[A2] forward returns by regime_flow_risk (raw | demeaned | hit%):
+   -- fwd_5d (sample mean +0.53%) --
+      Bullish  raw=+0.919 demean=+0.391 hit=80.3% n=71
+      Neutral  raw=+0.506 demean=-0.022 hit=64.0% n=89
+      Bearish  raw=+0.306 demean=-0.222 hit=55.2% n=116
+   -- fwd_10d (sample mean +1.02%) --
+      Bullish  raw=+1.513 demean=+0.489 hit=80.3% n=71
+      Neutral  raw=+1.251 demean=+0.227 hit=76.1% n=88
+      Bearish  raw=+0.535 demean=-0.488 hit=55.4% n=112
+   -- fwd_20d (sample mean +2.04%) --
+      Bullish  raw=+3.106 demean=+1.068 hit=95.8% n=71
+      Neutral  raw=+2.232 demean=+0.193 hit=76.9% n=78
+      Bearish  raw=+1.226 demean=-0.812 hit=67.9% n=112
+
+[A3] Bullish-Bearish spread + circular-shift perm p:
+   fwd_ 1d  spread=+0.163%  perm_p=0.132
+   fwd_ 5d  spread=+0.613%  perm_p=0.274
+   fwd_10d  spread=+0.977%  perm_p=0.352
+   fwd_20d  spread=+1.880%  perm_p=0.291
+
+[A4] 2-way gamma_state x flow_risk, mean fwd_ret_20d (demeaned):
+regime_flow_risk  Bearish  Bullish  Neutral
+spx_gamma_state                            
+Negative            -0.07     1.19     1.54
+Neutral             -1.62     2.44    -1.05
+Positive            -1.19     0.78     0.29
+counts:
+ regime_flow_risk  Bearish  Bullish  Neutral
+spx_gamma_state                            
+Negative               47        5       10
+Neutral                24       11       15
+Positive               41       55       53
+
+[A5] redundancy: flow_risk vs gamma_state (day counts):
+spx_gamma_state   Negative  Neutral  Positive
+regime_flow_risk                             
+Bearish                 48       29        43
+Bullish                  5       11        55
+Neutral                 10       15        65
+
+[A6] episodes (independent runs):
+   regime_flow_risk: 38 episodes {'Neutral': 17, 'Bullish': 10, 'Bearish': 11}
+   regime_strategic: 7 episodes {'Risk Off': 3, 'Neutral': 2, 'Risk On': 2}
+   regime_pvband_rr: 32 episodes {'Short': 6, 'Neutral': 16, 'Long': 10}
+
+[A7] episode-entry fwd_ret_20d by flow_risk (independent obs):
+         mean  median  count
+s                           
+Bearish  0.64    0.96      9
+Bullish  2.60    3.41     10
+Neutral  1.68    0.70     16
+
+[A8] in-sample stress window Feb-Apr 2026 (flow flip-flop):
+   2026-01-15 SPX    6927 gamma=Neutral  flow=Neutral
+   2026-01-21 SPX    6797 gamma=Negative flow=Bearish
+   2026-01-26 SPX    6916 gamma=Negative flow=Neutral
+   2026-02-02 SPX    6954 gamma=Neutral  flow=Bearish
+   2026-02-04 SPX    6918 gamma=Negative flow=Neutral
+   2026-02-06 SPX    6798 gamma=Negative flow=Bearish
+   2026-02-19 SPX    6881 gamma=Negative flow=Bullish
+   2026-02-20 SPX    6862 gamma=Negative flow=Neutral
+   2026-02-23 SPX    6910 gamma=Negative flow=Bearish
+   2026-04-06 SPX    6583 gamma=Negative flow=Neutral
+
+[A9] regime_pvband_rr Long/Short vs rest, perm p:
+   Long  fwd_ 1d  Long-rest=+0.445%  perm_p=0.039
+   Long  fwd_ 5d  Long-rest=+0.759%  perm_p=0.236
+   Long  fwd_10d  Long-rest=-0.031%  perm_p=0.952
+   Short fwd_ 5d  Short-rest=+0.342%  perm_p=0.575
+   Short fwd_10d  Short-rest=+0.847%  perm_p=0.378
+   Short fwd_20d  Short-rest=+1.494%  perm_p=0.231
+
+========================================================================
+PART B — MULTI-REGIME PROXY TEST (SPY 2008-2026, 5+ real bears)
+========================================================================
+sample 2009-01-30 -> 2026-06-24  n=4376
+proxy day-counts: {'Bullish': 2708, 'Bearish': 1122, 'Neutral': 546}
+
+[B1] forward returns by proxy state (raw | demeaned | hit%):
+   -- f5d (sample mean +0.31%) --
+      Bullish  raw=+0.240 demean=-0.073 hit=60.9% n=2708
+      Neutral  raw=+0.348 demean=+0.035 hit=63.2% n=546
+      Bearish  raw=+0.473 demean=+0.160 hit=61.6% n=1117
+   -- f10d (sample mean +0.62%) --
+      Bullish  raw=+0.479 demean=-0.143 hit=64.2% n=2708
+      Neutral  raw=+0.679 demean=+0.057 hit=68.7% n=546
+      Bearish  raw=+0.944 demean=+0.321 hit=65.1% n=1112
+   -- f20d (sample mean +1.27%) --
+      Bullish  raw=+1.025 demean=-0.243 hit=69.1% n=2698
+      Neutral  raw=+1.278 demean=+0.010 hit=75.6% n=546
+      Bearish  raw=+1.854 demean=+0.586 hit=67.1% n=1112
+
+[B2] Bull-Bear spread + perm p  (note SIGN vs Part A3):
+   f 5d  Bull-Bear=-0.233%  perm_p=0.130
+   f10d  Bull-Bear=-0.465%  perm_p=0.111
+   f20d  Bull-Bear=-0.829%  perm_p=0.132
+
+[B3] DECISIVE risk-adjusted overlay (drift-normalized):
+   strategy               CAGR%   vol%  Sharpe   maxDD%  inMkt%
+   Buy&Hold               15.44   17.7    0.90    -33.7   100.0
+   Flat-when-Bearish      10.01   10.8    0.94    -20.5    74.4
+   Sized 1/0.5/0           8.85    9.9    0.91    -14.5    68.1
+
+[B4] bear-market timing: does proxy flag severe declines in advance?
+   P(proxy=Bearish | next-20d <  -5%) = 47.0%  (n=313)
+   P(proxy=Bearish | next-20d < -10%) = 47.5%  (n=59)
+   worst 8 forward-20d windows & preceding state:
+      2020-02-21  f20= -31.0%  rvol=13.8  proxy=Neutral
+      2020-02-24  f20= -30.4%  rvol=18.1  proxy=Bearish
+      2020-02-19  f20= -29.1%  rvol=13.1  proxy=Bullish
+      2020-02-14  f20= -29.0%  rvol=13.3  proxy=Neutral
+      2020-02-20  f20= -28.6%  rvol=13.2  proxy=Bullish
+      2020-02-12  f20= -26.5%  rvol=13.3  proxy=Neutral
+      2020-02-18  f20= -24.9%  rvol=13.1  proxy=Bullish
+      2020-02-25  f20= -21.8%  rvol=20.7  proxy=Bearish
+
+[B5] robustness: same Bull-Bear test EXCLUDING the vendor era:
+   f10d  Bull-Bear=-0.364%  perm_p=0.215
+   f20d  Bull-Bear=-0.678%  perm_p=0.214
+
+========================================================================
+PART C — VALIDITY CHECK: proxy vs vendor label on the overlap
+========================================================================
+overlap days=281
+confusion (rows=vendor flow_risk, cols=proxy):
+proxy             Bearish  Bullish  Neutral
+regime_flow_risk                           
+Bearish                16      104        0
+Bullish                13       56        2
+Neutral                15       69        6
+
+directional agreement (both non-neutral) = 38.1%  (n=189)
+proxy distribution in overlap: {'Bullish': 229, 'Bearish': 44, 'Neutral': 8}
+vendor distribution in overlap: {'Bearish': 120, 'Neutral': 90, 'Bullish': 71}

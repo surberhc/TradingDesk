@@ -1,0 +1,15 @@
+# Adaptive All-Weather Core Backtester — pinned dependencies.
+# Python 3.11+ (developed on 3.14). If a wheel is unavailable for your
+# Python version at install time, tell Claude before changing a pin.
+#
+# Per CLAUDE.md: do NOT add heavy backtesting frameworks (backtrader,
+# zipline, vectorbt). Ask before adding anything not listed here.
+
+pandas==2.2.3
+numpy==2.1.3
+requests==2.32.3
+plotly==5.24.1
+jinja2==3.1.4
+python-dotenv==1.0.1
+pyarrow==18.1.0        # Parquet engine for data/ storage
+pytest==8.3.4

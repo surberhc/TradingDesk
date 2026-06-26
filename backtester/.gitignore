@@ -1,0 +1,25 @@
+# Secrets — NEVER commit
+.env
+
+# Downloaded data — treat as read-only, never commit
+data/
+
+# Virtual environment
+.venv/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Generated reports / outputs — keep the folder, ignore its contents
+output/*
+!output/.gitkeep
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
