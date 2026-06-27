@@ -404,3 +404,31 @@ RANK_REPLACEMENT_THRESHOLD = 10    # 10-point score gap to replace a holding
 WALK_FORWARD_ENABLED = False
 WALK_FORWARD_TRAIN_END = "2019-12-31"   # build params here, evaluate after
 ASSERT_NO_LOOKAHEAD = True              # test toggle (SPEC §16)
+
+
+# ---------------------------------------------------------------------------
+# GEX gamma-regime OVERLAY (research; default OFF) — backtester-level post-process
+# ---------------------------------------------------------------------------
+# A backtester-only risk-SIZING overlay layered on top of S0's target weights. It
+# does NOT touch the shared strategy brain and must leave S0 BYTE-IDENTICAL when off.
+#
+# Economic motivation (MSR/S1 verdict): dealer gamma's edge is SIZING + hedge-timing,
+# NOT direction. When the as-of SPX gamma regime is NEGATIVE (dealers are short gamma
+# and AMPLIFY moves -> fragile tape), trim RISK-asset exposure and park the trimmed
+# weight in the existing cash sleeve. When Positive/Neutral, leave S0 untouched.
+# This is sizing only — it never flips direction or changes which assets S0 picks.
+#
+# Strictly causal: the gamma_state applied at a rebalance is the most recent state
+# as-of (on/before) the SIGNAL date, never the execution date — no look-ahead.
+GAMMA_OVERLAY_ENABLED = False          # master flag — OFF keeps S0 byte-identical
+GAMMA_OVERLAY_GEX_FILE = r"C:\TradingDesk-Local\warehouse\derived\SPX_gex_daily.parquet"
+# Multiplier applied to RISK-asset weights when the as-of gamma_state is Negative.
+# 1.0 = no change; 0.5 = halve risk; 0.0 = fully de-risk to cash. Trimmed weight is
+# moved to the cash sleeve. Only "Negative" de-risks; Positive/Neutral/unknown pass.
+GAMMA_OVERLAY_NEGATIVE_RISK_SCALE = 0.5
+# Tickers treated as RISK assets by the overlay (equity beta + real assets). Anything
+# NOT in this set (T-bills, Treasuries, floating-rate, TIPS) is treated as defensive
+# and is the destination for trimmed weight. The cash ticker chosen for parking is the
+# largest-weight cash-like holding already in the book (fallback BENCHMARK_TBILL).
+GAMMA_OVERLAY_RISK_ASSETS = tuple(EQUITY_CORE + SECTORS + GOLD + COMMODITIES)
+GAMMA_OVERLAY_CASH_TICKER = BENCHMARK_TBILL  # fallback park destination

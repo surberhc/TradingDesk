@@ -29,6 +29,7 @@ from strategies.base import MarketState
 from strategies.all_weather import AdaptiveAllWeather
 
 from src import data_loader
+from src import gamma_overlay
 
 
 def _next_trading_day(index: pd.DatetimeIndex, after) -> pd.Timestamp | None:
@@ -52,6 +53,8 @@ def run_backtest(
     rebalance_frequency: str = config.REBALANCE_FREQUENCY,
     adaptive_fast_regimes=None,
     use_real_assets: bool = True,
+    gamma_overlay_enabled: bool = config.GAMMA_OVERLAY_ENABLED,
+    gamma_negative_risk_scale: float = config.GAMMA_OVERLAY_NEGATIVE_RISK_SCALE,
 ) -> dict:
     """
     Run the month-by-month simulation and return the result time series.
@@ -112,6 +115,13 @@ def run_backtest(
     strategy.warmup(prices, macro, start, end)
     signal_dates = strategy.signal_dates
 
+    # --- GEX gamma-regime overlay (research; default OFF). Loaded once here so the
+    # daily as-of lookups in the loop are cheap. When disabled, gamma_state stays None
+    # and the loop's overlay branch is skipped entirely -> S0 is byte-identical. ---
+    gamma_state = None
+    if gamma_overlay_enabled:
+        gamma_state = gamma_overlay.load_gamma_state()
+
     # --- Build target weights at each rebalance date, to execute the next day ---
     targets: dict[pd.Timestamp, pd.Series] = {}
     monthly_rows: list[dict] = []
@@ -125,6 +135,21 @@ def run_backtest(
         state = MarketState(prices=prices, macro=macro, as_of=t, positions=prev_weights)
         decision = strategy.on_data(state)
         weights = decision.weights
+
+        # --- Gamma overlay (post-process on S0's weights). Strictly causal: the
+        # gamma_state used is the most recent reading AS-OF the SIGNAL date t (never
+        # the T+1 exec_date). When the state is Negative, risk-asset weight is trimmed
+        # to cash; otherwise weights pass through unchanged. The overlaid book is fed
+        # forward as prev_weights so next month's incumbent/whipsaw logic sees what is
+        # actually held. ---
+        gamma_now = None
+        if gamma_state is not None:
+            gamma_now = gamma_overlay.gamma_state_asof(gamma_state, t)
+            weights = gamma_overlay.apply_overlay(
+                weights, gamma_now,
+                negative_risk_scale=gamma_negative_risk_scale,
+            )
+
         targets[exec_date] = weights
         prev_weights = weights
         ex = decision.extras
@@ -137,6 +162,7 @@ def run_backtest(
                 # fractions; keep the held hedge's TICKER under a distinct key so
                 # it does not overwrite the real_asset sleeve fraction.
                 **decision.sleeves, "real_asset_ticker": decision.real_asset,
+                "gamma_state": gamma_now,
                 "reasons": "; ".join(decision.reasons),
             }
         )
