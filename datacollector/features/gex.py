@@ -34,7 +34,9 @@ import pandas as pd
 CONTRACT_MULT = 100          # equity/ETF/SPX index options are x100
 CALL_SIGN = +1.0             # dealers long call gamma  (calibratable)
 PUT_SIGN = -1.0              # dealers short put gamma   (calibratable)
-NEUTRAL_BAND_FRAC = 0.10     # |net_gex| within this fraction of the day's gross -> Neutral
+NEUTRAL_BAND_FRAC = 0.05     # |net_gex| within this fraction of the day's gross -> Neutral
+                             # (0.10 -> 0.05 on 2026-06-27: calibration vs the msr vendor labels
+                             #  lifted gamma-state accuracy 61% -> 70%, direction unchanged)
 _T_FLOOR = 0.5 / 365.0       # clamp DTE so 0DTE gamma doesn't blow up
 _FLIP_LO, _FLIP_HI, _FLIP_STEP = 0.85, 1.15, 0.001   # flip scan: +/-15% of spot, 0.1% grid
 
