@@ -29,8 +29,9 @@
   spot for SPX/SPXW/VIX/NDX/RUT/XSP). Last night's forward run failed 30/43 symbols on this bug; future
   runs are now clean.
 - ThetaData historical grab COMPLETE (`GRAB_END=20260625`); supervisor self-heals via Task Scheduler.
-- IN PROGRESS: a worker is backfilling **2026-06-26 EOD** from ThetaData (covers the symbols last night's
-  forward run dropped).
+- VERIFIED COMPLETE 2026-06-27: the **2026-06-26 EOD** ThetaData backfill is done — all 30 previously-failed
+  symbols now have Friday's data (**50/50 symbols present**, none empty/corrupt). Covers the symbols last
+  night's forward run dropped.
 - Do NOT delete empty/zero-column parquets (`have_day` relies on them).
 
 ## C — Paperbot Execution
@@ -43,6 +44,18 @@
 - Runner built + committed (22dee54): `paperbot/rebalance_run.py` — multi-account dry-run runner,
   review→arm→transmit gate, reads live FA groups via requestFA + fails closed on name mismatch, transmits
   nothing. clientId **37**.
+- **Transmit EXECUTOR BUILT + committed (9220716): `paperbot/rebalance_execute.py`, clientId 38** — the
+  transmit-CAPABLE Monday sibling of the runner. Default run = read-only DRY review (transmits nothing,
+  writes no FA config). Armed transmit requires the **4-condition gate**: `READONLY=False` AND `DRY_RUN=False`
+  AND `armed=True` AND the exact CLI token `--arm-i-understand` (which flips READONLY/DRY_RUN in-process; no
+  auto-arm). Armed flow in code: discover → build_plan → resolve_tier_groups (fail-closed) → risk_manager →
+  BACK UP FA config → set each group's ContractsOrShares via `replaceFA` → place blocks ONE at a time (never
+  whatIfOrders a group) → reconcile. `order_router` now **rejects NaN/<=0 limit prices** (hard price guard).
+  **33 tests pass.** Monday CLI: dry review `python rebalance_execute.py`; armed `python rebalance_execute.py
+  --arm-i-understand`.
+- **MONDAY FLAG:** the executor's `set_group_contracts_or_shares` XML tag casing must be **eyeballed against
+  a live `requestFA(1)` dump (run `fa_probe.py`) before the armed run** — couldn't be confirmed offline. New
+  pre-arm step added to `MONDAY_RUNBOOK.md`.
 - Account reality: 5 client subs DU8922142–146, each FUNDED ~$1.1M paper, all enrolled, all FLAT (cash) →
   each needs a full initial rebalance. FA groups exist: Conservative→DU142; Balanced→DU143,144;
   Growth→DU145,146 (method ContractsOrShares; prior config backed up to `state\paperbot\fa_groups_backup.xml`).
@@ -60,5 +73,5 @@
 ## Shared plumbing
 - Local git repo (in Drive, no remote); commit after each change-set.
 - clientId registry in `connections/clientids.py`. In use this lane: paperbot=30, flatten=34, fa_block=35,
-  fa_admin=36, rebalance_run=37. Don't collide.
+  fa_admin=36, rebalance_run=37, rebalance_exec=38. Don't collide.
 - Handoffs consolidated into `conductor/handoffs/`; the stray "Andrew is pissed off" folder was deleted.

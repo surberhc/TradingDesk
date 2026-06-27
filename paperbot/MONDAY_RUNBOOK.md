@@ -16,20 +16,26 @@ First live paper rebalance of 5 FLAT client sub-accounts, each ~$1.1M:
 
 Allocation = **explicit per-account integer shares** the engine computes. Order-level
 `faMethod=""` (NetLiq is rejected, Err 10226). Each FA group's stored **ContractsOrShares**
-is set to the computed split by hand in the gateway GUI before the block is sent.
+is set to the computed split **by the executor** (`rebalance_execute.py` via `replaceFA`)
+in lockstep with each block — no manual GUI editing of the splits.
 
-> KNOW THIS BEFORE YOU START: `rebalance_run.py` is **build-only**. It connects
-> `readonly=True` and hardcodes `armed=False`, so it can NEVER transmit — it only prints the
-> plan and logs the order objects. The actual order placement on Monday is a **manual GUI
-> step** in IB Gateway/TWS (set ContractsOrShares, then transmit the group/direct orders),
-> OR an explicitly-armed `order_router.place(armed=True)` over a `readonly=False` connection
-> (the pattern in `live_fill_test.py` / `fa_block_test.py`). `rebalance_run.py` is the
-> source of truth for the NUMBERS, not the thing that sends them.
+> KNOW THIS BEFORE YOU START: the Monday transmit is driven by **`rebalance_execute.py`**
+> (clientId **38**), the transmit-CAPABLE sibling of `rebalance_run.py`. **Default run is a
+> read-only DRY review that transmits NOTHING** — identical to `rebalance_run.py`. To send,
+> you must line up ALL FOUR gate conditions: `READONLY=False` AND `DRY_RUN=False` AND
+> `armed=True` AND the exact CLI token `--arm-i-understand` present. The token (and nothing
+> else) flips READONLY/DRY_RUN in-process; there is NO auto-arm. The armed flow is fully in
+> code: discover → build_plan → resolve_tier_groups (fail-closed) → risk_manager → **BACK UP
+> FA config** → set each group's ContractsOrShares via `replaceFA` → place blocks ONE at a
+> time (never `whatIfOrder` a group order) → reconcile. `order_router` now rejects any
+> NaN/<=0 limit price. 33 tests pass. `rebalance_run.py` is still the read-only source of
+> truth for the NUMBERS; `rebalance_execute.py` is the thing that sends them.
 
 Python venv: `C:\TradingDesk-Local\venv\Scripts\python.exe`. Run every paperbot script
 **from the paperbot dir** (flat imports). ClientIds: accounts=31, recon=32, fa-probe=33,
-rebalance-runner=37. The runner pins its connection to DU8922142 (master DF…141 hangs the
-account stream — never connect un-pinned to the master).
+rebalance-runner=37, **rebalance-executor=38**. Both runner and executor pin their
+connection to DU8922142 (master DF…141 hangs the account stream — never connect un-pinned
+to the master).
 
 ---
 
@@ -49,12 +55,13 @@ from the master, so a hang here means the feed itself is not healthy.)
 ---
 
 ## STEP B — Dry-run review: eyeball per-account shares + the splits
-Read-only, build-only. Computes tier models off live quotes (falls back to strategy close),
+Read-only, build-only. The executor's **default run** (no token) is identical to
+`rebalance_run.py`: computes tier models off live quotes (falls back to strategy close),
 resolves each tier→FA group by **live membership** (fail-closed), prints the full plan, and
-logs the order objects with **nothing transmitted**.
+logs the order objects with **nothing transmitted, no FA config written**.
 
 ```
-C:\TradingDesk-Local\venv\Scripts\python.exe rebalance_run.py
+C:\TradingDesk-Local\venv\Scripts\python.exe rebalance_execute.py
 ```
 Confirm ALL of the following before continuing — if any is off, **STOP**:
 - Safety banner reads `READONLY=True  DRY_RUN=True  armed=False` and `transmission: BLOCKED`.
@@ -72,65 +79,76 @@ Confirm ALL of the following before continuing — if any is off, **STOP**:
 - Routes: every `fa_block` split sums to its `total_qty`; the one Conservative line is
   `direct account=DU8922142`.
 
-**Write down**, per FA group, the exact per-account share split (you will type these into the
-GUI in Step C). Example shape:
+**Eyeball**, per FA group, the exact per-account share split — these are what the executor
+will write to ContractsOrShares via `replaceFA` when armed (you do NOT type them by hand).
+Example shape:
 `tier_balanced: SPY DU…143=870 DU…144=870 (block 1740); BND DU…143=7256 DU…144=7256 (14512)`.
 
 ---
 
-## STEP C — Set each FA group's ContractsOrShares to the computed split
-GUI step in IB Gateway/TWS FA configuration (Account → FA config → Groups). For EACH tier
-group that has an FA block (`tier_balanced`, `tier_growth` — NOT Conservative, it's direct):
-1. Open the group, method = **ContractsOrShares**.
-2. Enter, per member account, the **share count for the symbol you are about to send**.
-   ContractsOrShares is per-order-quantity allocation: you set it to the split for the block
-   you are placing next, then place that block, then update it for the next symbol's block.
-3. Save. Re-read the group and confirm the numbers match what you wrote down in Step B.
+## STEP C — Pre-arm: eyeball the FA-groups XML casing (MONDAY FLAG)
+The executor's `set_group_contracts_or_shares` matches/writes XML tags
+(`defaultMethod`/`ListOfAccts`/`Account`/`acct`/`amount`) in the live GROUPS XML. **The exact
+tag casing could not be confirmed offline.** Before arming, dump the live config and eyeball it:
 
-Because the split is set per symbol, place ONE block at a time: set group split → send that
-block → confirm fills → set next split → next block. Do not batch different symbols against
-one stored split. The Conservative account skips this entirely (direct order).
-
----
-
-## STEP D — Flip the arm gate (only after B + C are clean)
-Arming = `ReadOnlyApi=no` + gateway restart (`arming.py`), THEN a `readonly=False` connection
-and `order_router.place(..., armed=True)`. All three must hold to transmit: `READONLY=False`,
-`DRY_RUN=False`, `armed=True`.
-
-- If transmitting from the GUI: arm with `python -c "import arming; arming.arm()"` (flips
-  ReadOnlyApi and restarts the gateway), then place orders in the GUI. Re-run `accounts.py`
-  after the restart to confirm the feed came back before you send anything.
-- If transmitting from code: use the `live_fill_test.py` pattern (connect `readonly=False`,
-  build, `place(armed=True)`). `rebalance_run.py` will NOT send even if you pass armed — it
-  connects read-only by construction; do not rely on it to transmit.
-
-Keep the dry-run review window open. The numbers you arm against MUST be the numbers from
-Step B's run on the SAME session (quotes drift — re-run B if more than a few minutes pass).
+```
+C:\TradingDesk-Local\venv\Scripts\python.exe fa_probe.py
+```
+Confirm the group names match enrollment (`tier_balanced`, `tier_growth`) and that the
+member/method tag casing in the dump matches what the executor expects. If casing differs,
+**STOP** and fix the executor's tag handling before any armed run — a casing mismatch means
+ContractsOrShares may not be written correctly. (fa_probe uses its own clientId 33.)
 
 ---
 
-## STEP E — Transmit, one block at a time
-Order: do the direct Conservative orders and the FA blocks symbol-by-symbol. After each:
-- Confirm the order ACCEPTS (no Err 10226 — that means a stray `faMethod` slipped in; the
-  block must carry `faMethod=""` and rely on the stored ContractsOrShares).
-- **Never `whatIfOrder` a group order — it HANGS.** Skip what-if for FA blocks entirely.
-- Use LIMIT orders (config ORDER_STYLE=limit), DAY tif. orderRef is deterministic
-  (`paperbot:<group|account>:<as_of>:<side>:<symbol>`) so a re-send is detectable, not blind.
+## STEP D — Arm the gateway (only after A + B + C are clean)
+The 4-condition gate: `READONLY=False` AND `DRY_RUN=False` AND `armed=True` AND the
+`--arm-i-understand` token. The token (Step E) flips READONLY/DRY_RUN in-process; this step
+satisfies the gateway side.
+
+```
+C:\TradingDesk-Local\venv\Scripts\python.exe -c "import arming; arming.arm()"
+```
+This flips `ReadOnlyApi=no` and restarts the gateway. **Re-run `accounts.py` after the restart
+to confirm the feed came back** before you send anything. Keep the Step B review handy — the
+numbers you arm against MUST be from a recent run (quotes drift — re-run Step B if >few min).
+
+---
+
+## STEP E — Transmit via the executor (armed; one block at a time, in code)
+With the gateway armed (Step D), run the executor WITH the exact token. The executor itself
+backs up the FA config, sets each group's ContractsOrShares via `replaceFA`, and places blocks
+one at a time — you do not touch the GUI:
+
+```
+C:\TradingDesk-Local\venv\Scripts\python.exe rebalance_execute.py --arm-i-understand
+```
+The safety banner must read `transmission: PERMITTED`. The armed run will, per the ledger:
+1. Re-discover live state, rebuild the plan, resolve groups fail-closed, run risk guards
+   (any HALT/VETO = NOTHING sent, no FA config written).
+2. **Back up** the live FA groups XML to a timestamped file under `state\paperbot\fa_backups\`.
+3. For each FA block: write THAT group's ContractsOrShares to the split via `replaceFA`, then
+   place the block with `place(armed=True)` — `faMethod=""`, LIMIT/DAY, deterministic orderRef.
+4. Conservative (DU8922142) routes **DIRECT** (lone account, no group).
+- Confirm each order ACCEPTS (no Err 10226 — would mean a stray order-level `faMethod`).
+- The executor **never `whatIfOrder`s a group order** (it HANGS) — what-if is skipped for blocks.
+- The HARD PRICE GUARD rejects any NaN/<=0 limit before an order is built; a rejected route is
+  logged and skipped, never sent blank.
 
 ---
 
 ## STEP F — Watch fills
-- In the GUI or from `place()` output, confirm each block fills and the master **allocates**
-  to the member accounts per the stored split (filled = sum of the split).
+- From the executor's `place()` output (and the GUI if open), confirm each block fills and the
+  master **allocates** to the member accounts per the written split (filled = sum of the split).
 - Partial/no fill on a limit: leave it working or adjust the limit; do NOT switch to market.
 - Confirm each member account's filled shares == its split number. A mismatch means the
-  group's ContractsOrShares didn't match the block qty — cancel remainder, re-check Step C.
+  group's ContractsOrShares didn't match the block qty — stop, re-check Step C's casing.
 
 ---
 
 ## STEP G — Reconcile each account to model
-After fills, prove the book matches the model with the read-only readout:
+The armed executor reconciles in-process at the end (recon_report read-only readout, step `[8]`)
+— every account should print `in-band`. To re-confirm independently after the run:
 
 ```
 C:\TradingDesk-Local\venv\Scripts\python.exe recon_report.py
@@ -142,8 +160,8 @@ filled → investigate that symbol before close.
 
 ---
 
-## DISARM (always, when done or aborting)
-Restore the safe lock:
+## DISARM (MANDATORY — always, when done or aborting)
+Restore the safe lock. **This is not optional — never leave the gateway armed:**
 ```
 C:\TradingDesk-Local\venv\Scripts\python.exe -c "import arming; arming.disarm()"
 ```
@@ -153,22 +171,27 @@ re-run `accounts.py` to confirm the feed is healthy in the locked state.
 ---
 
 ## ABORT / ROLLBACK — if anything looks wrong at ANY step
-1. **Stop sending.** Do not place the next block.
+1. **Stop sending.** `Ctrl-C` the executor (it prints a disarm reminder) / do not place the next block.
 2. Cancel any working (unfilled) orders in the GUI.
 3. **DISARM immediately** (`arming.disarm()`) — restores ReadOnlyApi=yes + restart.
 4. If a block already filled and is wrong, flatten the affected accounts back to flat with
    `flatten_accounts.py` (own clientId 34; review it first — it places real paper sells),
-   then re-run `recon_report.py` to confirm flat, and re-diagnose with `rebalance_run.py`
-   before any retry.
+   then re-run `recon_report.py` to confirm flat, and re-diagnose with the dry-run
+   (`rebalance_execute.py` with no token, or `rebalance_run.py`) before any retry. The FA
+   config backup lives in `state\paperbot\fa_backups\` if a group's split needs restoring.
 5. Re-run `accounts.py` to confirm the feed is healthy before walking away.
 
 ## Gotchas (ranked) to watch for live
-1. The runner cannot transmit — placement is a separate manual/armed step (above).
-2. Conservative (DU8922142) is a LONE account → DIRECT order, no FA group. Don't wait for a
+1. **Default `rebalance_execute.py` transmits NOTHING** — the armed run needs ALL FOUR:
+   `READONLY=False` + `DRY_RUN=False` + `armed=True` + the exact `--arm-i-understand` token.
+2. The executor writes ContractsOrShares via `replaceFA` — **eyeball the FA-groups XML casing
+   with `fa_probe.py` first (Step C)**; the tag casing was not confirmable offline.
+3. Conservative (DU8922142) is a LONE account → DIRECT order, no FA group. Don't wait for a
    block that won't come.
-3. Stored ContractsOrShares is per-symbol — set it per block, in lockstep with sending.
-4. A missing quote → NaN limit price builds a $0/NaN order. Step B's "no NaN" check catches
-   it; never transmit a NaN/blank-priced line.
-5. Live group membership must equal enrollment exactly or Step B fails closed — fix the GUI
+4. ContractsOrShares is per-symbol — the executor sets it per block, in lockstep with sending.
+5. A missing quote → NaN/<=0 limit. The HARD PRICE GUARD rejects it before build; Step B's
+   "no NaN" check is your early warning. Never transmit a NaN/blank-priced line.
+6. Live group membership must equal enrollment exactly or it fails closed — fix the GUI
    group, never override the name.
-6. Re-run Step B if quotes are stale (>few min) before arming; arm against fresh numbers.
+7. Re-run Step B if quotes are stale (>few min) before arming; arm against fresh numbers.
+8. **DISARM is mandatory** when done or aborting — never leave the gateway armed.
