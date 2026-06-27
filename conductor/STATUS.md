@@ -20,7 +20,9 @@
   NOT on disk — only AGG+LQD reach 2005; a SPY-only CSV (2008+) sits at msr\Flow Project\flow_verdict\data\
   spy_hist_2008_2026.csv; TLT/VTI/sectors/gold/commodities all start 2010. Only path = Tiingo re-download
   with earlier DATA_START + key loaded. HOLD until ThetaData download finishes (Andrew: don't compete for bandwidth).
-  (3) re-prove paperbot byte-parity vs the new margin-ON default before any paper use.
+  (3) DONE 2026-06-27: paperbot byte-parity RE-PROVEN. paperbot strategy_target.current_target() calls
+  src.backtest.run_backtest (single weight path) → targets byte-identical to the backtester with
+  REGIME_TREND_MARGIN=0.03 (max abs diff 0.0 across 4 dates × 3 versions). Paper-use prerequisite cleared.
 
 ## B — Data Warehouse / Collector
 - DuckDB `options_eod` view still needs the "build over non-empty parquets only" fix.
@@ -71,8 +73,9 @@
     distinguishing test added; 15 pytest tests pass. NOTE: engine triggers the rebalance off the
     required TRADE SIZE vs NetLiq (not reconcile's raw weight-vs-model drift) so the cash-reserve gap
     can't falsely flag a correctly-invested account / defeat the band on >~60%-weight holdings.
-    FOLLOW-UP (needs Andrew): recon_report's daily readout still classifies drift the old (raw-weight)
-    way → align it to the engine's trade-size logic so the readout and the actor agree.
+    FOLLOW-UP DONE 2026-06-27: recon_report.plan_account aligned to the engine's account-level trade-size
+    band (readout now matches the actor); verified offline; 15 engine tests still pass.
+    Architecture reference written: docs/ARCHITECTURE.md (code-on-Drive vs data-on-C: map, caveats).
     REMAINING LIVE STEPS (conductor, serialized, gated): align tier group names
     (tier_conservative/balanced/growth vs Conservative/Balanced/Growth); per-rebalance set each group's
     ContractsOrShares = RoutePlan split; wire build_plan→order_router behind READONLY+DRY_RUN+armed; then place.

@@ -74,8 +74,26 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     lines = reconcile.reconcile(target, net_liq, positions,
                                 tolerance_w=config.REBALANCE_BAND_PCT,
                                 investable=investable)
-    # No-trade band: leave the account alone unless a holding actually breaches it.
-    breached = any(ln.status in ("DRIFTED", "MISSING", "UNTRACKED") for ln in lines)
+    # NO-TRADE BAND — ACCOUNT-LEVEL, all-or-nothing. Mirrors rebalance_engine.plan_account
+    # exactly so this readout's REBALANCE/in-band labels match what the engine actually does.
+    # The breach test keys on the SIZE OF THE TRADE the rebalance would make
+    # (|target_shares - actual_shares| valued vs NetLiq), NOT raw weight-vs-model drift:
+    # the cash reserve means a fully-invested account sits ~reserve% under its raw model
+    # weight by construction, so the old status-based test falsely flagged correctly-invested
+    # accounts and defeated the band on any holding over ~60% weight. A stray UNTRACKED
+    # position always breaches (it must be cleared regardless of size). (Replicated here, not
+    # imported: rebalance_engine imports AccountPlan/BlockOrder FROM this module.)
+    band_pct = config.REBALANCE_BAND_PCT
+
+    def _trade_weight(ln) -> float:
+        # No live `prices` override in this readout's signature; size off the strategy close.
+        price = float(target.prices.get(ln.symbol, float("nan")))
+        if not (price == price and price > 0) or not net_liq:
+            return 0.0
+        return abs(ln.target_shares - int(ln.actual_shares)) * price / net_liq
+
+    breached = (any(ln.status == "UNTRACKED" for ln in lines)
+                or any(_trade_weight(ln) > band_pct for ln in lines))
     orders: dict = {}
     if breached:
         for ln in lines:
