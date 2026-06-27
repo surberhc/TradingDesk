@@ -28,7 +28,9 @@ import status
 
 WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse")
 RAW_OPTIONS = WAREHOUSE / "raw" / "options"
+DERIVED = WAREHOUSE / "derived"
 SUPERVISOR_HB = WAREHOUSE / "supervisor_heartbeat.txt"
+FORWARD_HB = WAREHOUSE / "forward_heartbeat.txt"
 TIINGO_MANIFEST = Path(r"C:\Users\andre\My Drive (andrew@surberhc.com)"
                        r"\TradingDesk\backtester\data\_manifest.json")
 LOG = Path(r"C:\TradingDesk-Local\state\dailyreport\eod_report.log")
@@ -63,8 +65,99 @@ def _sec(key, title, st, headline, rows):
 # --------------------------------------------------------------------------- #
 # Section builders — each returns a section dict. Never raise.
 # --------------------------------------------------------------------------- #
+def _parse_forward_heartbeat():
+    """Parse warehouse\\forward_heartbeat.txt into a dict, or None if absent/unparseable.
+
+    Two shapes the collector writes (datacollector\\forward_daily.py):
+      in-progress: "2026-06-26 23:55:10  20260626  43/50 roots  ok=13 skip=0 empty=0 fail=30"
+      complete:    "2026-06-26 23:59:00  20260626  COMPLETE ok=.. skip=.. empty=.. fail=.."
+    Returns: {ts, date, done(int|None), total(int|None), complete(bool),
+              ok, skip, empty, fail}
+    """
+    if not FORWARD_HB.exists():
+        return None
+    try:
+        text = FORWARD_HB.read_text().strip()
+    except Exception:
+        return None
+    if not text:
+        return None
+    line = text.splitlines()[-1].strip()
+    import re
+    # "YYYY-MM-DD HH:MM:SS" then 8-digit run date
+    m_head = re.match(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2})\s+(\d{8})", line)
+    if not m_head:
+        return None
+    ts, date = m_head.group(1), m_head.group(2)
+    complete = "COMPLETE" in line
+    m_prog = re.search(r"(\d+)\s*/\s*(\d+)\s+roots", line)
+    done = int(m_prog.group(1)) if m_prog else None
+    total = int(m_prog.group(2)) if m_prog else None
+
+    def _int(key):
+        mm = re.search(rf"{key}=(\d+)", line)
+        return int(mm.group(1)) if mm else None
+
+    return {"ts": ts, "date": date, "done": done, "total": total,
+            "complete": complete, "ok": _int("ok"), "skip": _int("skip"),
+            "empty": _int("empty"), "fail": _int("fail")}
+
+
+def _build_forward_from_heartbeat():
+    """Fallback section for when forward.json is missing/stale: render from the
+    heartbeat the collector writes after every root. Returns a section or None."""
+    h = _parse_forward_heartbeat()
+    if not h:
+        return None
+    fresh = h["date"] == TODAY_STR
+    fail = h.get("fail") or 0
+    if not fresh:
+        st = "stale"
+    elif fail > 0 or not h["complete"]:
+        st = "warn"
+    else:
+        st = "ok"
+
+    if h["done"] is not None and h["total"] is not None:
+        progress = f"{h['done']}/{h['total']} roots"
+    elif h["complete"]:
+        progress = "COMPLETE"
+    else:
+        progress = None
+
+    parts = []
+    if h["complete"]:
+        parts.append("collector finished")
+    elif progress:
+        parts.append(f"partial run reached {progress}")
+    else:
+        parts.append("collector ran")
+    parts.append(f"ok={h.get('ok')} fail={fail}")
+    headline = "(from heartbeat — forward.json missing) " + " · ".join(parts)
+    if not fresh:
+        headline += "  ⚠ heartbeat is from a previous day"
+
+    rows = [("Run date", h["date"]),
+            ("Progress", progress or ("COMPLETE" if h["complete"] else "—")),
+            ("Roots written", h.get("ok")),
+            ("Already had", h.get("skip")),
+            ("Empty/holiday", h.get("empty")),
+            ("Failed roots", h.get("fail")),
+            ("Last update", h["ts"]),
+            ("Source", "forward_heartbeat.txt (forward.json absent)")]
+    return _sec("forward", "IBKR Forward Collector", st, headline, rows)
+
+
 def build_forward():
     s = status.read("forward")
+    # Prefer forward.json when present AND fresh (it's richer). Otherwise fall back
+    # to the heartbeat the collector writes after every root, so a partial/aborted
+    # run (which never writes forward.json) still renders a meaningful line instead
+    # of reading as "missing/stale".
+    if not s or s.get("date") != TODAY_STR:
+        hb_sec = _build_forward_from_heartbeat()
+        if hb_sec is not None:
+            return hb_sec
     if not s:
         return _sec("forward", "IBKR Forward Collector", "stale",
                     "No status written — did the 5:30 PM run fire?", [])
@@ -158,7 +251,122 @@ def build_strategy():
     return _sec("strategy", "Strategy EOD Update", st, s.get("message", ""), rows)
 
 
-SECTIONS = [build_forward, build_thetadata, build_tiingo, build_system, build_strategy]
+# Dealer-gamma reads the derived GEX tables (features/gex.py output) directly.
+# Index first (the validated MSR signal lives on SPX), ETF second for the cash tape.
+GEX_INDEX = ["SPX", "SPXW"]   # use whichever derived table exists; SPX preferred
+GEX_ETF = "SPY"
+# gamma_state -> dot color. Negative gamma is the fragile/high-vol regime.
+GEX_STATE_DOT = {"Positive": "ok", "Neutral": "info", "Negative": "warn"}
+
+
+def _gex_latest(symbol: str):
+    """Return the latest day's GEX row (dict) for a symbol, or None if no table yet."""
+    import pandas as pd
+    path = DERIVED / f"{symbol}_gex_daily.parquet"
+    if not path.exists():
+        return None
+    df = pd.read_parquet(path)
+    if df.empty:
+        return None
+    # tables are written sorted ascending by date; be defensive and sort anyway.
+    df = df.sort_values("date")
+    return df.iloc[-1].to_dict()
+
+
+def _gex_fmt_mag(net_gex):
+    """Human $GEX magnitude (per 1% move): $1.2B / $345M / $12K, signed."""
+    try:
+        v = float(net_gex)
+    except (TypeError, ValueError):
+        return "—"
+    if v != v:  # NaN
+        return "—"
+    sign = "+" if v >= 0 else "−"
+    a = abs(v)
+    if a >= 1e9:
+        return f"{sign}${a/1e9:.2f}B"
+    if a >= 1e6:
+        return f"{sign}${a/1e6:.0f}M"
+    if a >= 1e3:
+        return f"{sign}${a/1e3:.0f}K"
+    return f"{sign}${a:,.0f}"
+
+
+def _gex_num(v, suffix="", nd=2):
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return "—"
+    if f != f:
+        return "—"
+    return f"{f:,.{nd}f}{suffix}"
+
+
+def _gex_oneliner(sym, r):
+    """A compact spot/state/flip line for a single symbol's row."""
+    state = r.get("gamma_state", "?")
+    return (f"{sym} {state} · net {_gex_fmt_mag(r.get('net_gex'))} · "
+            f"spot {_gex_num(r.get('spot'))} · flip {_gex_num(r.get('gamma_flip'))} "
+            f"({_gex_num(r.get('dist_to_flip_pct'), '%', 2)} away) · "
+            f"exp move {_gex_num(r.get('expected_move_pct'), '%', 2)}")
+
+
+def build_gex():
+    """Dealer Gamma — latest derived GEX for the index (SPX) + ETF (SPY)."""
+    # pick the first index table that exists (SPX preferred over SPXW)
+    idx_sym, idx = None, None
+    for sym in GEX_INDEX:
+        r = _gex_latest(sym)
+        if r is not None:
+            idx_sym, idx = sym, r
+            break
+    etf = _gex_latest(GEX_ETF)
+
+    if idx is None and etf is None:
+        return _sec("gex", "Dealer Gamma", "info",
+                    "No derived GEX tables yet — warehouse build still landing.", [])
+
+    primary = idx if idx is not None else etf
+    primary_sym = idx_sym if idx is not None else GEX_ETF
+    state = primary.get("gamma_state", "?")
+    st = GEX_STATE_DOT.get(state, "info")
+
+    flip_dir = "above" if primary.get("above_flip") else "below"
+    headline = (f"{primary_sym} dealer gamma is {state.upper()} "
+                f"(spot {flip_dir} the {_gex_num(primary.get('gamma_flip'))} flip)")
+    if state == "Negative":
+        headline += " — fragile / vol-amplifying regime"
+    elif state == "Positive":
+        headline += " — pinning / vol-dampening regime"
+
+    rows = []
+    if idx is not None:
+        rows += [
+            (f"{idx_sym} as-of", idx.get("date")),
+            (f"{idx_sym} gamma state", idx.get("gamma_state")),
+            (f"{idx_sym} net GEX (per 1%)", _gex_fmt_mag(idx.get("net_gex"))),
+            (f"{idx_sym} spot", _gex_num(idx.get("spot"))),
+            (f"{idx_sym} gamma flip", _gex_num(idx.get("gamma_flip"))),
+            (f"{idx_sym} dist to flip", _gex_num(idx.get("dist_to_flip_pct"), "%", 2)),
+            (f"{idx_sym} expected move", _gex_num(idx.get("expected_move_pct"), "%", 2)),
+            (f"{idx_sym} focal strike", _gex_num(idx.get("focal_strike"), nd=0)),
+        ]
+    else:
+        rows.append(("Index (SPX/SPXW)", "no table yet"))
+    if etf is not None:
+        rows.append((f"{GEX_ETF} line", _gex_oneliner(GEX_ETF, etf)))
+    else:
+        rows.append((f"{GEX_ETF} line", "no table yet"))
+
+    # stale if the primary table's last day isn't today's run date.
+    if str(primary.get("date")) != TODAY_STR:
+        st = "stale" if st in ("ok", "info") else st
+        headline += f"  ⚠ latest GEX is {primary.get('date')}, not today"
+
+    return _sec("gex", "Dealer Gamma", st, headline, rows)
+
+
+SECTIONS = [build_forward, build_thetadata, build_tiingo, build_gex, build_system, build_strategy]
 
 
 # --------------------------------------------------------------------------- #
