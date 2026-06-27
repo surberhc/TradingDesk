@@ -83,6 +83,14 @@
     REMAINING LIVE STEPS (conductor, serialized, gated): align tier group names
     (tier_conservative/balanced/growth vs Conservative/Balanced/Growth); per-rebalance set each group's
     ContractsOrShares = RoutePlan split; wire build_plan→order_router behind READONLY+DRY_RUN+armed; then place.
+  - FIRST REBALANCE — IN PROGRESS 2026-06-27 (Andrew APPROVED: build+dry-run review today, TRANSMIT MONDAY).
+    Building `paperbot/rebalance_run.py` (multi-account dry-run runner, review→arm→transmit gate; reads live FA
+    groups via requestFA + fails closed on name mismatch; transmits nothing). GATEWAY BLOCK: Sat 2026-06-27 the
+    paper gateway's account-data feed is DOWN (weekend maintenance) — accounts.py/fa_probe.py both hang at the
+    connect-time account sync ("account updates ... request timed out"). So the LIVE read-only review can't run
+    today; an OFFLINE preview (representative $1.1M/acct, all flat, Friday close) is being produced instead.
+    MONDAY (market open): live read-only review (real net-liq/positions) → resolve group names via requestFA →
+    set each group's ContractsOrShares = split → ANDREW ARMS → transmit blocks → watch fills → reconcile to model.
 - Account model: trade **DU sub-accounts**; FA master DF8922141 rejects direct orders +
   hangs reads (connect with explicit `account=`). Paper gateway hard read-only lock is OFF
   (software arming is the control).

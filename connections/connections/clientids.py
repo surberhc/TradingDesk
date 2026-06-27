@@ -27,6 +27,7 @@ CLIENT_IDS = {
     "paperbot_flatten": 34,         # paperbot: one-shot flatten-to-zero sweep (own id so it never collides with the engine on 30)
     "paperbot_fa_block": 35,        # paperbot: one-shot FA block-order proof (test_group/NetLiq) — own id, never collides with 30
     "paperbot_fa_admin": 36,        # paperbot: FA config write (replaceFA group create/edit) — own id, serialize this shared write
+    "paperbot_rebalance": 37,       # paperbot: multi-account rebalance RUNNER (read-only connect, build-only, arm-gated) — own id so it never collides with the engine on 30 or any read-only probe
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.
