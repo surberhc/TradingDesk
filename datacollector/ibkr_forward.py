@@ -182,10 +182,17 @@ def _to_df(rows: list[dict], sym: str, daystr: str, snap_ts: str, spot) -> pd.Da
     df["timestamp"] = snap_ts
     df["underlying_timestamp"] = snap_ts
     # Per-row undPrice from greeks is best; fall back to the underlying spot.
+    # spot can be None (index roots: reqTickers on an Index often returns NaN for
+    # marketPrice/close/last, whereas the model-greeks undPrice IS populated). Guard
+    # the fill: fillna(None) raises ValueError("Must specify a fill 'value' or
+    # 'method'.") in pandas >=2, so only backfill when we actually have a spot —
+    # otherwise leave the per-row undPrice values intact.
+    spot_val = _num(spot)
     if "underlying_price" in df:
-        df["underlying_price"] = df["underlying_price"].fillna(_num(spot))
+        if spot_val is not None:
+            df["underlying_price"] = df["underlying_price"].fillna(spot_val)
     else:
-        df["underlying_price"] = _num(spot)
+        df["underlying_price"] = spot_val
     for col in SCHEMA_COLS:
         if col not in df.columns:
             df[col] = pd.NA          # ThetaData-only columns IBKR can't supply
