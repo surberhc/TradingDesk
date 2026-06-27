@@ -1,105 +1,64 @@
-# LANE STATUS  (last updated by: Conductor/dispatch, 2026-06-26)
+# LANE STATUS  (last updated by: Conductor, 2026-06-27 ~12:35 CT)
 
-> Seeded from one session's view + shared memory. The Conductor should CONFIRM each lane
-> against the actual sessions and correct anything stale.
->
-> RAW SESSION HANDOFFS now live in `conductor/handoffs/` (dated drop folder; read its
-> README). This sitting's four: `HANDOFF_paperbot_2026-06-26_1958.md`,
-> `HANDOFF_paperbot-optionB_2026-06-26_2001.md`,
-> `HANDOFF_datacollector-reporting_2026-06-26_2000.md`,
-> `HANDOFF_backtester-ma200_2026-06-26_2000.md`.
+> Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` (dated drop folder;
+> read its README). Latest weekend handoff: `HANDOFF_weekend-conductor_2026-06-27_1235.md`.
+> First live paperbot rebalance is HELD for **MONDAY** — steps in `MONDAY_RUNBOOK.md` (repo root).
 
 ## A — Strategy & Backtester
 - 200d-MA fragility fix ADOPTED: `REGIME_TREND_MARGIN=0.03` (regime-only early-exit margin).
-  Full handoff: `handoffs/HANDOFF_backtester-ma200_2026-06-26_2000.md`.
-- DONE 2026-06-27: `backtester/data/` MOVED off Drive to `C:\TradingDesk-Local\bt_data\`
-  (config repointed; loader/downloader made absolute-path-aware; Drive copies deleted; data/
-  folder kept w/ .gitkeep). 89 tests pass; loads 2010-01-04→2026-06-26. Drive-sync instability RESOLVED.
-- OPEN: (1) the 2 uncommitted doc edits (`backtester/README.md`, `VALIDATION.md`) — left for conductor git;
-  (2) regenerate GFC (2008) tables — DEFERRED. C-drive search DONE 2026-06-27: full pre-2010 universe is
-  NOT on disk — only AGG+LQD reach 2005; a SPY-only CSV (2008+) sits at msr\Flow Project\flow_verdict\data\
-  spy_hist_2008_2026.csv; TLT/VTI/sectors/gold/commodities all start 2010. Only path = Tiingo re-download
-  with earlier DATA_START + key loaded. HOLD until ThetaData download finishes (Andrew: don't compete for bandwidth).
-  (3) DONE 2026-06-27: paperbot byte-parity RE-PROVEN. paperbot strategy_target.current_target() calls
-  src.backtest.run_backtest (single weight path) → targets byte-identical to the backtester with
-  REGIME_TREND_MARGIN=0.03 (max abs diff 0.0 across 4 dates × 3 versions). Paper-use prerequisite cleared.
+- DONE 2026-06-27: `backtester/data/` MOVED off Google Drive to `C:\TradingDesk-Local\bt_data\`
+  (Drive sync was corrupting the data). config repointed; loader/downloader are absolute-path-aware;
+  data/ kept w/ .gitkeep. 89 tests pass. Drive-sync instability RESOLVED.
+- DONE 2026-06-27 (committed 78cdabe): GFC/2008 tables REGENERATED on extended 2007+ Tiingo data.
+  `config.DATA_START` now `2007-01-01`. Balanced 2007→2026: **CAGR 8.5% / maxDD -10.2% / Calmar 0.83 /
+  Sortino 1.16**; GFC-window maxDD -7.1%; **calendar-2008 +8.3%** (up from old +3.4% pre-margin) — 2022 -6.1%.
+  2015-26 headline UNCHANGED (CAGR 7.45% / maxDD -10.20% / Calmar 0.73). Good 2010 data backed up at
+  `C:\TradingDesk-Local\bt_data_backup_2010_good`.
+  - **FLAGGED for Andrew's gut-check:** the 2008 jump (+3.4% → +8.3%) is a big move; sanity-confirm it
+    looks right before leaning on the GFC numbers.
+- DONE 2026-06-27: paperbot byte-parity RE-PROVEN — paperbot targets are byte-identical to the backtester
+  with `REGIME_TREND_MARGIN=0.03` (max abs diff 0.0). Paper-use prerequisite cleared.
 
 ## B — Data Warehouse / Collector
-- RESOLVED 2026-06-27: the DuckDB `options_eod` "non-empty parquets only" fix is ALREADY in the
-  committed code (storage.py `_nonempty_parquets()` + `rebuild_catalog()`); the prior STATUS line was
-  STALE. Verified against the LIVE warehouse: 102,148 parquet across 47 symbols, 7,659 zero-column
-  markers correctly EXCLUDED (kept on disk), 0 corrupt; view builds clean. No code change needed.
-  Optional future perf nicety: skip footer read via `_manifest.json` row count (not a correctness issue).
-- ThetaData terminal: was stopped for the move; has been seen running this session.
-- Do NOT delete empty/zero-column parquets (have_day relies on them).
+- RESOLVED 2026-06-27: the DuckDB `options_eod` "non-empty parquets only" fix is ALREADY in committed
+  `storage.py` (`_nonempty_parquets()` + `rebuild_catalog()`). Verified against the LIVE ~102k-file
+  warehouse — zero-column markers correctly EXCLUDED (kept on disk), 0 corrupt, view builds clean.
+- KILLED 2026-06-27: a rogue duplicate `download.py` (running on system-Python, 6–12 GB, a
+  warehouse-race hazard). Gone.
+- FIXED 2026-06-27 (committed 6187fda): index-root crash in `ibkr_forward.py` (`_to_df` fillna on NaN
+  spot for SPX/SPXW/VIX/NDX/RUT/XSP). Last night's forward run failed 30/43 symbols on this bug; future
+  runs are now clean.
+- ThetaData historical grab COMPLETE (`GRAB_END=20260625`); supervisor self-heals via Task Scheduler.
+- IN PROGRESS: a worker is backfilling **2026-06-26 EOD** from ThetaData (covers the symbols last night's
+  forward run dropped).
+- Do NOT delete empty/zero-column parquets (`have_day` relies on them).
 
 ## C — Paperbot Execution
-> Two threads in this lane. Serialize any order placement / gateway / git between them.
-- **Option B build — advanced through Increment 3 (2026-06-26).** Full handoff:
-  `conductor/handoffs/HANDOFF_paperbot-optionB_2026-06-26_2001.md`. All READ-ONLY / what-if —
-  nothing transmitted, no FA config written.
-  - BUILT + verified: per-tier `ENROLLMENT`; multi-account discovery (`accounts.py`);
-    distribution-reserve + schedule (`cashflows.py`, empty until Andrew feeds it); daily
-    reconciliation/drift/**block-aggregation** report (`recon_report.py`); no-trade band;
-    version stamping (v0.4.0); read-only FA-config probe (`fa_probe.py`).
-  - Account reality: 5 client subs DU8922142–146 each FUNDED ~$1.1M paper, all enrolled,
-    currently all-cash → each needs a full initial rebalance.
-  - **OPEN (do first):** `fa_block_test.py` (does the FA master accept an API block order?)
-    stalled with no output → **result UNKNOWN; re-run in the FOREGROUND.**
-  - **DECISION (APPROVED 2026-06-26):** after the block what-if passes, create the 3 paper
-    allocation groups (Conservative/Balanced/Growth), replacing the leftover test group.
-    Paper only, reversible, no client orders by this step. (See DECISIONS `optionB-create-groups`.)
-- **Flatten thread (Andrew APPROVED 2026-06-26):** sweep DU142-146, sell every leftover
-  (incl. GOOG in DU143 + 1 test PDBC share in DU142), confirm zero, log each. See
-  `handoffs/HANDOFF_paperbot_2026-06-26_1958.md`. **Must finish BEFORE the first Option B
-  block rebalance** (invest from a blank slate).
-  - **DONE & VERIFIED 2026-06-26 16:10 CT.** Flatten EXECUTED in extended hours (outsideRth=True);
-    confirmed by IBKR execution feed (execIds): DU146 SLD 100 SPY @730.57, DU143 SLD 100 GOOG @335.70,
-    DU142 SLD 1 PDBC @15.81. **All 5 DU subs FLAT (0 positions), zero open orders.** The earlier
-    "flatten-monday / market-closed" note was a PARKED session reading a STALE pre-flatten snapshot —
-    obsolete, no Monday action needed (see DECISIONS corrections).
-  - **Block-order proof DONE & VERIFIED 2026-06-26:** master ACCEPTS + SPLITS a group block order
-    (3 PDBC -> 1 each into DU142/143/144, then flattened; execIds on file; all flat again). Order-level
-    NetLiq is NOT available (Err 10226) -> allocation must be explicit shares (ContractsOrShares).
-  - **DECISION (Andrew APPROVED A, 2026-06-26):** execution model = engine computes each account's
-    explicit target shares (net liq + reserve + band) and places blocks against ContractsOrShares groups.
-  - **DONE & VERIFIED 2026-06-26 ~22:08 CT:** 3 tier FA groups created via replaceFA + re-probed —
-    Conservative->DU142; Balanced->DU143,144; Growth->DU145,146; method ContractsOrShares; test_group
-    dropped (prior config backed up to state\paperbot\fa_groups_backup.xml). SAFE STATE at session end:
-    all 5 DU subs FLAT, 0 open orders, nothing transmitted, FA config consistent. NEXT (separately gated,
-    needs Andrew's go): build the multi-account block engine (recon -> per-acct shares -> set group amounts
-    -> block -> arm -> transmit). clientId registry now: flatten=34, fa_block=35, fa_admin=36.
-  - DONE 2026-06-27 (OFFLINE, no transmit): computation core built — `paperbot/rebalance_engine.py`
-    (per-acct integer target shares, reserve carve-out, 3% band, block aggregation w/ per-account
-    `ContractsOrShares` split; emits empty FA method per Err-10226 fix; never whatIfOrders a group).
-    14 pytest tests pass. version 0.4.0→0.5.0. NOT committed (conductor git).
-    BAND DECISION RESOLVED (Andrew 2026-06-27): ACCOUNT-LEVEL all-or-nothing. Engine updated + a
-    distinguishing test added; 15 pytest tests pass. NOTE: engine triggers the rebalance off the
-    required TRADE SIZE vs NetLiq (not reconcile's raw weight-vs-model drift) so the cash-reserve gap
-    can't falsely flag a correctly-invested account / defeat the band on >~60%-weight holdings.
-    FOLLOW-UP DONE 2026-06-27: recon_report.plan_account aligned to the engine's account-level trade-size
-    band (readout now matches the actor); verified offline; 15 engine tests still pass.
-    Architecture reference written: docs/ARCHITECTURE.md (code-on-Drive vs data-on-C: map, caveats).
-    REMAINING LIVE STEPS (conductor, serialized, gated): align tier group names
-    (tier_conservative/balanced/growth vs Conservative/Balanced/Growth); per-rebalance set each group's
-    ContractsOrShares = RoutePlan split; wire build_plan→order_router behind READONLY+DRY_RUN+armed; then place.
-  - FIRST REBALANCE — IN PROGRESS 2026-06-27 (Andrew APPROVED: build+dry-run review today, TRANSMIT MONDAY).
-    Building `paperbot/rebalance_run.py` (multi-account dry-run runner, review→arm→transmit gate; reads live FA
-    groups via requestFA + fails closed on name mismatch; transmits nothing). GATEWAY BLOCK: Sat 2026-06-27 the
-    paper gateway's account-data feed is DOWN (weekend maintenance) — accounts.py/fa_probe.py both hang at the
-    connect-time account sync ("account updates ... request timed out"). So the LIVE read-only review can't run
-    today; an OFFLINE preview (representative $1.1M/acct, all flat, Friday close) is being produced instead.
-    MONDAY (market open): live read-only review (real net-liq/positions) → resolve group names via requestFA →
-    set each group's ContractsOrShares = split → ANDREW ARMS → transmit blocks → watch fills → reconcile to model.
-- Account model: trade **DU sub-accounts**; FA master DF8922141 rejects direct orders +
-  hangs reads (connect with explicit `account=`). Paper gateway hard read-only lock is OFF
-  (software arming is the control).
+> All PAPER. Nothing transmitted. review→arm→transmit gate intact. Serialize any order / gateway / git.
+- Multi-account rebalance ENGINE built + committed: `paperbot/rebalance_engine.py` (per-acct integer
+  target shares, reserve carve-out, **account-level all-or-nothing band**, block aggregation w/ per-account
+  `ContractsOrShares` split; emits empty FA method per the Err-10226 fix; never whatIfOrders a group).
+  Engine triggers off required **trade size vs NetLiq**, not raw weight-vs-model drift. Tests pass.
+- `recon_report.plan_account` ALIGNED to the engine's account-level trade-size band (readout matches the actor).
+- Runner built + committed (22dee54): `paperbot/rebalance_run.py` — multi-account dry-run runner,
+  review→arm→transmit gate, reads live FA groups via requestFA + fails closed on name mismatch, transmits
+  nothing. clientId **37**.
+- Account reality: 5 client subs DU8922142–146, each FUNDED ~$1.1M paper, all enrolled, all FLAT (cash) →
+  each needs a full initial rebalance. FA groups exist: Conservative→DU142; Balanced→DU143,144;
+  Growth→DU145,146 (method ContractsOrShares; prior config backed up to `state\paperbot\fa_groups_backup.xml`).
+- **FIRST LIVE REBALANCE — HELD FOR MONDAY.** Two blockers, both expected: (1) the paper gateway's
+  account-data feed is DOWN for the weekend (account reads HANG at connect-time sync), so the live read-only
+  review can't run today; (2) market is closed. Build + dry-run review are done; **transmit is Monday**.
+  - MONDAY steps live in `MONDAY_RUNBOOK.md` (repo root) — being written by a worker this session.
+- Account model: trade the **DU sub-accounts**; FA master DF8922141 rejects direct orders + hangs reads.
+  Paper gateway hard read-only lock is OFF (software arming is the control).
 
 ## D — Reporting
-- RRG retired; harness repurposed into an EOD status digest (`eod_report.py`). Scheduled (CT).
-- `daily_run.py` got the same gateway java_version=17 fix this session.
+- UNCHANGED. RRG retired; harness repurposed into the EOD status digest (`eod_report.py`), scheduled (CT).
+- `daily_run.py` + `connections/ibkr.py` carry the gateway `java_version=17` launch fix.
 
 ## Shared plumbing
-- `connections/ibkr.py` carries the gateway launch fix (`java_version=17`).
-- Project is now a local git repo (in Drive, no remote); commit after each change-set.
-- clientId registry in `connections/clientids.py` (paperbot=30); don't collide.
+- Local git repo (in Drive, no remote); commit after each change-set.
+- clientId registry in `connections/clientids.py`. In use this lane: paperbot=30, flatten=34, fa_block=35,
+  fa_admin=36, rebalance_run=37. Don't collide.
+- Handoffs consolidated into `conductor/handoffs/`; the stray "Andrew is pissed off" folder was deleted.
