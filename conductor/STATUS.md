@@ -25,7 +25,11 @@
   REGIME_TREND_MARGIN=0.03 (max abs diff 0.0 across 4 dates × 3 versions). Paper-use prerequisite cleared.
 
 ## B — Data Warehouse / Collector
-- DuckDB `options_eod` view still needs the "build over non-empty parquets only" fix.
+- RESOLVED 2026-06-27: the DuckDB `options_eod` "non-empty parquets only" fix is ALREADY in the
+  committed code (storage.py `_nonempty_parquets()` + `rebuild_catalog()`); the prior STATUS line was
+  STALE. Verified against the LIVE warehouse: 102,148 parquet across 47 symbols, 7,659 zero-column
+  markers correctly EXCLUDED (kept on disk), 0 corrupt; view builds clean. No code change needed.
+  Optional future perf nicety: skip footer read via `_manifest.json` row count (not a correctness issue).
 - ThetaData terminal: was stopped for the move; has been seen running this session.
 - Do NOT delete empty/zero-column parquets (have_day relies on them).
 
