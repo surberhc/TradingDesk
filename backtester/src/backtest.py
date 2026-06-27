@@ -30,6 +30,7 @@ from strategies.all_weather import AdaptiveAllWeather
 
 from src import data_loader
 from src import gamma_overlay
+from src import flow_overlay
 
 
 def _next_trading_day(index: pd.DatetimeIndex, after) -> pd.Timestamp | None:
@@ -55,6 +56,8 @@ def run_backtest(
     use_real_assets: bool = True,
     gamma_overlay_enabled: bool = config.GAMMA_OVERLAY_ENABLED,
     gamma_negative_risk_scale: float = config.GAMMA_OVERLAY_NEGATIVE_RISK_SCALE,
+    flow_overlay_enabled: bool = config.FLOW_OVERLAY_ENABLED,
+    flow_overlay_variant: str = config.FLOW_OVERLAY_VARIANT,
 ) -> dict:
     """
     Run the month-by-month simulation and return the result time series.
@@ -122,6 +125,14 @@ def run_backtest(
     if gamma_overlay_enabled:
         gamma_state = gamma_overlay.load_gamma_state()
 
+    # --- FLOW de-risk overlay (research; default OFF). Same pattern: load the
+    # daily price-only flow state once here so the per-rebalance as-of lookups are
+    # cheap. When disabled, flow_state stays None and the loop's overlay branch is
+    # skipped entirely -> S0 is byte-identical. ---
+    flow_state = None
+    if flow_overlay_enabled:
+        flow_state = flow_overlay.compute_flow_state()
+
     # --- Build target weights at each rebalance date, to execute the next day ---
     targets: dict[pd.Timestamp, pd.Series] = {}
     monthly_rows: list[dict] = []
@@ -150,6 +161,17 @@ def run_backtest(
                 negative_risk_scale=gamma_negative_risk_scale,
             )
 
+        # --- Flow overlay (post-process on S0's weights). Strictly causal: the
+        # flow_state used is the most recent reading AS-OF the SIGNAL date t (never
+        # the T+1 exec_date). When the state warrants de-risking (G1/G2 scales),
+        # risk-asset weight is trimmed to cash; otherwise weights pass through. ---
+        flow_now = None
+        if flow_state is not None:
+            flow_now = flow_overlay.flow_state_asof(flow_state, t)
+            weights = flow_overlay.apply_overlay(
+                weights, flow_now, variant=flow_overlay_variant,
+            )
+
         targets[exec_date] = weights
         prev_weights = weights
         ex = decision.extras
@@ -163,6 +185,7 @@ def run_backtest(
                 # it does not overwrite the real_asset sleeve fraction.
                 **decision.sleeves, "real_asset_ticker": decision.real_asset,
                 "gamma_state": gamma_now,
+                "flow_state": flow_now,
                 "reasons": "; ".join(decision.reasons),
             }
         )

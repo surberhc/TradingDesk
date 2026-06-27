@@ -432,3 +432,41 @@ GAMMA_OVERLAY_NEGATIVE_RISK_SCALE = 0.5
 # largest-weight cash-like holding already in the book (fallback BENCHMARK_TBILL).
 GAMMA_OVERLAY_RISK_ASSETS = tuple(EQUITY_CORE + SECTORS + GOLD + COMMODITIES)
 GAMMA_OVERLAY_CASH_TICKER = BENCHMARK_TBILL  # fallback park destination
+
+
+# ---------------------------------------------------------------------------
+# FLOW de-risk OVERLAY (research; default OFF) — backtester-level post-process
+# ---------------------------------------------------------------------------
+# A backtester-only risk-SIZING overlay layered on top of S0's target weights,
+# the SAME pattern as the gamma overlay. It does NOT touch the shared strategy
+# brain and must leave S0 BYTE-IDENTICAL when off.
+#
+# Economic motivation (Flow Project verdict, FLOW_VERDICT.md): the vendor flow
+# signal is DROPPED for direction, but the free PRICE-ONLY de-risk gate is real.
+# A Bullish/Neutral/Bearish positioning state is reconstructed from SPY price
+# alone (px vs MA200 + 12m-1m momentum + 252d realized-vol percentile rank):
+#   Bearish : px < MA200            OR  rvol_rank > vol_top   (downtrend or vol spike)
+#   Bullish : px > MA200 AND mom>0  AND rvol_rank < vol_calm  (uptrend AND calm)
+#   Neutral : otherwise
+# When Bearish, trim RISK-asset exposure and park it in the existing cash sleeve.
+#
+# Two pre-specified variants from the verdict (no extra grid):
+#   G1 "flat"  : risk x0.0 when Bearish; x1.0 Bullish/Neutral.
+#   G2 "sized" : risk x1.0 / x0.5 / x0.0 for Bullish / Neutral / Bearish.
+#
+# Strictly causal: every feature uses only data on/before the SIGNAL date, and the
+# state applied at a rebalance is the most recent state as-of the signal date.
+FLOW_OVERLAY_ENABLED = False           # master flag — OFF keeps S0 byte-identical
+FLOW_OVERLAY_VARIANT = "G1"            # "G1" (flat) | "G2" (1/0.5/0 sizing)
+FLOW_OVERLAY_PRICE_TICKER = "SPY"      # price series the proxy is computed from
+# Proxy knobs — the verdict's defaults (do NOT tune these to manufacture a win).
+FLOW_OVERLAY_MA_LEN = 200
+FLOW_OVERLAY_MOM_LONG = 252
+FLOW_OVERLAY_MOM_SKIP = 21
+FLOW_OVERLAY_RVOL_WIN = 21
+FLOW_OVERLAY_VOL_RANK_WIN = 252
+FLOW_OVERLAY_VOL_TOP = 0.80
+FLOW_OVERLAY_VOL_CALM = 0.70
+# Risk-asset set and park destination (same as the gamma overlay).
+FLOW_OVERLAY_RISK_ASSETS = tuple(EQUITY_CORE + SECTORS + GOLD + COMMODITIES)
+FLOW_OVERLAY_CASH_TICKER = BENCHMARK_TBILL
