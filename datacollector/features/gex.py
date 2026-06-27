@@ -58,7 +58,13 @@ def _prep(chain: pd.DataFrame) -> pd.DataFrame:
     """Clean one day's chain to the columns the math needs."""
     df = chain.copy()
     df["right"] = df["right"].str.upper().str[0]                 # C / P
-    df["oi"] = pd.to_numeric(df.get("open_interest"), errors="coerce").fillna(0.0)
+    # Some snapshots (e.g. VIX half-days) return greeks but no OI endpoint, so the
+    # parquet has no open_interest column at all. df.get() would yield a scalar NaN
+    # (no .fillna) and crash the whole symbol build -> treat an absent column as 0 OI.
+    if "open_interest" in df.columns:
+        df["oi"] = pd.to_numeric(df["open_interest"], errors="coerce").fillna(0.0)
+    else:
+        df["oi"] = 0.0
     df["iv"] = pd.to_numeric(df.get("implied_vol"), errors="coerce")
     exp = pd.to_datetime(df["expiration"])
     asof = pd.to_datetime(df["date"], format="%Y%m%d")
