@@ -47,7 +47,7 @@ CROSS_CHECK = ["SPY"]
 # *simulate* alternatives in-script. We never import or mutate the live module.
 CALL_SIGN = +1.0
 PUT_SIGN = -1.0
-NEUTRAL_BAND_FRAC = 0.10
+NEUTRAL_BAND_FRAC = 0.05  # mirrors production datacollector/features/gex.py
 
 
 # ---------------------------------------------------------------------------

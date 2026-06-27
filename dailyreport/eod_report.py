@@ -159,7 +159,7 @@ def build_forward():
         if hb_sec is not None:
             return hb_sec
     if not s:
-        return _sec("forward", "IBKR Forward Collector", "stale",
+        return _sec("forward", "Daily Options Grab (ThetaData)", "stale",
                     "No status written — did the 5:30 PM run fire?", [])
     m = s.get("metrics", {})
     fresh = s.get("date") == TODAY_STR
@@ -169,7 +169,7 @@ def build_forward():
             ("Failed roots", m.get("fail")), ("Real errors", m.get("real_errors")),
             ("Last update", s.get("ts"))]
     headline = s.get("message", "") + ("" if fresh else "  ⚠ status is from a previous day")
-    return _sec("forward", "IBKR Forward Collector", st, headline, rows)
+    return _sec("forward", "Daily Options Grab (ThetaData)", st, headline, rows)
 
 
 def build_thetadata():
