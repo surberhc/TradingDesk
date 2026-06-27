@@ -4,12 +4,12 @@
 > read its README). Latest weekend handoff: `HANDOFF_weekend-conductor_2026-06-27_1235.md`.
 > First live paperbot rebalance is HELD for **MONDAY** — steps in `MONDAY_RUNBOOK.md` (repo root).
 
-## OPEN ITEMS — running tally (2026-06-27; also in the session task list)
-**In progress:** [1] SPXW 1-min collector full 2022→today pull (~38/1170, ETA ~June 30; 1 clean instance, smart-filtered).
-**Open — doable now:** [3] test Flow de-risk gate on S0 · [4] build S3 v1 fixed-delta condor control · [2] re-pull 1-min day 20260529 · [9] cosmetic (EOD "IBKR Forward Collector" label + calibrate_gex 0.10 constant) · [10] decide keep/kill the 10-min collector cron.
+## OPEN ITEMS — running tally (updated 2026-06-27; mirrors the session task list)
+**In progress:** [1] SPXW 1-min collector (~44/1170, ETA ~June 30; 1 clean instance, smart-filtered).
+**Open / next:** [2] re-pull 1-min day 20260529 (self-heals on the collector's next run) · dashboard Phase 2 (backtester controls) + Phase 3 (gated trading controls) — Phase-1 monitor DONE.
 **Blocked / time-gated:** [5] S2/S3 condor backtests — blocked on 1-min data (~June 30) · [6] Monday first live paper rebalance — gated to Monday (gateway+market), needs [7] first · [7] Monday pre-arm: verify replaceFA FA-XML tag casing · [11] don't cancel ThetaData sub until pulls complete.
 **Owed:** [8] Andrew gut-check the 2008 GFC +8.3% number.
-**Recently closed:** gamma overlay (tested→rejected), weekly cadence (tested→rejected), GEX rebuild+calibration (70%), daily grab→ThetaData (IBKR retired), EOD Dealer-Gamma section, Friday 6/26 data fix, full top-down audit.
+**Recently closed:** dashboard Phase-1 monitor [12]; S3 v1 condor control [4]; flow de-risk gate [3] (tested→rejected); cosmetics [9]; killed redundant cron [10]; gamma overlay + weekly cadence (both tested→rejected); GEX rebuild+calibration (70%); daily grab→ThetaData (IBKR retired); EOD Dealer-Gamma section; Friday 6/26 data fix; full top-down audit.
 
 ## A — Strategy & Backtester
 - 200d-MA fragility fix ADOPTED: `REGIME_TREND_MARGIN=0.03` (regime-only early-exit margin).
