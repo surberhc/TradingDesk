@@ -7,8 +7,18 @@ derived/{SYMBOL}_gex_daily.parquet. These derived tables are tiny (one row/day)
 and ARE safe to copy back to Drive for backup.
 
 Usage:
-    python build_features.py SPX          # one root
-    python build_features.py              # every root that has raw data
+    python build_features.py SPX          # one root, FULL rebuild
+    python build_features.py              # every root, FULL rebuild (HEAVY, ~30min+)
+    python build_features.py --latest     # FAST incremental: append only NEW days for the
+                                          #   report symbols (SPX SPXW SPY QQQ) — for nightly cron
+    python build_features.py --latest all # incremental for every root that has raw data
+    python build_features.py --latest SPX QQQ   # incremental for a chosen subset
+
+Incremental (--latest) reads the existing derived/{SYMBOL}_gex_daily.parquet, finds the
+latest date already in it, and processes ONLY the raw daily files newer than that — then
+appends and rewrites the (still tiny) derived table. It never recomputes history, so it is
+seconds-fast per symbol. If no derived table exists yet for a symbol, it falls back to a
+full build_symbol() for that one symbol. Full-rebuild behavior is unchanged.
 """
 
 from __future__ import annotations
@@ -21,20 +31,37 @@ import config
 import storage
 from features import gex
 
+# Symbols the EOD report's Dealer Gamma section actually reads (SPX->SPXW->SPY),
+# plus QQQ. The nightly incremental defaults to these so the report is always fresh.
+REPORT_SYMBOLS = ["SPX", "SPXW", "SPY", "QQQ"]
 
-def build_symbol(symbol: str) -> int:
-    raw_dir = config.RAW_OPTIONS / symbol
-    if not raw_dir.exists():
-        print(f"  {symbol}: no raw data yet")
-        return 0
+
+def _day_rows(raw_dir, only_after: str | None = None) -> list[dict]:
+    """GEX feature rows for each raw daily parquet in raw_dir.
+
+    If only_after (a 'YYYYMMDD' date string) is given, only files whose stem
+    (the date) is strictly greater than it are processed — the incremental path.
+    """
     rows = []
     for p in sorted(raw_dir.glob("*.parquet")):
+        if only_after is not None and p.stem <= only_after:
+            continue
         chain = pd.read_parquet(p)
         if chain.empty:
             continue
         f = gex.day_features(chain)
         if f:
             rows.append(f)
+    return rows
+
+
+def build_symbol(symbol: str) -> int:
+    """FULL rebuild: recompute every day's GEX from scratch and overwrite the table."""
+    raw_dir = config.RAW_OPTIONS / symbol
+    if not raw_dir.exists():
+        print(f"  {symbol}: no raw data yet")
+        return 0
+    rows = _day_rows(raw_dir)
     if not rows:
         print(f"  {symbol}: no usable days")
         return 0
@@ -45,12 +72,63 @@ def build_symbol(symbol: str) -> int:
     return len(out)
 
 
+def update_symbol(symbol: str) -> int:
+    """INCREMENTAL: append only days newer than what's already in the derived table.
+
+    Returns the number of NEW days appended. Falls back to a full build if no
+    derived table exists yet (first run for a symbol).
+    """
+    raw_dir = config.RAW_OPTIONS / symbol
+    if not raw_dir.exists():
+        print(f"  {symbol}: no raw data yet")
+        return 0
+    out_path = config.DERIVED / f"{symbol}_gex_daily.parquet"
+    if not out_path.exists():
+        print(f"  {symbol}: no derived table yet -> full build")
+        return build_symbol(symbol)
+    existing = pd.read_parquet(out_path)
+    # 'date' is stored as a 'YYYYMMDD' string (str(chain['date'].iloc[0])); compare as str.
+    last_date = str(existing["date"].astype(str).max()) if not existing.empty else None
+    new_rows = _day_rows(raw_dir, only_after=last_date)
+    if not new_rows:
+        print(f"  {symbol}: up to date (latest {last_date})")
+        return 0
+    out = (pd.concat([existing, pd.DataFrame(new_rows)], ignore_index=True)
+           .drop_duplicates(subset="date", keep="last")
+           .sort_values("date")
+           .reset_index(drop=True))
+    config.DERIVED.mkdir(parents=True, exist_ok=True)
+    out.to_parquet(out_path, index=False)
+    added = [r["date"] for r in new_rows]
+    print(f"  {symbol}: +{len(new_rows)} day(s) {added} -> {len(out)} total")
+    return len(new_rows)
+
+
 def main(roots: list[str]) -> None:
+    """FULL rebuild for the given roots (or every root if empty)."""
     if not roots:
         roots = sorted(p.name for p in config.RAW_OPTIONS.glob("*") if p.is_dir())
     for symbol in roots:
         build_symbol(symbol)
 
 
+def main_incremental(roots: list[str]) -> None:
+    """FAST incremental update for the given roots.
+
+    Empty -> the report symbols. ['ALL'] -> every root that has raw data.
+    """
+    if not roots:
+        roots = REPORT_SYMBOLS
+    elif roots == ["ALL"]:
+        roots = sorted(p.name for p in config.RAW_OPTIONS.glob("*") if p.is_dir())
+    print("build_features --latest (incremental):")
+    for symbol in roots:
+        update_symbol(symbol)
+
+
 if __name__ == "__main__":
-    main([r.upper() for r in sys.argv[1:]])
+    args = [a.upper() for a in sys.argv[1:]]
+    if args and args[0] == "--LATEST":
+        main_incremental(args[1:])
+    else:
+        main(args)
