@@ -33,12 +33,42 @@ def _order_ref(account: str, as_of, side: str, symbol: str) -> str:
     return f"paperbot:{account}:{as_of}:{side}:{symbol}"
 
 
+def _check_limit_price(symbol: str, limit_price) -> float:
+    """HARD PRICE GUARD: refuse to build any order whose limit price is NaN, None, or
+    <= 0. A missing quote that silently became a 0.0/NaN limit is the "NaN limit price"
+    footgun a review found — caught here so no such order is ever constructed (let alone
+    transmitted). Raises ValueError with a clear reason; the caller logs/skips it.
+
+    Returns the validated float so callers can use the cleaned value."""
+    try:
+        px = float(limit_price)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"refusing to build order for {symbol}: limit price {limit_price!r} is not a "
+            f"number (missing/failed quote). PRICE GUARD — no order built.")
+    # NaN is the only float that is not equal to itself.
+    if px != px:
+        raise ValueError(
+            f"refusing to build order for {symbol}: limit price is NaN "
+            f"(missing/failed quote). PRICE GUARD — no order built.")
+    if px <= 0:
+        raise ValueError(
+            f"refusing to build order for {symbol}: limit price {px} is <= 0. "
+            f"PRICE GUARD — no order built.")
+    return px
+
+
 def build(approved, account: str, as_of, ib=None) -> list[BuiltOrder]:
     """Construct (contract, LIMIT order) for each approved intent. transmit stays
     False. If an ib session is given, qualify the contracts (read-only) so we know
-    they resolve on IBKR before we would ever route them."""
+    they resolve on IBKR before we would ever route them.
+
+    HARD PRICE GUARD: each intent's limit price is validated (NaN/None/<=0 rejected)
+    BEFORE any order object is built — a bad price raises rather than producing a
+    $0/NaN order."""
     built: list[BuiltOrder] = []
     for o in approved:
+        _check_limit_price(o.symbol, o.limit_price)
         contract = Stock(o.symbol, "SMART", "USD")
         order = LimitOrder(o.side, o.quantity, o.limit_price)
         order.account = account
@@ -59,7 +89,12 @@ def build_fa_block(symbol: str, side: str, quantity: int, limit_price: float,
     """Construct ONE FA group (block) order: the master executes it as a single block
     at one average price and allocates across the group's accounts by fa_method. No
     single `account` is set — that is what makes it a group order rather than a direct
-    one. transmit stays False (this module never arms)."""
+    one. transmit stays False (this module never arms).
+
+    HARD PRICE GUARD: the block's limit price is validated (NaN/None/<=0 rejected)
+    BEFORE the order object is built — a missing quote can never become a $0/NaN block
+    order that the master would then split across a whole tier."""
+    _check_limit_price(symbol, limit_price)
     contract = Stock(symbol, "SMART", "USD")
     order = LimitOrder(side, quantity, limit_price)
     order.faGroup = fa_group        # the allocation group defined on the gateway
