@@ -28,7 +28,10 @@ ENV_FILE = ".env"          # holds TIINGO_API_KEY — never read/print its conte
 # ---------------------------------------------------------------------------
 # Backtest window & timing (SPEC §3, DATA.md)
 # ---------------------------------------------------------------------------
-DATA_START = "2010-01-01"      # download floor: warm-up before backtest floor
+DATA_START = "2007-01-01"      # download floor: warm-up before backtest floor
+                               # (2007 = GFC window; Tiingo returns each ticker's
+                               # full history from inception, pre-2010 universe is
+                               # legitimately thinner — handled by inception-aware loader)
 BACKTEST_START = "2015-01-01"  # full defensive universe exists by here (SPEC §2)
 PRIMARY_PERIOD_START = "2017-01-01"  # period of interest for reporting (SPEC §2)
 # BACKTEST_END defaults to "today" at run time when left as None.

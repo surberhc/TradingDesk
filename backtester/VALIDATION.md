@@ -56,16 +56,17 @@ explicitly accepts this.
 
 ## 2. The same strategy including the 2008 GFC (2007-01 → 2026-06)
 
-> _Numbers below are PRE-margin. Spot-checks with the regime margin (§4.1) preserved the 2008
-> behavior (≈ Calmar 0.82 / maxDD −10% vs pre-margin 0.84 / −10.7%), but the full table needs a clean
-> re-run — the 2005–2009 history is currently missing from `data/` (Drive-sync revert; see §3 note)._
+_Regenerated 2026-06-27 on stabilized off-Drive data (`C:\TradingDesk-Local\bt_data`, refetched from
+inception) with the regime early-exit margin `REGIME_TREND_MARGIN = 0.03` (§4.1). The pre-2010 GFC
+universe is legitimately thinner (9 of 11 sectors; no SGOV/floating-rate/GLDM/TIPS-ETFs/PDBC) and the
+inception-aware loader handles the gaps._
 
 | Metric | Strategy | SPY | 60/40 |
 |---|---|---|---|
-| CAGR | **9.0%** | 10.8% | 8.2% |
-| **Max drawdown** | **−10.7%** | −55.2% | −34.7% |
-| Calmar | **0.84** | 0.19 | 0.24 |
-| Sortino | **1.14** | 0.77 | 0.85 |
+| CAGR | **8.5%** | 10.7% | 8.1% |
+| **Max drawdown** | **−10.2%** | −55.2% | −34.7% |
+| Calmar | **0.83** | 0.19 | 0.23 |
+| Sortino | **1.16** | 0.77 | 0.85 |
 
 **When a real systemic bear is in the window, the strategy beats 60/40 on EVERYTHING** — return,
 drawdown, and risk-adjusted return — because 2008 is exactly where adaptive de-risking pays off and
@@ -73,8 +74,8 @@ a static 60/40 cannot. This is the core thesis, and it is the reason the benign-
 (§1) understates the strategy's purpose.
 
 GFC window (2007-10 → 2009-06) max drawdown: **strategy −7.1%**, SPY −55.2%, 60/40 −34.7%.
-Calendar 2008 return: **strategy +3.4%**, SPY −36.8%, 60/40 −20.0%.
-Calendar 2022 return: **strategy −8.7%**, SPY −18.2%, 60/40 −15.6%.
+Calendar 2008 return: **strategy +8.3%**, SPY −36.8%, 60/40 −20.0%.
+Calendar 2022 return: **strategy −6.1%**, SPY −18.2%, 60/40 −15.6%.
 
 ---
 
@@ -92,13 +93,14 @@ Ordering is intuitive: Conservative = lowest return / smoothest / least downside
 most return / most exposure. The margin improved Calmar and shallowed drawdown for all three vs the
 pre-fix figures (Conservative 0.67→0.73, Balanced 0.71→0.74, Growth 0.73→0.76).
 
-> **Data-stability note (2026-06-26).** The local `data/` price files live under the Google Drive
-> root and were observed being overwritten by Drive sync mid-session (the 2005-extended GFC dataset
-> reverted to a 2010-start snapshot, and successive runs drifted at the 3rd decimal). The 2015–26
-> numbers here are stable to 2 d.p. and reproduced across runs; the **2008 GFC figures (§2, §5) need a
-> clean re-run once the data is restored and `data/` is moved off Drive** (recommended: alongside the
-> venv at `C:\TradingDesk-Local`). (An earlier design inverted this via accidental gold concentration;
-that was diagnosed and fixed — see §6.)
+> **Data-stability note (resolved 2026-06-27).** The price files previously lived under the Google
+> Drive root and were observed being overwritten by Drive sync mid-session (the extended GFC dataset
+> reverted to a 2010-start snapshot, and successive runs drifted at the 3rd decimal). The data has
+> now been moved OFF Drive to a stable local path (`C:\TradingDesk-Local\bt_data`, alongside the
+> venv), the full pre-2010 history was re-fetched from inception, and the **2008 GFC figures (§2, §5)
+> were regenerated 2026-06-27 on that stabilized data** — the 2015–26 numbers reproduce to 2 d.p.
+> across runs. (An earlier design inverted this via accidental gold concentration; that was diagnosed
+> and fixed — see §6.)
 
 ---
 
@@ -184,13 +186,14 @@ The strategy's thesis is that it adapts the KIND of defense to the regime. Teste
 
 | Regime | Data quality | Strategy did | Result vs 60/40 |
 |---|---|---|---|
-| **2008 deflation** | REAL | held Treasuries (they rallied), cut equity to ~4% | **+3.4%** vs −20.0% |
-| **2022 inflation** | REAL | banned long Treasuries, held cash + real assets | **−8.7%** vs −15.6% |
+| **2008 deflation** | REAL | held Treasuries (they rallied), cut equity to ~0% | **+8.3%** vs −20.0% |
+| **2022 inflation** | REAL | banned long Treasuries, held cash + real assets | **−6.1%** vs −15.6% |
 | **1970s stagflation** | SYNTHETIC (low fidelity) | avoided bonds, held cash + real assets | "won" nominally, see caveat |
 
 - **2008 vs 2022 is the proof it isn't curve-fit to 2022:** the *same duration-engine code* read 2008
-  as deflationary and HELD Treasuries (~21% of the book), and read 2022 as inflationary and held
-  ~1%. A static 60/40 holds the same 40% bonds in both — saved in 2008, sunk in 2022.
+  as deflationary and HELD duration Treasuries (TLT+IEF ~24% of the book, inside a ~95% defensive
+  sleeve with equity cut to ~0%), and read 2022 as inflationary and held long Treasuries at ~0%. A
+  static 60/40 holds the same 40% bonds in both — saved in 2008, sunk in 2022.
 - **Stagflation is the weakest test (synthetic).** No ETFs/sector data exist for the 1970s, so this
   is a constructed scenario calibrated to documented 1970s magnitudes, NOT a historical replay. The
   strategy's logic responded correctly (avoid bonds, hold cash + real assets). But **NOMINAL returns
