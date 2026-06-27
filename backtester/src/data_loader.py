@@ -21,8 +21,12 @@ import pandas as pd
 from strategies import config
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = PROJECT_ROOT / config.DATA_DIR
-MANIFEST_PATH = PROJECT_ROOT / config.MANIFEST_FILE
+# DATA_DIR/MANIFEST_FILE may be an absolute local path (data moved off Drive) or a
+# project-relative one; resolve absolute paths as-is, else relative to the project.
+_d = Path(config.DATA_DIR)
+DATA_PATH = _d if _d.is_absolute() else PROJECT_ROOT / _d
+_m = Path(config.MANIFEST_FILE)
+MANIFEST_PATH = _m if _m.is_absolute() else PROJECT_ROOT / _m
 
 # Files in data/ that are not per-ticker price series.
 _NON_TICKER_FILES = {

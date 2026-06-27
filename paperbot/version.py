@@ -15,10 +15,20 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.4.0"
+VERSION = "0.5.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.5.0", "2026-06-27", "Pure offline multi-account block REBALANCE ENGINE "
+                            "(rebalance_engine.py): per-account reserve carve-out + "
+                            "explicit integer target shares + per-holding no-trade band; "
+                            "same-tier/symbol/side block aggregation with per-account "
+                            "ContractsOrShares split (sums to block qty); single-account "
+                            "true-up falls back to a DIRECT order. Emits order_router "
+                            "inputs as a transmit-free RoutePlan with fa_method='' (the "
+                            "group's ContractsOrShares governs; faMethod='NetLiq' is "
+                            "rejected, Err 10226). 14 pytest unit tests, all green. No "
+                            "broker contact, no order object built, nothing transmitted."),
     ("0.4.0", "2026-06-26", "FA block-order plumbing: read-only FA-config probe "
                             "(fa_probe.py), order_router.build_fa_block(), and a "
                             "what-if-only block validator (fa_block_test.py). No "

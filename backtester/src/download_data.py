@@ -33,8 +33,12 @@ from strategies import config
 
 # Resolve paths relative to the project root (this file lives in src/).
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-DATA_PATH = PROJECT_ROOT / config.DATA_DIR
-MANIFEST_PATH = PROJECT_ROOT / config.MANIFEST_FILE
+# DATA_DIR/MANIFEST_FILE may be an absolute local path (data moved off Drive) or a
+# project-relative one; resolve absolute paths as-is, else relative to the project.
+_d = Path(config.DATA_DIR)
+DATA_PATH = _d if _d.is_absolute() else PROJECT_ROOT / _d
+_m = Path(config.MANIFEST_FILE)
+MANIFEST_PATH = _m if _m.is_absolute() else PROJECT_ROOT / _m
 
 # Macro-proxy extras: tickers config references for signals but that are not
 # part of the tradeable universe (config.ALL_TICKERS). Downloaded and labeled

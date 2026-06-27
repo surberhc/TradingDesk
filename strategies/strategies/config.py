@@ -16,9 +16,12 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # Paths & files
 # ---------------------------------------------------------------------------
-DATA_DIR = "data"
+# Price data moved OFF Google Drive to a stable LOCAL path (2026-06-27): Drive sync
+# was corrupting the parquet files mid-session. These are now absolute local paths;
+# data_loader/download_data resolve absolute paths as-is (see those modules).
+DATA_DIR = r"C:\TradingDesk-Local\bt_data"
 OUTPUT_DIR = "output"
-MANIFEST_FILE = "data/_manifest.json"
+MANIFEST_FILE = r"C:\TradingDesk-Local\bt_data\_manifest.json"
 ENV_FILE = ".env"          # holds TIINGO_API_KEY — never read/print its contents
 
 
