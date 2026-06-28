@@ -95,6 +95,8 @@ def _net_gex_supplied(df: pd.DataFrame, spot: float) -> tuple[float, float, floa
 
 def _gamma_flip(df: pd.DataFrame, spot: float) -> float:
     """Spot level where BS-repriced net GEX crosses zero, nearest current spot."""
+    if not spot or spot <= 0:        # spot==0 -> arange step is 0 -> ZeroDivisionError
+        return float("nan")
     grid = np.arange(spot * _FLIP_LO, spot * _FLIP_HI, spot * _FLIP_STEP)
     net = np.array([_net_gex_at(df, S) for S in grid])
     sign_change = np.where(np.diff(np.sign(net)) != 0)[0]
@@ -124,6 +126,8 @@ def day_features(chain: pd.DataFrame) -> dict:
     if df.empty or df["spot"].dropna().empty:
         return {}
     spot = float(df["spot"].dropna().iloc[0])
+    if spot <= 0:                    # thin symbol w/ a 0 underlying_price -> unusable day
+        return {}
     net, call_g, put_g = _net_gex_supplied(df, spot)
     gross = abs(call_g) + abs(put_g)
     if gross == 0:
