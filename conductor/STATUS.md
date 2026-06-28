@@ -1,20 +1,35 @@
-# LANE STATUS  (last updated by: Conductor, 2026-06-27 ~19:15 CT — SESSION CLOSE)
+# LANE STATUS  (last updated by: Conductor, 2026-06-28 ~19:00 CT — SESSION CLOSE)
 
 > Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` (dated drop folder).
-> **PICK UP HERE NEXT SESSION → `conductor/handoffs/HANDOFF_2026-06-27_session-close.md`** (full session-close handoff).
+> **PICK UP HERE NEXT SESSION → `conductor/handoffs/HANDOFF_2026-06-28_session-close.md`** (full session-close handoff).
 > First live paperbot rebalance is HELD for **MONDAY** — steps in `MONDAY_RUNBOOK.md` (repo root).
 > Desk runs on its own: collector + ThetaData terminal + dashboard survive this session closing (Task Scheduler / background).
+> **Regime config is UNTOUCHED this session.** The re-entry MAX_LAG 6→3 change was TESTED and **HELD — NOT adopted.** No strategy/data code or config changed; this was a research + audit session.
 
-## OPEN ITEMS — running tally (updated 2026-06-27 19:15; mirrors the session task list)
-**In progress (autonomous):** [1] SPXW 1-min collector — **256/1170 (~22%)** as of 2026-06-28 08:13, ~7.2 GB, **ETA ~2026-06-30** (ahead of plan); ran clean overnight (no crashes/restarts; only correct holiday skips); 1 clean instance, smart-filtered, self-healing via Task Scheduler.
-**Open / next:** dashboard Phase 2 (backtester controls) + Phase 3 (gated trading controls) — Phase-1 monitor DONE; **Desktop one-click launcher DONE** (icon "Trading Desk Dashboard").
-**Blocked / time-gated:** [5] S2/S3 condor backtests — blocked on 1-min data (~July 1) · [6] Monday first live paper rebalance — gated to Monday (gateway+market), needs [7] first · [7] Monday pre-arm: verify replaceFA FA-XML tag casing (`fa_probe.py`) · [11] don't cancel ThetaData sub until pulls complete (~July 1).
-**Owed:** [8] 2008 GFC +8.3% — INDEPENDENTLY AUDITED CLEAN 2026-06-28 (data-integrity + method re-derivation + margin sweep + look-ahead, all PASS; evidence `backtester/output/gfc_decomposition_2026-06-28.md`). Pending only Andrew's final nod to close.
-**FIXED 2026-06-28 (committed a953389):** `features/gex.py` spot<=0 ZeroDivisionError guarded (`_gamma_flip` returns NaN; `day_features` skips a spot<=0 day). Was the NDX thin-symbol rough edge.
+## OPEN ITEMS — running tally (updated 2026-06-28 ~19:00; mirrors the session task list)
+**In progress (autonomous):** [1] SPXW 1-min collector — **374/1170 (~32%)** as of 2026-06-28 18:47, ~10.49 GB, current day 20241227, **0 errors**, avg ~220 s/day, **ETA ~2026-06-30 19:30**. Self-healing via Task Scheduler. (Survived a terminal outage mid-session — resumed from day ~342, not from scratch.)
+**Open research leads (NOTHING adopted):** regime `sharp_recovery` clean-V-only refinement (PRIME lead, HIGH curve-fit risk) · S4 SPX vol-control fund (new buildable strategy idea) · DDOI gamma build (negative-gamma method gap, blocked on 1-min data) · intraday-gamma early-exit revisit (~June 30).
+**Open infra:** ThetaData terminal **port-25503 WATCHDOG** — recommended after this session's outage, NOT built.
+**Open dashboard:** look-improvement roadmap (gamma grid, GEX zero-line chart, consistent formatting) — quick-win restyle done this session, deeper roadmap NOT done · Phase 2 (backtester controls) + Phase 3 (gated trading controls).
+**Blocked / time-gated:** [5] S2/S3 condor backtests + PV-band chart + DDOI build — blocked on 1-min data (~June 30) · [6] Monday first live paper rebalance — gated to Monday (gateway+market), needs [7] first · [7] Monday pre-arm: verify replaceFA FA-XML tag casing (`fa_probe.py`) · [11] don't cancel ThetaData sub until pulls complete (~June 30).
+**Owed:** [8] 2008 GFC +8.3% — INDEPENDENTLY AUDITED CLEAN 2026-06-28 (data-integrity + method re-derivation + margin sweep + look-ahead, all PASS; evidence `backtester/output/gfc_decomposition_2026-06-28.md`) PLUS active-2008-navigation CONFIRMED real via a warm-up test (separate `bt_data_ext2005`; engine at CapitalPreservation by Jan-2008, led by trend/breadth/vol). Pending only Andrew's final nod to close.
+**TESTED → REJECTED this session:** vol-control borrows as an S0 OVERLAY (subordinate to the regime band) · re-entry MAX_LAG 6→3 (failed the per-episode safety gate — a risk-budget trade-off, not a free win; HELD) · drawdown-depth exit gate + gamma/vol/term-structure exit overlays (the exit-whipsaw is NOT signal-separable).
+**FIXED 2026-06-28:** `features/gex.py` spot<=0 ZeroDivisionError guarded (`a953389`) · `FRED_API_KEY` added + verified (`610507c`; ICE HY OAS limited to ~2023-06+ by rolling-3yr restriction — can't warm 2008) · dashboard restyle (`6b3609a` / `acb0bb6` / `99865da`).
 **Recently closed:** desktop launcher [13]; dashboard Phase-1 monitor [12]; collector smart-filter committed; re-pull day 20260529 (self-heals); S3 v1 condor control [4]; flow de-risk gate [3] (tested→rejected); cosmetics [9]; killed redundant cron [10]; gamma overlay + weekly cadence (both tested→rejected); GEX rebuild+calibration (70%); daily grab→ThetaData (IBKR retired); EOD Dealer-Gamma section; Friday 6/26 data fix; full top-down audit.
 
 ## A — Strategy & Backtester
 - 200d-MA fragility fix ADOPTED: `REGIME_TREND_MARGIN=0.03` (regime-only early-exit margin).
+- **REGIME ENGINE STRUCTURAL EXPLORATION 2026-06-28 — NOTHING ADOPTED, config UNTOUCHED (all in-process tests).**
+  Conclusion is a NEGATIVE (curve-fit-PREVENTING) result: the engine is ROBUST and no structural tweak cleanly improves it without a cost.
+  * **Bleed characterized:** it is RE-ENTRY LAG + SHALLOW-DIP WHIPSAWS (2025 cut to 0% on ~−8.6%, 2026 cut 85%→24% on ~−5–8%, both round-tripped). The deep-crisis EXITS are GOOD — leave them alone.
+  * Existing knobs = a robust plateau; can't fix the whipsaw.
+  * **Re-entry `MAX_LAG` 6→3: TESTED → HELD (NOT adopted).** Looked free in Stage A but FAILED the final per-episode safety gate — 3 episodes worsen >100bp (2008 tail −118bp, 2011 −114bp, 2015-16 −152bp). It's a risk-budget TRADE-OFF: full-window maxDD byte-identical (−10.20%, no new tail risk), WINS episode-NAV 2009 (+2.76%) & 2011 (+0.95%); only genuine loser is the SIDEWAYS 2015-16 grind. Benefit smaller than first quoted (2022 lag ~14→12mo). **`REENTRY_MAX_LAG_MONTHS` stays 6.**
+  * **Exit gates can't fix it:** a drawdown-DEPTH gate FAILS (depth can't separate whipsaws from real-crash first legs — both −7% to −9%); gamma/vol/term-structure overlays ALSO can't separate them. The exit-whipsaw is NOT signal-separable by any overlay.
+  * **PRIME OPEN LEAD (next session):** tighten the override's `sharp_recovery` trigger to fire only on CLEAN V-recoveries (the failure is the override firing in SIDEWAYS grinds), then re-run the per-episode gate. HIGH curve-fit risk; needs a principled trigger + OOS re-test. Until/unless it clears, re-entry stays `MAX_LAG=6`.
+- **Vol-control borrows as an S0 OVERLAY 2026-06-28: TESTED → REJECTED** (subordinate to the regime band — the band already collapses exposure in crises). VIX3M/VIX9D/VVIX pulled to `bt_data`. `FRED_API_KEY` added + verified (committed `610507c`); ICE HY OAS limited to ~2023-06+ (rolling-3yr restriction) — can't warm 2008; HYG/IEF proxy retained for history.
+- **NEW STRATEGY LEAD — S4 "SPX vol-control fund" (OPEN, not built):** the SAME vol-control mechanics (`exposure = min(leverage_cap, target_vol/realized_vol)`, daily) as a STANDALONE single-asset SPX fund (FIA-style vol-control index replica), NOT an S0 overlay — which sidesteps the "subordinate to the regime band" rejection. `target_vol` and `leverage_cap` both swept. Buildable today. (Memory note `s4-spx-vol-control-fund`.)
+- **GFC active-2008-navigation CONFIRMED real 2026-06-28:** a definitive warm-up test (separate dir `bt_data_ext2005`; canonical `bt_data` untouched) shows trend/breadth/vol warmed by 2006-03 and the engine at CapitalPreservation by late-2007/Jan-2008, BEFORE the worst leg — the de-risk is active navigation, not a warm-up artifact. CAVEAT: the CREDIT half of the GFC-entry read is unwarmable (HYG inception ~2007-04), so the entry was driven by trend/breadth/vol, not credit. `VALIDATION.md` §5 softened accordingly.
+- **Gamma symbol verdict HELD + characterized 2026-06-28:** daily S0 signal stays on SPX root (matches Tier1Alpha vendor labels 69.8% vs SPXW 60.1% / combined 65.5%-null). The residual gap is a genuine method diff on the NEGATIVE-gamma side (our static dealer-sign vs vendors' inferred DDOI) — closing it needs a DDOI-style trade-direction build off the 1-min data (future). Gamma is HORIZON-DEPENDENT (daily SPX for S0; intraday SPXW/0DTE for S2/S3).
 - DONE 2026-06-27: `backtester/data/` MOVED off Google Drive to `C:\TradingDesk-Local\bt_data\`
   (Drive sync was corrupting the data). config repointed; loader/downloader are absolute-path-aware;
   data/ kept w/ .gitkeep. 89 tests pass. Drive-sync instability RESOLVED.
@@ -36,6 +51,12 @@
   with `REGIME_TREND_MARGIN=0.03` (max abs diff 0.0). Paper-use prerequisite cleared.
 
 ## B — Data Warehouse / Collector
+- **OUTAGE + RECOVERY 2026-06-28 ~14:47:** ThetaData terminal + collector + dashboard all died. Recovered —
+  terminal relaunched via `datacollector/start_terminal.py`; collector RESUMED from day ~342 (not from scratch,
+  thanks to the progress heartbeat + on-disk dedupe). **ROOT CAUSE:** no watchdog auto-restarts the ThetaData
+  TERMINAL (the collector's supervisor restarts the *collector*, but a dead terminal on port 25503 just stalls it).
+  **OPEN:** build a port-25503 watchdog scheduled task (recommended, not built).
+- Collector snapshot 2026-06-28 18:47: **374/1170 days (31.97%)**, ~10.49 GB, 0 errors, avg ~220 s/day, ETA ~2026-06-30 19:30.
 - RESOLVED 2026-06-27: the DuckDB `options_eod` "non-empty parquets only" fix is ALREADY in committed
   `storage.py` (`_nonempty_parquets()` + `rebuild_catalog()`). Verified against the LIVE ~102k-file
   warehouse — zero-column markers correctly EXCLUDED (kept on disk), 0 corrupt, view builds clean.

@@ -300,6 +300,13 @@ clamp stage to [0,4]
 ```
 `ladder_cap = REENTRY_STAGES[stage].equity_pct` (0 at stage 0). De-risk is fast; re-risk is staged.
 
+> **Status note (2026-06-28, no config change).** Tightening re-entry by setting `REENTRY_MAX_LAG_MONTHS
+> = 3` was TESTED and **HELD — NOT adopted**: it failed a per-episode safety gate (a risk-budget
+> trade-off, not a free win — full detail in `VALIDATION.md` §4.4). `REENTRY_MAX_LAG_MONTHS` stays **6**.
+> The OPEN lead is to make the `sharp_recovery` override fire only on **clean V-recoveries** (the
+> residual re-entry whipsaw is the override firing in sideways grinds) — HIGH curve-fit risk, needs a
+> principled trigger + OOS re-test before any change. Nothing in this section's parameters has changed.
+
 ---
 
 ## 9. Portfolio Assembly (order of operations per rebalance)

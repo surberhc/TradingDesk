@@ -21,6 +21,41 @@ Costs: 3 bps per trade, monthly rebalance, T+1 execution. Version shown: **Balan
 
 ---
 
+## 0. Where S0 stands — ADOPTED / REJECTED / OPEN (status ledger, updated 2026-06-28)
+
+A single place to see what is locked into the live config vs. what was tested-and-dropped vs. what is
+still an open question. The full evidence for each line is in the cited section.
+
+**ADOPTED (live in `config.py`):**
+- **Regime early-exit margin** `REGIME_TREND_MARGIN = 0.03` — the 200d-MA fragility fix; flattens the MA
+  sweep from a 42% spread to a plateau, improves all three versions, holds OOS (§4.1). *Adopted 2026-06-26.*
+- The whole multi-engine spec as written in `STRATEGY.md` (regime / duration / defensive / vol-trim /
+  real-asset sleeve / re-entry ladder), with `REENTRY_MAX_LAG_MONTHS = 6`.
+
+**REJECTED (tested, left OFF / not changed):**
+- Gamma-regime overlay; weekly/biweekly cadence; flow de-risk gate — all TESTED → REJECTED (the regime
+  engine already captures the edge; kept default-OFF for provenance).
+- Equity→real-asset rotation (`EQUITY_ROTATION_ENABLED=False`) — broke the frozen base case (§7).
+- HYG/LQD "purer" credit proxy — worse for the deflation read; HYG/IEF retained (§8.7, §11).
+- **Vol-control borrow OVERLAY on S0** (target-vol exposure scaling, VIX/VIX3M gate) — TESTED → REJECTED
+  2026-06-28: subordinate to the regime band, which already collapses exposure in crises. (Memory:
+  `vol-control-borrowables`.)
+- **Re-entry `MAX_LAG` 6→3** — TESTED → **HELD (not adopted)** 2026-06-28: failed the final per-episode
+  safety gate (3 episodes worsen >100bp; a risk-budget trade-off, not a free win). Config untouched. (§4.4)
+- **Exit-whipsaw overlays** (drawdown-depth gate; gamma/vol/term-structure exit gates) — TESTED →
+  REJECTED 2026-06-28: the exit-whipsaw is NOT signal-separable from real-crash first legs (§4.4).
+
+**OPEN (leads, nothing built/adopted):**
+- **Regime `sharp_recovery` clean-V-only refinement** — the PRIME lead from the 2026-06-28 exploration
+  (the re-entry failure is isolated to the override firing in SIDEWAYS grinds, not clean V's). HIGH
+  curve-fit risk; needs a principled trigger + OOS re-test before adoption (§4.4).
+- **S4 "SPX vol-control fund"** — the same vol-control mechanics as a STANDALONE single-asset SPX fund
+  (FIA-style), NOT an S0 overlay (which sidesteps the rejection above). A NEW strategy, not an S0 change.
+  Buildable. (Memory: `s4-spx-vol-control-fund`.)
+- Andrew's final nod on the GFC +8.3% number (§2) — audited clean + active-nav confirmed; pending sign-off.
+
+---
+
 ## 1. Headline results — Balanced (2015-02 → 2026-06)
 
 _Numbers reflect the regime-engine early-exit margin adopted 2026-06-26 (§4.1)._
@@ -76,6 +111,21 @@ a static 60/40 cannot. This is the core thesis, and it is the reason the benign-
 GFC window (2007-10 → 2009-06) max drawdown: **strategy −7.1%**, SPY −55.2%, 60/40 −34.7%.
 Calendar 2008 return: **strategy +8.3%**, SPY −36.8%, 60/40 −20.0%.
 Calendar 2022 return: **strategy −6.1%**, SPY −18.2%, 60/40 −15.6%.
+
+**AUDITED CLEAN + active-navigation CONFIRMED (2026-06-28).** The +8.3% closed clean under a 3-way
+independent audit — (1) data-integrity (2008 prices real-world correct; +8.28% explained by sane
+holdings: ~0% equity / ~24% Treasuries / ~5% gold / rest cash), (2) method re-derivation from raw NAV
+(reproduces exactly; the −7.13% GFC maxDD is mechanically forced by a fully-de-risked book through the
+deep-stress leg), (3) margin sweep (cal-2008 is a PLATEAU flat at +8.28% for ALL margins ≥0.01 — so
+`REGIME_TREND_MARGIN=0.03` is NOT 2008-tuned). Decomposition: ~44% of the +3.4%→+8.3% jump is the data
+refetch, ~56% is the general early-de-risk property (which COSTS full-window CAGR while shaving drawdown)
+— neither is curve-fit. Evidence: `output/gfc_decomposition_2026-06-28.md`.
+Separately, a **warm-up test** (run on a deeper `bt_data_ext2005` history; the canonical `bt_data` left
+untouched) CONFIRMED the 2008 de-risk is **active navigation, not a warm-up artifact**: the trend / breadth
+/ realized-vol signals were fully warmed by 2006-03, and the regime engine was already at
+**CapitalPreservation by late-2007 / January-2008 — before the worst leg of the crash.** Caveat: the
+CREDIT sub-signal is *unwarmable* over this period (HYG inception ~2007-04), so the **entry timing was
+driven by trend / breadth / vol, not credit** (see §5).
 
 ---
 
@@ -178,6 +228,30 @@ Head-to-head across the 200 paths:
   worst case is DEEPER than 60/40's worst — the bootstrap can't make a 2008, so true tail risk is
   likely understated.
 
+### 4.4 Regime-engine structural exploration — a NEGATIVE (curve-fit-PREVENTING) result (2026-06-28)
+We tried hard to find a structural improvement to the regime engine and **could not find one that pays
+without a cost.** Recording the failures is itself anti-curve-fit evidence — the engine is robust and we
+did NOT bend the config to manufacture a win. **Nothing here was adopted; the config is untouched.**
+
+- **The residual bleed is RE-ENTRY LAG + SHALLOW-DIP WHIPSAWS, not bad crisis exits.** Recent cases:
+  2025 cut to 0% equity on a ~−8.6% dip; 2026 cut 85%→24% on a ~−5–8% dip — **both round-tripped.** The
+  deep-crisis exits (2008, 2020, 2022) are GOOD and were left alone.
+- **Re-entry `MAX_LAG` 6→3: TESTED → HELD (not adopted).** It looked free in an early stage but FAILED
+  the final per-episode safety gate: 3 episodes worsen by >100bp (2008 tail −118bp, 2011 −114bp, 2015-16
+  −152bp). It is a **risk-budget TRADE-OFF, not a free win** — full-window maxDD is byte-identical
+  (−10.20%, no new tail risk) and it WINS episode-NAV in 2009 (+2.76%) and 2011 (+0.95%); the only
+  genuine loser is the SIDEWAYS 2015-16 grind. The benefit is also smaller than first quoted (2022 lag
+  ~14→12 months). **`REENTRY_MAX_LAG_MONTHS` stays 6.**
+- **Exit gates cannot fix the whipsaw.** A drawdown-DEPTH gate FAILS — depth cannot separate whipsaws
+  from real-crash first legs (both live at −7% to −9%). Gamma, realized-vol, and term-structure overlays
+  ALSO fail to separate them. **The exit-whipsaw is not signal-separable by any overlay we tried.**
+- **NET:** no structural tweak (re-entry knobs, exit-depth gate, gamma/vol/term-structure overlays)
+  cleanly improves the engine without a cost. The engine is ROBUST.
+- **PRIME OPEN LEAD (not built):** the re-entry failure is isolated to the ladder's `sharp_recovery`
+  override firing in SIDEWAYS grinds rather than clean V-recoveries. Tighten that trigger to fire **only
+  on clean V's**, then re-run the per-episode gate. **HIGH curve-fit risk** — requires a principled
+  trigger and an OOS re-test before any adoption.
+
 ---
 
 ## 5. Tail-regime tests (the three bear types)
@@ -186,7 +260,7 @@ The strategy's thesis is that it adapts the KIND of defense to the regime. Teste
 
 | Regime | Data quality | Strategy did | Result vs 60/40 |
 |---|---|---|---|
-| **2008 deflation** | REAL | held Treasuries (they rallied), cut equity to ~0% | **+8.3%** vs −20.0% |
+| **2008 deflation** | REAL | cut equity to ~0% (driven by trend/breadth/vol), then held the rallying Treasuries | **+8.3%** vs −20.0% |
 | **2022 inflation** | REAL | banned long Treasuries, held cash + real assets | **−6.1%** vs −15.6% |
 | **1970s stagflation** | SYNTHETIC (low fidelity) | avoided bonds, held cash + real assets | "won" nominally, see caveat |
 
@@ -194,6 +268,13 @@ The strategy's thesis is that it adapts the KIND of defense to the regime. Teste
   as deflationary and HELD duration Treasuries (TLT+IEF ~24% of the book, inside a ~95% defensive
   sleeve with equity cut to ~0%), and read 2022 as inflationary and held long Treasuries at ~0%. A
   static 60/40 holds the same 40% bonds in both — saved in 2008, sunk in 2022.
+- **What drove the 2008 ENTRY timing (precise, post-2026-06-28 warm-up test):** the early-2008 de-risk
+  was led by the **trend / breadth / realized-vol** signals (warmed by 2006-03; engine at
+  CapitalPreservation by Jan-2008). The **deflation/credit read came LATER** — the credit sub-signal is
+  unwarmable before ~2007-04 (HYG inception), so it did NOT drive the *entry*. The strategy then *held*
+  the Treasuries that rallied through the panic (a correct deflation read once it was readable), which is
+  where the return came from. So the honest framing is: **trend/breadth/vol timed the exit; the duration
+  engine then chose Treasuries-over-cash and was rewarded** — not "a deflation read got us out early."
 - **Stagflation is the weakest test (synthetic).** No ETFs/sector data exist for the 1970s, so this
   is a constructed scenario calibrated to documented 1970s magnitudes, NOT a historical replay. The
   strategy's logic responded correctly (avoid bonds, hold cash + real assets). But **NOMINAL returns
