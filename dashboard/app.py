@@ -84,7 +84,7 @@ st.markdown(
       }
       /* Pull the top of the main block up and tighten its horizontal padding. */
       .block-container {
-        padding-top: 1.2rem !important;
+        padding-top: 4rem !important;
         padding-bottom: 1.2rem !important;
         padding-left: 1.6rem !important;
         padding-right: 1.6rem !important;
