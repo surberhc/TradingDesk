@@ -27,6 +27,9 @@ strategy — **buy the history once, never re-subscribe.**
 1. **Java 21+** — Terminal requires it. `winget install EclipseAdoptium.Temurin.21.JDK`
    then reopen the shell. (`start_terminal.py` auto-downloads the Terminal jar itself.)
 2. ThetaData key — in `C:\TradingDesk-Local\secrets\.env` as `THETADATA_API_KEY` (outside Drive). ✅
+   The same file also holds `TIINGO_API_KEY` and `FRED_API_KEY` (FRED verified authenticating
+   2026-06-28; note FRED HY OAS `BAMLH0A0HYM2` returns only ~3 yrs, 2023-06-27→2026-06-25, due to the
+   April-2026 ICE rolling-3-year restriction — recent dates only; HYG/IEF proxy retained for history). ✅
 
 ## Run order
 

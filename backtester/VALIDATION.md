@@ -286,9 +286,11 @@ The strategy's thesis is that it adapts the KIND of defense to the regime. Teste
    (2018–2026) was a favorable era for real assets. A sustained multi-year real-asset drought is
    only lightly tested (the trend gate correctly sat out 2017 — encouraging but a thin proxy).
 7. **Macro proxies:** 10y yield = real US Treasury par yield; VIX = real (CBOE); **credit = HYG/IEF
-   PROXY**. The real ICE BofA HY OAS is no longer freely available with usable history — FRED
-   restricted the ICE indices to a rolling 3-year window (April 2026), so a live key returns only
-   ~3 yrs; full history is commercial-only (ICE/Bloomberg/Refinitiv). A "purer" **HYG/LQD** proxy
+   PROXY**. The real ICE BofA HY OAS is no longer freely available with usable history — `FRED_API_KEY`
+   is now present in `C:\TradingDesk-Local\secrets\.env` (verified authenticating 2026-06-28), but FRED
+   restricted the ICE indices to a rolling 3-year window (April 2026), so the key returns only
+   2023-06-27→2026-06-25 (~3 yrs). The real OAS is therefore usable for recent dates only (~2023+) and
+   the HYG/IEF proxy is retained for history; full history is commercial-only (ICE/Bloomberg/Refinitiv). A "purer" **HYG/LQD** proxy
    (HY vs investment-grade, which cancels the rate component) was tested head-to-head and was
    **worse** across the board (2008 +3.4%→+1.4%, Calmar 0.71→0.58): the deflation filter *wants*
    the flight-to-quality/rate component HYG/LQD removes — in 2008, IG corporates blew out too, so
