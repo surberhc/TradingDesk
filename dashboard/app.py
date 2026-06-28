@@ -70,6 +70,56 @@ BACKTEST_VERSIONS = ("Conservative", "Balanced", "Growth")
 
 st.set_page_config(page_title="Trading Desk", page_icon="📊", layout="wide")
 
+# --- Compact restyle (STYLING ONLY — no data/logic change) ---------------------
+# Smaller base font + tighter vertical spacing so far more fits per screen on
+# this read-only monitor. Nothing here touches data, queries, or behavior.
+st.markdown(
+    """
+    <style>
+      /* Base font: ~13.5px vs Streamlit's 16px default, across body & markdown. */
+      html, body, [class*="css"], .stMarkdown, .stMarkdown p,
+      .stText, .stCaption, [data-testid="stMarkdownContainer"] {
+        font-size: 13.5px !important;
+        line-height: 1.35 !important;
+      }
+      /* Pull the top of the main block up and tighten its horizontal padding. */
+      .block-container {
+        padding-top: 1.2rem !important;
+        padding-bottom: 1.2rem !important;
+        padding-left: 1.6rem !important;
+        padding-right: 1.6rem !important;
+        max-width: 1500px !important;
+      }
+      /* Headers: smaller sizes + tighter margins. */
+      h1, .stTitle { font-size: 1.55rem !important; margin: 0 0 .35rem 0 !important; }
+      h2 { font-size: 1.20rem !important; margin: .4rem 0 .3rem 0 !important; }
+      h3 { font-size: 1.02rem !important; margin: .35rem 0 .25rem 0 !important; }
+      h4 { font-size: .92rem !important; margin: .3rem 0 .2rem 0 !important; }
+      /* Shrink the gap Streamlit puts between vertical elements. */
+      [data-testid="stVerticalBlock"] { gap: .45rem !important; }
+      [data-testid="stHorizontalBlock"] { gap: .55rem !important; }
+      /* Captions a touch smaller. */
+      .stCaption, [data-testid="stCaptionContainer"] { font-size: 11.5px !important; }
+      /* Metrics: denser label + value. */
+      [data-testid="stMetric"] { padding: .15rem 0 !important; }
+      [data-testid="stMetricLabel"] p { font-size: 11.5px !important; }
+      [data-testid="stMetricValue"] { font-size: 1.25rem !important; line-height: 1.2 !important; }
+      /* Tabs: tighter padding, smaller label. */
+      .stTabs [data-baseweb="tab"] { padding: .35rem .7rem !important; font-size: 13px !important; }
+      .stTabs [data-baseweb="tab-list"] { gap: .3rem !important; }
+      /* Dividers: collapse the big default vertical margin. */
+      hr { margin: .5rem 0 !important; }
+      /* Dataframe/table: shorter rows, smaller cell text. */
+      [data-testid="stDataFrame"] { font-size: 12px !important; }
+      [data-testid="stTable"] td, [data-testid="stTable"] th { padding: .2rem .4rem !important; }
+      /* Expanders & buttons: trim padding. */
+      .streamlit-expanderHeader { font-size: 13px !important; padding: .3rem .5rem !important; }
+      .stButton button { padding: .25rem .7rem !important; font-size: 13px !important; }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
+
 
 # ============================ small shared helpers =============================
 def _fmt_dt(ts: str | None) -> str:

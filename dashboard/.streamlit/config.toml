@@ -1,0 +1,7 @@
+[theme]
+base = "dark"
+# Slightly smaller base font than Streamlit's 16px default for higher density.
+font = "sans serif"
+
+[server]
+headless = true
