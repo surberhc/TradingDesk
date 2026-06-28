@@ -6,11 +6,11 @@
 > Desk runs on its own: collector + ThetaData terminal + dashboard survive this session closing (Task Scheduler / background).
 
 ## OPEN ITEMS — running tally (updated 2026-06-27 19:15; mirrors the session task list)
-**In progress (autonomous):** [1] SPXW 1-min collector — **51/1170 (4.36%)**, ~1.70 GB, **ETA ~2026-07-01 02:39**; 1 clean instance, smart-filtered, self-healing via Task Scheduler.
+**In progress (autonomous):** [1] SPXW 1-min collector — **256/1170 (~22%)** as of 2026-06-28 08:13, ~7.2 GB, **ETA ~2026-06-30** (ahead of plan); ran clean overnight (no crashes/restarts; only correct holiday skips); 1 clean instance, smart-filtered, self-healing via Task Scheduler.
 **Open / next:** dashboard Phase 2 (backtester controls) + Phase 3 (gated trading controls) — Phase-1 monitor DONE; **Desktop one-click launcher DONE** (icon "Trading Desk Dashboard").
 **Blocked / time-gated:** [5] S2/S3 condor backtests — blocked on 1-min data (~July 1) · [6] Monday first live paper rebalance — gated to Monday (gateway+market), needs [7] first · [7] Monday pre-arm: verify replaceFA FA-XML tag casing (`fa_probe.py`) · [11] don't cancel ThetaData sub until pulls complete (~July 1).
-**Owed:** [8] Andrew gut-check the 2008 GFC +8.3% number.
-**Known rough edge (minor):** `features/gex.py:98` ZeroDivisionError when spot==0 (thin symbol e.g. NDX); full GEX build still completes. Add a guard next time gex.py is touched.
+**Owed:** [8] 2008 GFC +8.3% — INDEPENDENTLY AUDITED CLEAN 2026-06-28 (data-integrity + method re-derivation + margin sweep + look-ahead, all PASS; evidence `backtester/output/gfc_decomposition_2026-06-28.md`). Pending only Andrew's final nod to close.
+**FIXED 2026-06-28 (committed a953389):** `features/gex.py` spot<=0 ZeroDivisionError guarded (`_gamma_flip` returns NaN; `day_features` skips a spot<=0 day). Was the NDX thin-symbol rough edge.
 **Recently closed:** desktop launcher [13]; dashboard Phase-1 monitor [12]; collector smart-filter committed; re-pull day 20260529 (self-heals); S3 v1 condor control [4]; flow de-risk gate [3] (tested→rejected); cosmetics [9]; killed redundant cron [10]; gamma overlay + weekly cadence (both tested→rejected); GEX rebuild+calibration (70%); daily grab→ThetaData (IBKR retired); EOD Dealer-Gamma section; Friday 6/26 data fix; full top-down audit.
 
 ## A — Strategy & Backtester
@@ -23,8 +23,15 @@
   Sortino 1.16**; GFC-window maxDD -7.1%; **calendar-2008 +8.3%** (up from old +3.4% pre-margin) — 2022 -6.1%.
   2015-26 headline UNCHANGED (CAGR 7.45% / maxDD -10.20% / Calmar 0.73). Good 2010 data backed up at
   `C:\TradingDesk-Local\bt_data_backup_2010_good`.
-  - **FLAGGED for Andrew's gut-check:** the 2008 jump (+3.4% → +8.3%) is a big move; sanity-confirm it
-    looks right before leaning on the GFC numbers.
+  - **AUDITED CLEAN 2026-06-28 (3 independent passes):** (1) data-integrity — no corruption/stale data,
+    2008 prices real-world correct, +8.28% explained by sane holdings (0% equity / ~24% Treasuries / ~5% gold
+    / rest cash); (2) method re-derivation from raw NAV — reproduces exactly; identical −7.13% GFC maxDD is
+    mechanically forced (byte-identical fully-de-risked book through the deep-stress leg; margin changes only
+    the recovery, not the depth); (3) margin sweep — PLATEAU not peak (cal-2008 flat at +8.28% for ALL margins
+    ≥0.01, so 0.03 is NOT 2008-tuned; Calmar spread 0.034 across 0.03–0.05), 95/95 tests pass incl. both
+    no-look-ahead tests, T+1 lag verified real, start-date perturbation leaves cal-2008 unchanged. Decomposition:
+    ~44% of the +3.4%→+8.3% jump is the data refetch, ~56% is the general early-de-risk property (which COSTS
+    full-window CAGR while shaving drawdown) — neither is curve-fit. Evidence: `backtester/output/gfc_decomposition_2026-06-28.md`.
 - DONE 2026-06-27: paperbot byte-parity RE-PROVEN — paperbot targets are byte-identical to the backtester
   with `REGIME_TREND_MARGIN=0.03` (max abs diff 0.0). Paper-use prerequisite cleared.
 
