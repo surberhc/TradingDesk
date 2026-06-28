@@ -19,6 +19,30 @@ Output tree (NEW, never collides with the EOD warehouse):
     C:\TradingDesk-Local\warehouse\raw\options_1m\SPXW\ohlc\{YYYYMMDD}.parquet
   zstd-compressed, written atomically (temp file + os.replace).
 
+SMART (LOSSLESS) STORAGE — read this before consuming the parquet files:
+  The terminal returns a DENSE grid (every contract x all ~391 trading minutes).
+  ~95% of those rows carry no information. We apply two LOSSLESS filters in memory
+  AFTER each day's pull and BEFORE writing, so the files are ~20x smaller but every
+  original value is exactly recoverable:
+
+  1) OHLC = TRADE BARS ONLY. We KEEP only minutes that actually traded
+     (volume > 0). No-trade minutes (volume==0, which here always coincides with
+     count==0 and open/high/low/close==0) are DROPPED. They are intentionally
+     ABSENT from the file. A minute missing from the OHLC file means "no trade in
+     that minute" — do NOT treat the gap as missing/bad data. Do NOT forward-fill
+     OHLC (a trade bar is point-in-time, not a state that persists).
+
+  2) QUOTE (NBBO) = STORE-ON-CHANGE. Per contract
+     (symbol, expiration, strike, right), rows are sorted by timestamp and a row is
+     KEPT only when (bid, ask, bid_size, ask_size) differs from the previously kept
+     row. Each contract's FIRST row of the day is ALWAYS kept as the baseline.
+     RECONSTRUCTION: to get the NBBO for ANY minute, take the most recent kept row
+     at or before that minute, i.e. FORWARD-FILL the last kept quote within each
+     contract. A contract's quote is undefined before its first kept timestamp.
+     Only (bid, ask, bid_size, ask_size) participate in the change test; the
+     ancillary columns (bid_exchange, bid_condition, ask_exchange, ask_condition)
+     ride along on the kept rows and are likewise valid until the next kept row.
+
 Bulletproof / resumable contract:
   * A day is DONE only when BOTH its quote AND ohlc files exist AND are non-empty.
     Skip done days. A re-launch continues EXACTLY where it stopped.
@@ -250,6 +274,64 @@ def pull_ohlc(d: dt.date, expirations: list[str]) -> pd.DataFrame:
 
 
 # --------------------------------------------------------------------------- #
+# SMART (LOSSLESS) STORAGE FILTERS — applied in memory after the pull, before
+# the write. See the module docstring for the full reconstruction contract.
+# --------------------------------------------------------------------------- #
+CONTRACT_KEYS = ["symbol", "expiration", "strike", "right"]
+QUOTE_CHANGE_COLS = ["bid", "ask", "bid_size", "ask_size"]
+
+
+def filter_ohlc(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop no-trade bars. LOSSLESS: a no-trade minute carries no information.
+
+    Keep only minutes that actually traded (volume > 0). Empty == no trade, so a
+    minute absent from the file simply means no trade happened then. Robust to a
+    missing 'volume' column (then nothing is dropped).
+    """
+    if df.empty or "volume" not in df.columns:
+        return df
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0)
+    return df[vol > 0].reset_index(drop=True)
+
+
+def filter_quote_on_change(df: pd.DataFrame) -> pd.DataFrame:
+    """STORE-ON-CHANGE per contract — LOSSLESS via forward-fill on read.
+
+    Per contract (symbol, expiration, strike, right), sort by timestamp and keep a
+    row only when (bid, ask, bid_size, ask_size) differs from the previously kept
+    row. The first row of each contract's day is ALWAYS kept (baseline). Any minute
+    is reconstructed by forward-filling the last kept quote within the contract.
+
+    Vectorized: a single stable sort + a per-group "any-of-4-changed" mask via
+    groupby().shift(), so it is fast over millions of rows (no Python per-row loop).
+    """
+    if df.empty:
+        return df
+    cols = CONTRACT_KEYS + QUOTE_CHANGE_COLS
+    if any(c not in df.columns for c in cols + ["timestamp"]):
+        return df
+
+    # Stable sort by contract then timestamp so "previous kept row" is well-defined
+    # and the original arrival order is preserved within identical timestamps.
+    df = df.sort_values(CONTRACT_KEYS + ["timestamp"],
+                        kind="stable").reset_index(drop=True)
+
+    g = df.groupby(CONTRACT_KEYS, sort=False)
+    # First row of each contract -> always keep (its shifted "prev" is NaN).
+    prev = g[QUOTE_CHANGE_COLS].shift(1)
+    is_first = prev[QUOTE_CHANGE_COLS[0]].isna()
+    # Changed if ANY of the 4 fields differs from the previous kept row.
+    # (NaN-safe: treat NaN!=NaN as unchanged so all-NaN runs collapse correctly.)
+    changed = pd.Series(False, index=df.index)
+    for c in QUOTE_CHANGE_COLS:
+        a, b = df[c], prev[c]
+        diff = (a != b) & ~(a.isna() & b.isna())
+        changed = changed | diff
+    keep = is_first | changed
+    return df[keep].reset_index(drop=True)
+
+
+# --------------------------------------------------------------------------- #
 # Heartbeat
 # --------------------------------------------------------------------------- #
 def _dir_gb(root) -> float:
@@ -323,6 +405,18 @@ def collect_day(d: dt.date) -> tuple[bool, int, str]:
     if o.empty:
         return False, len(q), "no ohlc data — left un-done"
 
+    # 2b) SMART LOSSLESS FILTERS — shrink in memory before the write.
+    #     OHLC: keep only traded minutes. QUOTE: store-on-change per contract.
+    #     (Both fully recoverable — see module docstring.) Guard against a filter
+    #     emptying everything (would otherwise write a 0-row file and mark the day
+    #     done) — that should never happen on a real trading day.
+    q_dense, o_dense = len(q), len(o)
+    q = filter_quote_on_change(q)
+    o = filter_ohlc(o)
+    if q.empty or o.empty:
+        return False, q_dense, ("filter emptied quote or ohlc — left un-done "
+                                f"(quote {q_dense}->{len(q)}, ohlc {o_dense}->{len(o)})")
+
     # 3) Write both atomically. Write ohlc first, then quote LAST, so that if a
     #    crash lands between the two writes the day is still not "done" (quote is
     #    the second/final marker) and will be cleanly retried.
@@ -330,8 +424,12 @@ def collect_day(d: dt.date) -> tuple[bool, int, str]:
     _write_atomic(QUOTE_DIR / f"{ds}.parquet", q)
 
     secs = time.time() - t0
-    return True, len(q), (f"quote={len(q):,} rows, ohlc={len(o):,} rows, "
-                          f"{len(exps)} exps, {secs:.0f}s")
+    return True, len(q), (
+        f"quote={len(q):,} rows (dense {q_dense:,}, "
+        f"{100.0 * len(q) / q_dense:.1f}% kept), "
+        f"ohlc={len(o):,} rows (dense {o_dense:,}, "
+        f"{100.0 * len(o) / o_dense:.1f}% kept), "
+        f"{len(exps)} exps, {secs:.0f}s")
 
 
 # --------------------------------------------------------------------------- #
