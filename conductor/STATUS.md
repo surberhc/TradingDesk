@@ -1,15 +1,17 @@
-# LANE STATUS  (last updated by: Conductor, 2026-06-27 ~12:35 CT)
+# LANE STATUS  (last updated by: Conductor, 2026-06-27 ~19:15 CT — SESSION CLOSE)
 
-> Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` (dated drop folder;
-> read its README). Latest weekend handoff: `HANDOFF_weekend-conductor_2026-06-27_1235.md`.
+> Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` (dated drop folder).
+> **PICK UP HERE NEXT SESSION → `conductor/handoffs/HANDOFF_2026-06-27_session-close.md`** (full session-close handoff).
 > First live paperbot rebalance is HELD for **MONDAY** — steps in `MONDAY_RUNBOOK.md` (repo root).
+> Desk runs on its own: collector + ThetaData terminal + dashboard survive this session closing (Task Scheduler / background).
 
-## OPEN ITEMS — running tally (updated 2026-06-27; mirrors the session task list)
-**In progress:** [1] SPXW 1-min collector (~44/1170, ETA ~June 30; 1 clean instance, smart-filtered).
-**Open / next:** [2] re-pull 1-min day 20260529 (self-heals on the collector's next run) · dashboard Phase 2 (backtester controls) + Phase 3 (gated trading controls) — Phase-1 monitor DONE.
-**Blocked / time-gated:** [5] S2/S3 condor backtests — blocked on 1-min data (~June 30) · [6] Monday first live paper rebalance — gated to Monday (gateway+market), needs [7] first · [7] Monday pre-arm: verify replaceFA FA-XML tag casing · [11] don't cancel ThetaData sub until pulls complete.
+## OPEN ITEMS — running tally (updated 2026-06-27 19:15; mirrors the session task list)
+**In progress (autonomous):** [1] SPXW 1-min collector — **51/1170 (4.36%)**, ~1.70 GB, **ETA ~2026-07-01 02:39**; 1 clean instance, smart-filtered, self-healing via Task Scheduler.
+**Open / next:** dashboard Phase 2 (backtester controls) + Phase 3 (gated trading controls) — Phase-1 monitor DONE; **Desktop one-click launcher DONE** (icon "Trading Desk Dashboard").
+**Blocked / time-gated:** [5] S2/S3 condor backtests — blocked on 1-min data (~July 1) · [6] Monday first live paper rebalance — gated to Monday (gateway+market), needs [7] first · [7] Monday pre-arm: verify replaceFA FA-XML tag casing (`fa_probe.py`) · [11] don't cancel ThetaData sub until pulls complete (~July 1).
 **Owed:** [8] Andrew gut-check the 2008 GFC +8.3% number.
-**Recently closed:** dashboard Phase-1 monitor [12]; S3 v1 condor control [4]; flow de-risk gate [3] (tested→rejected); cosmetics [9]; killed redundant cron [10]; gamma overlay + weekly cadence (both tested→rejected); GEX rebuild+calibration (70%); daily grab→ThetaData (IBKR retired); EOD Dealer-Gamma section; Friday 6/26 data fix; full top-down audit.
+**Known rough edge (minor):** `features/gex.py:98` ZeroDivisionError when spot==0 (thin symbol e.g. NDX); full GEX build still completes. Add a guard next time gex.py is touched.
+**Recently closed:** desktop launcher [13]; dashboard Phase-1 monitor [12]; collector smart-filter committed; re-pull day 20260529 (self-heals); S3 v1 condor control [4]; flow de-risk gate [3] (tested→rejected); cosmetics [9]; killed redundant cron [10]; gamma overlay + weekly cadence (both tested→rejected); GEX rebuild+calibration (70%); daily grab→ThetaData (IBKR retired); EOD Dealer-Gamma section; Friday 6/26 data fix; full top-down audit.
 
 ## A — Strategy & Backtester
 - 200d-MA fragility fix ADOPTED: `REGIME_TREND_MARGIN=0.03` (regime-only early-exit margin).
