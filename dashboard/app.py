@@ -128,15 +128,36 @@ def _fmt_dt(ts: str | None) -> str:
     return str(ts).replace("T", " ")
 
 
-def _status_badge(status: str) -> str:
+def _status_tier(status: str) -> str:
+    """Map any free-text status onto one of: good / warn / bad / unknown."""
     s = (status or "").lower()
-    if s in ("ok", "ready", "green"):
-        return "🟢"
-    if s in ("warn", "partial", "stale", "yellow"):
-        return "🟡"
-    if s in ("fail", "error", "disabled", "red"):
-        return "🔴"
-    return "⚪"
+    if any(k in s for k in ("ok", "ready", "green", "running", "aligned", "clean")):
+        return "good"
+    if any(k in s for k in ("warn", "partial", "stale", "yellow", "queued", "drift")):
+        return "warn"
+    if any(k in s for k in ("fail", "error", "disabled", "red", "offline", "not found")):
+        return "bad"
+    return "unknown"
+
+
+# One source of truth for the dot + accent colour used everywhere.
+_TIER_DOT = {"good": "🟢", "warn": "🟡", "bad": "🔴", "unknown": "⚪"}
+_TIER_COLOR = {"good": "#3ddc84", "warn": "#f5c451", "bad": "#ff5c5c", "unknown": "#9aa0a6"}
+
+
+def _status_badge(status: str) -> str:
+    """The single 🟢/🟡/🔴/⚪ renderer used by Health tiles, gamma state and tasks."""
+    return _TIER_DOT[_status_tier(status)]
+
+
+def _badge_legend() -> None:
+    st.caption("🟢 ok / ready  ·  🟡 warning / partial / stale  ·  "
+               "🔴 fail / error / offline  ·  ⚪ unknown / no data")
+
+
+def _color_text(text: str, tier: str) -> str:
+    """Inline coloured markdown span for a given good/warn/bad/unknown tier."""
+    return f"<span style='color:{_TIER_COLOR.get(tier, _TIER_COLOR['unknown'])}'>{text}</span>"
 
 
 @st.cache_data(ttl=60)
@@ -208,8 +229,122 @@ def eod_coverage() -> tuple[pd.DataFrame, dict]:
     return df, summary
 
 
+def _parse_ts(s: str | None) -> datetime | None:
+    if not s:
+        return None
+    s = str(s).strip().replace("T", " ")
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y%m%d"):
+        try:
+            return datetime.strptime(s[:19] if len(s) >= 19 else s, fmt)
+        except Exception:
+            continue
+    return None
+
+
+@st.cache_data(ttl=60)
+def last_refreshed() -> str:
+    """Newest of every available data timestamp: collector `updated`, the status
+    JSON `ts` values, latest GEX `date`, and the newest backtest report mtime."""
+    cands: list[datetime] = []
+    prog = load_json(str(PROGRESS_JSON))
+    if prog:
+        d = _parse_ts(prog.get("updated"))
+        if d:
+            cands.append(d)
+    for name in ("forward", "tiingo", "gex", "eod_report"):
+        js = load_json(str(STATUS_DIR / f"{name}.json"))
+        if js:
+            d = _parse_ts(js.get("ts")) or _parse_ts(js.get("date"))
+            if d:
+                cands.append(d)
+    try:
+        _, summ = eod_coverage()
+        d = _parse_ts(summ.get("latest_day"))
+        if d:
+            cands.append(d)
+    except Exception:
+        pass
+    for v in BACKTEST_VERSIONS:
+        f = BACKTEST_OUTPUT / f"backtest_report_{v}.html"
+        if f.exists():
+            cands.append(datetime.fromtimestamp(f.stat().st_mtime))
+    if not cands:
+        return "—"
+    return max(cands).strftime("%Y-%m-%d %H:%M")
+
+
+@st.cache_data(ttl=60)
+def desk_status() -> dict:
+    """Roll the pipeline up into one home-screen summary. Read-only; reuses the
+    same JSONs/parquet the detail sections show."""
+    # Overall pipeline health = worst tier across the status JSONs.
+    order = {"good": 0, "unknown": 1, "warn": 2, "bad": 3}
+    worst, worst_name = "good", "—"
+    any_status = False
+    for name in ("forward", "tiingo", "gex", "eod_report"):
+        js = load_json(str(STATUS_DIR / f"{name}.json"))
+        if not js:
+            continue
+        any_status = True
+        shown = js.get("metrics", {}).get("overall") or js.get("status", "")
+        t = _status_tier(shown)
+        if order[t] > order[worst]:
+            worst, worst_name = t, name
+    if not any_status:
+        worst = "unknown"
+
+    prog = load_json(str(PROGRESS_JSON)) or {}
+    done = prog.get("days_done", 0)
+    total = prog.get("days_total", 0) or 1
+    pct = prog.get("pct", round(100 * done / total, 2))
+
+    try:
+        _, summ = eod_coverage()
+        latest_day = summ.get("latest_day", "—")
+    except Exception:
+        latest_day = "—"
+
+    states = scheduled_task_states()
+    not_ready = sum(1 for s in states.values() if str(s).lower() != "ready")
+    n_tasks = len(states)
+
+    return {
+        "overall_tier": worst, "overall_name": worst_name,
+        "collector_pct": pct, "collector_eta": prog.get("eta", "—"),
+        "latest_day": latest_day,
+        "tasks_not_ready": not_ready, "tasks_total": n_tasks,
+    }
+
+
 def render_health() -> None:
     st.subheader("Desk health")
+
+    # --- At-a-glance desk status (the "is anything broken?" row) ---
+    s = desk_status()
+    cols = st.columns(4)
+    with cols[0]:
+        tier = s["overall_tier"]
+        label = {"good": "Healthy", "warn": "Warning",
+                 "bad": "Problem", "unknown": "Unknown"}[tier]
+        st.metric("Pipeline health", f"{_TIER_DOT[tier]} {label}", border=True)
+        if tier in ("warn", "bad") and s["overall_name"] != "—":
+            st.caption(f"worst: {s['overall_name']}")
+    with cols[1]:
+        st.metric("Collector", f"{s['collector_pct']:.1f}%", border=True)
+        st.caption(str(s["collector_eta"]))
+    with cols[2]:
+        st.metric("Latest warehouse day", s["latest_day"], border=True)
+    with cols[3]:
+        nr = s["tasks_not_ready"]
+        st.metric("Tasks not Ready", f"{nr} / {s['tasks_total']}",
+                  delta=("all Ready" if nr == 0 and s["tasks_total"] else None),
+                  delta_color="off", border=True)
+        is_weekend = datetime.now().weekday() >= 5
+        st.caption("Weekend — gateway offline is expected"
+                   if is_weekend else "Weekday — gateway should be up")
+    _badge_legend()
+
+    st.divider()
 
     # --- SPXW 1-min collector progress ---
     prog = load_json(str(PROGRESS_JSON))
@@ -260,7 +395,10 @@ def render_health() -> None:
             # eod_report carries a nested 'overall' that's the real health.
             overall = js.get("metrics", {}).get("overall")
             shown = overall or status
-            st.markdown(f"**{name}**  {_status_badge(shown)} {shown}")
+            tier = _status_tier(shown)
+            st.markdown(
+                f"**{name}**  {_TIER_DOT[tier]} {_color_text(shown, tier)}",
+                unsafe_allow_html=True)
             st.caption(f"date {js.get('date','—')} · {_fmt_dt(js.get('ts'))}")
             if js.get("message"):
                 st.caption(js["message"])
@@ -276,7 +414,10 @@ def render_health() -> None:
         cols = st.columns(3)
         for i, (label, state) in enumerate(states.items()):
             with cols[i % 3]:
-                st.markdown(f"{_status_badge(state)} **{label}** — {state}")
+                tier = _status_tier(state)
+                st.markdown(
+                    f"{_TIER_DOT[tier]} **{label}** — {_color_text(state, tier)}",
+                    unsafe_allow_html=True)
 
 
 # ================================ 2. GAMMA ====================================
@@ -319,14 +460,23 @@ def render_gamma() -> None:
                 st.caption("no data")
                 continue
             state = str(snap.get("gamma_state", "—"))
-            badge = "🟢" if state.lower().startswith("pos") else (
-                "🔴" if state.lower().startswith("neg") else "⚪")
-            st.markdown(f"{badge} **{state} gamma**")
-            st.metric("Spot", f"{snap.get('spot', float('nan')):,.2f}")
-            st.metric("Net GEX", f"{snap.get('net_gex', 0)/1e9:,.2f} B")
-            st.metric("Gamma flip", f"{snap.get('gamma_flip', float('nan')):,.2f}")
-            st.metric("Dist to flip", f"{snap.get('dist_to_flip_pct', float('nan')):.2f}%")
-            st.metric("Expected move", f"{snap.get('expected_move_pct', float('nan')):.3f}%")
+            sl = state.lower()
+            g_tier = ("good" if sl.startswith("pos") else
+                      "bad" if sl.startswith("neg") else
+                      "warn" if sl.startswith("neu") else "unknown")
+            st.markdown(
+                f"{_TIER_DOT[g_tier]} **{_color_text(state + ' gamma', g_tier)}**",
+                unsafe_allow_html=True)
+            net = snap.get("net_gex", 0) or 0
+            net_tier = "good" if net > 0 else ("bad" if net < 0 else "unknown")
+            st.metric("Spot", f"{snap.get('spot', float('nan')):,.2f}", border=True)
+            st.metric("Net GEX", f"{net/1e9:,.2f} B",
+                      delta=("positive" if net > 0 else "negative" if net < 0 else None),
+                      delta_color=("normal" if net > 0 else "inverse" if net < 0 else "off"),
+                      border=True)
+            st.metric("Gamma flip", f"{snap.get('gamma_flip', float('nan')):,.2f}", border=True)
+            st.metric("Dist to flip", f"{snap.get('dist_to_flip_pct', float('nan')):.2f}%", border=True)
+            st.metric("Expected move", f"{snap.get('expected_move_pct', float('nan')):.3f}%", border=True)
             st.caption(f"as of {snap.get('date','—')}")
 
     st.divider()
@@ -382,16 +532,38 @@ def render_backtests() -> None:
 
     try:
         df = backtest_metrics()
-        show = df.copy()
-        for c in ("CAGR", "Max drawdown", "Down capture vs SPY"):
-            if c in show.columns:
-                show[c] = (show[c] * 100).map(lambda x: f"{x:.1f}%")
-        for c in ("Calmar", "Sortino"):
-            if c in show.columns:
-                show[c] = show[c].map(lambda x: f"{x:.2f}")
-        st.dataframe(show, use_container_width=True)
+
+        # Per-version metric cards. The VALUE is colour-coded by meaning:
+        # green for favourable CAGR/Calmar/Sortino, red for the drawdown &
+        # down-capture risk stats (which are inherently "bad" magnitudes).
+        risk_metrics = {"Max drawdown", "Down capture vs SPY"}
+        for v in BACKTEST_VERSIONS:
+            if v not in df.index:
+                continue
+            st.markdown(f"#### {v}")
+            row = df.loc[v]
+            mcols = st.columns(len(df.columns))
+            for mc, metric in zip(mcols, df.columns):
+                raw = row[metric]
+                if metric in ("CAGR", "Max drawdown", "Down capture vs SPY"):
+                    txt = f"{raw * 100:.1f}%" if pd.notna(raw) else "—"
+                else:
+                    txt = f"{raw:.2f}" if pd.notna(raw) else "—"
+                if pd.isna(raw):
+                    tier = "unknown"
+                elif metric in risk_metrics:
+                    tier = "bad"          # drawdown / down-capture read red
+                else:
+                    tier = "good" if raw >= 0 else "bad"
+                with mc:
+                    st.caption(metric)
+                    st.markdown(
+                        f"<div style='font-size:1.25rem;font-weight:600'>"
+                        f"{_color_text(txt, tier)}</div>",
+                        unsafe_allow_html=True)
         st.caption("Computed live from the validated run_backtest "
-                   "(strategy column vs SPY). Cached 1 hour.")
+                   "(strategy column vs SPY). Cached 1 hour. Green = favourable, "
+                   "red = drawdown / down-capture (deeper is worse).")
     except Exception as exc:
         st.error(f"Could not compute metrics: {exc}")
 
@@ -501,9 +673,16 @@ def render_accounts() -> None:
                     "drift": f"{ln.drift_weight*100:+.1f}%",
                 } for ln in lines if ln.target_weight > 0 or ln.actual_shares != 0]
                 aligned = all(ln.status == "MATCHED" for ln in lines)
+                dot = _TIER_DOT["good"] if aligned else _TIER_DOT["bad"]
                 with st.expander(
-                        f"{info.number} [{info.version}] — "
+                        f"{dot} {info.number} [{info.version}] — "
                         f"{'ALIGNED' if aligned else 'drift present'}"):
+                    if aligned:
+                        st.markdown(_color_text("Aligned with target — no drift.",
+                                                "good"), unsafe_allow_html=True)
+                    else:
+                        st.markdown(_color_text("Drifting from target.", "bad"),
+                                    unsafe_allow_html=True)
                     st.dataframe(pd.DataFrame(drift_rows),
                                  use_container_width=True, hide_index=True)
 
@@ -540,6 +719,9 @@ def render_accounts() -> None:
 # ================================= LAYOUT =====================================
 def main() -> None:
     st.title("📊 Trading Desk")
+    st.caption(f"As of {last_refreshed()} (newest available data) · auto-refreshes "
+               "as caches expire (status/JSON 60s, GEX/coverage 120s, "
+               "backtests cached 1h).")
     st.caption("Read-only dashboard · Phase 1 · paper account only · nothing here "
                "places, arms, or transmits any order.")
 
