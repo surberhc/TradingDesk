@@ -99,3 +99,86 @@ REBALANCE_BAND_PCT = 0.03
 
 # --- Order style ---------------------------------------------------------------
 ORDER_STYLE = "limit"   # agreed default for paper. (limit | marketable_limit | market)
+
+# --- Laddered order-execution router (see docs/IBKR_ORDER_TYPES_RESEARCH.md) ------
+# The 2026-06-29 rebalance sent a STATIC limit at the neutral reference price with no
+# escalation, so the wide-spread Treasury/cash legs (TFLO all accounts, VGSH on DU142)
+# never crossed and died at session disconnect. The router below replaces the single
+# scalar ORDER_STYLE with an instrument-aware RECIPE: a per-class ordered ladder of
+# rungs that escalates from passive (best price) toward marketable (fill certainty),
+# and ALWAYS terminates at a marketable-cap rung so a leg can never hang open again.
+#
+# This is policy data only — no orders are placed by importing it, and the existing
+# review->arm->transmit gate (order_router.transmit_guard, fails closed) is unchanged.
+
+# Instrument classes. The classifier (order_router.classify_instrument) is data-driven:
+# it consults these seed sets first, then falls back to a live spread-width heuristic.
+INSTRUMENT_CLASS_LIQUID_ETF = "LIQUID_ETF"
+INSTRUMENT_CLASS_ILLIQUID_ETF = "ILLIQUID_ETF"
+INSTRUMENT_CLASS_INDEX_OPTION = "INDEX_OPTION"
+
+# Seed symbol sets (extend as the universe grows). Known liquid ~1-tick-spread ETFs
+# cross immediately; known thin Treasury/cash ETFs are the ones that hung on 06-29.
+LIQUID_ETF_SYMBOLS = {"SPY", "VTI", "RSP", "PDBC"}
+ILLIQUID_ETF_SYMBOLS = {"TFLO", "VGSH", "SHV", "BIL", "GBIL", "SGOV", "ICSH", "JPST"}
+
+# Spread-width heuristic for symbols NOT in a seed set: an ETF whose live relative
+# spread (ask-bid)/mid exceeds this is treated as ILLIQUID (gets the full ladder);
+# at or under it, LIQUID (cross now). Index options never hit the heuristic — they are
+# classified by security type (sec_type="OPT") and get the options-only recipe.
+ILLIQUID_SPREAD_THRESHOLD = 0.0015   # 15 bps of mid
+
+# Cap budget `k`: the marketable cap is BUY ask*(1+k) / SELL bid*(1-k). The cap is a
+# worst-case price the engine will pay to GET DONE on a rung; the peg/algo usually
+# fills better. Validated through the HARD PRICE GUARD on every rung.
+ORDER_CAP_K = 0.003               # 30 bps over/under the touch as the marketable cap
+
+# Per-rung watch window (seconds) and per-rung poll cadence. Tight per the
+# supervise-long-ops rule: place, watch with flushed progress, then cancel+escalate.
+LADDER_RUNG_SECONDS = 15          # how long to watch each rung before escalating
+LADDER_POLL_SECONDS = 1.0         # fill-watch poll cadence within a rung
+
+# The RECIPE: instrument class -> ordered list of ladder rungs. Each rung is a dict
+# {"order_type": <builder kind>, ...}. The router walks rungs in order, re-placing only
+# the UNFILLED remainder, until filled or the terminal (marketable-cap) rung. The final
+# rung of every ladder is a marketable limit, so the ladder always terminates.
+#   order_type values:
+#     "marketable_limit" -> capped LMT that crosses the spread now
+#     "midprice"         -> Order(orderType="MIDPRICE", lmtPrice=cap)   [stocks/ETFs ONLY]
+#     "adaptive"         -> LMT + algoStrategy="Adaptive", priority Patient|Normal|Urgent
+#     "rel"              -> Order(orderType="REL", auxPrice=cap)        [options-safe peg]
+ORDER_LADDER = {
+    INSTRUMENT_CLASS_LIQUID_ETF: [
+        {"order_type": "marketable_limit"},
+        {"order_type": "adaptive", "priority": "Urgent"},
+    ],
+    INSTRUMENT_CLASS_ILLIQUID_ETF: [
+        {"order_type": "midprice"},
+        {"order_type": "adaptive", "priority": "Patient"},
+        {"order_type": "adaptive", "priority": "Urgent"},
+        {"order_type": "marketable_limit"},
+    ],
+    # NEVER MIDPRICE on options (unsupported) and NO scheduler algos. Capped LMT, then a
+    # REL peg toward marketable (capped via auxPrice), then a hard marketable LMT.
+    INSTRUMENT_CLASS_INDEX_OPTION: [
+        {"order_type": "marketable_limit"},
+        {"order_type": "rel"},
+        {"order_type": "marketable_limit"},
+    ],
+}
+
+# GTC-REMAINDER LAYER ("ladder while connected, rest when gone"). See
+# docs/IBKR_RESTING_CONDITIONAL_ORDERS.md §6. After the terminal (marketable-cap) rung's
+# watch window, if quantity is STILL unfilled, do not give up: convert the remainder to a
+# RESTING plain LMT at the cap with tif="GTC" and leave it at IB so the leg cannot die at
+# session disconnect (the exact failure that killed the 2026-06-29 TFLO/VGSH DAY legs).
+# The rest MUST be a plain LMT — Adaptive forbids GTC and MIDPRICE is DAY-only, so neither
+# can carry the resting tif. Reported as "RESTING (GTC)", never "failed".
+LADDER_REST_REMAINDER = True
+
+# FA-block compatibility with MIDPRICE/Adaptive is UNCONFIRMED (docs are single-account;
+# needs a live PAPER probe — see research §4/§6). Until proven, FA *block* (group) legs
+# stay on the existing safe capped-limit path; only DIRECT (lone-account) legs get the
+# full ladder. Flip this ONLY after a probe confirms algos ride an FA block.
+LADDER_FA_BLOCKS = False
+

@@ -84,3 +84,34 @@ def limit_price(side: str, q: Quote, style: str | None = None) -> float | None:
     else:  # neutral "limit"
         ref = reference_price(q)
     return round(ref, 2) if _valid(ref) else None
+
+
+def relative_spread(q: Quote) -> float | None:
+    """(ask-bid)/mid — the live relative spread width, used to classify an unknown
+    symbol as liquid vs illiquid. None if a usable two-sided quote is unavailable."""
+    mid = _mid(q)
+    if mid is None or not (_valid(q.bid) and _valid(q.ask)):
+        return None
+    return (q.ask - q.bid) / mid
+
+
+def marketable_cap(side: str, q: Quote, k: float | None = None) -> float | None:
+    """The WORST-CASE marketable cap for a laddered order: BUY = ask*(1+k),
+    SELL = bid*(1-k). This is the hard price a rung will pay to GET DONE; pegs/algos
+    usually fill better. Falls back to the neutral reference (then a tiny k pad) when a
+    one-sided quote is missing, so the cap is still a real, positive, marketable number.
+    None only when no usable price exists at all (caller then routes the PRICE GUARD).
+
+    The returned value is ROUNDED to a cent and must still be passed through the router's
+    HARD PRICE GUARD by the caller — this function does no validation of its own beyond
+    requiring a usable input price."""
+    k = config.ORDER_CAP_K if k is None else k
+    touch = q.ask if side == "BUY" else q.bid
+    if not _valid(touch):
+        # No touch on our crossing side — pad the neutral reference toward marketable.
+        ref = reference_price(q)
+        if not _valid(ref):
+            return None
+        touch = ref
+    cap = touch * (1 + k) if side == "BUY" else touch * (1 - k)
+    return round(cap, 2) if _valid(cap) else None

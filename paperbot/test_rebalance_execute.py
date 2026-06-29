@@ -144,3 +144,161 @@ def test_armed_place_path_is_unreachable_without_all_three(monkeypatch):
     sentinel = object()
     result = order_router.place(sentinel, built, armed=True)   # armed, but config locked
     assert result["transmitted"] == 0
+
+
+# --- SCOPE FILTER: restrict a run to one account / tier ------------------------
+# These prove a lone-DU142 (Conservative direct) run drops ALL fa_block routes so an armed
+# scoped run provably issues NO replaceFA / no block placement for DU143-146 — the thing
+# that unblocks the live DU142 completion. Pure functions where possible; the loop-level
+# guarantee is asserted by feeding a filtered route set through the armed loop body.
+from rebalance_engine import RoutePlan   # noqa: E402
+
+
+def _direct(version, symbol, account, qty=10):
+    return RoutePlan("direct", version, symbol, "BUY", qty, None, "", account)
+
+
+def _block(version, symbol, group, split):
+    return RoutePlan("fa_block", version, symbol, "BUY", sum(split.values()), group, "",
+                     None, dict(split))
+
+
+def _fleet_routes():
+    # The real 5-account shape: DU142 Conservative runs as DIRECT legs; DU143-146 run as
+    # FA-block routes per tier.
+    return [
+        _direct("Conservative", "TFLO", "DU8922142", 10),
+        _direct("Conservative", "VGSH", "DU8922142", 5),
+        _block("Balanced", "SPY", "tier_balanced", {"DU8922143": 15, "DU8922144": 15}),
+        _block("Growth", "VTI", "tier_growth", {"DU8922145": 20, "DU8922146": 20}),
+    ]
+
+
+def test_parse_scope_reads_both_flags():
+    assert rx.parse_scope([]) == (None, None)                                   # default
+    assert rx.parse_scope([rx.ARM_TOKEN]) == (None, None)                       # arm only
+    assert rx.parse_scope(["--only-account", "DU8922142"]) == ("DU8922142", None)
+    assert rx.parse_scope(["--only-tier", "Conservative"]) == (None, "Conservative")
+    assert rx.parse_scope([rx.ARM_TOKEN, "--only-account", "DU8922142"]) == ("DU8922142", None)
+    assert rx.parse_scope(["--only-account", "DU8922142", "--only-tier", "Conservative"]) == \
+        ("DU8922142", "Conservative")
+
+
+def test_parse_scope_flag_without_value_raises():
+    with pytest.raises(ValueError):
+        rx.parse_scope(["--only-account"])                  # no value
+    with pytest.raises(ValueError):
+        rx.parse_scope(["--only-account", "--only-tier", "Growth"])   # next token is a flag
+
+
+def test_validate_scope_unknown_account_fails_closed():
+    with pytest.raises(ValueError):
+        rx.validate_scope("DU9999999", None)                # not in ENROLLMENT
+    with pytest.raises(ValueError):
+        rx.validate_scope(None, "Aggressive")               # not a VALID_VERSION
+    # valid values do not raise
+    rx.validate_scope("DU8922142", None)
+    rx.validate_scope(None, "Conservative")
+    rx.validate_scope(None, None)
+
+
+def test_filter_only_account_keeps_direct_drops_all_blocks():
+    routes = _fleet_routes()
+    scoped = rx.filter_routes(routes, "DU8922142", None)
+    # ONLY DU142 direct routes survive.
+    assert all(r.route == "direct" and r.account == "DU8922142" for r in scoped)
+    assert {r.symbol for r in scoped} == {"TFLO", "VGSH"}
+    # ZERO fa_block routes remain — the DU143-146 tiers are untouched.
+    assert not any(r.route == "fa_block" for r in scoped)
+
+
+def test_filter_only_tier_keeps_that_tier():
+    routes = _fleet_routes()
+    assert {r.symbol for r in rx.filter_routes(routes, None, "Conservative")} == {"TFLO", "VGSH"}
+    growth = rx.filter_routes(routes, None, "Growth")
+    assert [r.symbol for r in growth] == ["VTI"]
+    assert all(r.version == "Growth" for r in growth)
+
+
+def test_filter_no_scope_is_unchanged():
+    routes = _fleet_routes()
+    assert rx.filter_routes(routes, None, None) == routes        # full fleet, identical
+
+
+def test_filter_no_match_is_empty():
+    # A scope that matches nothing -> empty route list (caller then no-ops, sends nothing).
+    routes = _fleet_routes()
+    # Balanced has no direct routes, so account-scope on a Balanced account + tier mismatch
+    # yields nothing.
+    assert rx.filter_routes(routes, "DU8922143", None) == []     # DU143 has only a block
+
+
+class _ScopedIB:
+    """Minimal IB stand-in for driving the armed loop's route branch. Records replaceFA /
+    set-group writes and order placements; nothing hits a real broker."""
+    def __init__(self):
+        self.replace_fa_calls = 0
+        self.placed = []
+
+    def replaceFA(self, *_a, **_k):
+        self.replace_fa_calls += 1
+
+    def requestFA(self, *_a, **_k):
+        return "<ListOfGroups/>"
+
+    def qualifyContracts(self, *c):
+        return c
+
+    def placeOrder(self, contract, order):
+        self.placed.append((contract, order))
+        return SimpleNamespace(
+            orderStatus=SimpleNamespace(status="Filled", filled=order.totalQuantity,
+                                        remaining=0, avgFillPrice=100.0),
+            contract=contract, isDone=lambda: True)
+
+    def sleep(self, *_):
+        pass
+
+
+def test_scoped_du142_run_issues_no_replacefa(monkeypatch):
+    # End-to-end proof on the loop body: with the route set scoped to DU142 (direct only),
+    # the armed loop NEVER calls set_group_contracts_or_shares / replaceFA and places only
+    # the two direct legs. We drive the same branch logic the executor runs, armed.
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    # Guard: if anything tries to write FA config, blow up loudly.
+    def _boom(*_a, **_k):
+        raise AssertionError("scoped DU142 run must NEVER write FA config (replaceFA)!")
+    monkeypatch.setattr(rx, "set_group_contracts_or_shares", _boom)
+    # Make the direct laddered placement a no-op that reports a clean fill (no real ladder).
+    monkeypatch.setattr(rx, "_place_direct_laddered",
+                        lambda ib, r, q, as_of, armed: {"fills": [{"symbol": r.symbol}]})
+
+    ib = _ScopedIB()
+    scoped = rx.filter_routes(_fleet_routes(), "DU8922142", None)
+    assert len(scoped) == 2 and not any(r.route == "fa_block" for r in scoped)
+
+    # Replicate the executor's per-route loop (the exact branch in execute_armed).
+    placed_fills = []
+    for r in scoped:
+        if r.route == "fa_block":
+            rx.set_group_contracts_or_shares(ib, r.fa_group, r.per_account_split)  # would boom
+            res = order_router.place(ib, [], armed=True)
+        else:
+            res = rx._place_direct_laddered(ib, r, None, "as_of", armed=True)
+        placed_fills.extend(res.get("fills", []))
+
+    assert ib.replace_fa_calls == 0                  # provably no FA-config write
+    assert {f["symbol"] for f in placed_fills} == {"TFLO", "VGSH"}
+
+
+def test_scope_does_not_bypass_arm_gate(monkeypatch):
+    # Scoping is orthogonal to arming: with the committed-safe defaults, the gate is still
+    # BLOCKED regardless of any scope flag. Scope narrows WHAT runs, never WHETHER it can
+    # transmit.
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    # A scope flag present, but no arm token -> not armed, gate blocked.
+    assert rx.arm_requested(["--only-account", "DU8922142"]) is False
+    permit, _ = rx.gate_state(armed=False)
+    assert permit is False

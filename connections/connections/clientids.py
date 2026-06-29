@@ -29,6 +29,7 @@ CLIENT_IDS = {
     "paperbot_fa_admin": 36,        # paperbot: FA config write (replaceFA group create/edit) — own id, serialize this shared write
     "paperbot_rebalance": 37,       # paperbot: multi-account rebalance RUNNER (read-only connect, build-only, arm-gated) — own id so it never collides with the engine on 30 or any read-only probe
     "paperbot_rebalance_exec": 38,  # paperbot: multi-account rebalance EXECUTOR (transmit-capable; connects readonly=False, pinned to a DU sub, writes ContractsOrShares via replaceFA, places blocks armed) — own id so it never collides with the engine on 30 or the read-only runner on 37
+    "paperbot_arm_verify": 39,      # paperbot: arm/disarm VERIFICATION probe — connects readonly=False and inspects the gateway's API read-only state via the "Read-Only mode" rejection signal; NEVER transmits (orders it probes with are rejected at the API boundary or never sent). Own id so it never collides with the engine on 30 or the executor on 38
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.

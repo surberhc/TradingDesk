@@ -45,6 +45,14 @@ Run — DRY-RUN review (default, transmits nothing, identical to rebalance_run):
 
 Run — ARMED execute (Monday, human-supervised; ALL of: arm token + non-read-only):
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe rebalance_execute.py --arm-i-understand
+
+Optional SCOPE (restrict the run; default = full enrolled fleet, unchanged):
+  --only-account DU8922142   only that account's DIRECT routes (ALL fa_block routes
+                             dropped — no replaceFA / no block orders for other tiers)
+  --only-tier Conservative   only that tier's routes
+  e.g. complete just DU142's stuck direct legs, armed:
+  ...rebalance_execute.py --arm-i-understand --only-account DU8922142
+Scoping NEVER bypasses the arm gate; an unknown account/tier FAILS CLOSED.
 """
 from __future__ import annotations
 
@@ -86,6 +94,68 @@ def arm_requested(argv: list[str]) -> bool:
     """True ONLY if the exact arm token is present. This is condition (4) of the gate
     and the single thing that authorizes flipping the in-process safety flags."""
     return ARM_TOKEN in argv
+
+
+# --- optional SCOPE filter (restrict a run to one account or one tier) ----------
+# Default behavior is UNCHANGED: with neither flag the full enrolled fleet runs exactly
+# as before. The flags only NARROW the set of routes the execute loop acts on; they do NOT
+# touch the arm gate (scoping never bypasses or weakens arming) or the engine math.
+SCOPE_ACCOUNT_FLAG = "--only-account"
+SCOPE_TIER_FLAG = "--only-tier"
+
+
+def parse_scope(argv: list[str]) -> tuple[str | None, str | None]:
+    """Pull the optional scope from argv: (only_account, only_tier), each None if absent.
+    Accepts `--only-account DU8922142` and `--only-tier Conservative` (space-separated
+    value, mirroring how the arm token is a bare flag). Raises ValueError on a flag given
+    without a value so a typo fails loudly rather than silently widening scope."""
+    only_account = None
+    only_tier = None
+    for flag, setter in ((SCOPE_ACCOUNT_FLAG, "account"), (SCOPE_TIER_FLAG, "tier")):
+        if flag in argv:
+            i = argv.index(flag)
+            if i + 1 >= len(argv) or argv[i + 1].startswith("--"):
+                raise ValueError(f"{flag} requires a value (e.g. {flag} "
+                                 f"{'DU8922142' if setter == 'account' else 'Conservative'})")
+            val = argv[i + 1]
+            if setter == "account":
+                only_account = val
+            else:
+                only_tier = val
+    return only_account, only_tier
+
+
+def validate_scope(only_account: str | None, only_tier: str | None) -> None:
+    """FAIL CLOSED on a scope that names something not enrolled/valid — better to abort
+    than to silently match zero and look like a clean no-op for the wrong reason."""
+    if only_account is not None and only_account not in config.ENROLLMENT:
+        raise ValueError(
+            f"--only-account {only_account!r} is not in config.ENROLLMENT "
+            f"({sorted(config.ENROLLMENT)}). FAILING CLOSED — no run.")
+    if only_tier is not None and only_tier not in config.VALID_VERSIONS:
+        raise ValueError(
+            f"--only-tier {only_tier!r} is not a valid version "
+            f"({list(config.VALID_VERSIONS)}). FAILING CLOSED — no run.")
+
+
+def filter_routes(routes, only_account: str | None, only_tier: str | None):
+    """Narrow the route list to the requested scope. Applied AFTER build_plan, so the
+    engine math/allocation is untouched — we only choose which routes the loop acts on.
+
+      --only-account A : keep ONLY `direct` routes whose account == A. ALL `fa_block`
+                         routes are dropped (a block spans a whole tier's accounts and
+                         must never be partially written/placed for one account — this is
+                         exactly what protects the unproven FA-block legs DU143-146 during
+                         a lone-DU142 completion).
+      --only-tier T    : keep ONLY routes for tier/version T (direct or block).
+
+    Both may be given together (intersection). Neither -> routes unchanged."""
+    out = list(routes)
+    if only_tier is not None:
+        out = [r for r in out if r.version == only_tier]
+    if only_account is not None:
+        out = [r for r in out if r.route == "direct" and r.account == only_account]
+    return out
 
 
 def gate_state(armed: bool) -> tuple[bool, str]:
@@ -195,11 +265,17 @@ def _net_liq(summary, account: str):
                  if r.account == account and r.tag == "NetLiquidation"), None)
 
 
-def execute_armed(armed: bool) -> int:
+def execute_armed(armed: bool, only_account: str | None = None,
+                  only_tier: str | None = None) -> int:
     """The Monday path. Connects NON-read-only pinned to a DU sub, discovers live state,
     builds the plan, resolves groups fail-closed, runs risk guards, and (only if the gate
     fully permits) writes each tier group's ContractsOrShares and places its block, one at
-    a time, watching fills, then reconciles. Every step is logged to the ledger."""
+    a time, watching fills, then reconciles. Every step is logged to the ledger.
+
+    Optional SCOPE (only_account / only_tier): narrows the routes the loop acts on AFTER
+    build_plan. Default (both None) = full enrolled fleet, identical to before. Scoping
+    applies in BOTH the dry-review and armed paths and composes with — never bypasses —
+    the arm gate."""
     permit, why = gate_state(armed)
     targets = rebalance_run._targets_by_version()
     print("\n[1] Tier models:")
@@ -264,6 +340,27 @@ def execute_armed(armed: bool) -> int:
         # [5] Preview (pure) + the plan we will act on.
         out = rebalance_run.build_preview(account_inputs, targets, tier_groups=tier_groups)
         routes = out["routes"]
+
+        # [5b] SCOPE FILTER (optional) — narrow to one account/tier, AFTER build_plan so the
+        # engine math is untouched. A --only-account run drops ALL fa_block routes, so no
+        # replaceFA write and no block placement happens for the out-of-scope tiers.
+        if only_account is not None or only_tier is not None:
+            scope_desc = ", ".join(
+                p for p in (f"account={only_account}" if only_account else "",
+                            f"tier={only_tier}" if only_tier else "") if p)
+            before = len(routes)
+            routes = filter_routes(routes, only_account, only_tier)
+            dropped_blocks = [r for r in out["routes"]
+                              if r.route == "fa_block" and r not in routes]
+            print(f"\n[5b] SCOPE active ({scope_desc}): {len(routes)}/{before} routes in "
+                  f"scope; {len(dropped_blocks)} fa_block route(s) DROPPED "
+                  f"(no replaceFA / no block placement for them).")
+            if not routes:
+                print("    Scope matched ZERO routes — nothing to do. Transmitting nothing, "
+                      "writing no FA config.")
+                _ledger(armed, account_inputs, routes, placed_fills, backup_path,
+                        halted=False, halt_reason="")
+                return 0
 
         # [6] RISK GUARDS per account BEFORE any transmit (kill switch + per-order caps).
         print("\n[6] Risk guards (risk_manager) per account, pre-transmit...")
@@ -332,15 +429,23 @@ def execute_armed(armed: bool) -> int:
                 res = order_router.place(ib, [bo], armed=True)
                 placed_fills.extend(res.get("fills", []))
             else:
-                # Direct single-account true-up.
+                # Direct single-account true-up. DIRECT legs are where the laddered
+                # router applies first (FA-block algo compatibility is a separate probe —
+                # see config.LADDER_FA_BLOCKS / research §4). The ladder escalates passive
+                # -> marketable so a thin Treasury/cash leg (TFLO/VGSH) can never hang.
                 print(f"\n    [direct] {r.side} {r.symbol} x{r.total_qty}  account={r.account}")
-                intent = rebalance_run._DirectIntent(r.symbol, r.side, r.total_qty, limit)
-                try:
-                    built = order_router.build([intent], r.account, as_of, ib=ib)
-                except ValueError as exc:
-                    print(f"      SKIP — {exc}")
-                    continue
-                res = order_router.place(ib, built, armed=True)
+                q = quotes.get(r.symbol)
+                res = _place_direct_laddered(ib, r, q, as_of, armed=True)
+                if res is None:
+                    # Fall back to the legacy single capped-limit path (no usable quote
+                    # for the ladder caps, or ladder disabled).
+                    intent = rebalance_run._DirectIntent(r.symbol, r.side, r.total_qty, limit)
+                    try:
+                        built = order_router.build([intent], r.account, as_of, ib=ib)
+                    except ValueError as exc:
+                        print(f"      SKIP — {exc}")
+                        continue
+                    res = order_router.place(ib, built, armed=True)
                 placed_fills.extend(res.get("fills", []))
 
         # [8] Reconcile each account to model (read-only readout, in-process).
@@ -368,6 +473,39 @@ def execute_armed(armed: bool) -> int:
     finally:
         ib.disconnect()
         print("Session closed.")
+
+
+def _ladder_caps(side: str, q) -> dict | None:
+    """Compute the per-rung worst-case cap prices for a DIRECT laddered leg from the live
+    quote. Every rung order_type maps to the same marketable cap (BUY ask*(1+k) /
+    SELL bid*(1-k)); MIDPRICE/Adaptive use it as their lmtPrice worst-case, REL as auxPrice,
+    marketable_limit as the limit. Returns None if no usable price exists (caller falls
+    back to the legacy capped-limit path), so a missing quote can never build a NaN cap."""
+    if q is None:
+        return None
+    cap = live_quotes.marketable_cap(side, q)
+    if cap is None or cap != cap or cap <= 0:
+        return None
+    return {"marketable_limit": cap, "midprice": cap, "adaptive": cap, "rel": cap}
+
+
+def _place_direct_laddered(ib, route, q, as_of, armed: bool):
+    """Place ONE direct route through the laddered router. Returns the ladder result, or
+    None to signal the caller to fall back to the legacy single-limit path (quote
+    unusable for caps). Classification is data-driven via order_router.classify_instrument
+    using the live relative spread; the per-rung PRICE GUARD still validates every cap."""
+    caps = _ladder_caps(route.side, q)
+    if caps is None:
+        print("      (no usable quote for ladder caps — using legacy capped-limit path)")
+        return None
+    rel_spread = live_quotes.relative_spread(q) if q else None
+    instrument_class = order_router.classify_instrument(
+        route.symbol, sec_type="STK", relative_spread=rel_spread)
+    order_ref = order_router._order_ref(route.account, as_of, route.side, route.symbol)
+    return order_router.place_laddered(
+        ib, symbol=route.symbol, side=route.side, total_qty=route.total_qty, caps=caps,
+        instrument_class=instrument_class, account=route.account, order_ref=order_ref,
+        armed=armed)
 
 
 def _build_all(ib, routes, account_inputs, targets):
@@ -429,13 +567,27 @@ def main(argv: list[str] | None = None) -> int:
 
     _safety_banner(armed, token_present)
 
+    # Optional SCOPE — narrows the run to one account/tier. FAIL CLOSED on a bad value.
+    try:
+        only_account, only_tier = parse_scope(argv)
+        validate_scope(only_account, only_tier)
+    except ValueError as exc:
+        print(f"\nSCOPE ERROR: {exc}")
+        return 2
+    if only_account or only_tier:
+        scope_desc = ", ".join(p for p in (
+            f"{SCOPE_ACCOUNT_FLAG} {only_account}" if only_account else "",
+            f"{SCOPE_TIER_FLAG} {only_tier}" if only_tier else "") if p)
+        print(f"\nSCOPE: this run is restricted to [{scope_desc}]. Out-of-scope FA-block "
+              f"tiers will NOT be touched (no replaceFA, no block orders).")
+
     if not token_present:
         print("\nNo arm token -> DRY-RUN review (read-only outcome; identical to "
               "rebalance_run). To transmit on Monday, re-run with the exact token:")
         print(f"    {ARM_TOKEN}")
 
     try:
-        return execute_armed(armed)
+        return execute_armed(armed, only_account=only_account, only_tier=only_tier)
     except KeyboardInterrupt:
         print("\nInterrupted — disarm the gateway (arming.disarm()) if you armed it.")
         return 130
