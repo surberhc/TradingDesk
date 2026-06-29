@@ -86,3 +86,83 @@ spot via BSM (`features/gex.py`). **No tier upgrade required.**
   the v1 fixed-delta control engine + single-account cash-settlement/reserve mechanics. Adaptive layers
   + regime gate BLOCKED on S1 calibration + intraday data. Paper account = final judge (separate from
   backtester).
+
+## S4 — SPX Volatility-Control Fund  *(standalone; shared-brain strategy, `strategies/spx_vol_control.py`)*
+- **Family:** single-asset volatility targeting. A faithful in-house replica of the FIA/RILA/annuity
+  vol-control engine (S&P 500 Daily Risk Control is the reference spec). **NOT diversified** — no bonds,
+  no real assets, no regime engine. One risk asset (SPX via SPY) + a cash leg.
+- **Goal (specific):** hold the S&P 500 at a constant *target annualized volatility* by scaling exposure
+  daily between T-bills and a leverage cap, so the fund delivers SPX-like-or-better **risk-adjusted**
+  returns with a materially **smoother equity curve and shallower max drawdown** than buy-and-hold SPX.
+  The objective is to know, empirically and on our own data, exactly what a pure vol-control fund **can
+  and cannot do** — not to beat SPX on raw CAGR.
+- **Core mechanic (universal vol-control formula):**
+  `exposure_t = min(leverage_cap, target_vol / realized_vol_t)`, rebalanced **daily**; residual
+  `(1 − exposure)` in T-bills (cash earns the risk-free rate; >100% borrows at it). Realized vol uses the
+  asymmetric **`max(fast, slow)`** estimator (de-risk fast, re-risk slow — the FIA "headline steal").
+- **Knobs (both swept — Andrew's call 2026-06-28):**
+  - `TARGET_VOL` — annualized vol the fund holds constant (sweepable; FIA standard 10%, SPX runs ~15–16%).
+  - `LEVERAGE_CAP` — max exposure (sweepable **1.0–2.0**; FIA/RILA standard 1.5×). Cap 1.0 = pure
+    smoothing/unlevered; >1.0 = lever up in calm markets to chase the target.
+  - Secondary: estimator windows (fast/slow), an optional rebalance band / max-daily-weight-change
+    (turnover control), an optional observation lag, and the cash/financing rate (see construction).
+- **Construction & measurement (from "Vol Control Funds Analysis" memo, 2026-06-28):** build a
+  **Total-Return** version (cash leg earns the risk-free rate; >100% borrows at it) AND report an
+  **Excess-Return** variant (subtracts the financing/cash return), because real insurance indices are
+  usually ER and the gap is large. Hard anchor from a 2024 SEC supplement (S&P 500 **5%** Daily Risk
+  Control, 5yr ending 2024-04-01): **S&P 500 TR +14.74%/yr → DRC-5% TR +5.68% → DRC-5% ER +3.55%.** That
+  is the bull-market give-up (target-vol drag) AND the ER drag, stacked — a sanity target for our 5%
+  build, and a reminder our headline numbers must state TR-vs-ER and dividends-in/out explicitly. The
+  live retail standard is the **10% target at 150% cap** (Lincoln S&P 500 10% DRC participation 150–170%).
+- **The key reframe (why this is NOT the rejected overlay):** vol-control was previously tested as a
+  *subordinate trim* on S0's regime band and rejected — the band already collapses to the floor in
+  2008/2022, leaving the trim no room. **S4 has no regime band underneath; vol-targeting IS the whole
+  mechanism**, so that rejection does not apply. See memory `vol-control-borrowables`.
+- **Data:** SPY daily adjusted prices (Tiingo, free) + a cash/T-bill series (BIL/SGOV) + the CBOE vol
+  family (VIX/VIX3M/VIX9D/VVIX) — **all already on local disk** (`C:\TradingDesk-Local\bt_data`). No
+  options, no new pull. **Buildable today.**
+- **Benchmark:** buy-and-hold **SPY** (and SPX total-return), NOT 60/40 — this is a single-asset product.
+  Judged on Sharpe/Sortino, max drawdown, and equity-curve smoothness vs SPY, across 2008 AND 2022.
+- **Status:** BUILT + validated 2026-06-28. Pure strategy at strategies/spx_vol_control.py (SpxVolControl); standalone daily TR/ER runner + 2-D sweep at backtester/s4_vol_control.py; report at backtester/output/s4_vol_control_20260628.md. Validated near-exactly against a published SEC index supplement (S&P 500 5% Daily Risk Control, 5yr->2024-04: our 14.93/5.70/3.75% vs SEC 14.74/5.68/3.55%). Realized vol lands on target; at 10%/1.5x -> CAGR 7.5% vs SPY 10.7% but max drawdown -21% vs SPY -55% (2008 -13% vs -37%); Sharpe/Sortino beat buy-and-hold across the whole surface. Clean-mechanics study (costs/chart/re-entry-lag follow-ups in progress). S0 + paperbot untouched.
+
+## S5 — Financed Convexity Overlay on a Synthetic SPX Core  *(spec; braids S1–S4; `docs/S5_SPEC.md`)*
+- **Family:** financed long-convexity overlay. A long-SPX core carrying a PERMANENT, self-financed tail
+  hedge. Where S4 dials **DELTA** (cash vs SPY), S5 dials **CONVEXITY** (own long puts always; flip a
+  *short* overlay on/off). Same signal brain, different lever. Judged on whether it closes S4's V-bottom gap.
+- **Thesis:** never buy protection *after* the spike (that's S4's re-entry lag in disguise). Instead: (1)
+  ALWAYS own longer-dated downside puts, bought cheap when calm; (2) finance their theta with calm-day
+  0DTE selling; (3) in the crash you ALREADY own the hedge — as the puts balloon near the bottom,
+  MONETIZE them and roll proceeds into cheap equity. **The hedge becomes the re-entry fuel.** Long-put
+  delta auto-de-risks the core as spot falls (no signal, no timing) — so the core stays CONSTANT.
+- **Core:** SPX held SYNTHETICALLY (long ATM call + short ATM put ≈ long index) inside the SPXW/SPX
+  cash-settled, European, **Section-1256 (60/40)** complex — no assignment/pin risk, portfolio-margin
+  netting (long puts cut margin on the shorts), deepest 0DTE liquidity. Cost: embeds a financing leg (~r)
+  + must be rolled.
+- **Signal:** reuse S4's `max(fast,slow)` realized-vol estimator (v1) + S1 gamma/term-structure
+  (contango/backwardation, dealer-gamma sign) confirmation (v2+). CALM ⇒ HARVEST 0DTE premium (the S2/S3
+  engine, flat by the close); ROUGH ⇒ STAND DOWN, let the owned puts work.
+- **Knobs:** tail layer (strike/DTE/uncapped-vs-spread), Tier-2 income-gated put-spread sizing, regime
+  thresholds + hysteresis, overlay delta/wing/tenor (S3), combo roll cadence, financing rate (TR vs ER).
+- **Design rules:** (A) **net convexity MUST stay LONG always** — shorts are FINANCING, never the bet
+  (extends S2's "if paired, net tail LONG"); (B) financing can run a DEFICIT in choppy-no-crash tape —
+  measure it, don't assume it away; (C) regime whipsaw; (D) intraday execution complexity; (E) the
+  synthetic's carry leg is real cost (TR-vs-ER like S4).
+- **Two open forks (see spec):** Fork 1 constant-core (RECOMMENDED — let put delta be the variable
+  exposure) *conditional on* Fork 2 keeping an **UNCAPPED tail** (RECOMMENDED laddered hybrid: mandatory
+  cheap deep-OTM uncapped Tier-1 + optional income-financed put-spread Tier-2). The two recommendations
+  are one coupled decision.
+- **Feasibility (BSM, rough):** calm-day 0DTE income ~5–9% of notional/yr (16d strangle, 50% haircut,
+  40–70% calm days) plausibly covers a layered tail carry of ~0.3–1.0%/yr **in a normal year** — but the
+  honest test is the FULL-CYCLE ledger (choppy-no-crash deficit vs crash-year payoff), not the calm-year
+  surplus. Needs warehouse for skew-adjusted tail pricing + intraday pull for real 0DTE path P&L.
+- **Data:** warehouse EOD SPX/SPXW chains (combo + tail + spread pricing, settlement) — **EOD version
+  buildable NOW**; **intraday SPXW 0DTE pull (Phase 1) BLOCKED** exactly like S2/S3 for the realistic
+  0DTE overlay + intraday monetization. Reuses S3's cash-settled reserve + S4's TR/ER accounting.
+- **Status:** spec + EOD prototype + tail-size sweep + **REAL-SKEW VALIDATION all DONE on EOD (2026-06-28).**
+  V-bottom gate PASSED (edge = the passive uncapped tail; active monetization demoted to Phase-2). Tail-size
+  sweep re-run on ACTUAL SPXW skew (≈ +0.71 vol-pts/1% OTM): design SURVIVES honest pricing, frontier shape
+  identical, **validated default ~0.50 notional / 20–25% OTM** (≈ −0.24% CAGR carry; reserve ~0.7–2.1% NAV,
+  non-binding). **DEFENSIVE / tail half is now real-data-validated.** Spec = a **ledger priority-waterfall**
+  (Tier1 tail → Tier2 protection → T-bill reserve → surplus→upside calls). **STILL PENDING (the OFFENSIVE /
+  harvest half): the harvest engine + Phase-2 active monetization + dynamic-throttle layer, all gated on the
+  intraday SPXW pull.** See docs/S5_SPEC.md
