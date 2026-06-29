@@ -1,15 +1,16 @@
-# LANE STATUS  (last updated by: Conductor, 2026-06-28 ~19:00 CT — SESSION CLOSE)
+# LANE STATUS  (last updated by: Conductor, 2026-06-29 ~14:00 CT — SESSION CLOSE)
 
-> Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` (dated drop folder).
-> **PICK UP HERE NEXT SESSION → `conductor/handoffs/HANDOFF_2026-06-28_session-close.md`** (full session-close handoff).
-> First live paperbot rebalance is HELD for **MONDAY** — steps in `MONDAY_RUNBOOK.md` (repo root).
-> Desk runs on its own: collector + ThetaData terminal + dashboard survive this session closing (Task Scheduler / background).
-> **Regime config is UNTOUCHED this session.** The re-entry MAX_LAG 6→3 change was TESTED and **HELD — NOT adopted.** No strategy/data code or config changed; this was a research + audit session.
+> Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` + dated `docs/SESSION_HANDOFF_*.md`.
+> **PICK UP HERE NEXT SESSION → `docs/SESSION_HANDOFF_2026-06-30.md`** (full 2026-06-29 session-close handoff).
+> **First multi-account PAPER rebalance: DONE 2026-06-29 — all 5 accounts (DU142-146) in-band.** Built + proved live a dynamic laddered order router + self-verifying hands-free gateway arming + `--only-account` scope flag (memory `dynamic-order-router`, `paper-arming-and-fills`). Gateway disarmed + verified-locked.
+> Desk runs on its own: collector + ThetaData **terminal-watchdog (NEW, live)** + dashboard survive session close. **Collector ~59%, ETA 2026-06-30 ~18:19 CT** — gates S5 harvest + S2/S3.
+> **Regime config still UNTOUCHED.** `sharp_recovery` refinement TESTED 2026-06-29 → SHELVED (clean negative; GFC fails −118bp filter-independently). Re-entry stays MAX_LAG=6. 2008 GFC audit CLOSED.
 
 ## OPEN ITEMS — running tally (updated 2026-06-28 ~19:00; mirrors the session task list)
 **In progress (autonomous):** [1] SPXW 1-min collector — **374/1170 (~32%)** as of 2026-06-28 18:47, ~10.49 GB, current day 20241227, **0 errors**, avg ~220 s/day, **ETA ~2026-06-30 19:30**. Self-healing via Task Scheduler. (Survived a terminal outage mid-session — resumed from day ~342, not from scratch.)
 **Open research leads (NOTHING adopted):** regime `sharp_recovery` clean-V-only refinement (PRIME lead, HIGH curve-fit risk) · S4 SPX vol-control fund (new buildable strategy idea) · DDOI gamma build (negative-gamma method gap, blocked on 1-min data) · intraday-gamma early-exit revisit (~June 30).
 **Open infra:** ThetaData terminal **port-25503 WATCHDOG** — recommended after this session's outage, NOT built.
+**Open SPEC (paperbot):** cashflow-aware account-management layer — requirements + design for Andrew to react to (shrink cash reserve 5%→~1.5%, explicit CASH bucket vs haircut, withdrawal fail-safe, deposit trigger, per-account monitor = future algo substrate). `docs/ACCOUNT_CASHFLOW_MANAGEMENT.md`. SPEC only, no code/config changed.
 **Open dashboard:** look-improvement roadmap (gamma grid, GEX zero-line chart, consistent formatting) — quick-win restyle done this session, deeper roadmap NOT done · Phase 2 (backtester controls) + Phase 3 (gated trading controls).
 **Blocked / time-gated:** [5] S2/S3 condor backtests + PV-band chart + DDOI build — blocked on 1-min data (~June 30) · [6] Monday first live paper rebalance — gated to Monday (gateway+market), needs [7] first · [7] Monday pre-arm: verify replaceFA FA-XML tag casing (`fa_probe.py`) · [11] don't cancel ThetaData sub until pulls complete (~June 30).
 **Owed:** _(none open)_ — [8] 2008 GFC +8.3% **CLOSED 2026-06-29 (closed on Andrew's nod).** See Recently closed.
