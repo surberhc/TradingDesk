@@ -52,7 +52,7 @@ still an open question. The full evidence for each line is in the cited section.
 - **S4 "SPX vol-control fund"** — the same vol-control mechanics as a STANDALONE single-asset SPX fund
   (FIA-style), NOT an S0 overlay (which sidesteps the rejection above). A NEW strategy, not an S0 change.
   Buildable. (Memory: `s4-spx-vol-control-fund`.)
-- Andrew's final nod on the GFC +8.3% number (§2) — audited clean + active-nav confirmed; pending sign-off.
+- ~~Andrew's final nod on the GFC +8.3% number (§2) — audited clean + active-nav confirmed; pending sign-off.~~ **CLOSED 2026-06-29 (Andrew's nod).** Audit fully flushed (3 independent passes + look-ahead + active-nav warm-up test); evidence `output/gfc_decomposition_2026-06-28.md`. Documented caveat (a limitation, not an open task): the credit half of the GFC-entry read is unwarmable (HYG inception ~2007-04).
 
 ---
 

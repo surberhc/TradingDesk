@@ -15,6 +15,9 @@ __pycache__/
 # --- Generated reports / outputs (regenerable; large) ---
 backtester/output/
 *.html
+# Run-output logs from one-off research scripts (stdout/stderr captures, not source)
+*.err
+*.out
 
 # --- Research data & binaries (not code) ---
 *.pdf
