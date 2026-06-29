@@ -182,3 +182,15 @@ LADDER_REST_REMAINDER = True
 # full ladder. Flip this ONLY after a probe confirms algos ride an FA block.
 LADDER_FA_BLOCKS = False
 
+# FA-block MARKETABLE pricing (approach b). The armed run on 2026-06-29 placed FA blocks
+# fine and the liquid equity legs (PDBC/RSP/SPY/VTI) filled, but the illiquid TFLO block
+# legs (DU143-146) did NOT fill because the block limit was priced at the neutral
+# reference/mid and never crossed the thin book. Until the MIDPRICE/Adaptive-on-FA-block
+# probe is done (LADDER_FA_BLOCKS above), price the single FA-block limit MARKETABLE — the
+# same cap the direct ladder uses (BUY ask*(1+k) / SELL bid*(1-k), via
+# live_quotes.marketable_cap, ORDER_CAP_K) — so a thin-book block leg actually crosses.
+# Liquid block legs get ~touch (harmless on a 1-tick spread). If no usable quote is
+# available, the block falls back to the neutral reference price (then the HARD PRICE GUARD
+# still rejects NaN/<=0). This is NOT an algo on the block — it is a plain marketable LMT.
+FA_BLOCK_MARKETABLE = True
+

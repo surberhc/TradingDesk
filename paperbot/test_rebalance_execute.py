@@ -302,3 +302,103 @@ def test_scope_does_not_bypass_arm_gate(monkeypatch):
     assert rx.arm_requested(["--only-account", "DU8922142"]) is False
     permit, _ = rx.gate_state(armed=False)
     assert permit is False
+
+
+# --- FA-BLOCK MARKETABLE pricing (approach b) ----------------------------------
+# The illiquid TFLO FA-block legs (DU143-146) didn't fill because the block limit was the
+# neutral reference/mid and never crossed the thin book. Approach b prices the single block
+# limit MARKETABLE (BUY ask*(1+k) / SELL bid*(1-k)) so it crosses — everything else about
+# the proven FA-block path (faMethod='', split, replaceFA-in-lockstep, no what-if) unchanged.
+import live_quotes   # noqa: E402
+
+
+def _quote(symbol="TFLO", bid=50.00, ask=50.20, last=50.10, close=50.05):
+    return live_quotes.Quote(symbol, bid=bid, ask=ask, last=last, close=close, md_type=1)
+
+
+def _block(version, symbol, group, split, side="BUY"):
+    qty = sum(split.values())
+    return RoutePlan("fa_block", version, symbol, side, qty, group, "", None, dict(split))
+
+
+def _ai_with_price(account, version, symbol, price):
+    return [{"account": account, "version": version, "prices": {symbol: price}}]
+
+
+def test_fa_block_uses_marketable_cap_buy(monkeypatch):
+    monkeypatch.setattr(config, "FA_BLOCK_MARKETABLE", True)
+    r = _block("Balanced", "TFLO", "tier_balanced", {"DU8922143": 15, "DU8922144": 15})
+    quotes = {"TFLO": _quote(bid=50.00, ask=50.20)}
+    ai = _ai_with_price("DU8922143", "Balanced", "TFLO", 50.10)   # neutral ref would be 50.10
+    limit = rx._fa_block_limit(r, quotes, ai, {})
+    expected = round(50.20 * (1 + config.ORDER_CAP_K), 2)         # ask*(1+k) = marketable
+    assert limit == expected
+    assert limit != 50.10                                         # NOT the neutral reference
+
+
+def test_fa_block_uses_marketable_cap_sell(monkeypatch):
+    monkeypatch.setattr(config, "FA_BLOCK_MARKETABLE", True)
+    r = _block("Growth", "VTI", "tier_growth", {"DU8922145": 20, "DU8922146": 20}, side="SELL")
+    quotes = {"VTI": _quote("VTI", bid=250.00, ask=250.40)}
+    ai = _ai_with_price("DU8922145", "Growth", "VTI", 250.20)
+    limit = rx._fa_block_limit(r, quotes, ai, {})
+    assert limit == round(250.00 * (1 - config.ORDER_CAP_K), 2)   # bid*(1-k)
+
+
+def test_fa_block_falls_back_to_reference_without_quote(monkeypatch):
+    # No usable quote -> the neutral reference (prices_for) is used; never a blank/NaN.
+    monkeypatch.setattr(config, "FA_BLOCK_MARKETABLE", True)
+    r = _block("Balanced", "TFLO", "tier_balanced", {"DU8922143": 15, "DU8922144": 15})
+    ai = _ai_with_price("DU8922143", "Balanced", "TFLO", 50.10)
+    assert rx._fa_block_limit(r, {}, ai, {}) == 50.10            # quotes empty -> reference
+    assert rx._fa_block_limit(r, None, ai, {}) == 50.10         # quotes None -> reference
+
+
+def test_fa_block_flag_off_uses_reference(monkeypatch):
+    # With the flag off, the block reverts to the prior neutral-reference behavior exactly.
+    monkeypatch.setattr(config, "FA_BLOCK_MARKETABLE", False)
+    r = _block("Balanced", "TFLO", "tier_balanced", {"DU8922143": 15, "DU8922144": 15})
+    quotes = {"TFLO": _quote(bid=50.00, ask=50.20)}
+    ai = _ai_with_price("DU8922143", "Balanced", "TFLO", 50.10)
+    assert rx._fa_block_limit(r, quotes, ai, {}) == 50.10       # neutral reference, not cap
+
+
+def test_fa_block_marketable_limit_builds_with_faMethod_empty_and_split_sums(monkeypatch):
+    # The marketable cap flows into build_fa_block: faMethod='' (Err-10226 fix), and the
+    # split still sums to the block qty. The order carries the marketable limit price.
+    monkeypatch.setattr(config, "FA_BLOCK_MARKETABLE", True)
+    split = {"DU8922143": 15, "DU8922144": 15}
+    r = _block("Balanced", "TFLO", "tier_balanced", split)
+    quotes = {"TFLO": _quote(bid=50.00, ask=50.20)}
+    ai = _ai_with_price("DU8922143", "Balanced", "TFLO", 50.10)
+    limit = rx._fa_block_limit(r, quotes, ai, {})
+    bo = order_router.build_fa_block("TFLO", "BUY", r.total_qty, limit, r.fa_group,
+                                     r.fa_method, "as_of", ib=None)
+    assert bo.order.lmtPrice == round(50.20 * (1 + config.ORDER_CAP_K), 2)
+    assert bo.order.faMethod == ""                              # the Err-10226 fix preserved
+    assert bo.order.faGroup == "tier_balanced"
+    assert sum(split.values()) == r.total_qty                  # split sums to block qty
+    assert bo.order.tif == "DAY"
+
+
+@pytest.mark.parametrize("bad", [float("nan"), None, 0.0, -1.0])
+def test_fa_block_price_guard_still_rejects_bad(bad):
+    # The HARD PRICE GUARD inside build_fa_block must still reject NaN/<=0 regardless of how
+    # the (marketable) limit was computed — a bad price can never become a $0/NaN block.
+    with pytest.raises(ValueError):
+        order_router.build_fa_block("TFLO", "BUY", 30, bad, "tier_balanced", "", "t", ib=None)
+
+
+def test_fa_block_marketable_does_not_touch_direct_or_scope(monkeypatch):
+    # Sanity: the marketable-block helper only affects fa_block routes. A direct route's
+    # legacy reference and the scope filter are unaffected.
+    monkeypatch.setattr(config, "FA_BLOCK_MARKETABLE", True)
+    # Direct routes are still filtered/handled by the unchanged scope + ladder path.
+    routes = _fleet_routes()
+    scoped = rx.filter_routes(routes, "DU8922142", None)
+    assert all(r.route == "direct" for r in scoped)            # scope unaffected
+    # The block helper is never invoked for a direct route (it's only called in the
+    # fa_block branch), and direct caps still come from _ladder_caps:
+    q = _quote()
+    caps = rx._ladder_caps("BUY", q)
+    assert caps["marketable_limit"] == live_quotes.marketable_cap("BUY", q)

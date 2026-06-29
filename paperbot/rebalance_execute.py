@@ -396,7 +396,7 @@ def execute_armed(armed: bool, only_account: str | None = None,
         if not permit:
             print(f"\n[7] Transmission BLOCKED ({why}). Building order objects for the log "
                   f"only (place armed=False) — NOTHING sent, no FA config written.")
-            built = _build_all(ib, routes, account_inputs, targets)
+            built = _build_all(ib, routes, account_inputs, targets, quotes=quotes)
             order_router.place(ib, built, armed=False)
             _ledger(armed, account_inputs, routes, placed_fills, backup_path,
                     halted=False, halt_reason="")
@@ -411,10 +411,13 @@ def execute_armed(armed: bool, only_account: str | None = None,
 
         as_of = next(iter(targets.values())).as_of
         for r in routes:
-            limit = round(float(rebalance_run.prices_for(account_inputs, targets, r)), 2)
             if r.route == "fa_block":
+                # Approach b: price the single block limit MARKETABLE so thin-book block
+                # legs (TFLO) cross. Everything else about the FA-block path is unchanged.
+                limit = _fa_block_limit(r, quotes, account_inputs, targets)
                 # Set THIS group's ContractsOrShares to the split, THEN place the block.
-                print(f"\n    [block] {r.side} {r.symbol} x{r.total_qty}  group={r.fa_group}")
+                print(f"\n    [block] {r.side} {r.symbol} x{r.total_qty}  group={r.fa_group} "
+                      f"limit={limit} (marketable={config.FA_BLOCK_MARKETABLE})")
                 print(f"      writing ContractsOrShares: {dict(sorted(r.per_account_split.items()))}")
                 set_group_contracts_or_shares(ib, r.fa_group, r.per_account_split)
                 # build_fa_block runs the HARD PRICE GUARD (NaN/<=0 rejected) before build.
@@ -438,7 +441,8 @@ def execute_armed(armed: bool, only_account: str | None = None,
                 res = _place_direct_laddered(ib, r, q, as_of, armed=True)
                 if res is None:
                     # Fall back to the legacy single capped-limit path (no usable quote
-                    # for the ladder caps, or ladder disabled).
+                    # for the ladder caps, or ladder disabled). Neutral reference, unchanged.
+                    limit = round(float(rebalance_run.prices_for(account_inputs, targets, r)), 2)
                     intent = rebalance_run._DirectIntent(r.symbol, r.side, r.total_qty, limit)
                     try:
                         built = order_router.build([intent], r.account, as_of, ib=ib)
@@ -475,6 +479,30 @@ def execute_armed(armed: bool, only_account: str | None = None,
         print("Session closed.")
 
 
+def _fa_block_limit(route, quotes, account_inputs, targets) -> float:
+    """The limit price for an FA-BLOCK route. Approach b: when config.FA_BLOCK_MARKETABLE
+    is on (default), use the MARKETABLE cap from the live quote (BUY ask*(1+k) /
+    SELL bid*(1-k), via live_quotes.marketable_cap with ORDER_CAP_K) so a thin-book block
+    leg (e.g. TFLO) actually crosses — the fix for the legs that didn't fill at the neutral
+    reference. Liquid block legs get ~touch (harmless). If no usable quote is available (or
+    the flag is off), fall back to the neutral reference (prices_for), exactly as before.
+
+    The returned value is rounded to a cent and STILL passes through order_router's HARD
+    PRICE GUARD inside build_fa_block — a NaN/<=0 can never be sent. This function never
+    returns a NaN: prices_for itself falls back to the tier close, and the guard catches
+    any residual bad value at build time."""
+    if config.FA_BLOCK_MARKETABLE:
+        q = quotes.get(route.symbol) if quotes else None
+        if q is not None:
+            cap = live_quotes.marketable_cap(route.side, q)   # same logic as the direct ladder
+            if cap is not None and cap == cap and cap > 0:
+                return round(float(cap), 2)
+        # No usable quote -> fall back to the neutral reference (then the guard still applies).
+        print(f"      (FA block {route.symbol}: no usable quote for marketable cap — "
+              f"falling back to neutral reference price)")
+    return round(float(rebalance_run.prices_for(account_inputs, targets, route)), 2)
+
+
 def _ladder_caps(side: str, q) -> dict | None:
     """Compute the per-rung worst-case cap prices for a DIRECT laddered leg from the live
     quote. Every rung order_type maps to the same marketable cap (BUY ask*(1+k) /
@@ -508,19 +536,23 @@ def _place_direct_laddered(ib, route, q, as_of, armed: bool):
         armed=armed)
 
 
-def _build_all(ib, routes, account_inputs, targets):
-    """Build every route's order object (build-only). order_router's HARD PRICE GUARD
-    rejects NaN/<=0 limits; a rejected route is logged and skipped, never built blank."""
+def _build_all(ib, routes, account_inputs, targets, quotes=None):
+    """Build every route's order object (build-only) for the DRY-RUN log. order_router's
+    HARD PRICE GUARD rejects NaN/<=0 limits; a rejected route is logged and skipped, never
+    built blank. FA-block legs use the SAME marketable limit the armed path would send
+    (_fa_block_limit), so the dry review reflects the real price; direct legs keep the
+    neutral reference here (the laddered caps are computed at place-time, not build-time)."""
     as_of = next(iter(targets.values())).as_of
     built = []
     for r in routes:
-        limit = round(float(rebalance_run.prices_for(account_inputs, targets, r)), 2)
         try:
             if r.route == "fa_block":
+                limit = _fa_block_limit(r, quotes, account_inputs, targets)
                 built.append(order_router.build_fa_block(
                     r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method,
                     as_of, ib=ib))
             else:
+                limit = round(float(rebalance_run.prices_for(account_inputs, targets, r)), 2)
                 intent = rebalance_run._DirectIntent(r.symbol, r.side, r.total_qty, limit)
                 built.extend(order_router.build([intent], r.account, as_of, ib=ib))
         except ValueError as exc:
