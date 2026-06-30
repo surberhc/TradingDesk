@@ -1,6 +1,6 @@
 # TradingDesk Scheduler — Job Inventory + Unification Plan
 
-*Last updated: 2026-06-30 · Status: DISCOVERY + PLAN. This is the single organizing
+*Last updated: 2026-06-30 · Status: PLAN + account monitor now LIVE. This is the single organizing
 home for everything on the desk that runs on a clock. Nothing here changes a task,
 launcher, or script — it is a ground-truth inventory (read from Windows Task Scheduler
 and the repo) plus a design plan for unifying scheduling and surfacing it in the GUI.*
@@ -14,11 +14,12 @@ and the repo) plus a design plan for unifying scheduling and surfacing it in the
 
 ## 1. Inventory (lead here — one row per job)
 
-Eight TradingDesk jobs are registered in Windows Task Scheduler today (7 enabled, 1
+Nine TradingDesk jobs are registered in Windows Task Scheduler today (8 enabled, 1
 disabled/retired). All launch a `.bat` wrapper in `C:\TradingDesk-Local\warehouse\`,
 which calls the venv python (`C:\TradingDesk-Local\venv\Scripts\pythonw.exe`, or the base
 Python 3.12 for the two self-healing supervisors) against a script in the Drive repo.
-One more job — the **account monitor** — is built but deliberately **not scheduled yet**.
+The **account monitor** (#7) is now LIVE — it was the last held job; the gateway-lock
+interlock (it SKIPs cleanly if a rebalance holds the lock) made scheduling it safe.
 
 | # | Job (Task name) | What it does (plain English) | Trigger / cadence (CT) | External services it touches | Defined where | Status |
 |---|-----------------|------------------------------|------------------------|------------------------------|---------------|--------|
@@ -28,13 +29,16 @@ One more job — the **account monitor** — is built but deliberately **not sch
 | 4 | **ThetaEodDaily** | One daily EOD pass of the **full-chain** option collector (EOD greeks + open interest, full universe, today + ~5-day self-heal). Writes the per-(root,day) parquet warehouse. **Replaced** the IBKR forward collector (#8). | Daily **5:30 PM** | **ThetaData LOCAL Terminal** port `25503` (full-chain pull) | TS `ThetaEodDaily` → `run_eoddaily.bat` → `datacollector\eod_daily.py` | **LIVE** |
 | 5 | **GexDailyBuild** | Fast **incremental** dealer-gamma (GEX) rebuild — appends only the newest day's gamma features for SPX/SPXW/SPY/QQQ to the derived tables so the 9 PM report's "Dealer Gamma" section is fresh. `--latest` only (seconds), not the heavy full rebuild. | Daily **7:30 PM** | **Local warehouse parquet only** (reads files written by #4; no network). *Note: a full rebuild would hit the Terminal, but `--latest` does not.* | TS `GexDailyBuild` → `run_gex.bat` → `datacollector\build_features.py --latest` | **LIVE** |
 | 6 | **EodReport** | The end-of-day digest. Runs LAST — reads every job's status artifact (status JSONs + heartbeats + Tiingo manifest) and emails ONE summary. Re-runs nothing; a crashed job shows red, never takes the report down. | Daily **9:00 PM** | **SMTP / Gmail** (`smtp.gmail.com:587`, STARTTLS) to send the email; reads local files only otherwise | TS `EodReport` → `run_eod.bat` → `dailyreport\eod_report.py` (→ `mailer.py`) | **LIVE** |
-| 7 | **Account monitor** | Per-account cashflow monitor. **READ-ONLY** connect to the IBKR paper Gateway (clientId 40), reads NetLiquidation / TotalCashValue / SettledCashByDate + today's fills, compares against a saved baseline + operator earmarks, and PRINTS a propose-only verdict (deposit detected → rebalance nudge; sale-raised cash → nudge; earmarked cash → fenced). Persists only a local baseline file. **Transmits nothing.** | **PLANNED — daily EOD** (proposed; not registered) | **IBKR paper Gateway** (`127.0.0.1:4002`, clientId 40, `readonly=True`) | `paperbot\account_monitor_run.py` (+ pure core `account_monitor.py`); no `.bat`, no Task Scheduler entry yet | **PLANNED — HELD** |
+| 7 | **AccountMonitorDaily** | Per-account cashflow monitor. **READ-ONLY / PROPOSE-ONLY** connect to the IBKR paper Gateway (clientId 40), reads NetLiquidation / TotalCashValue / SettledCashByDate + today's fills for the 5 enrolled DU sub-accounts, compares against a saved baseline + operator earmarks, and PRINTS a verdict (deposit detected → rebalance nudge; sale-raised cash → nudge; earmarked cash → fenced; else HOLD/IN_BAND). Acquires the single-process **gateway lock** for the whole read-only session and **SKIPs cleanly** if a rebalance holds it (F2 interlock). Persists only a local baseline file. **Transmits nothing** — no order, no whatIfOrder, no FA/gateway config write. | Daily **4:30 PM** | **IBKR paper Gateway** (`127.0.0.1:4002`, clientId 40, `readonly=True`); auto-launches the Gateway read-only if down | TS `AccountMonitorDaily` → `run_account_monitor.bat` → `paperbot\account_monitor_run.py` (+ pure core `account_monitor.py`) | **LIVE** |
 | 8 | **ThetaForwardDaily** | Old IBKR forward option collector (band-limited ±50-strike snapshot through the live Gateway). **Retired** — superseded by #4 (full-chain ThetaData pull, no Gateway needed). Left disabled for reference. | *Disabled* (was daily 5:30 PM) | (was: **IBKR paper Gateway** port 4002) | TS `ThetaForwardDaily` (Disabled) → `run_forward.bat` → `datacollector\forward_daily.py` | **HELD / retired** |
 
-> **Scheduler stand-up is paused pending this plan.** The account monitor (#7) is built,
-> read-only, and propose-only, but it is intentionally NOT yet registered as a scheduled
-> task — registration is on hold until the timing/conflict and ownership questions below
-> are resolved (specifically: when it can safely share the Gateway).
+> **Account monitor stand-up is DONE (2026-06-30).** The account monitor (#7) is now
+> registered as `AccountMonitorDaily`, daily 4:30 PM CT, read-only / propose-only. The F2
+> Gateway-sharing question that held it (see below) is resolved by the **gateway lock**: the
+> monitor acquires the single-process mutex for its whole read-only session and SKIPs the
+> cycle cleanly if a rebalance holds the lock, so it can never read mid-rebalance state. The
+> remaining open questions below (orchestration, alerting) are about the *rest* of the chain,
+> not the monitor.
 
 ### Related infra not on Task Scheduler (context)
 - **`supervisor.py` / `run_supervisor.bat`** — the original one-time ThetaData warehouse-grab
@@ -52,10 +56,13 @@ One more job — the **account monitor** — is built but deliberately **not sch
 
 ```
  4:30 PM  TiingoDailyUpdate ........ Tiingo + FRED (cloud)          [data pull]
+ 4:30 PM  AccountMonitorDaily ...... IBKR paper Gateway :4002       [read-only, gateway-lock-guarded]
  5:30 PM  ThetaEodDaily ............ ThetaData Terminal :25503      [data pull, full chain]
  7:30 PM  GexDailyBuild ............ local parquet (reads #4)       [derive]
  9:00 PM  EodReport ................ SMTP (reads everyone's status) [report — runs LAST]
-   ↑ proposed slot for the ACCOUNT MONITOR sits in this evening window (IBKR Gateway)
+   (the monitor shares the 4:30 slot with Tiingo but touches a different service — Tiingo
+    hits the cloud, the monitor the IBKR Gateway — so no contention; the gateway lock makes
+    it safe even if a rebalance is in flight: it SKIPs that cycle, see F2)
 
  6:00 AM  Spxw1mCollector + ThetaTerminalWatchdog (both, + at logon)  [intraday data infra]
  all day  ThetaTerminalWatchdog probes :25503 continuously; Spxw1mCollector runs resumably
@@ -74,15 +81,18 @@ report (9:00). That ordering is real and load-bearing — see D1 below.
   a heavy 5:30 EOD pull competing with an active 1-min pull could slow both. No hard
   collision (they write different trees), but it is the busiest shared resource — a unified
   scheduler should at minimum *know* both are using it.
-- **F2 — IBKR Gateway / clientId contention (the reason the monitor is HELD).** The
+- **F2 — IBKR Gateway / clientId contention (RESOLVED by the gateway lock).** The
   account monitor (#7) connects to the paper Gateway on clientId 40, read-only. The
   **rebalance path** (the gated executor, clientId 38) and any forward-collector revival
-  (#8, old clientId) also use the Gateway. **Do NOT run the read-only monitor while a
-  rebalance run is using the Gateway.** Even though clientIds differ (no API-level
-  collision), a rebalance is a transmit operation and the monitor must not read mid-flight
-  account state that is changing under it, nor compete for Gateway attention. Rule of
-  thumb: **monitor and rebalance are mutually exclusive on the Gateway.** This is the
-  central reason the monitor is not yet scheduled.
+  (#8, old clientId) also use the Gateway. **Monitor and rebalance are mutually exclusive
+  on the Gateway** — a rebalance is a transmit operation and the monitor must not read
+  mid-flight account state that is changing under it. This is now **enforced**, not just a
+  rule of thumb: the monitor acquires the single-process **gateway lock**
+  (`C:\TradingDesk-Local\state\paperbot\gateway.lock`) for its entire read-only session, and
+  because it is automated + read-only it yields to a human rebalance — `on_busy="skip"` means
+  if a rebalance holds the lock the monitor waits briefly then **SKIPs the cycle cleanly** (a
+  non-event; the next day's run catches up). This interlock is what unblocked scheduling the
+  monitor (was the central reason it was HELD).
 - **F3 — Ordering dependency: data must finish before derive/report.** GexDailyBuild
   (7:30) reads the parquet that ThetaEodDaily (5:30) writes; EodReport (9:00) reads the
   status artifacts all upstream jobs write. The 2-hour gaps are generous buffers, but they
@@ -135,12 +145,12 @@ report (9:00). That ordering is real and load-bearing — see D1 below.
   flapping terminal isn't surfaced until someone reads the watchdog log. Question: is the
   daily digest sufficient, or do we want a real-time alert (push/email) on
   supervisor-restart-storms or a missed evening job?
-- **D5 — When (and how) does the account monitor get scheduled?** It's the one HELD job.
-  It needs a Gateway window that is provably clear of any rebalance (F2). Options: (a) a
-  fixed evening slot chosen to never overlap the manual Monday rebalance; (b) a soft
-  interlock (the monitor checks for an active rebalance/lock before connecting and skips if
-  busy); (c) keep it on-demand from the dashboard (see §4) and never put it on a clock at
-  all. Resolving this is the gate on standing up the scheduler.
+- **D5 — When (and how) does the account monitor get scheduled? — RESOLVED (2026-06-30).**
+  Chosen: option (b), the interlock. The monitor is registered as `AccountMonitorDaily` at
+  daily 4:30 PM CT and uses the **gateway lock** to make the Gateway window safe — it acquires
+  the lock for its read-only session and SKIPs cleanly if a rebalance holds it (see F2), so it
+  never needs a hand-chosen slot that "provably" avoids the manual rebalance. The on-demand
+  dashboard panel (option c, §4) remains a complementary nicety, not a replacement.
 
 ---
 
@@ -200,12 +210,12 @@ guarantees).
 
 ## 5. One-line summary for the owner
 
-There are **7 live clock jobs** (an evening data→derive→report chain at 4:30 / 5:30 / 7:30 /
-9:00 PM CT, plus an all-day 1-minute collector and its terminal watchdog), **1 retired**
-(the old IBKR forward pull), and **1 built-but-held** (the read-only account monitor). The
-two things to decide before standing the scheduler up: **when the account monitor can safely
-share the IBKR Gateway** (never during a rebalance), and **whether the evening chain should
-gain a light ordering layer** or keep relying on its current hand-tuned time gaps +
-idempotency. The cleanest near-term GUI win is surfacing the scheduler in the dashboard's
-existing Health tab and running the monitor on-demand with a one-click earmark-vs-rebalance
-prompt for fresh cash.
+There are **8 live clock jobs** (an evening data→derive→report chain at 4:30 / 5:30 / 7:30 /
+9:00 PM CT, plus the read-only account monitor at 4:30 PM, plus an all-day 1-minute collector
+and its terminal watchdog) and **1 retired** (the old IBKR forward pull). The account monitor
+— previously the one held job — went **LIVE 2026-06-30**: the gateway-lock interlock (it SKIPs
+if a rebalance holds the lock) resolved the "when can it safely share the Gateway" question.
+The remaining decision is **whether the evening chain should gain a light ordering layer** or
+keep relying on its current hand-tuned time gaps + idempotency. The cleanest near-term GUI win
+is surfacing the scheduler in the dashboard's existing Health tab and running the monitor
+on-demand with a one-click earmark-vs-rebalance prompt for fresh cash.
