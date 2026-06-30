@@ -50,6 +50,7 @@ import config
 import strategy_target
 import version
 from connections import clientids, ibkr
+from gateway_lock import GatewayBusySkip, gateway_lock
 
 # --- STATE_DIR artifacts (off Drive, same dir/pattern as ledger.py) ------------
 BASELINES_JSON = os.path.join(config.STATE_DIR, "monitor_baselines.json")
@@ -311,6 +312,30 @@ def main() -> int:
     for v, t in targets.items():
         print(f"    {v:13s} as_of={t.as_of.date()}  ({len(t.weights)} holdings)")
 
+    # GATEWAY LOCK (Slice 2): acquire the single-process Gateway mutex BEFORE connecting and
+    # hold it through the ENTIRE read-only session, releasing only after disconnect. The
+    # monitor is automated + read-only, so it YIELDS to a human rebalance — on_busy="skip"
+    # means a brief wait then a clean SKIP of this cycle (a non-event; the next cycle catches
+    # up). This is the F2 interlock: the monitor can never read account state mid-rebalance.
+    try:
+        with gateway_lock(purpose="monitor",
+                          client_id=clientids.get("paperbot_monitor"), on_busy="skip"):
+            return _run_gateway_session(today, targets, baselines, earmarks_by_acct)
+    except GatewayBusySkip as busy:
+        holder = busy.holder or {}
+        print(f"\n[2] gateway busy — held by {holder.get('purpose')} pid {holder.get('pid')} "
+              f"clientId {holder.get('client_id')} since "
+              f"{holder.get('acquired_at') or holder.get('acquired_ts')}; skipping this "
+              f"monitor cycle. (Read-only; nothing read or transmitted. Next cycle retries.)")
+        return 0
+
+
+def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> int:
+    """The connect -> read -> disconnect body, run only while the gateway lock is HELD.
+
+    Factored out of main() so the `with gateway_lock(...)` block wraps the WHOLE session —
+    connect, all reads, and disconnect — not just the connect call. The lock guarantees no
+    other paperbot process operates the Gateway for the lifetime of this session."""
     # Connect READ-ONLY, bounded timeout. Watchdog deadline for the whole cycle.
     deadline = datetime.now().timestamp() + CYCLE_WATCHDOG_SECONDS
     print(f"\n[2] Connecting read-only (timeout=15s, cycle watchdog={CYCLE_WATCHDOG_SECONDS}s)...")
