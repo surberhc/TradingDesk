@@ -13,11 +13,13 @@ Run:
 from __future__ import annotations
 
 import inspect
+from datetime import date
 
 import pandas as pd
 import pytest
 
 import account_monitor as mon
+import accounts
 import cashflows
 import config
 
@@ -135,6 +137,143 @@ def test_verdict_is_frozen():
         v.action = "REBALANCE"   # frozen dataclass -> FrozenInstanceError
 
 
+# --- 5a. SettledCashByDate parser (REAL feed format) --------------------------
+def test_parse_settled_cash_by_date_roundtrip():
+    # The exact shape a live read-only probe returned 2026-06-30: 'YYYYMMDD:amount'.
+    result = accounts.parse_settled_cash_by_date("20260630:51755.46")
+    assert result == (date(2026, 6, 30), 51755.46)
+
+
+def test_parse_settled_cash_by_date_handles_whitespace_and_int():
+    assert accounts.parse_settled_cash_by_date("  20260101:1000  ") == (date(2026, 1, 1), 1000.0)
+
+
+@pytest.mark.parametrize("bad", ["", None, "51755.46", "notadate:1000",
+                                 "20260630:", ":1000", "20260630"])
+def test_parse_settled_cash_by_date_rejects_malformed(bad):
+    # Missing/empty/garbled -> None (NEVER a spurious 0.0 that could look like a withdrawal).
+    assert accounts.parse_settled_cash_by_date(bad) is None
+
+
+def test_parse_never_floats_the_raw_string():
+    # The raw tag is NOT float()-able; the parser must split it, not blow up.
+    with pytest.raises(ValueError):
+        float("20260630:51755.46")
+    assert accounts.parse_settled_cash_by_date("20260630:51755.46")[1] == 51755.46
+
+
+# --- 5b. Deposit-detection core (PURE) — synthetic fixtures, REAL field formats ----
+def make_deposit_state(*, settled_cash, baseline, net_liq=1_000_000.0,
+                       fills=None, already_flagged=False,
+                       positions=None, cash=None) -> mon.AccountState:
+    """An on-target, no-schedule AccountState carrying deposit-detection inputs. On-target
+    holdings + no flows mean ONLY the deposit path can change the verdict away from HOLD."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0}, "Balanced")
+    # default holdings = the on-target share count for NAV (so drift never trips on its own)
+    if positions is None:
+        invest = mon.reconcile._investable.compute_investable(net_liq, 0.0)
+        positions = {"SPY": int(invest // 100.0)}
+    return mon.AccountState(
+        account="DU0001", version="Balanced", net_liq=net_liq,
+        cash=cash if cash is not None else settled_cash,
+        positions=positions, schedule=[], target=target,
+        settled_cash=settled_cash, baseline_settled_cash=baseline,
+        baseline_date=date(2026, 6, 29), as_of_date=date(2026, 6, 30),
+        fills=fills or [], deposit_already_flagged_today=already_flagged)
+
+
+def test_clean_external_deposit_fires():
+    # +$60,000 on a $1M account = 6% of NAV, > the 3% NAV floor AND > the $1,000 abs floor,
+    # with NO sell fill -> EXTERNAL DEPOSIT -> REBALANCE / DEPOSIT_ARRIVED.
+    state = make_deposit_state(settled_cash=110_000.0, baseline=50_000.0)
+    v = mon.decide(state)
+    assert v.action == "REBALANCE"
+    assert v.reason == mon.REASON_DEPOSIT_ARRIVED
+    assert v.detail["delta"] == pytest.approx(60_000.0)
+
+
+def test_classify_clean_deposit():
+    state = make_deposit_state(settled_cash=110_000.0, baseline=50_000.0)
+    assert mon.classify_cash_increase(state)["classification"] == "EXTERNAL_DEPOSIT"
+
+
+def test_sale_raised_cash_does_not_fire():
+    # Cash up $60,000 BUT a same-day SLD fill (600 sh @ $100 = $60,000 proceeds) explains
+    # it -> SALE_RAISED, NOT a deposit. (Sell down so the post-sale book isn't wildly off.)
+    sld = mon.Execution(symbol="SPY", side="SLD", shares=600, price=100.0)
+    state = make_deposit_state(settled_cash=110_000.0, baseline=50_000.0,
+                               fills=[sld], positions={"SPY": 9250})
+    res = mon.classify_cash_increase(state)
+    assert res["classification"] == "SALE_RAISED"
+    assert mon.decide(state).reason != mon.REASON_DEPOSIT_ARRIVED
+
+
+def test_small_dividend_below_floor_does_not_fire():
+    # +$200 dividend/interest, NO fill -> below BOTH the $1,000 abs floor and the 3% NAV
+    # floor -> BELOW_GUARDS, never a deposit.
+    state = make_deposit_state(settled_cash=50_200.0, baseline=50_000.0)
+    assert mon.classify_cash_increase(state)["classification"] == "BELOW_GUARDS"
+    assert mon.decide(state).reason != mon.REASON_DEPOSIT_ARRIVED
+
+
+def test_increase_clears_abs_floor_but_not_nav_floor_does_not_fire():
+    # +$2,000 clears the $1,000 abs floor but is only 0.2% of a $1M NAV -> under the 3%
+    # NAV floor -> BELOW_GUARDS. BOTH guards must clear.
+    state = make_deposit_state(settled_cash=52_000.0, baseline=50_000.0)
+    assert mon.classify_cash_increase(state)["classification"] == "BELOW_GUARDS"
+
+
+def test_debounce_second_same_day_does_not_refire():
+    # Same qualifying deposit, but the live shell already flagged it today -> DEBOUNCED,
+    # no second DEPOSIT_ARRIVED.
+    state = make_deposit_state(settled_cash=110_000.0, baseline=50_000.0,
+                               already_flagged=True)
+    assert mon.classify_cash_increase(state)["classification"] == "DEBOUNCED"
+    assert mon.decide(state).reason != mon.REASON_DEPOSIT_ARRIVED
+
+
+def test_cold_start_no_baseline_does_not_fire():
+    # No prior baseline (first observation) -> can't claim a deposit -> INSUFFICIENT_DATA.
+    state = make_deposit_state(settled_cash=110_000.0, baseline=None)
+    assert mon.classify_cash_increase(state)["classification"] == "INSUFFICIENT_DATA"
+
+
+def test_missing_settled_cash_does_not_fire():
+    # A garbled SettledCashByDate decodes to None upstream -> no current cash -> no deposit.
+    state = make_deposit_state(settled_cash=None, baseline=50_000.0)
+    assert mon.classify_cash_increase(state)["classification"] == "INSUFFICIENT_DATA"
+
+
+def test_cash_decrease_is_not_a_deposit():
+    # Settled cash DOWN since baseline -> NONE (a withdrawal, handled elsewhere, never a
+    # deposit).
+    state = make_deposit_state(settled_cash=40_000.0, baseline=50_000.0)
+    assert mon.classify_cash_increase(state)["classification"] == "NONE"
+
+
+def test_deposit_with_unreserved_withdrawal_still_alerts_withdrawal():
+    # A qualifying deposit AND an uncovered upcoming distribution -> the liquidity ALERT
+    # still WINS (cash earmarked for a client must surface before any redeploy proposal).
+    sched = [cashflows.Flow("distribution", amount=20_000.0, pct_nav=0.0, day=1,
+                            note="SYNTHETIC test flow")]
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0}, "Balanced")
+    invest = mon.reconcile._investable.compute_investable(1_000_000.0, 20_000.0)
+    state = mon.AccountState(
+        account="DU0001", version="Balanced", net_liq=1_000_000.0,
+        cash=5_000.0, positions={"SPY": int(invest // 100.0)}, schedule=sched,
+        target=target, settled_cash=110_000.0, baseline_settled_cash=50_000.0,
+        baseline_date=date(2026, 6, 29), as_of_date=date(2026, 6, 30), fills=[])
+    v = mon.decide(state)
+    assert v.action == "ALERT"
+    assert v.reason == mon.REASON_WITHDRAWAL_DUE_UNRESERVED
+
+
+def test_no_deposit_inputs_behaves_like_slice5():
+    # An AccountState built WITHOUT any deposit fields (the Slice-5 call shape) must still
+    # produce a HOLD on an on-target account — defaults make deposit detection a no-op.
+    assert mon.decide(make_state({"SPY": ON_TARGET})).action == "HOLD"
+
+
 # --- 6. PROPOSE-ONLY BOUNDARY: the module cannot reach a transmit/arm path -----
 # Symbols that, if reachable from account_monitor's namespace, would mean it could touch a
 # broker / build / transmit / arm an order. The monitor must compose only PURE pieces.
@@ -144,6 +283,11 @@ _FORBIDDEN_MODULES = {
     "live_quotes",           # live broker quotes -> a broker session
     "ibkr",                  # connections.ibkr — the gateway/broker connection
     "ib_async", "ib_insync",
+    # Slice 6a: the monitor must NOT import accounts (it reaches connections.ibkr / a live
+    # reqExecutions read). The deposit core takes ALREADY-DECODED settled-cash floats +
+    # Execution objects as inputs; the live shell (6b) owns the broker read and the
+    # accounts.parse_settled_cash_by_date decode.
+    "accounts",
 }
 _FORBIDDEN_CALLABLE_NAMES = {
     "transmit", "build", "build_fa_block", "transmit_guard", "arm", "place_order",
@@ -174,8 +318,26 @@ def test_source_does_not_reference_transmit_symbols():
     forbidden import even if it were aliased so the namespace check missed it."""
     src = inspect.getsource(mon)
     for bad in ("import order_router", "import execution_engine", "import live_quotes",
-                "from connections import", "import ib_async", "import ib_insync"):
+                "from connections import", "import ib_async", "import ib_insync",
+                "import accounts"):
         assert bad not in src, f"account_monitor source references a transmit path: {bad!r}"
+    # No LIVE executions call (the prose may NAME reqExecutions to document the seam, so we
+    # forbid the actual call form `.reqExecutions(`, not the bare word).
+    assert ".reqExecutions(" not in src, "account_monitor calls reqExecutions live"
+
+
+def test_deposit_core_reaches_no_transmit_path():
+    """Slice 6a: the deposit-detection additions stay inside the pure boundary. The new
+    classify function and Execution type must reach nothing transmit-capable, and
+    classify_cash_increase must build/transmit nothing (it returns a plain dict)."""
+    assert "accounts" not in {getattr(v, "__name__", None)
+                              for v in vars(mon).values() if inspect.ismodule(v)}
+    res = mon.classify_cash_increase(
+        mon.AccountState(account="DU0001", version="Balanced", net_liq=1_000_000.0,
+                         cash=0.0, positions={}, schedule=[],
+                         target=make_target({"SPY": 1.0}, {"SPY": 100.0}),
+                         settled_cash=110_000.0, baseline_settled_cash=50_000.0))
+    assert isinstance(res, dict) and res["classification"] == "EXTERNAL_DEPOSIT"
 
 
 def test_transitive_imports_stay_pure():

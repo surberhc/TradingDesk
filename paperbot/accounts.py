@@ -27,9 +27,45 @@ from __future__ import annotations
 
 import sys
 from dataclasses import dataclass
+from datetime import date, datetime
 
 import config
 from connections import clientids, ibkr
+
+
+# --- account-feed field parsing (PURE — no broker) -----------------------------
+def parse_settled_cash_by_date(value: str | None) -> tuple[date, float] | None:
+    """Parse IBKR's `SettledCashByDate` account tag.
+
+    REAL FORMAT (confirmed by a live read-only probe 2026-06-30): there is NO flat
+    `SettledCash` tag. Settled cash arrives as a STRING shaped 'YYYYMMDD:amount', e.g.
+    '20260630:51755.46' (the currency field on the row is empty -> treat the amount as
+    the account base currency / USD). It MUST be split — `float('20260630:51755.46')`
+    raises — so this is the single place that decoding lives.
+
+    Returns (settle_date, amount) on success, or None when the value is missing, empty,
+    or malformed (a missing/garbled tag must never be mistaken for a $0 settled balance,
+    which could spuriously look like a withdrawal — so we return None, not (date, 0.0)).
+
+    PURE: no broker handle, no I/O. The live shell (Slice 6b) reads the raw tag string
+    off ib.accountSummary and hands it here.
+    """
+    if not value or not isinstance(value, str):
+        return None
+    raw = value.strip()
+    if ":" not in raw:
+        return None
+    date_part, _, amount_part = raw.partition(":")
+    date_part = date_part.strip()
+    amount_part = amount_part.strip()
+    if not date_part or not amount_part:
+        return None
+    try:
+        settle_date = datetime.strptime(date_part, "%Y%m%d").date()
+        amount = float(amount_part)
+    except ValueError:
+        return None
+    return settle_date, amount
 
 
 @dataclass

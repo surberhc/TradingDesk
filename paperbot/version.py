@@ -15,10 +15,15 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.9.0"
+VERSION = "0.10.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.10.0", "2026-06-30", "Deposit-detection core (pure): SettledCashByDate baseline + "
+                             "executions cross-check distinguishes external deposit from "
+                             "sale-raised/dividend; over-trading guards + per-day debounce; "
+                             "emits propose-only DEPOSIT_ARRIVED. No broker connection / no "
+                             "scheduler yet (Slice 6b)."),
     ("0.9.0", "2026-06-30", "Per-account monitor brain (account_monitor.py): pure "
                             "Verdict/decide() core — HOLD/REBALANCE/ALERT, propose-only, "
                             "transmits nothing. Withdrawal-coverage + drift + "
