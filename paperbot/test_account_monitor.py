@@ -274,6 +274,100 @@ def test_no_deposit_inputs_behaves_like_slice5():
     assert mon.decide(make_state({"SPY": ON_TARGET})).action == "HOLD"
 
 
+# --- 5c. Withdrawal EARMARK fence + sale-raised NUDGE (Slice 6b) — PURE, synthetic ----
+# Scenario substrate: NAV $1M, model 100% SPY @ $100. The operator sells ~600 SPY to raise
+# ~$60,000 for an ad-hoc client withdrawal. Post-sale book ~9250 SPY + the raised cash.
+#
+# target shares with NO earmark: investable 1M*(1-0.015)=985,000 -> 9850 sh.
+# target shares WITH a $60k earmark: (1M-60k)*0.985=925,900 -> 9259 sh, so a 9250-share
+# post-sale book reads IN-BAND (the fence shrank the target to match the sold-down holdings).
+SOLD_DOWN = 9250          # post-sale SPY share count
+RAISED = 60_000.0         # cash raised by the sale / amount the operator earmarks
+
+
+def make_earmark_state(*, earmarks, cash, positions, net_liq=1_000_000.0,
+                       fills=None) -> mon.AccountState:
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0}, "Balanced")
+    return mon.AccountState(
+        account="DU0001", version="Balanced", net_liq=net_liq, cash=cash,
+        positions=positions, schedule=[], target=target,
+        # carry a prior baseline so the 6a classifier can see today's cash jump
+        settled_cash=cash, baseline_settled_cash=cash - RAISED,
+        baseline_date=date(2026, 6, 29), as_of_date=date(2026, 6, 30),
+        fills=fills or [], earmarks=earmarks)
+
+
+def test_earmark_fences_cash_no_rebalance():
+    # An earmark covering the raised cash -> the sold-down book reads in-band (fence) and
+    # the verdict is the WITHDRAWAL_EARMARK_RESERVED status, NOT a rebalance.
+    em = mon.Earmark(account="DU0001", amount=RAISED, note="client X ad-hoc withdrawal")
+    state = make_earmark_state(earmarks=[em], cash=RAISED, positions={"SPY": SOLD_DOWN})
+    v = mon.decide(state)
+    assert v.action == "ALERT"
+    assert v.reason == mon.REASON_WITHDRAWAL_EARMARK_RESERVED
+    assert v.detail["earmarked"] == pytest.approx(RAISED)
+
+
+def test_earmark_sold_down_holdings_do_not_buy_back():
+    # The fenced (sold-down) holdings must NOT produce a buy-back rebalance. Even setting
+    # the deposit baseline aside, the drift path must propose nothing for the fenced cash.
+    em = mon.Earmark(account="DU0001", amount=RAISED, note="fence")
+    state = make_earmark_state(earmarks=[em], cash=RAISED, positions={"SPY": SOLD_DOWN})
+    v = mon.decide(state)
+    assert v.reason != mon.REASON_DRIFT_BAND_BREACH
+    assert v.action != "REBALANCE"
+
+
+def test_unearmarked_sale_raised_cash_nudges_not_rebalances():
+    # Same sold-down book + raised cash, but NO earmark and a same-day SLD fill explaining
+    # the cash -> SALE_RAISED_UNEARMARKED nudge, NOT a drift rebalance.
+    sld = mon.Execution(symbol="SPY", side="SLD", shares=600, price=100.0)
+    state = make_earmark_state(earmarks=[], cash=RAISED, positions={"SPY": SOLD_DOWN},
+                               fills=[sld])
+    v = mon.decide(state)
+    assert v.action == "ALERT"
+    assert v.reason == mon.REASON_SALE_RAISED_UNEARMARKED
+    assert v.detail["amount"] == pytest.approx(RAISED)
+
+
+def test_external_deposit_still_fires_without_sale_or_earmark():
+    # An external deposit (no sale fill, no earmark) must STILL read as DEPOSIT_ARRIVED, not
+    # be swallowed by the nudge path. +$60k, no SLD fill -> EXTERNAL_DEPOSIT.
+    state = make_earmark_state(earmarks=[], cash=110_000.0,
+                               positions={"SPY": ON_TARGET}, net_liq=1_000_000.0)
+    # baseline = cash - RAISED = 50_000 -> +60k delta, no fill -> external deposit
+    v = mon.decide(state)
+    assert v.action == "REBALANCE"
+    assert v.reason == mon.REASON_DEPOSIT_ARRIVED
+
+
+def test_earmark_plus_drift_earmark_status_wins():
+    # An earmark IS set (cash covers it) but the book is also genuinely drifted (way under
+    # even the earmark-shrunk target). The earmark status outranks the drift rebalance so the
+    # fenced cash is never proposed for redeployment.
+    em = mon.Earmark(account="DU0001", amount=RAISED, note="fence")
+    state = make_earmark_state(earmarks=[em], cash=RAISED, positions={"SPY": 5000})
+    v = mon.decide(state)
+    assert v.action == "ALERT"
+    assert v.reason == mon.REASON_WITHDRAWAL_EARMARK_RESERVED
+
+
+def test_earmark_set_but_cash_not_yet_raised_alerts_withdrawal():
+    # The operator set the earmark BEFORE selling (cash does not yet cover it). Liquidity
+    # safety: WITHDRAWAL_DUE_UNRESERVED still wins (the fenced cash isn't actually there).
+    em = mon.Earmark(account="DU0001", amount=RAISED, note="fence pre-sale")
+    state = make_earmark_state(earmarks=[em], cash=1_000.0, positions={"SPY": ON_TARGET})
+    v = mon.decide(state)
+    assert v.action == "ALERT"
+    assert v.reason == mon.REASON_WITHDRAWAL_DUE_UNRESERVED
+
+
+def test_no_earmarks_field_behaves_like_before():
+    # An AccountState with the default (empty) earmarks list behaves exactly as Slice 6a:
+    # on-target -> HOLD; no earmark status, no nudge.
+    assert mon.decide(make_state({"SPY": ON_TARGET})).action == "HOLD"
+
+
 # --- 6. PROPOSE-ONLY BOUNDARY: the module cannot reach a transmit/arm path -----
 # Symbols that, if reachable from account_monitor's namespace, would mean it could touch a
 # broker / build / transmit / arm an order. The monitor must compose only PURE pieces.
@@ -338,6 +432,26 @@ def test_deposit_core_reaches_no_transmit_path():
                          target=make_target({"SPY": 1.0}, {"SPY": 100.0}),
                          settled_cash=110_000.0, baseline_settled_cash=50_000.0))
     assert isinstance(res, dict) and res["classification"] == "EXTERNAL_DEPOSIT"
+
+
+def test_earmark_core_reaches_no_transmit_path():
+    """Slice 6b: the earmark fence + nudge additions stay inside the pure boundary. The new
+    Earmark type and the earmark/nudge path in decide() must build/transmit nothing — decide
+    returns a plain frozen Verdict, and the module imports no transmit-capable module."""
+    # No forbidden module bound by the new code.
+    assert {getattr(v, "__name__", None) for v in vars(mon).values()
+            if inspect.ismodule(v)} & _FORBIDDEN_MODULES == set()
+    # An earmark verdict is a plain frozen Verdict carrying no order / transmit handle.
+    em = mon.Earmark(account="DU0001", amount=60_000.0, note="fence")
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    invest = mon.reconcile._investable.compute_investable(1_000_000.0 - 60_000.0, 0.0)
+    state = mon.AccountState(
+        account="DU0001", version="Balanced", net_liq=1_000_000.0, cash=60_000.0,
+        positions={"SPY": int(invest // 100.0)}, schedule=[], target=target,
+        earmarks=[em])
+    v = mon.decide(state)
+    assert isinstance(v, mon.Verdict)
+    assert v.reason == mon.REASON_WITHDRAWAL_EARMARK_RESERVED
 
 
 def test_transitive_imports_stay_pure():

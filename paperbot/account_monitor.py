@@ -35,6 +35,23 @@ A cash increase is classified three ways and only ONE is a deposit:
   * DIVIDEND/INTEREST/ROUNDING — a small increase below the guards, no fill. Never trips.
 See `classify_cash_increase` for the exact rules and the three guards.
 
+WITHDRAWAL EARMARK FENCE + SALE-RAISED NUDGE (Slice 6b — PURE core, built here)
+-------------------------------------------------------------------------------
+An EARMARK is an in-the-moment OPERATOR tool (separate from the parked recurring client
+SCHEDULE): when the operator sells holdings to raise cash for an ad-hoc client withdrawal,
+they set an earmark to FENCE that cash so no rebalance proposes redeploying it. An earmark
+is a pending-withdrawal reserve entry (account, amount, note); it feeds the SAME reserve
+`investable.compute_investable` already subtracts, so the earmarked cash simply shrinks
+investable — the sold-down holdings are measured against post-reserve capital and do NOT
+read as "under target / buy me back", and the drift path proposes nothing for that cash.
+`decide()` annotates this with a WITHDRAWAL_EARMARK_RESERVED status verdict.
+
+The NUDGE complements the fence: when today's cash was SALE_RAISED (the 6a classifier) but
+is NOT covered by an earmark, `decide()` emits a SALE_RAISED_UNEARMARKED ALERT asking the
+operator to earmark-or-release — instead of letting that loose sale cash read as a
+DRIFT_BAND_BREACH rebalance. Earmarks are PURE inputs on AccountState (an `earmarks` list);
+the core reads no files. The live shell (Part B) loads operator earmarks from STATE_DIR.
+
 REAL CLIENT DATA: the real per-account distribution schedule is personal client data and
 is NOT in committed code (cashflows.SCHEDULE stays empty). `decide()` reads the schedule
 from the AccountState passed in, so it is exercised only with SYNTHETIC fixtures in tests.
@@ -99,6 +116,26 @@ class Execution:
 
 
 @dataclass(frozen=True)
+class Earmark:
+    """A PENDING-WITHDRAWAL reserve entry the OPERATOR sets to FENCE cash. PURE data — no
+    broker handle, no I/O. The operator sets one when they have raised (or are about to
+    raise) cash for an ad-hoc client withdrawal; it tells the monitor "this $X is spoken
+    for, do not propose redeploying it".
+
+      account : full account number the earmark applies to (for the operator's records;
+                `decide` is called per account, so the amount is what's used here).
+      amount  : dollars FENCED (added to this account's required reserve, shrinking
+                investable so the sold-down book is measured post-reserve and reads in-band).
+      note    : free-text operator note (client/reason), for the verdict detail only.
+
+    The live shell (Part B) loads these from an operator-maintained STATE_DIR JSON file;
+    the pure core only ever receives them as inputs on AccountState.earmarks."""
+    account: str
+    amount: float
+    note: str = ""
+
+
+@dataclass(frozen=True)
 class AccountState:
     """Everything `decide` needs for ONE account — a plain data bundle, no broker handle.
 
@@ -145,6 +182,10 @@ class AccountState:
     as_of_date: date | None = None
     fills: list = field(default_factory=list)
     deposit_already_flagged_today: bool = False
+    # --- Slice 6b: operator EARMARKS that fence pending-withdrawal cash (defaulted empty so
+    # callers without earmarks are unchanged). Each Earmark.amount is added to this account's
+    # required reserve, so earmarked cash shrinks investable and never reads as buy-me-back.
+    earmarks: list = field(default_factory=list)
 
 
 # --- reason codes (stable strings) --------------------------------------------
@@ -153,6 +194,8 @@ REASON_DRIFT_BAND_BREACH = "DRIFT_BAND_BREACH"          # REBALANCE
 REASON_WITHDRAWAL_DUE_UNRESERVED = "WITHDRAWAL_DUE_UNRESERVED"   # ALERT
 REASON_UNTRACKED_POSITION = "UNTRACKED_POSITION"        # ALERT
 REASON_DEPOSIT_ARRIVED = "DEPOSIT_ARRIVED"             # REBALANCE (Slice 6a)
+REASON_WITHDRAWAL_EARMARK_RESERVED = "WITHDRAWAL_EARMARK_RESERVED"  # ALERT (Slice 6b)
+REASON_SALE_RAISED_UNEARMARKED = "SALE_RAISED_UNEARMARKED"          # ALERT (Slice 6b)
 
 
 # --- deposit-detection guards --------------------------------------------------
@@ -177,15 +220,38 @@ DEPOSIT_ABS_FLOOR = 1_000.0                            # $ minimum to be a depos
 DEPOSIT_SALE_MATCH_TOL = 0.02                          # 2% of the delta
 
 
-def _required_reserve(schedule: list, nav: float) -> float:
-    """Dollars that should be held liquid for upcoming DISTRIBUTIONS on this account =
-    RESERVE_MONTHS of monthly distributions. Reuses the cashflows reserve POLICY
-    (_occurrence_amount + RESERVE_MONTHS) so the monitor and the engine agree on what a
-    reserve is — but operates on the state-provided schedule, so it is pure and testable
-    with synthetic flows (the global cashflows.SCHEDULE stays empty in committed code)."""
+def _earmarked_total(earmarks: list) -> float:
+    """Total dollars FENCED by the operator's pending-withdrawal earmarks for this account.
+    PURE — sums Earmark.amount over the state-provided list. Negative/garbled amounts
+    contribute 0 (an earmark can only ADD to the reserve, never relax it)."""
+    total = 0.0
+    for em in earmarks:
+        amt = getattr(em, "amount", 0.0)
+        try:
+            amt = float(amt)
+        except (TypeError, ValueError):
+            amt = 0.0
+        if amt > 0:
+            total += amt
+    return total
+
+
+def _required_reserve(schedule: list, nav: float, earmarks: list | None = None) -> float:
+    """Dollars that should be held liquid on this account = RESERVE_MONTHS of monthly
+    scheduled DISTRIBUTIONS PLUS any operator EARMARK (pending-withdrawal fence).
+
+    The schedule part reuses the cashflows reserve POLICY (_occurrence_amount +
+    RESERVE_MONTHS) so the monitor and the engine agree on what a recurring reserve is.
+    The earmark part is the in-the-moment operator fence: it feeds the SAME reserve that
+    investable.compute_investable subtracts, so earmarked cash shrinks investable and the
+    sold-down book is measured against post-reserve capital (it does NOT read as buy-me-
+    back). Operates on state-provided inputs, so it stays pure and synthetic-testable (the
+    global cashflows.SCHEDULE stays empty in committed code)."""
     monthly_dist = sum(cashflows._occurrence_amount(f, nav)
                        for f in schedule if f.kind == "distribution")
-    return cashflows.RESERVE_MONTHS * monthly_dist
+    reserve = cashflows.RESERVE_MONTHS * monthly_dist
+    reserve += _earmarked_total(earmarks or [])
+    return reserve
 
 
 # --- deposit detection (PURE) -------------------------------------------------
@@ -263,32 +329,47 @@ def decide(state: AccountState) -> Verdict:
     policy), transmits NOTHING.
 
     Precedence (most-urgent human-attention condition first):
-      1. ALERT  WITHDRAWAL_DUE_UNRESERVED — an upcoming distribution exists but available
-                cash does not cover the required reserve. (Liquidity safety: surfaced
-                before a rebalance so cash earmarked for a client is never traded away.)
+      1. ALERT  WITHDRAWAL_DUE_UNRESERVED — an upcoming distribution OR a pending-withdrawal
+                EARMARK exists, but available cash does not cover the required reserve.
+                (Liquidity safety: surfaced before everything else so cash a client is owed
+                is never traded away. An earmark set BEFORE the cash is raised correctly
+                trips this until the sale settles.)
       2. ALERT  UNTRACKED_POSITION        — a held symbol the model does not know about.
-      3. REBALANCE DEPOSIT_ARRIVED        — (Slice 6a) a confirmed EXTERNAL deposit landed
+      3. ALERT  WITHDRAWAL_EARMARK_RESERVED — (Slice 6b) the operator has FENCED cash for an
+                ad-hoc client withdrawal and the account now holds it (cash covers the
+                earmark). Status: "pending withdrawal, $X reserved, do not redeploy". The
+                earmark already shrank investable, so the sold-down book reads in-band and
+                no rebalance is proposed for the fenced cash — this verdict just SURFACES it.
+      3b.ALERT SALE_RAISED_UNEARMARKED    — (Slice 6b) today's cash was SALE_RAISED (6a
+                classifier) but NOT covered by any earmark. NUDGE the operator to
+                earmark-or-release, instead of letting that loose cash read as a drift
+                rebalance. Ranked above DEPOSIT_ARRIVED/drift so loose sale cash never
+                auto-proposes redeployment.
+      4. REBALANCE DEPOSIT_ARRIVED        — (Slice 6a) a confirmed EXTERNAL deposit landed
                 (settled cash up past both guards, not explained by a sale). Proposes
                 putting the new cash to work. Ranked above the generic drift code so a
                 fresh deposit reports the specific reason (a deposit raises cash and would
                 also trip drift, but DEPOSIT_ARRIVED is the actionable explanation). Still
                 a PROPOSAL only — routes to the human review->arm->transmit gate.
-      4. REBALANCE DRIFT_BAND_BREACH      — the no-trade band is breached (engine WOULD
+      5. REBALANCE DRIFT_BAND_BREACH      — the no-trade band is breached (engine WOULD
                 true the account back to model). Uses the SHARED band test, so the
                 monitor's REBALANCE proposal exactly matches what rebalance_engine does.
-      5. HOLD   IN_BAND                   — none of the above.
+      6. HOLD   IN_BAND                   — none of the above.
 
-    The deposit path is liquidity-safety-subordinate by construction: the withdrawal
-    ALERT is checked FIRST and returns before deposit detection runs, so an account that
-    both took a deposit AND has an uncovered upcoming distribution still surfaces the
-    withdrawal ALERT (cash earmarked for a client is never proposed for redeployment).
+    The deposit/drift paths are liquidity-safety-subordinate by construction: the
+    withdrawal ALERT is checked FIRST and the earmark/nudge statuses BEFORE deposit/drift,
+    so an account that both took a deposit/drifted AND has fenced or loose sale cash never
+    proposes redeploying the spoken-for cash.
     """
     band_pct = config.REBALANCE_BAND_PCT
 
     # Reconcile against the tier model at band tolerance — same call the engine makes, so
     # the line statuses (UNTRACKED) and the band test below see identical inputs. Reserve
-    # is carved out of investable exactly as the engine does, so target shares match.
-    reserve = _required_reserve(state.schedule, state.net_liq)
+    # is carved out of investable exactly as the engine does, so target shares match. The
+    # reserve now ALSO includes any operator EARMARK, so fenced cash shrinks investable and
+    # the sold-down book is measured post-reserve (it does NOT read as buy-me-back).
+    reserve = _required_reserve(state.schedule, state.net_liq, state.earmarks)
+    earmarked = _earmarked_total(state.earmarks)
     investable = reconcile._investable.compute_investable(state.net_liq, reserve)
     lines = reconcile.reconcile(state.target, state.net_liq, state.positions,
                                 tolerance_w=band_pct, investable=investable)
@@ -312,19 +393,46 @@ def decide(state: AccountState) -> Verdict:
             state.account, "ALERT", REASON_UNTRACKED_POSITION,
             {"symbols": untracked})
 
-    # 3. DEPOSIT detection (Slice 6a) — a CONFIRMED external deposit. PURE: diffs today's
+    # Classify today's settled-cash change ONCE (shared by the earmark/nudge statuses and
+    # the deposit path below). PURE — returns a plain dict, builds/transmits nothing.
+    deposit = classify_cash_increase(state)
+
+    # 3. WITHDRAWAL EARMARK status (Slice 6b) — the operator has FENCED cash for an ad-hoc
+    #    client withdrawal AND the account now holds it (cash covers the earmark; if it did
+    #    NOT, step 1's WITHDRAWAL_DUE_UNRESERVED already fired and returned). The earmark has
+    #    already shrunk investable, so the sold-down book reads in-band and the drift path
+    #    below proposes NOTHING for the fenced cash — this verdict just SURFACES it: "pending
+    #    withdrawal, $X reserved, do not redeploy". ALERT (human attention), proposes no trade.
+    if earmarked > 0 and state.cash >= reserve:
+        return Verdict(
+            state.account, "ALERT", REASON_WITHDRAWAL_EARMARK_RESERVED,
+            {"earmarked": earmarked, "available_cash": state.cash,
+             "notes": [getattr(em, "note", "") for em in state.earmarks
+                       if getattr(em, "amount", 0) and float(em.amount) > 0]})
+
+    # 3b. SALE-RAISED NUDGE (Slice 6b) — today's cash was SALE_RAISED (6a classifier) but is
+    #     NOT covered by an earmark. Instead of letting that loose cash read as a drift
+    #     rebalance below, NUDGE the operator to earmark-or-release it. ALERT, proposes no
+    #     trade. (Ranked above DEPOSIT_ARRIVED/drift: a sale already explained the cash, so it
+    #     must never auto-propose redeployment until the operator decides.)
+    if deposit.get("classification") == "SALE_RAISED" and earmarked <= 0:
+        return Verdict(
+            state.account, "ALERT", REASON_SALE_RAISED_UNEARMARKED,
+            {"amount": deposit.get("delta"),
+             "sale_proceeds": deposit.get("sale_proceeds")})
+
+    # 4. DEPOSIT detection (Slice 6a) — a CONFIRMED external deposit. PURE: diffs today's
     #    settled cash against a prior baseline carried on the state, cross-checks today's
     #    executions to rule out a sale, and applies the over-trading guards + per-day
     #    debounce. Only EXTERNAL_DEPOSIT proposes action; everything else (sale-raised,
     #    dividend/interest below guards, cold start, already-flagged) falls through. This is
     #    a PROPOSAL only — it builds and transmits nothing; it routes to the existing human
     #    review->arm->transmit gate exactly like any other REBALANCE verdict.
-    deposit = classify_cash_increase(state)
     if deposit["classification"] == "EXTERNAL_DEPOSIT":
         return Verdict(
             state.account, "REBALANCE", REASON_DEPOSIT_ARRIVED, deposit)
 
-    # 4. Drift band — the SHARED, single-source-of-truth account-level band test. If it
+    # 5. Drift band — the SHARED, single-source-of-truth account-level band test. If it
     #    breaches, the engine would rebalance the whole account back to model; the monitor
     #    PROPOSES that as a REBALANCE verdict (it builds and transmits nothing).
     if rebalance_engine.band_breached(lines, state.net_liq, state.target,
@@ -335,5 +443,5 @@ def decide(state: AccountState) -> Verdict:
             state.account, "REBALANCE", REASON_DRIFT_BAND_BREACH,
             {"drifted_lines": n_drift})
 
-    # 5. In-band, no flow issues, no stray positions -> HOLD.
+    # 6. In-band, no flow issues, no stray positions -> HOLD.
     return Verdict(state.account, "HOLD", REASON_IN_BAND, {})
