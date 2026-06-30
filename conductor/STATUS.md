@@ -1,10 +1,19 @@
-# LANE STATUS  (last updated by: Conductor, 2026-06-29 ~14:00 CT — SESSION CLOSE)
+# LANE STATUS  (last updated by: Conductor, 2026-06-30 ~16:30 CT — SESSION CLOSE)
 
 > Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` + dated `docs/SESSION_HANDOFF_*.md`.
-> **PICK UP HERE NEXT SESSION → `docs/SESSION_HANDOFF_2026-06-30.md`** (full 2026-06-29 session-close handoff).
+> **PICK UP HERE NEXT SESSION → `docs/SESSION_HANDOFF_2026-07-01.md`** (full 2026-06-30 session-close handoff).
 > **First multi-account PAPER rebalance: DONE 2026-06-29 — all 5 accounts (DU142-146) in-band.** Built + proved live a dynamic laddered order router + self-verifying hands-free gateway arming + `--only-account` scope flag (memory `dynamic-order-router`, `paper-arming-and-fills`). Gateway disarmed + verified-locked.
 > Desk runs on its own: collector + ThetaData **terminal-watchdog (NEW, live)** + dashboard survive session close. **Collector ~59%, ETA 2026-06-30 ~18:19 CT** — gates S5 harvest + S2/S3.
 > **Regime config still UNTOUCHED.** `sharp_recovery` refinement TESTED 2026-06-29 → SHELVED (clean negative; GFC fails −118bp filter-independently). Re-entry stays MAX_LAG=6. 2008 GFC audit CLOSED.
+
+### 2026-06-30 SESSION CLOSE — shipped
+- **Cashflow layer built end-to-end** (paperbot v0.6.0→v0.12.0, Slices 1-3/5/6a/6b): execution-side CASH bucket (backtester untouched), propose-only monitor brain (`account_monitor.py`), deposit detection, withdrawal earmark fence + sale-raised nudge, live read-only shell (`account_monitor_run.py`).
+- **Gateway lock interlock** (`gateway_lock.py`, single-process mutex) wiring monitor↔rebalance; **account monitor SCHEDULED** daily 16:30 CT (AccountMonitorDaily, clientId 40, read-only/propose-only, lock-guarded).
+- **All 8 desk scheduled tasks HARDENED** to run-whether-logged-on (LogonType=Password) — survives sign-out/overnight reboot. CAVEAT: re-run `harden_scheduled_tasks.ps1` after any Windows password change.
+- **Reference paper** AsymmetricReturns (AllianceBernstein) added — best external statement of S5's convexity/tail thesis.
+- **Regime breadth-thrust re-entry lead logged** (`docs/REGIME_RESEARCH_BACKLOG.md`; HIGH curve-fit risk).
+- **Scheduler plan** (`docs/SCHEDULER_PLAN.md`, 8-job inventory) + **LIVE_RESILIENCE stub** (`docs/LIVE_RESILIENCE.md`, server-resting-protection gap) written.
+- **S5 1-min reader** (`backtester/s5_intraday_data.py`) + ledger experiment (endogenous self-funding wins the twitchy-bleed regime; nothing adopted).
 
 ## OPEN ITEMS — running tally (updated 2026-06-28 ~19:00; mirrors the session task list)
 **In progress (autonomous):** [1] SPXW 1-min collector — **374/1170 (~32%)** as of 2026-06-28 18:47, ~10.49 GB, current day 20241227, **0 errors**, avg ~220 s/day, **ETA ~2026-06-30 19:30**. Self-healing via Task Scheduler. (Survived a terminal outage mid-session — resumed from day ~342, not from scratch.)
@@ -57,7 +66,7 @@
   thanks to the progress heartbeat + on-disk dedupe). **ROOT CAUSE:** no watchdog auto-restarts the ThetaData
   TERMINAL (the collector's supervisor restarts the *collector*, but a dead terminal on port 25503 just stalls it).
   **OPEN:** build a port-25503 watchdog scheduled task (recommended, not built).
-- Collector snapshot 2026-06-28 18:47: **374/1170 days (31.97%)**, ~10.49 GB, 0 errors, avg ~220 s/day, ETA ~2026-06-30 19:30.
+- Collector snapshot 2026-06-30 09:41: **~82% (961/1170 days)**, ETA tonight ~23:24 CT — finishing unblocks S5 harvest + S2/S3 + DDOI.
 - RESOLVED 2026-06-27: the DuckDB `options_eod` "non-empty parquets only" fix is ALREADY in committed
   `storage.py` (`_nonempty_parquets()` + `rebuild_catalog()`). Verified against the LIVE ~102k-file
   warehouse — zero-column markers correctly EXCLUDED (kept on disk), 0 corrupt, view builds clean.
@@ -74,6 +83,10 @@
 
 ## C — Paperbot Execution
 > All PAPER. Nothing transmitted. review→arm→transmit gate intact. Serialize any order / gateway / git.
+- **NEW 2026-06-30 (cashflow + gateway-lock layer, v0.12.0):** `investable.py` (consolidated buffer math, 1.5%);
+  `account_monitor.py` (propose-only Verdict/decide brain) + `account_monitor_run.py` (live read-only shell,
+  clientId **40**, scheduled daily 16:30 CT, gateway-lock-guarded); `gateway_lock.py` (single-process mutex
+  interlocking monitor↔rebalance). Execution-side CASH bucket; deposit detection; withdrawal earmark fence + nudge.
 - Multi-account rebalance ENGINE built + committed: `paperbot/rebalance_engine.py` (per-acct integer
   target shares, reserve carve-out, **account-level all-or-nothing band**, block aggregation w/ per-account
   `ContractsOrShares` split; emits empty FA method per the Err-10226 fix; never whatIfOrders a group).
@@ -111,5 +124,5 @@
 ## Shared plumbing
 - Local git repo (in Drive, no remote); commit after each change-set.
 - clientId registry in `connections/clientids.py`. In use this lane: paperbot=30, flatten=34, fa_block=35,
-  fa_admin=36, rebalance_run=37, rebalance_exec=38. Don't collide.
+  fa_admin=36, rebalance_run=37, rebalance_exec=38, **account_monitor=40**. Don't collide.
 - Handoffs consolidated into `conductor/handoffs/`; the stray "Andrew is pissed off" folder was deleted.
