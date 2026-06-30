@@ -45,6 +45,7 @@ import order_router
 import strategy_target
 import version
 from connections import clientids, ibkr
+from gateway_lock import GatewayBusyRefuse, gateway_lock
 from rebalance_engine import build_plan
 
 
@@ -250,6 +251,32 @@ def main(armed: bool = False) -> int:
         print(f"    {v:13s} as_of={t.as_of.date()}  price_date={t.price_date.date()}  "
               f"({len(t.weights)} holdings)")
 
+    # GATEWAY LOCK (Slice 3): acquire the single-process Gateway mutex BEFORE connecting and
+    # hold it through the ENTIRE session (connect -> build -> disconnect). The rebalance is the
+    # value-bearing, human-supervised path, so it INSISTS: on_busy="refuse" waits a short
+    # bounded time then, if still held, REFUSES — naming the holder — and ABORTS before any
+    # connect or order work. Never operate the Gateway blind into a contended session.
+    try:
+        with gateway_lock(purpose="rebalance_run",
+                          client_id=clientids.get("paperbot_rebalance"), on_busy="refuse"):
+            return _run_gateway_session(armed, targets)
+    except GatewayBusyRefuse as busy:
+        holder = busy.holder or {}
+        print(f"\n[2] REFUSING to start the rebalance — gateway held by "
+              f"{holder.get('purpose')} pid {holder.get('pid')} clientId "
+              f"{holder.get('client_id')} since "
+              f"{holder.get('acquired_at') or holder.get('acquired_ts')}. No connection "
+              f"opened, NO orders built, nothing transmitted, no FA config written. Re-run "
+              f"once the holder finishes.")
+        return 2
+
+
+def _run_gateway_session(armed: bool, targets: dict) -> int:
+    """The connect -> build -> disconnect body, run only while the gateway lock is HELD.
+
+    Factored out of main() so the `with gateway_lock(...)` block wraps the WHOLE session, not
+    just the connect call — the lock is held across connect, the live reads, the build, and
+    place(armed=False), then released after disconnect."""
     # [2] Connect read-only, PINNED to a DU sub-account so the master account stream
     # (DF...141) never hangs the session. We pick the lowest-numbered enrolled DU account.
     pin_account = sorted(config.ENROLLMENT)[0]

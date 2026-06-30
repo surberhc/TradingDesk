@@ -73,6 +73,7 @@ import order_router      # noqa: E402
 import risk_manager      # noqa: E402
 import version           # noqa: E402
 from connections import clientids, ibkr   # noqa: E402
+from gateway_lock import GatewayBusyRefuse, gateway_lock   # noqa: E402
 from rebalance_engine import build_plan   # noqa: E402
 # Reuse, don't duplicate: the review runner already has the preview, the fail-closed
 # group resolver, the per-version target compute, the price lookup and the direct-intent.
@@ -282,6 +283,36 @@ def execute_armed(armed: bool, only_account: str | None = None,
     for v, t in targets.items():
         print(f"    {v:13s} as_of={t.as_of.date()}  ({len(t.weights)} holdings)")
 
+    # GATEWAY LOCK (Slice 3): acquire the single-process Gateway mutex BEFORE connecting and
+    # hold it across the ENTIRE armed flow (connect -> replaceFA -> place blocks one at a time
+    # -> reconcile -> disconnect). The heartbeat thread keeps the lease alive through a
+    # legitimately long laddered execution. This is the transmit-capable path, so it INSISTS:
+    # on_busy="refuse" waits a short bounded time then REFUSES — naming the holder — and ABORTS
+    # BEFORE any connect, FA-config write, or order build. Never transmit into a contended
+    # Gateway. The context manager releases on normal exit AND on exception.
+    try:
+        with gateway_lock(purpose="rebalance_execute",
+                          client_id=clientids.get("paperbot_rebalance_exec"),
+                          on_busy="refuse"):
+            return _run_armed_session(armed, only_account, only_tier, permit, why, targets)
+    except GatewayBusyRefuse as busy:
+        holder = busy.holder or {}
+        print(f"\n[2] REFUSING to start the armed execute — gateway held by "
+              f"{holder.get('purpose')} pid {holder.get('pid')} clientId "
+              f"{holder.get('client_id')} since "
+              f"{holder.get('acquired_at') or holder.get('acquired_ts')}. No connection "
+              f"opened, NO orders built, nothing transmitted, no FA config written, no "
+              f"replaceFA. Re-run once the holder finishes.")
+        return 2
+
+
+def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | None,
+                       permit: bool, why: str, targets: dict) -> int:
+    """The connect -> (FA config write + place blocks) -> reconcile -> disconnect body, run
+    only while the gateway lock is HELD. Factored out of execute_armed so the
+    `with gateway_lock(...)` block wraps the WHOLE armed flow — not just the connect — and the
+    heartbeat keeps the lease alive across the laddered execution. Behavior inside is
+    unchanged from before the lock was added."""
     # Connect NON-read-only, pinned to a DU account (flatten_accounts.py pattern). This is
     # the only way the session can transmit; pinning dodges the master account-stream hang.
     print(f"\n[2] Connecting NON-readonly pinned to {PIN_ACCOUNT} "

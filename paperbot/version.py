@@ -15,10 +15,14 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.11.0"
+VERSION = "0.12.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.12.0", "2026-06-30", "Rebalance run/execute acquire the gateway lock for the whole "
+                             "session and wait-then-refuse (naming the holder) if it's held; "
+                             "monitor skips on busy. Single-process gateway interlock now "
+                             "active (clientIds + lock)."),
     ("0.11.0", "2026-06-30", "Withdrawal earmark fence + sale-raised nudge in monitor core; "
                              "live read-only monitor shell (account_monitor_run.py, clientId "
                              "40) reads SettledCashByDate/fills, persists baselines, runs "
