@@ -71,6 +71,25 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
 
         lines.append(Line(sym, weight, target_shares, actual_shares,
                           actual_weight, drift_w, status))
+
+    # --- Slice 3: explicit execution-side CASH bucket -------------------------
+    # Each RISK line above measures drift against its TRUE model weight (no haircut),
+    # exactly as before. But the model weights sum to ~100% with no cash line, while the
+    # account is deliberately holding back the buffer — so without a cash bucket the book
+    # does not sum to 100% and looks "light". Add a synthetic CASH line whose target is the
+    # standing buffer and whose actual is the real uninvested cash fraction. A correctly
+    # invested account then reads ~0 drift on CASH and the book sums to ~100%.
+    #
+    # This is READOUT-ONLY: no shares are sized here (target_shares=0, actual_shares=0.0),
+    # and the loop above is untouched, so order quantities are exactly what Slice 2 produced.
+    risk_value = sum(ln.actual_shares * float((prices or {}).get(ln.symbol,
+                     target.prices.get(ln.symbol, 0.0)))
+                     for ln in lines)
+    cash_target_w, cash_actual_w = _investable.cash_line(nav, risk_value)
+    cash_drift_w = cash_actual_w - cash_target_w
+    cash_status = "MATCHED" if abs(cash_drift_w) <= tolerance_w else "DRIFTED"
+    lines.append(Line(_investable.CASH_SYMBOL, cash_target_w, 0, 0.0,
+                      cash_actual_w, cash_drift_w, cash_status))
     return lines
 
 

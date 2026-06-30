@@ -15,10 +15,13 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.7.0"
+VERSION = "0.8.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.8.0", "2026-06-30", "Explicit execution-side CASH bucket (~1.5%); risk lines "
+                            "reconcile against true model weights; phantom drift removed. "
+                            "Backtester untouched; order sizing unchanged."),
     ("0.7.0", "2026-06-30", "Cash buffer 5%->1.5% via single config knob "
                             "(cash_reserve_pct=0.015); risk positions now size ~3.5% of "
                             "NAV closer to model. Order-affecting."),

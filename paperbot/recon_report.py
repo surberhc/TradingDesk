@@ -170,6 +170,22 @@ def main() -> int:
                   f"{cashflows.describe(p.account, p.net_liq)}")
         print("-" * 92)
 
+        # --- Section A.1: per-account holdings detail (incl. the CASH bucket) ---
+        # Slice 3: risk lines now reconcile against their TRUE model weight (no buffer
+        # haircut), and a synthetic CASH line carries the deliberate uninvested buffer.
+        # A correctly-invested account therefore reads MATCHED on every risk line and ~0
+        # drift on CASH, and TGT_W (incl. CASH) sums to ~100% — the phantom "everything is
+        # ~buffer% light" readout is gone. CASH places no order (it is readout-only).
+        print("\nPER-ACCOUNT HOLDINGS (risk lines vs TRUE model weight; CASH = uninvested "
+              "buffer bucket)")
+        for p in plans:
+            print(f"\n  {p.account}  [{p.version}]")
+            print(f"    {'STATUS':9s} {'SYM':6s} {'TGT_W':>7s} {'ACT_W':>7s} {'DRIFT':>7s}")
+            for ln in p.lines:
+                print(f"    {ln.status:9s} {ln.symbol:6s} {ln.target_weight*100:>6.2f}% "
+                      f"{ln.actual_weight*100:>6.2f}% {ln.drift_weight*100:>+6.2f}%")
+        print()
+
         # --- Section B: aggregated block orders (fair single-price execution) ---
         blocks = aggregate_blocks(plans)
         print("\nAGGREGATED BLOCK ORDERS (one average price per block; per-account split fixed "
