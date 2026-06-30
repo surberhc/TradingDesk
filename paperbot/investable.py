@@ -12,8 +12,9 @@ cash_reserve_pct knob). It deliberately does NOT import reconcile or rebalance_e
 rebalance_engine imports reconcile, and reconcile/rebalance_engine will call into here,
 so importing them back would create a cycle. Keeping this a leaf keeps it cycle-free.
 
-Slice 1 is a pure consolidation: ZERO behavior change. The buffer value stays exactly
-what config holds today (0.05). No number moves; this module only removes duplication.
+Slice 1 was a pure consolidation: ZERO behavior change. Because the buffer now lives in
+exactly one place (config.RISK_LIMITS["cash_reserve_pct"]), Slice 2 re-based it 0.05 ->
+0.015 by editing that single knob — every site below reads the new value automatically.
 """
 from __future__ import annotations
 

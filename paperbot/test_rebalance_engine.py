@@ -37,52 +37,50 @@ def make_target(weights: dict, prices: dict, version: str = "Balanced") -> strat
     )
 
 
-CASH_RESERVE = config.RISK_LIMITS["cash_reserve_pct"]   # 0.05 by default
+CASH_RESERVE = config.RISK_LIMITS["cash_reserve_pct"]   # 0.015 (Slice 2 re-base)
 
 
 # --- 1. reserve carve-out ------------------------------------------------------
 def test_investable_no_reserve():
-    # (1,000,000 - 0) * (1 - 0.05) = 950,000
-    assert eng.compute_investable(1_000_000, 0.0, 0.05) == pytest.approx(950_000.0)
+    # (1,000,000 - 0) * (1 - 0.015) = 985,000
+    assert eng.compute_investable(1_000_000, 0.0, 0.015) == pytest.approx(985_000.0)
 
 
 def test_investable_with_reserve_carved_first():
-    # reserve removed BEFORE the cash buffer: (1,000,000 - 100,000) * 0.95 = 855,000
-    assert eng.compute_investable(1_000_000, 100_000, 0.05) == pytest.approx(855_000.0)
+    # reserve removed BEFORE the cash buffer: (1,000,000 - 100,000) * 0.985 = 886,500
+    assert eng.compute_investable(1_000_000, 100_000, 0.015) == pytest.approx(886_500.0)
 
 
 def test_investable_never_negative():
     # reserve larger than NetLiq must clamp to 0, not manufacture phantom sells.
-    assert eng.compute_investable(50_000, 200_000, 0.05) == 0.0
+    assert eng.compute_investable(50_000, 200_000, 0.015) == 0.0
 
 
 # --- 2. share math -------------------------------------------------------------
 def test_share_math_floor_division():
     # one all-cash account, single 100% holding @ $250, NetLiq 1,000,000.
-    # investable = 950,000 ; target = floor(950,000 / 250) = 3800 shares.
+    # investable = 985,000 ; target = floor(985,000 / 250) = 3940 shares.
     target = make_target({"SPY": 1.0}, {"SPY": 250.0})
     plan = eng.plan_account("DU0001", "Balanced", 1_000_000, {}, target, band_pct=0.03)
-    assert plan.investable == pytest.approx(950_000.0)
-    assert plan.orders == {"SPY": 3800}     # all BUY from flat
+    assert plan.investable == pytest.approx(985_000.0)
+    assert plan.orders == {"SPY": 3940}     # all BUY from flat
     line = next(l for l in plan.lines if l.symbol == "SPY")
-    assert line.target_shares == 3800
+    assert line.target_shares == 3940
 
 
 def test_share_math_two_holdings():
-    # 60/40 split. investable 950,000.
-    #   SPY 60% -> 570,000 / 200 = 2850 ; BND 40% -> 380,000 / 100 = 3800
+    # 60/40 split. investable 985,000.
+    #   SPY 60% -> 591,000 / 200 = 2955 ; BND 40% -> 394,000 / 100 = 3940
     target = make_target({"SPY": 0.6, "BND": 0.4}, {"SPY": 200.0, "BND": 100.0})
     plan = eng.plan_account("DU0002", "Balanced", 1_000_000, {}, target, band_pct=0.03)
-    assert plan.orders == {"SPY": 2850, "BND": 3800}
+    assert plan.orders == {"SPY": 2955, "BND": 3940}
 
 
 # --- 3. band suppression -------------------------------------------------------
 def test_band_suppresses_small_drift():
-    # Hold a position whose weight is ~1% off target (inside the 3% band) -> NO delta.
-    # target SPY 100% @ $100, NetLiq 1,000,000 -> target_w 100%, investable 950,000.
-    # Hold 9600 sh -> actual_w = 9600*100/1,000,000 = 96% ; drift -4%? -> recompute:
-    # Use a drift well inside band: hold 9700 -> actual_w 97%, drift -3% (== band edge).
-    # To be unambiguously INSIDE the band, hold 9800 -> 98%, drift -2% -> MATCHED, no delta.
+    # Hold a position whose required trade is well inside the 3% band -> NO delta.
+    # target SPY 100% @ $100, NetLiq 1,000,000, investable 985,000 -> target 9850 sh.
+    # Hold 9800 -> trade = |9850-9800|*100/1,000,000 = 0.5% of NetLiq -> INSIDE band, no delta.
     target = make_target({"SPY": 1.0}, {"SPY": 100.0})
     plan = eng.plan_account("DU0003", "Balanced", 1_000_000, {"SPY": 9800}, target,
                             band_pct=0.03)
@@ -91,20 +89,22 @@ def test_band_suppresses_small_drift():
 
 
 def test_band_lets_large_drift_through():
-    # Same model, but hold only 5000 sh -> actual_w 50%, drift -50% (way past band).
-    # Breaches -> emit the delta back to the integer target (9500 sh on 950,000 investable).
+    # Same model, but hold only 5000 sh -> trade ~48% of NetLiq (way past band).
+    # Breaches -> emit the delta back to the integer target (9850 sh on 985,000 investable).
     target = make_target({"SPY": 1.0}, {"SPY": 100.0})
     plan = eng.plan_account("DU0004", "Balanced", 1_000_000, {"SPY": 5000}, target,
                             band_pct=0.03)
     assert plan.needs_rebalance is True
-    assert plan.orders == {"SPY": 9500 - 5000}   # target 9500, actual 5000 -> +4500 BUY
+    assert plan.orders == {"SPY": 9850 - 5000}   # target 9850, actual 5000 -> +4850 BUY
 
 
 def test_untracked_holding_is_sold():
     # A holding not in the model (weight 0) must be flagged and fully sold, band or not.
     target = make_target({"SPY": 1.0}, {"SPY": 100.0, "GOOG": 150.0})
-    # hold the full SPY target so SPY is in-band, plus a stray 10 GOOG.
-    plan = eng.plan_account("DU0005", "Balanced", 1_000_000, {"SPY": 9500, "GOOG": 10},
+    # hold the full SPY target (9850 on 985,000 investable) so SPY is on target, plus a
+    # stray 10 GOOG. The untracked GOOG breaches, the account rebalances, but SPY (delta 0)
+    # stays out of the orders.
+    plan = eng.plan_account("DU0005", "Balanced", 1_000_000, {"SPY": 9850, "GOOG": 10},
                             target, band_pct=0.03)
     assert plan.orders.get("GOOG") == -10        # SELL the untracked position
     assert "SPY" not in plan.orders              # SPY is on target / in band
@@ -113,17 +113,17 @@ def test_untracked_holding_is_sold():
 def test_account_level_band_rebalances_in_band_siblings():
     # ACCOUNT-LEVEL all-or-nothing (Andrew 2026-06-27): if ONE holding breaches, the WHOLE
     # account is rebalanced -- including holdings that are individually inside the band.
-    # 50/50 SPY/BND, investable 950,000 -> target 4750 each @ $100.
-    #   SPY held 4800 -> 48% vs 50% = -2% drift -> INSIDE band (would be left alone per-holding)
-    #   BND held 1000 -> 10% vs 50% = -40% drift -> BREACHES the band
-    # Because BND breaches, the account rebalances and SPY ALSO moves (-50) -- this is the
+    # 50/50 SPY/BND, investable 985,000 -> target 4925 each @ $100.
+    #   SPY held 4800 -> trade |4925-4800|*100/1M = 1.25% of NetLiq -> INSIDE band per-holding
+    #   BND held 1000 -> trade |4925-1000|*100/1M = 39.25% of NetLiq -> BREACHES the band
+    # Because BND breaches, the account rebalances and SPY ALSO moves (+125) -- this is the
     # behavior that distinguishes account-level from per-holding.
     target = make_target({"SPY": 0.5, "BND": 0.5}, {"SPY": 100.0, "BND": 100.0})
     plan = eng.plan_account("DU0099", "Balanced", 1_000_000, {"SPY": 4800, "BND": 1000},
                             target, band_pct=0.03)
     assert plan.needs_rebalance is True
-    assert plan.orders["BND"] == 4750 - 1000     # +3750 BUY (the breach)
-    assert plan.orders["SPY"] == 4750 - 4800     # -50 SELL (in-band sibling moves too)
+    assert plan.orders["BND"] == 4925 - 1000     # +3925 BUY (the breach)
+    assert plan.orders["SPY"] == 4925 - 4800     # +125 BUY (in-band sibling moves too)
 
 
 # --- 4. block aggregation: split sums to block qty -----------------------------
@@ -143,19 +143,19 @@ def test_block_aggregation_sums():
         assert set(b.per_account) == {"DU0006", "DU0007"}
         assert b.side == "BUY"
 
-    # spot-check SPY math: acct6 invest 950,000*0.5=475,000/200=2375 ;
-    #                      acct7 invest 1,900,000*0.5=950,000/200=4750 ; block 7125.
+    # spot-check SPY math: acct6 invest 985,000*0.5=492,500/200=2462 ;
+    #                      acct7 invest 1,970,000*0.5=985,000/200=4925 ; block 7387.
     spy = next(b for b in blocks if b.symbol == "SPY")
-    assert spy.per_account == {"DU0006": 2375, "DU0007": 4750}
-    assert spy.total_qty == 7125
+    assert spy.per_account == {"DU0006": 2462, "DU0007": 4925}
+    assert spy.total_qty == 7387
 
 
 def test_buys_and_sells_are_separate_blocks():
     # acct A must BUY SPY, acct B must SELL SPY (same tier) -> two blocks, never netted.
     target = make_target({"SPY": 1.0}, {"SPY": 100.0})
     inputs = [
-        {"account": "DU0008", "version": "Balanced", "net_liq": 1_000_000, "positions": {}},        # BUY 9500
-        {"account": "DU0009", "version": "Balanced", "net_liq": 1_000_000, "positions": {"SPY": 20000}},  # SELL down to 9500
+        {"account": "DU0008", "version": "Balanced", "net_liq": 1_000_000, "positions": {}},        # BUY 9850
+        {"account": "DU0009", "version": "Balanced", "net_liq": 1_000_000, "positions": {"SPY": 20000}},  # SELL down to 9850
     ]
     plans = eng.plan_accounts(inputs, {"Balanced": target}, band_pct=0.03)
     blocks = eng.aggregate_blocks(plans)
@@ -204,9 +204,10 @@ def test_route_single_account_falls_back_to_direct():
 
 def test_in_band_account_produces_no_routes():
     # Every account already on target -> no plans needing rebalance -> no blocks, no routes.
+    # target 9850 sh on 985,000 investable; hold exactly that so the account is on model.
     target = make_target({"SPY": 1.0}, {"SPY": 100.0})
     inputs = [
-        {"account": "DU0013", "version": "Balanced", "net_liq": 1_000_000, "positions": {"SPY": 9500}},
+        {"account": "DU0013", "version": "Balanced", "net_liq": 1_000_000, "positions": {"SPY": 9850}},
     ]
     out = eng.build_plan(inputs, {"Balanced": target}, band_pct=0.03)
     assert out["blocks"] == []

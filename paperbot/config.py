@@ -47,9 +47,11 @@ RISK_LIMITS = {
     "max_position_pct_nav": 0.35,
     "max_daily_loss_pct_nav": 0.02,   # KILL SWITCH: halt ALL trading at -2% on the day
     "max_legs_per_order": 1,          # S0 trades single ETFs; >1 leg = malformed for S0
-    "cash_reserve_pct": 0.05,         # keep >= 5% of NAV in cash (no leverage + a buffer);
+    "cash_reserve_pct": 0.015,        # keep >= 1.5% of NAV in cash (no leverage + a buffer);
                                       # positions are sized against NAV*(1-this) so the
-                                      # reserve is respected by construction
+                                      # reserve is respected by construction. Slice 2 of the
+                                      # account-cashflow build re-based this 5%->1.5% so risk
+                                      # positions size ~3.5% of NAV closer to the model.
     # per_trade_max_loss: defined per-strategy later (e.g. condor max loss = wing width).
 }
 

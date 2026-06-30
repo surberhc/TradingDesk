@@ -69,7 +69,7 @@ Confirm ALL of the following before continuing — if any is off, **STOP**:
   `Growth -> tier_growth`. If it raises "FAILING CLOSED" the live group membership doesn't
   match enrollment — fix the groups in the GUI, re-run. Do NOT hand-pick a group name.
 - PER-ACCOUNT TARGET BOOK: each account shows the expected tier holdings, sane TGT_SH, and
-  TGT_$ ≈ investable (≈ $1,045,000 = 1.1M × 0.95 cash-reserve; reserve=0 unless a cashflow
+  TGT_$ ≈ investable (≈ $1,083,500 = 1.1M × 0.985 cash-reserve; reserve=0 unless a cashflow
   is scheduled). From flat, DELTA_SH == TGT_SH and all BUYs.
 - BLOCK ORDERS: Balanced and Growth show one block per symbol with a 2-way split; each
   split line's two numbers sum to the block `x<qty>`. **Conservative shows as DIRECT**

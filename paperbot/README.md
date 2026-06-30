@@ -41,7 +41,7 @@ engine runs the EXACT code the backtester validated.
   trips + **persists** to `C:\TradingDesk-Local\state\paperbot\killswitch.json`, survives restart,
   manual-clear only — verified firing); **cash-reserve / no-leverage**; **per-position cap** (35% on
   risk assets, cash-equivalents exempt — the old 5% would have vetoed the strategy itself); **max
-  legs**; order sanity. Positions are now sized vs **investable = NAV×(1−5%)** so the reserve holds by
+  legs**; order sanity. Positions are now sized vs **investable = NAV×(1−1.5%)** so the reserve holds by
   construction and the book never levers.
 - ✅ `order_router.py` — **OrderRouter**: builds the exact IBKR LIMIT orders, **qualifies contracts**
   (real conIds returned), deterministic `orderRef` per (account, as_of, side, symbol) for

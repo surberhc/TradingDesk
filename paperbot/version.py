@@ -15,10 +15,13 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.6.0"
+VERSION = "0.7.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.7.0", "2026-06-30", "Cash buffer 5%->1.5% via single config knob "
+                            "(cash_reserve_pct=0.015); risk positions now size ~3.5% of "
+                            "NAV closer to model. Order-affecting."),
     ("0.6.0", "2026-06-30", "Consolidated the investable/buffer math into a single leaf "
                             "module investable.py (compute_investable + buffer_pct). The "
                             "5 sites that re-derived (NetLiq-reserve)*(1-cash_reserve) "
