@@ -17,6 +17,7 @@ same rule that keeps the options warehouse out of git). Only this README is trac
 |---|---|
 | `Navigating_Lost_Decades_Final_revised.pdf` | The source paper (23 pp). Gorman, Keel, Randazzo. |
 | `Tactical Options and Income.pdf` | A short derived summary (4 pp) that re-frames the paper toward options/income. |
+| `AsymmetricReturns.pdf` | AllianceBernstein institutional white paper (11 pp). McKoan & Ning, Jul 2011. The cleanest outside statement of the S5 convexity/tail thesis. |
 
 ---
 
@@ -152,6 +153,90 @@ S&P to rise every year.
 
 ---
 
+## 3. Seeking Asymmetric Returns — McKoan & Ning (AllianceBernstein)
+
+**What it is:** An 11-page institutional white paper from AllianceBernstein (J.J. McKoan,
+Director–Absolute Return Investments; Michael Ning, Senior Quantitative Analyst; July 2011),
+written in the wake of the 2008 crisis. It is a manifesto for "asymmetric returns" — and the
+single cleanest external statement of the thesis behind S5.
+
+**Core thesis (2–3 sentences):** The job of investing is the management of *risk*, not the
+chasing of return (Ben Graham). A linear long-only payoff is a coin toss — equal odds of a
+large gain or a large loss — but you can **bend the return profile** so you keep most of the
+upside while capping the downside, i.e. buy **convexity**. The key to sustainable compounding
+is a **dynamic risk-management process that limits the probability of large losses** — because
+fat-tailed crashes do *permanent, non-linear* damage (a 50% loss needs a 100% gain back), and
+**a handful of large losses can wipe out a long string of winning years**. "Winning by not
+losing" — defense wins championships.
+
+**Key mechanisms / ideas:**
+
+- **Convexity is the prize.** A positive-convexity payoff has more upside than downside (in
+  bonds: a convex bond rallies *more* as rates fall and sells off *less* as they rise). The
+  search for convexity at a *reasonable cost* is the whole game; the challenge is that buying
+  it is usually expensive.
+- **Exploit other people's constraints.** Asymmetric opportunities are *event-driven* and come
+  from forced behavior: utility preferences (corporates over-paying to hedge FX), regulatory
+  constraints (insurers *forced* to dump "fallen angels" at the bottom → they then outperform),
+  and liquidity/financing gaps (CDS-vs-cash-bond basis trades). The unconstrained investor
+  takes the other side. Many of these trades are *not directional bets* and have low/negative
+  correlation to the market.
+- **Volatility is the common link.** Vol is priced almost uniformly across asset classes and
+  correlations go to 1 in a crisis — which is *why* you can "macro hedge" one asset's tail with
+  a derivative in another, and why diversification alone fails exactly when you need it.
+- **Insurance is cheap before a crisis, ruinous after.** The cost of insuring a credit
+  portfolio spiked in late 2007, *well before* Lehman. Once everyone is running for the exits,
+  protection is prohibitively expensive — so you must own it *before* the spike, not buy it
+  during. Tail events are essentially unpredictable (Enron taught you nothing about Lehman), so
+  the answer is *standing* protection, not a timing call.
+- **Far-OTM S&P puts are the named tail-hedge instrument.** "We have found that put options on
+  the S&P 500 Index are the most effective and liquid instrument available for dynamically
+  hedging tail risk… buy far out-of-the-money options to reduce the cost of protection." That
+  is S5's tail leg, named explicitly by an outside institution.
+- **The collar finances protection.** In the FX example, an investor *sells a put to finance a
+  long call* (a "collar"), so the premium collected offsets the cost of the hedge — especially
+  attractive when puts are rich relative to calls. That is exactly S5's *income-finances-
+  protection* mechanism, stated generically.
+- **Dynamic risk management = "winning by not losing."** Stop-loss strategies can systematically
+  thin the left tail and make the return distribution more "normal" / options-like. The paper is
+  *honest* that they are not foolproof: in a crash, **a stop-loss can fail to fill if liquidity
+  vanishes** and there are no buyers at the limit price. Counterparty risk on OTC hedges is
+  flagged too (diversify dealers; post collateral).
+
+### How it maps to TradingDesk
+
+This is the **cleanest external statement of the S5 financed-convexity thesis** — it says, in an
+institution's own words, what S5 is trying to do.
+
+- **S5 financed convexity overlay** — Direct, multi-point hit:
+  - *Dial convexity, not direction.* The paper's whole frame is "bend the return profile / buy
+    convexity," and it stresses these are *not directional bets*. That is S5's core distinction
+    (dial CONVEXITY not delta) verbatim from an outside source.
+  - *The instrument is named.* Far-OTM S&P 500 puts as the tail-hedge tool = S5's permanent,
+    uncapped tail leg.
+  - *When to own it.* "Insurance is cheap before a crisis, ruinous after; tail events are
+    unpredictable" is the strategic justification for owning the tail **permanently** rather
+    than trying to time it on — the *when-to-own-it* logic S5 already assumes.
+  - *The collar = income-finances-protection.* Sell-a-put-to-fund-a-call is precisely S5's
+    "calm-day premium selling finances the tail" mechanism.
+- **S0 / regime engine** — "Winning by not losing," stop-losses that thin the left tail, and "a
+  few large losses wipe out years of gains" are the *compounding-preservation* argument that is
+  S0's reason to exist, restated. The honest caveat that **stops can fail to fill in a liquidity
+  vacuum** corroborates our own bias toward *standing exposure control* over reactive stop-outs.
+- **S2 / S3 condors** — Reinforces the existing guardrail: the value of the short-premium leg is
+  to *finance* convexity, not to be the return source. The paper's whole point is that the
+  convexity is the prize, not the harvested premium.
+
+**Honest caveat (scope):** Most of the paper's concrete trade examples — fallen-angel bonds,
+high-yield CDS-vs-cash *basis* trades, FX carry collars, Tier-1 bank debt — are **credit and
+cross-asset arbitrage that sit OUTSIDE our equity-options scope**. They are valuable as
+*illustrations of the convexity principle and of exploiting others' constraints*, not as
+strategies for us to build. The transferable content is the principle (convexity, cheap-
+insurance timing, collar financing, dynamic risk management), not the specific cross-asset
+trades.
+
+---
+
 ## Candidate research leads — UNVETTED, NOT ADOPTED
 
 These are ideas the two documents *suggest*. They are leads to test under our normal
@@ -199,3 +284,22 @@ no-curve-fit discipline (gate hard, alert-only first, out-of-sample, plateau-not
    deep-drawdown-recovery metrics over annual tracking error.
    *Curve-fit risk: LOW (it's an objective-function choice, not a fitted parameter)* — but
    verify it doesn't quietly select for strategies that just sit in cash.
+
+7. **Buy tail protection while it's cheap, before vol spikes (S5).** *(from Asymmetric Returns.)*
+   The paper shows the cost of insurance spikes *before* the crash and is ruinous once everyone
+   is at the exit — an argument for owning S5's tail when calm and avoiding buying it into a
+   vol spike. Lead: let regime context (vol cheap / calm) inform *when the tail is well-priced
+   to roll/add*, never *whether* to be protected at all.
+   *Curve-fit risk: LOW–MEDIUM as pure regime context; **HIGH the moment it becomes a timing
+   rule** ("be unhedged when vol is low").* The paper's own thesis is that tail events are
+   unpredictable, so this must stay a *cost-of-protection* read, not a hedge-on/hedge-off
+   trigger. The permanent tail stays permanent.
+
+8. **Stop-loss tail-thinning as a portfolio overlay.** *(from Asymmetric Returns.)* The paper
+   reports stop-loss strategies systematically thin the left tail and make returns more
+   options-like. Lead: test whether a coarse portfolio-level stop improves deep-drawdown
+   recovery.
+   *Curve-fit risk: HIGH.* Stop thresholds are directly tunable (easy to fit to one crisis), and
+   — as the paper itself concedes — **a stop can fail to fill in a liquidity vacuum**, so a
+   backtest will overstate its protection. Alert-only first; never trust a modeled fill at the
+   stop price in a crash.
