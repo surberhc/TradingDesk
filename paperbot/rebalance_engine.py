@@ -57,6 +57,40 @@ def compute_investable(net_liq: float, reserve: float,
     return _investable.compute_investable(net_liq, reserve, cash_reserve_pct)
 
 
+# --- shared no-trade band test -------------------------------------------------
+# The account-level breach decision is needed in two places that MUST agree byte-for-byte:
+# plan_account (which then emits the deltas) and the propose-only account_monitor (which
+# only emits a REBALANCE verdict). Factored here as ONE function so there is a single
+# definition of "does this account breach the band?" — never a copy that can drift.
+def _trade_weight(ln, net_liq: float, target: strategy_target.Target,
+                  prices: dict | None = None) -> float:
+    """Size of the trade THIS line would require, as a fraction of NetLiq:
+    |target_shares - actual_shares| * price / NetLiq. `prices` (symbol->price) overrides
+    the strategy-data close. A missing/non-positive price or zero NetLiq -> 0.0 (no trade
+    weight contributed)."""
+    price = float((prices or {}).get(ln.symbol,
+                                     target.prices.get(ln.symbol, float("nan"))))
+    if not (price == price and price > 0) or not net_liq:
+        return 0.0
+    return abs(ln.target_shares - int(ln.actual_shares)) * price / net_liq
+
+
+def band_breached(lines, net_liq: float, target: strategy_target.Target,
+                  prices: dict | None = None, band_pct: float | None = None) -> bool:
+    """ACCOUNT-LEVEL, all-or-nothing no-trade band test (the single source of truth).
+
+    Returns True iff the account needs work: some holding's required TRADE SIZE exceeds
+    band_pct of NetLiq, OR a stray UNTRACKED position is held (always cleared regardless
+    of size). The breach test keys on trade size, NOT raw weight-vs-model drift, so the
+    cash-reserve gap (a fully-invested account sits ~reserve% under raw model weight by
+    construction) can never falsely trip it. Pure — reads `lines` only."""
+    if band_pct is None:
+        band_pct = config.REBALANCE_BAND_PCT
+    return (any(ln.status == "UNTRACKED" for ln in lines)
+            or any(_trade_weight(ln, net_liq, target, prices) > band_pct
+                   for ln in lines))
+
+
 # --- 2. per-account target shares, deltas, band suppression --------------------
 def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target,
@@ -102,16 +136,9 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     # model weight by construction, so keying off raw drift (as reconcile's status does)
     # would falsely flag a correctly-invested account and, for any holding >~60% weight,
     # defeat the band entirely. A stray UNTRACKED position always breaches (it must be
-    # cleared regardless of size).
-    def _trade_weight(ln) -> float:
-        price = float((prices or {}).get(ln.symbol,
-                                         target.prices.get(ln.symbol, float("nan"))))
-        if not (price == price and price > 0) or not net_liq:
-            return 0.0
-        return abs(ln.target_shares - int(ln.actual_shares)) * price / net_liq
-
-    breached = (any(ln.status == "UNTRACKED" for ln in lines)
-                or any(_trade_weight(ln) > band_pct for ln in lines))
+    # cleared regardless of size). The breach decision lives in band_breached() above so
+    # the propose-only account_monitor uses the EXACT same test (no copy-paste).
+    breached = band_breached(lines, net_liq, target, prices=prices, band_pct=band_pct)
 
     orders: dict = {}
     if breached:
