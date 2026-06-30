@@ -39,30 +39,22 @@ from dataclasses import dataclass, field
 
 import cashflows
 import config
+import investable as _investable
 import reconcile
 import strategy_target
 from recon_report import AccountPlan, BlockOrder
 
 
 # --- 1. reserve carve-out ------------------------------------------------------
+# The reserve carve-out math now lives in the shared leaf module `investable` (Slice 1
+# of the account-cashflow consolidation). This thin wrapper is kept so existing imports
+# and tests (rebalance_engine.compute_investable) keep working unchanged — it is a pure
+# re-export, behavior-identical to the previous inline body.
 def compute_investable(net_liq: float, reserve: float,
                        cash_reserve_pct: float | None = None) -> float:
-    """Capital the engine is allowed to deploy for one account.
-
-    Two carve-outs, applied in this order (memory: ibkr-model-portfolio-api-limit):
-      * the distribution RESERVE is removed FIRST — cash earmarked for an upcoming
-        client distribution is never invested in the first place (no buy-today/
-        sell-tomorrow churn);
-      * the standing cash_reserve_pct buffer is then held back on what remains.
-
-    investable = (net_liq - reserve) * (1 - cash_reserve_pct)
-
-    Never returns a negative (a reserve larger than NetLiq -> 0 investable, not a
-    negative target that would manufacture phantom sells)."""
-    if cash_reserve_pct is None:
-        cash_reserve_pct = config.RISK_LIMITS["cash_reserve_pct"]
-    investable = (net_liq - reserve) * (1.0 - cash_reserve_pct)
-    return max(investable, 0.0)
+    """Capital the engine may deploy for one account. See investable.compute_investable
+    for the canonical logic; this is a thin pass-through re-export."""
+    return _investable.compute_investable(net_liq, reserve, cash_reserve_pct)
 
 
 # --- 2. per-account target shares, deltas, band suppression --------------------

@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import accounts
 import cashflows
 import config
+import investable as _investable
 import reconcile
 import strategy_target
 import version
@@ -70,7 +71,7 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target) -> AccountPlan:
     """Reconcile one account against its tier model, reserving its distribution cash."""
     reserve = cashflows.reserve_for(account, net_liq)
-    investable = (net_liq - reserve) * (1.0 - config.RISK_LIMITS["cash_reserve_pct"])
+    investable = _investable.compute_investable(net_liq, reserve)
     lines = reconcile.reconcile(target, net_liq, positions,
                                 tolerance_w=config.REBALANCE_BAND_PCT,
                                 investable=investable)

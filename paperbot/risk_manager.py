@@ -29,6 +29,7 @@ import os
 from dataclasses import dataclass, field
 
 import config
+import investable as _investable
 from strategies import config as strat_config
 
 # Cash-equivalents are EXEMPT from the per-position risk cap (holding them de-risks).
@@ -156,7 +157,11 @@ def evaluate(nav, daily_pnl, positions, orders, target, limits=None) -> RiskRepo
                                for sym, sh in resulting.items() if sym in CASH_EQUIVALENTS)
         uninvested = nav - (risk_value + cash_equiv_value)
         liquid_reserve_pct = (uninvested + cash_equiv_value) / nav
-        reserve = limits["cash_reserve_pct"]
+        # Threshold source is the shared buffer accessor; an explicit caller-supplied
+        # `limits` override still wins (preserves the existing override seam). When
+        # `limits` is the default config, limits["cash_reserve_pct"] == buffer_pct() — so
+        # this is behavior-identical to the previous limits["cash_reserve_pct"].
+        reserve = limits.get("cash_reserve_pct", _investable.buffer_pct())
         if liquid_reserve_pct < reserve - 1e-9:
             batch_reasons.append(
                 f"liquid reserve {liquid_reserve_pct * 100:.1f}% < required {reserve * 100:.0f}% "

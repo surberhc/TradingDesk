@@ -20,6 +20,7 @@ import sys
 from dataclasses import dataclass
 
 import config
+import investable as _investable
 import strategy_target
 from connections import clientids, ibkr
 
@@ -45,7 +46,9 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
     The multi-account engine passes (NAV - distribution_reserve)*(1-cash_reserve) so a
     client's upcoming distribution is carved out before any buy is sized."""
     if investable is None:
-        investable = nav * (1.0 - config.RISK_LIMITS["cash_reserve_pct"])
+        # Shared formula (investable module) with no distribution reserve carved out —
+        # behavior-identical to the previous inline nav*(1-cash_reserve_pct).
+        investable = _investable.compute_investable(nav, 0.0)
     lines: list[Line] = []
     for sym in sorted(set(target.weights.index) | set(positions)):
         weight = float(target.weights.get(sym, 0.0))

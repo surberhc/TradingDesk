@@ -29,6 +29,7 @@ import sys
 from dataclasses import dataclass
 
 import config
+import investable as _investable
 import ledger
 import live_quotes
 import order_router
@@ -104,7 +105,9 @@ def compute_intended_orders(nav: float, positions: dict, target: strategy_target
     Sizing + limit prices use LIVE quotes when available (read-only market data) and
     fall back to the strategy-data close per symbol if a quote is missing.
     """
-    investable = nav * (1.0 - config.RISK_LIMITS["cash_reserve_pct"])
+    # Shared formula (investable module), no distribution reserve carved out here —
+    # behavior-identical to the previous inline nav*(1-cash_reserve_pct).
+    investable = _investable.compute_investable(nav, 0.0)
     orders: list[IntendedOrder] = []
     symbols = set(target.weights.index) | set(positions)
     for sym in sorted(symbols):

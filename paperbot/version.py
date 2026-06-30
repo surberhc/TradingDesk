@@ -15,10 +15,21 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.5.0"
+VERSION = "0.6.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.6.0", "2026-06-30", "Consolidated the investable/buffer math into a single leaf "
+                            "module investable.py (compute_investable + buffer_pct). The "
+                            "5 sites that re-derived (NetLiq-reserve)*(1-cash_reserve) "
+                            "inline — rebalance_engine, reconcile, recon_report, "
+                            "execution_engine, and the risk_manager reserve threshold — "
+                            "now share that one function (rebalance_engine.compute_investable "
+                            "kept as a thin re-export). Buffer stays 0.05; proven "
+                            "behavior-identical (full paperbot suite green, +8 "
+                            "characterization tests pinning the math at 0.05). Slice 1 of "
+                            "the account-cashflow build: consolidation only, NO behavior "
+                            "change."),
     ("0.5.0", "2026-06-27", "Pure offline multi-account block REBALANCE ENGINE "
                             "(rebalance_engine.py): per-account reserve carve-out + "
                             "explicit integer target shares + per-holding no-trade band; "
