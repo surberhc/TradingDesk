@@ -53,11 +53,15 @@ Systematic closed-trade ledger **with** entry/exit prices, %, hold time, and P&L
   `ibkr-first-data-sourcing`.
 
 ## Open threads
-- Hard **-7% stop counterfactual** (2023–2026) — DONE; see `research/stop_analysis_report.md`.
-  Headline: over the full history a −7% hard stop would have made **less** money (−$37.5k vs
-  discretion), driven entirely by 2025 (stop would have cut huge winners); a −8% stop is
-  roughly break-even (+$8.6k). 3 windows (ERJ, SQ→XYZ, PSTG) uncovered on the Tiingo key and
-  excluded — ERJ 2024 is a flagged caveat.
+- **Stop-loss counterfactual** (2023–2026) — DONE; see `research/stop_analysis_report.md`.
+  Headline: a −7% hard stop would have made **less** money (−$36.8k vs discretion), driven
+  entirely by 2025 (stop cut huge winners); −8% is ~break-even (+$8.7k). Trailing/vol-aware
+  variants tested too (V1 breakeven+trail, V2 50-day-SMA trail, V3 2×/2.5×ATR): **no policy
+  helps in all four periods** — every one is sunk by the 2025 melt-up. V2 (50-day SMA, most
+  O'Neil-faithful) softens 2025 most but gives back crisis-year protection → different risk
+  profile, not a strict win. Stop CHOICE is regime-dependent noise on this sample. Price paths
+  RAW Tiingo; pre-entry SMA50/ATR20 pulled from the IBKR paper gateway (116/120). ERJ, PSTG
+  uncoverable on both sources (excluded); ERJ-2024 flip is probable-but-unconfirmable.
 - Potential **rule-based base/pivot detector**, validated against the advisor's own labeled
   watch-list picks.
 - **Fundamentals-vendor cost estimates** — scope strictly to fundamentals +
@@ -74,8 +78,11 @@ Systematic closed-trade ledger **with** entry/exit prices, %, hold time, and P&L
 ### research/ contents
 - `canslim_oneil_spec.md` — the O'Neil / CAN SLIM rule spec.
 - `ibkr_api_capabilities.md` — IBKR API capabilities/limits for this project.
-- `stop_analysis_report.md` — hard −7% (and −8% sensitivity) stop counterfactual across all
-  120 closed trades, 2023 H2–2026 H1: per-year and overall dollar effect of enforcing the
-  stop, rescue vs. bleeder lists, exclusions.
-- `stop_analysis_trades.csv` — per-trade detail behind the report (entry, breach, hard-stop
+- `stop_analysis_report.md` — stop-loss counterfactual across all 120 closed trades,
+  2023 H2–2026 H1. JOB 1: fixed −7%/−8% hard stop (per-year + overall dollar effect, rescue
+  vs. bleeder lists). JOB 2: trailing/vol-aware variants (V1 breakeven+trail, V2 50-day-SMA
+  trail, V3 2×/2.5×ATR) with a robustness/curve-fit verdict.
+- `stop_analysis_trades.csv` — per-trade detail behind JOB 1 (entry, breach, hard-stop
   return, delta_$, classification) for all 120 trades.
+- `trailing_trades.csv` — per-trade detail behind JOB 2: each policy's return, whether/when
+  it stopped, and the price/indicator data source, for all 120 trades.

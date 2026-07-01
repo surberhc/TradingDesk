@@ -134,3 +134,75 @@ These 3 windows could not be price-pathed, so their trades are dropped from the 
 - **RAW (unadjusted) prices** used to match his fills; dividends/splits during a hold could shift a breach flag slightly. Split-suspect trades are excluded and listed above.
 - **Intraday path assumption:** breach is detected on daily LOW; the exact fill within a breaching day is approximated (open if gapped through the stop, else the stop price). Real slippage on a gap could be worse.
 - Stop is anchored to HIS entry price (Cost/sh), not to a Tiingo reference, per the brief.
+
+---
+
+# Trailing / volatility-aware stop test (JOB 2)
+
+Same per-trade counterfactual as the fixed-stop test above: stop anchored to HIS entry, no redeployment, his entry timing held constant, RAW OHLC, breach on daily LOW with gap-through fill at the open. If a policy never stops, the trade keeps his actual exit.
+
+**Two-series method.** The breach/exit price path uses the same RAW Tiingo daily OHLC as JOB 1 (so fixed -7%/-8%/V1 stay identical to the committed baseline). The 50-day SMA and ATR(20) that V2/V3 need require ~50-90 days of PRE-ENTRY history the JOB-1 windows didn't have; that history was pulled from the **IBKR paper gateway** (read-only, wide daily TRADES bars). IBKR bars are split-ADJUSTED, so they are rescaled into the raw price frame by the entry-day ratio before computing indicators — correct for non-split holds; split-during-hold names are the already-excluded split-flagged trades.
+
+**Policies (small, principled set — deliberately NOT parameter-hunted):**
+- **Fixed -7% / -8%** — constant stop at entry×0.93 / ×0.92 (the JOB-1 baselines).
+- **V1 — breakeven + 20% trail:** -7% initial; once the trade trades +20% intraday, stop ratchets to breakeven, then trails 20% below the running high-water mark (stop only moves up).
+- **V2 — 50-day SMA (most O'Neil-faithful):** -7% initial; once a daily CLOSE is above a *rising* 50-day SMA, switch to "sell on a decisive close below the 50-day" (close < 0.98×SMA50), a proxy for his 10-week-line break rule.
+- **V3 — 2×ATR(20):** initial stop = entry − 2×ATR(20 at entry), with a breakeven ratchet at +20%. **V3b** = 2.5×ATR variant.
+
+## Net realized P/L by policy (dollars; higher = better)
+
+_"Actual" = his realized P/L on the same trades each policy could price. Excludes the 2 no-coverage names (ERJ, PSTG) and the split-flagged NVDA, so it differs from the JOB-1 headline by exactly those; every policy column is apples-to-apples against it._
+
+| Year | Actual (his exits) | Fixed -7% | Fixed -8% | V1 BE+20% trail | V2 50-SMA | V3 2xATR | V3b 2.5xATR |
+|---|---|---|---|---|---|---|---|
+| 2023 H2 | $-54,617 | $-43,582 | $-46,099 | $-43,582 | $-54,416 | $-53,291 | $-55,792 |
+| 2024 | $44,826 | $48,346 | $43,495 | $73,562 | $44,287 | $18,962 | $2,819 |
+| 2025 | $150,394 | $30,448 | $89,367 | $34,495 | $101,416 | $34,861 | $46,979 |
+| 2026 H1 | $-108,375 | $-39,803 | $-45,835 | $-40,435 | $-63,315 | $-69,018 | $-82,882 |
+| **ALL** | **$32,229** | **$-4,591** | **$40,928** | **$24,040** | **$27,972** | **$-68,485** | **$-88,875** |
+
+## Delta vs his actual exits (+ = policy makes MORE money than he did)
+
+| Year | Fixed -7% | Fixed -8% | V1 BE+20% trail | V2 50-SMA | V3 2xATR | V3b 2.5xATR |
+|---|---|---|---|---|---|---|
+| 2023 H2 | $11,035 | $8,517 | $11,035 | $201 | $1,325 | $-1,175 |
+| 2024 | $3,520 | $-1,331 | $28,735 | $-539 | $-25,864 | $-42,007 |
+| 2025 | $-119,946 | $-61,027 | $-115,899 | $-48,978 | $-115,533 | $-103,415 |
+| 2026 H1 | $68,571 | $62,540 | $67,940 | $45,060 | $39,357 | $25,493 |
+| **ALL** | **$-36,820** | **$8,699** | **$-8,189** | **$-4,257** | **$-100,714** | **$-121,104** |
+
+## Robustness — does any policy help (or at least not hurt) in ALL FOUR periods?
+
+| Policy | 2023 H2 | 2024 | 2025 | 2026 H1 | Overall | Helps in all 4? | Worst single year |
+|---|---|---|---|---|---|---|---|
+| Fixed -7% | $11,035 | $3,520 | $-119,946 | $68,571 | $-36,820 | no | $-119,946 (2025) |
+| Fixed -8% | $8,517 | $-1,331 | $-61,027 | $62,540 | $8,699 | no | $-61,027 (2025) |
+| V1 BE+20% trail | $11,035 | $28,735 | $-115,899 | $67,940 | $-8,189 | no | $-115,899 (2025) |
+| V2 50-SMA | $201 | $-539 | $-48,978 | $45,060 | $-4,257 | no | $-48,978 (2025) |
+| V3 2xATR | $1,325 | $-25,864 | $-115,533 | $39,357 | $-100,714 | no | $-115,533 (2025) |
+| V3b 2.5xATR | $-1,175 | $-42,007 | $-103,415 | $25,493 | $-121,104 | no | $-103,415 (2025) |
+
+## Plain-English verdict
+
+- **No policy helps in all four periods.** Every one is dragged negative by 2025.
+- 2025 is the graveyard for every stop: −7% −$119,946, V1 −$115,899, V3 −$115,533. Only **V2 (50-day-SMA trail)** materially softens 2025 (delta $-48,978) because it lets a winner ride as long as it holds its rising 50-day line, instead of stopping on the first −7% intraday dip — which is exactly what OKLO/RKLB/MSTR did before running.
+- But V2's edge is regime-dependent, not free: it gives back most of the loss-cutting benefit that helped 2023 & 2026 (V2 2023 $201, 2026 $45,060 vs fixed −7% $11,035 / $68,571), because a decisive-close-below-50-SMA exit is slower than a hard −7% and rides losers a bit further down first.
+- **Bottom line:** there is no stop policy here that is a durable, all-weather improvement over his discretion. The 50-day-SMA trail (V2) is the most defensible and the most O'Neil-faithful — it's the only one that doesn't get slaughtered by the 2025 melt-up — but it trades away part of the crisis-year protection, so it's a *different* risk profile, not a strict win. A wider ATR stop (V3) is worse than the fixed % almost everywhere. The honest read: stop CHOICE is regime-dependent noise on this sample; the only structural signal is that his single worst habit — riding a loser far past any stop — is what the bleeder list already quantified, and ANY disciplined exit (his own 10-week-line rule included) fixes THAT without needing a clever trail.
+
+## Curve-fit / fragility flags
+
+- **The fixed-stop verdict flips on the exact threshold:** -7% overall = $-36,820 (HURTS) but -8% = $8,699 (~break-even). A one-point change in a single knob flips the sign — that is textbook fragility, not an edge.
+- **V3 vs V3b (ATR multiple):** 2×ATR overall = $-100,714, 2.5×ATR = $-121,104. Similar sign — less knife-edge than the fixed %.
+- All policies are dominated by a handful of 2025 mega-winners (OKLO/RKLB/MSTR); any policy's 2025 number is really a bet on whether those specific trades get trailed out early. Small-sample, regime-specific — treat 2025 as one observation, not many.
+
+## ERJ-2024 resolution (does 2024's verdict flip?)
+
+ERJ (Embraer ADR, 2024, entry $28.90, held May–Dec 2024, +21% / +$14,994 on a $71.5k position) is **not priceable on either IBKR or Tiingo** on this account (IBKR returns no US security definition; Tiingo returns null history), so its intraday path CANNOT be observed and the −7% breach cannot be confirmed directly.
+- **Bound:** 2024's fixed −7% delta is +$3,520 *excluding* ERJ. If ERJ had breached −7% intraday during its 7-month hold and been stopped, that winner (+21%) would become a −7% exit — a swing of about (−0.07 − 0.21) × $71,510 ≈ **−$20,000** on that trade alone, which would drag 2024 to roughly **−$16,500 and FLIP 2024 from "stop helps" to "stop hurts."**
+- **Likelihood:** over a 7-month hold an ADR almost certainly traded 7% below entry at some point, so the flip is **probable but unconfirmable**. Treat 2024's small positive fixed-stop delta (+$3,520) as fragile — it likely does not survive ERJ. This *strengthens* the overall conclusion that the fixed stop is not a durable winner.
+
+## JOB-2 data sources
+
+- **Price path (breach/return):** RAW Tiingo daily OHLC, identical to JOB 1 (fixed −7%/−8%/V1 reproduce the committed baseline; only SQ, newly covered via IBKR→XYZ, is added).
+- **Indicators (SMA50 / ATR20):** **116 of 120 from the IBKR paper gateway** (wide daily bars, ~90+ pre-entry days), 1 from wide Tiingo, 0 short-only.
+- **No price coverage on either source (excluded, same as JOB 1):** [('ERJ', 2024), ('PSTG', 2025)] — ERJ and PSTG.

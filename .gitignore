@@ -24,6 +24,7 @@ backtester/output/
 *.parquet
 *.csv
 !canslim/research/stop_analysis_trades.csv
+!canslim/research/trailing_trades.csv
 *.xlsx
 *.xls
 *.zip
