@@ -78,6 +78,7 @@ QUOTE_DIR = ROOT_1M / "quote"
 OHLC_DIR = ROOT_1M / "ohlc"
 PROGRESS = config.DATA_ROOT / "spxw_1m_progress.json"
 LOG = config.DATA_ROOT / "spxw_1m.log"
+KNOWN_EMPTY = config.DATA_ROOT / "spxw_1m_known_empty.json"
 
 SYMBOL = "SPXW"
 INTERVAL = "1m"
@@ -183,6 +184,23 @@ def trading_days_newest_first(start: dt.date, end: dt.date) -> list[dt.date]:
             days.append(d)
         d -= dt.timedelta(days=1)
     return days
+
+
+def load_known_empty() -> set[str]:
+    """YYYYMMDD days known to have NO data (verified NYSE full-day closures).
+
+    Persisted by the warehouse audit (spxw_1m_known_empty.json). These days never
+    return data, so re-probing them writes no file — which the supervisor's
+    file-count watchdog reads as a stall and kills the pass on, so the collector
+    could never reach its clean 'done' exit. Excluding them lets a full pass find
+    nothing pending and exit 0. A missing/corrupt file -> empty set (old behavior).
+    Only known closures are listed, never a real trading day, so this can never
+    mask a genuine data hole.
+    """
+    try:
+        return set(json.loads(KNOWN_EMPTY.read_text()).get("days", []))
+    except Exception:
+        return set()
 
 
 # --------------------------------------------------------------------------- #
@@ -474,10 +492,21 @@ def main() -> int:
     OHLC_DIR.mkdir(parents=True, exist_ok=True)
 
     all_days = trading_days_newest_first(start, end)
+    # Exclude (a) verified NYSE full-day closures (persisted; they hold no data, so
+    # re-probing them only churns and never advances the counter) and (b) today +
+    # any future day (the terminal rejects current-day expiration=* with HTTP 400,
+    # so the session is not collectable until it is in the past). This makes the
+    # backfill's target set the real, collectable trading calendar, so a completed
+    # pass shows 100% and the supervisor can exit cleanly instead of stall-looping.
+    known_empty = load_known_empty()
+    today = dt.date.today()
+    excluded = [d for d in all_days if daystr(d) in known_empty or d >= today]
+    all_days = [d for d in all_days if daystr(d) not in known_empty and d < today]
     days_total = len(all_days)
     already = sum(1 for d in all_days if day_done(d))
     log(f"=== collector start === window {start}..{end} | "
-        f"{days_total} weekday-days | {already} already done | "
+        f"{days_total} trading-days (excluded {len(excluded)}: "
+        f"{len(known_empty)} holidays + today/future) | {already} already done | "
         f"newest-first | max_days={args.max_days or 'none'}")
 
     done_count = already
