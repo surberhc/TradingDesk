@@ -23,6 +23,7 @@ backtester/output/
 *.pdf
 *.parquet
 *.csv
+!canslim/research/stop_analysis_trades.csv
 *.xlsx
 *.xls
 *.zip

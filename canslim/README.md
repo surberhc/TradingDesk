@@ -53,7 +53,11 @@ Systematic closed-trade ledger **with** entry/exit prices, %, hold time, and P&L
   `ibkr-first-data-sourcing`.
 
 ## Open threads
-- Hard **-7% stop counterfactual** (2023–2026) — in progress.
+- Hard **-7% stop counterfactual** (2023–2026) — DONE; see `research/stop_analysis_report.md`.
+  Headline: over the full history a −7% hard stop would have made **less** money (−$37.5k vs
+  discretion), driven entirely by 2025 (stop would have cut huge winners); a −8% stop is
+  roughly break-even (+$8.6k). 3 windows (ERJ, SQ→XYZ, PSTG) uncovered on the Tiingo key and
+  excluded — ERJ 2024 is a flagged caveat.
 - Potential **rule-based base/pivot detector**, validated against the advisor's own labeled
   watch-list picks.
 - **Fundamentals-vendor cost estimates** — scope strictly to fundamentals +
@@ -70,5 +74,8 @@ Systematic closed-trade ledger **with** entry/exit prices, %, hold time, and P&L
 ### research/ contents
 - `canslim_oneil_spec.md` — the O'Neil / CAN SLIM rule spec.
 - `ibkr_api_capabilities.md` — IBKR API capabilities/limits for this project.
-- `stop_analysis_report.md` — *(pending; not yet generated)*
-- `stop_analysis_trades.csv` — *(pending; not yet generated)*
+- `stop_analysis_report.md` — hard −7% (and −8% sensitivity) stop counterfactual across all
+  120 closed trades, 2023 H2–2026 H1: per-year and overall dollar effect of enforcing the
+  stop, rescue vs. bleeder lists, exclusions.
+- `stop_analysis_trades.csv` — per-trade detail behind the report (entry, breach, hard-stop
+  return, delta_$, classification) for all 120 trades.
