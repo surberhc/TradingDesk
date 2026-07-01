@@ -6,6 +6,13 @@
 > Desk runs on its own: collector + ThetaData **terminal-watchdog (NEW, live)** + dashboard survive session close. **Collector ~59%, ETA 2026-06-30 ~18:19 CT** — gates S5 harvest + S2/S3.
 > **Regime config still UNTOUCHED.** `sharp_recovery` refinement TESTED 2026-06-29 → SHELVED (clean negative; GFC fails −118bp filter-independently). Re-entry stays MAX_LAG=6. 2008 GFC audit CLOSED.
 
+### 2026-07-01 — reliability hardening (reboot-survivability)
+- **SPXW 1-min collector reboot-death ROOT-CAUSED + FIXED.** It sat dead ~15.5h after a Windows reboot (Jun 30 14:40) — its task had only a single daily 06:00 trigger, so nothing relaunched it. Fix: StartWhenAvailable + battery guards off on 6 tasks; BootTrigger + 30-min Repetition on the continuous collector.
+- **All 8 desk scheduled tasks now REBOOT-SURVIVABLE.** Daily one-shots get StartWhenAvailable only (no BootTrigger — would misfire each reboot); the two continuous jobs get BootTrigger + Repetition.
+- **NEW task HeartbeatStalenessAlarm** — runs every 15 min, boot-hardened, run-whether-logged-on; emails an alert if a monitored collector's heartbeat goes cold >15 min while the job isn't complete. Closes the "unnoticed death" failure mode.
+- **Liveness rubric added to memory** (`liveness-rubric`). GOTCHA logged: verify task triggers from `Export-ScheduledTask` XML, NOT CIM trigger objects (false negatives). Modifying Password-principal tasks needs elevated shell + password re-supplied via `Register-ScheduledTask -Xml`.
+- **Collector healthy** — ~92% done, finishing this afternoon.
+
 ### 2026-06-30 SESSION CLOSE — shipped
 - **Cashflow layer built end-to-end** (paperbot v0.6.0→v0.12.0, Slices 1-3/5/6a/6b): execution-side CASH bucket (backtester untouched), propose-only monitor brain (`account_monitor.py`), deposit detection, withdrawal earmark fence + sale-raised nudge, live read-only shell (`account_monitor_run.py`).
 - **Gateway lock interlock** (`gateway_lock.py`, single-process mutex) wiring monitor↔rebalance; **account monitor SCHEDULED** daily 16:30 CT (AccountMonitorDaily, clientId 40, read-only/propose-only, lock-guarded).
