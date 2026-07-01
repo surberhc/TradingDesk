@@ -31,6 +31,7 @@ CLIENT_IDS = {
     "paperbot_rebalance_exec": 38,  # paperbot: multi-account rebalance EXECUTOR (transmit-capable; connects readonly=False, pinned to a DU sub, writes ContractsOrShares via replaceFA, places blocks armed) — own id so it never collides with the engine on 30 or the read-only runner on 37
     "paperbot_arm_verify": 39,      # paperbot: arm/disarm VERIFICATION probe — connects readonly=False and inspects the gateway's API read-only state via the "Read-Only mode" rejection signal; NEVER transmits (orders it probes with are rejected at the API boundary or never sent). Own id so it never collides with the engine on 30 or the executor on 38
     "paperbot_monitor": 40,         # paperbot: account-cashflow MONITOR shell (account_monitor_run.py) — connects READ-ONLY, reads SettledCashByDate/TotalCashValue + today's fills (reqExecutions), persists per-account baselines, runs the pure decide() and PRINTS propose-only verdicts. Transmits nothing; no whatIfOrder. Own id so it never collides with any other consumer
+    "capabilities_introspect": 41,  # connections: IBKR CAPABILITIES auto-updater (refresh_ibkr_capabilities.py) — connects READ-ONLY, calls reqScannerParameters() to snapshot the live scan-code/filter tag set, diffs against the prior snapshot, and keeps IBKR_CAPABILITIES.md honest. Transmits nothing; monthly schedule. Own id so it never collides with any other consumer
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.

@@ -29,6 +29,10 @@ backtester/output/
 *.png
 *.jpg
 
+# Exception: canslim advisor source spreadsheets are committed on purpose
+# (small static reference data / compliance data trail).
+!canslim/source/*.xlsx
+
 # --- Local tooling / editor ---
 .claude/
 .vscode/
