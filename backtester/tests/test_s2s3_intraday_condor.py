@@ -150,6 +150,30 @@ def test_gate_sits_out_big_gap_days_only():
     assert "90" in txt
 
 
+def test_comparison_emits_placebo_and_refutes_when_gate_no_better_than_random():
+    """On a losing book where the gate sits out RANDOM (not the worst) days, the placebo must
+    fire and the verdict must be REFUTED -- the gate's gain is the fewer-trades artifact, not
+    signal. Build 60 days: the gate sits out days that are NOT systematically the losers, so
+    random sit-out of the same count does at least as well."""
+    rng = np.random.default_rng(3)
+    n = 60
+    pnl = rng.normal(-30, 120, n)          # losing book, no gap->loss relationship
+    big = np.zeros(n, dtype=bool)
+    big[rng.choice(n, size=12, replace=False)] = True   # gate sits out 12 RANDOM days
+    df = pd.DataFrame({
+        "day": [dt.date(2024, 1, 1) + dt.timedelta(days=i) for i in range(n)],
+        "traded": [True] * n,
+        "big_gap": big,
+        "pnl_dollars": pnl,
+        "half": ["train"] * (n // 2) + ["test"] * (n - n // 2),
+        "gamma_regime": ["positive"] * n,
+        "vix_regime": ["contango"] * n,
+    })
+    txt = s23.compare_control_vs_gate(df)
+    assert "PLACEBO" in txt
+    assert "REFUTED" in txt or "REJECTED" in txt   # a random-gap gate cannot be a real edge
+
+
 # --------------------------------------------------------------------------- #
 # PV-band — coverage monotone in k; close_in_em is (close-entry)/EM.
 # --------------------------------------------------------------------------- #

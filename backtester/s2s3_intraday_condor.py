@@ -418,6 +418,25 @@ def _apply_gap_gate(df: pd.DataFrame) -> pd.DataFrame:
 # --------------------------------------------------------------------------- #
 # Measurement studies (DECOMPOSE BEFORE BUILDING) — pure observation, no strategy.
 # --------------------------------------------------------------------------- #
+def _spearman_rho(a: np.ndarray, b: np.ndarray) -> float:
+    """Spearman rank correlation via numpy only (no scipy dependency).
+
+    Spearman rho = Pearson correlation of the rank-transformed variables. Ties get their
+    average rank (pandas.rank default), matching scipy.stats.spearmanr for the point estimate.
+    Returns NaN if fewer than 3 finite pairs or if either ranked series is constant.
+    """
+    a = np.asarray(a, dtype=float)
+    b = np.asarray(b, dtype=float)
+    mask = np.isfinite(a) & np.isfinite(b)
+    if mask.sum() < 3:
+        return float("nan")
+    ra = pd.Series(a[mask]).rank().to_numpy()
+    rb = pd.Series(b[mask]).rank().to_numpy()
+    if ra.std() == 0 or rb.std() == 0:
+        return float("nan")
+    return float(np.corrcoef(ra, rb)[0, 1])
+
+
 def measure_relationships(df: pd.DataFrame) -> str:
     """Report the two S3-agenda relationships the gate is predicated on, BY REGIME.
 
@@ -428,8 +447,6 @@ def measure_relationships(df: pd.DataFrame) -> str:
     S3 spec's own suspicion (gaps precede MUTED days) predicts a WEAK/NEGATIVE (A) -- in which
     case the gate cannot help and we say so.
     """
-    from scipy.stats import spearmanr
-
     lines = ["===== MEASUREMENT (decompose before building) ====="]
     d = df.dropna(subset=["gap_abs_pct", "day_range_pct"]).copy()
 
@@ -437,7 +454,7 @@ def measure_relationships(df: pd.DataFrame) -> str:
         s = sub.dropna(subset=[a, b])
         if len(s) < 30:
             return float("nan"), len(s)
-        rho, _p = spearmanr(s[a], s[b])
+        rho = _spearman_rho(s[a].to_numpy(), s[b].to_numpy())
         return float(rho), len(s)
 
     lines.append("\n(A) open GAP (abs %) -> full-day RANGE (%)")
@@ -530,24 +547,68 @@ def compare_control_vs_gate(df: pd.DataFrame) -> str:
                 ctrl_pnl[(ctrl_pnl["gamma_regime"] == g) & (ctrl_pnl["vix_regime"] == v)],
                 gate_pnl[(gate_pnl["gamma_regime"] == g) & (gate_pnl["vix_regime"] == v)]))
 
-    # Verdict: plateau demand.
     c_all = _stats(ctrl_pnl); g_all = _stats(gate_pnl)
+
+    # --- PLACEBO (the test that actually decides it): on a LOSING book, sitting out ANY
+    # days helps (you remove negative-EV trades). The honest null for a sit-out gate is
+    # therefore RANDOM sit-out of the SAME count of days, NOT the trade-every-day control.
+    # If the gate does not beat random sit-out, its "improvement" is just fewer-trades, not
+    # signal. This is the placebo arm from the strategy-evaluation playbook. ---
+    pnl_all = ctrl_pnl["pnl_dollars"].to_numpy(dtype=float)
+    n_out = int(tr["big_gap"].sum())
+    full_total = float(np.nansum(pnl_all))
+    gate_gain = g_all["total_pnl_$"] - c_all["total_pnl_$"]
+    rng = np.random.default_rng(7)
+    n_draws = 3000
+    rand_gains = np.empty(n_draws)
+    for k in range(n_draws):
+        idx = rng.choice(len(pnl_all), size=min(n_out, len(pnl_all)), replace=False)
+        keep = np.ones(len(pnl_all), dtype=bool)
+        keep[idx] = False
+        rand_gains[k] = float(np.nansum(pnl_all[keep])) - full_total
+    frac_random_beats_gate = float(np.mean(rand_gains >= gate_gain))
+    lines.append("\n  PLACEBO (random sit-out of the SAME day count on this book):")
+    lines.append(f"    gate gain vs trade-all = ${round(gate_gain, 2)} on {n_out} days sat out")
+    lines.append(f"    random sit-out gain: mean ${round(float(rand_gains.mean()), 2)} "
+                 f"sd ${round(float(rand_gains.std()), 2)} "
+                 f"p95 ${round(float(np.percentile(rand_gains, 95)), 2)}  (3000 draws)")
+    lines.append(f"    fraction of RANDOM draws that beat the gate = {round(frac_random_beats_gate, 3)}")
+
+    # --- Sub-bucket plateau check: does the gate help in EVERY day-type bucket? ---
+    bucket_deltas = {}
+    for g in ("positive", "negative"):
+        for v in ("contango", "backwardation"):
+            cc = _stats(ctrl_pnl[(ctrl_pnl["gamma_regime"] == g) & (ctrl_pnl["vix_regime"] == v)])
+            gg = _stats(gate_pnl[(gate_pnl["gamma_regime"] == g) & (gate_pnl["vix_regime"] == v)])
+            bucket_deltas[f"{g[:3]}/{v[:4]}"] = gg["total_pnl_$"] - cc["total_pnl_$"]
+    buckets_all_positive = all(d > 0 for d in bucket_deltas.values())
+
+    # Verdict: plateau demand + placebo gate.
     c_tr = _stats(ctrl_pnl[ctrl_pnl["half"] == "train"]); g_tr = _stats(gate_pnl[gate_pnl["half"] == "train"])
     c_te = _stats(ctrl_pnl[ctrl_pnl["half"] == "test"]); g_te = _stats(gate_pnl[gate_pnl["half"] == "test"])
     better_all = g_all["total_pnl_$"] > c_all["total_pnl_$"]
     better_tr = g_tr["total_pnl_$"] > c_tr["total_pnl_$"]
     better_te = g_te["total_pnl_$"] > c_te["total_pnl_$"]
+    beats_placebo = frac_random_beats_gate < 0.05   # gate must be in the top 5% vs random
     lines.append("\n  VERDICT:")
-    if better_all and better_tr and better_te:
-        lines.append("    Gate raises total P&L in BOTH halves = PLATEAU on the OOS axis. "
-                     "(Still note: raising a NEGATIVE control toward zero is loss-reduction, "
-                     "NOT a profitable strategy -- see the control sign.)")
-    elif better_all:
-        lines.append("    Gate raises total P&L overall but NOT in both halves = PEAK -- "
-                     "not robust; reject per curve-fit caution.")
+    if not beats_placebo:
+        lines.append(f"    REFUTED. The gate does NOT beat random sit-out of the same day count "
+                     f"({round(frac_random_beats_gate * 100)}% of random draws do as well or better). "
+                     f"Its P&L 'improvement' is the trade-fewer-days-on-a-losing-book artifact, not "
+                     f"signal. The morning-gap wait-and-measure gate has no edge over the fixed 0DTE "
+                     f"iron condor.")
+    elif not buckets_all_positive:
+        losers = [k for k, d in bucket_deltas.items() if d <= 0]
+        lines.append(f"    REJECTED as a PEAK. Gate beats random overall but FAILS the sub-bucket "
+                     f"plateau: it does not help in {losers}. A plateau must hold across ALL "
+                     f"day-types.")
+    elif better_all and better_tr and better_te:
+        lines.append("    Gate beats random sit-out AND holds in both halves AND every day-type "
+                     "bucket. (Still note: raising a NEGATIVE control toward zero is loss-reduction, "
+                     "NOT a profitable strategy -- see the control sign. Adoption needs Andrew's "
+                     "blessing and a profitable base, neither of which exists here.)")
     else:
-        lines.append("    Gate does NOT raise total P&L overall -- the morning-gap wait-and-measure "
-                     "gate does not help the fixed 0DTE iron condor. Refuted.")
+        lines.append("    Gate does NOT raise total P&L in both halves -- not robust; reject.")
     lines.append(f"    (control total P&L = ${c_all['total_pnl_$']}; if negative, the underlying "
                  f"fixed 0DTE condor is unprofitable regardless -- consistent with the S6 refutation.)")
     return "\n".join(lines)
