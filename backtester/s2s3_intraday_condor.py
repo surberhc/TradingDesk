@@ -240,14 +240,19 @@ def run_day(d: _dt.date, clf: mx.DayClassifier,
     # in _apply_gap_gate from the sorted history (see run_day docstring).
     rec.open_spot = _spot_at(nbbo, d, OPEN_MINUTE)
 
+    # Full-session recovered-spot path (09:31..16:00). Computed ONCE; the AM window and the
+    # PM window are sliced from it (a subset), so we never recover the same minute twice.
+    # Used only by the MEASUREMENT studies + close fallback, never by the causal gate.
+    full = _spot_series(nbbo, d, OPEN_MINUTE, SETTLEMENT_TIME)
+
     # AM realized vol: stdev of 1-min log returns 09:31..11:00 (annualization-free; a %/min proxy).
-    am = _spot_series(nbbo, d, OPEN_MINUTE, MORNING_END)
+    morning_end_ts = pd.Timestamp(_dt.datetime.combine(d, MORNING_END))
+    am = full[full.index <= morning_end_ts] if len(full) else pd.Series(dtype=float)
     if len(am) >= 10:
         r = np.diff(np.log(am.to_numpy()))
         rec.am_rvol_pct = float(np.std(r, ddof=1) * 100.0)  # %/min stdev
 
-    # Full-session range (realized; used only by the MEASUREMENT studies, never the causal gate).
-    full = _spot_series(nbbo, d, OPEN_MINUTE, SETTLEMENT_TIME)
+    # Full-session range (realized).
     if len(full) >= 10:
         hi, lo = float(full.max()), float(full.min())
         op = rec.open_spot if np.isfinite(rec.open_spot) else float(full.iloc[0])
