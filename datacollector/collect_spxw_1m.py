@@ -444,7 +444,28 @@ def main() -> int:
     ap.add_argument("--max-days", type=int, default=0,
                     help="stop after collecting this many NEW days (0 = no limit; "
                          "for testing)")
+    ap.add_argument("--progress", default=None,
+                    help="override path for the progress/heartbeat JSON; default "
+                         "spxw_1m_progress.json. Use a DISTINCT path when running a "
+                         "2nd (unsupervised) catch-up instance so it can't clobber "
+                         "the primary's status / the staleness alarm.")
+    ap.add_argument("--log", default=None,
+                    help="override path for the append-only log; default spxw_1m.log. "
+                         "Pair with --progress to fully isolate a 2nd instance.")
     args = ap.parse_args()
+
+    # Isolation hooks: a 2nd (unsupervised) instance passes distinct --progress/--log
+    # so it writes its own status + log and cannot corrupt the primary's files (which
+    # the HeartbeatStalenessAlarm reads). Omitting the flags = byte-identical behavior
+    # to the supervised primary. write_progress()/log() reference these MODULE globals,
+    # so reassigning them here (before the loop) redirects all subsequent writes.
+    global PROGRESS, LOG
+    if args.progress:
+        from pathlib import Path
+        PROGRESS = Path(args.progress)
+    if args.log:
+        from pathlib import Path
+        LOG = Path(args.log)
 
     start = (dt.date.fromisoformat(args.start) if args.start else START_DAY)
     end = (dt.date.fromisoformat(args.end) if args.end else dt.date.today())
