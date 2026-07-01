@@ -148,21 +148,38 @@ def classify_day_trades(day: _dt.date) -> pd.DataFrame:
     if bars.empty:
         return _empty_classified()
 
-    # NBBO mid per (contract, minute): reconstruct the forward-filled grid for the
-    # WHOLE day (all expirations), then merge each bar to the mid at its own minute.
-    nbbo = s5.nbbo_grid(day, quote=dd.quote)
-    nbbo = nbbo[["expiration", "strike", "right", "minute", "bid", "ask"]].copy()
-    nbbo["bid"] = pd.to_numeric(nbbo["bid"], errors="coerce")
-    nbbo["ask"] = pd.to_numeric(nbbo["ask"], errors="coerce")
-    valid = (nbbo["ask"] > 0) & (nbbo["bid"] >= 0) & (nbbo["ask"] >= nbbo["bid"])
-    nbbo["mid"] = np.where(valid, (nbbo["bid"] + nbbo["ask"]) / 2.0, np.nan)
-    nbbo["half_spread"] = np.where(valid, (nbbo["ask"] - nbbo["bid"]) / 2.0, np.nan)
+    # NBBO mid at each traded (contract, minute). We only need the prevailing quote
+    # at the ~tens-of-thousands of minutes that actually TRADED, not a dense grid over
+    # every contract-minute in the session. Building the full forward-filled grid via
+    # s5.nbbo_grid materializes millions of rows (~37s/day); instead we merge_asof the
+    # raw store-on-change kept quotes directly onto the traded minutes. merge_asof with
+    # by=contract-key and direction="backward" takes, for each trade minute, the LAST
+    # kept quote at-or-before it -- which is EXACTLY the store-on-change forward-fill
+    # the reader defines (and it never back-fills, so no look-ahead). Identical values,
+    # a fraction of the work.
+    q = dd.quote.copy()
+    q["minute"] = q["timestamp"].dt.floor("min")
+    q["bid"] = pd.to_numeric(q["bid"], errors="coerce")
+    q["ask"] = pd.to_numeric(q["ask"], errors="coerce")
+    # Collapse any multiple kept rows inside one floored minute to the last (freshest),
+    # ordering by the true timestamp first so "last" is genuinely the most recent quote
+    # in that minute -- exactly the reader's drop_duplicates(minute, keep="last").
+    # merge_asof requires BOTH frames sorted by the `on` key (minute) globally.
+    q = (q.sort_values("timestamp")
+           .drop_duplicates(subset=["expiration", "strike", "right", "minute"], keep="last")
+           .sort_values("minute", kind="stable")
+           .reset_index(drop=True))
+    q = q[["expiration", "strike", "right", "minute", "bid", "ask"]]
 
-    # s5 nbbo_grid stores `right` as CALL/PUT (from the intraday feed). Bars too.
-    m = bars.merge(
-        nbbo[["expiration", "strike", "right", "minute", "mid", "half_spread"]],
-        on=["expiration", "strike", "right", "minute"], how="left",
+    bars_sorted = bars.sort_values("minute").reset_index(drop=True)
+    m = pd.merge_asof(
+        bars_sorted, q,
+        on="minute", by=["expiration", "strike", "right"],
+        direction="backward",
     )
+    valid = (m["ask"] > 0) & (m["bid"] >= 0) & (m["ask"] >= m["bid"])
+    m["mid"] = np.where(valid, (m["bid"] + m["ask"]) / 2.0, np.nan)
+    m["half_spread"] = np.where(valid, (m["ask"] - m["bid"]) / 2.0, np.nan)
 
     # --- Quote rule ---------------------------------------------------------
     # A print is "at the mid" when |price - mid| <= _MID_EPS_FRAC * half_spread.
