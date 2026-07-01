@@ -314,8 +314,9 @@ def _verdict(traded, calm, all_h, calm_h, h1, h2, yl) -> list:
                  "covering it needs a larger overlay (see break-even multiple), which raises "
                  "the short-gamma load -- weigh against Design Rule A (net convexity long).")
     L.append("")
+    calm_str = f"{calm_mean:+.2f}" if (len(calm) and np.isfinite(calm_mean)) else "n/a (no calm days in sample)"
     L.append(f"- Mean net $/sell-day: ALL {all_mean:+.2f} | CALM(VIX<=15) "
-             f"{calm_mean:+.2f} | half1 {h1_mean:+.2f} | half2 {h2_mean:+.2f}.")
+             f"{calm_str} | half1 {h1_mean:+.2f} | half2 {h2_mean:+.2f}.")
     L.append(f"- Plateau: net harvest sign consistent across halves = "
              f"{'YES' if (h1_mean>0)==(h2_mean>0) else 'NO (fragile)'}.")
     L.append(f"- Full-cycle: {pos_years}/{tot_years} calendar years net-positive.")
