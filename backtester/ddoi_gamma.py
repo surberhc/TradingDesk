@@ -132,8 +132,19 @@ def classify_day_trades(day: _dt.date) -> pd.DataFrame:
           price on the SAME contract (uptick=buy, downtick=sell; flat -> carry last).
     """
     dd = s5.load_day(day)
-    ohlc = dd.ohlc
-    if ohlc.empty:
+    return _classify_bars_quotes(dd.ohlc, dd.quote)
+
+
+def _classify_bars_quotes(ohlc: pd.DataFrame, quote: pd.DataFrame) -> pd.DataFrame:
+    """Pure Lee-Ready classifier over one day's raw OHLC trade bars + kept NBBO quotes.
+
+    Split out from `classify_day_trades` so the classification logic is unit-testable
+    with synthetic in-memory frames (no warehouse). Same schema the s5 reader returns:
+    `ohlc` has columns [expiration, strike, right, timestamp, close, volume, vwap]; and
+    `quote` has [expiration, strike, right, timestamp, bid, ask]. Both timestamps are
+    tz-naive datetimes. Returns the tidy classified frame documented above.
+    """
+    if ohlc is None or ohlc.empty:
         return _empty_classified()
 
     # Bars: one row per (contract, minute) that traded. Price = VWAP (the true
@@ -157,7 +168,7 @@ def classify_day_trades(day: _dt.date) -> pd.DataFrame:
     # kept quote at-or-before it -- which is EXACTLY the store-on-change forward-fill
     # the reader defines (and it never back-fills, so no look-ahead). Identical values,
     # a fraction of the work.
-    q = dd.quote.copy()
+    q = quote.copy()
     q["minute"] = q["timestamp"].dt.floor("min")
     q["bid"] = pd.to_numeric(q["bid"], errors="coerce")
     q["ask"] = pd.to_numeric(q["ask"], errors="coerce")
