@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import threading
 from pathlib import Path
 
 import mailer
@@ -221,13 +222,23 @@ def build_tiingo():
                 "No Tiingo status or manifest found", [])
 
 
+def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Cheap 'is something listening?' TCP probe — milliseconds, no asyncio, no
+    trading session. The EOD digest must NEVER open a live ib_async connection just
+    to print gateway up/down: under the non-interactive scheduled-task context that
+    full asyncio round-trip crashed the whole process before the email sent (silent
+    for 5 nights, 2026-06-27..07-01). A port-open check is a safe proxy for 'up'."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def build_system():
     rows = []
-    try:
-        from connections import ibkr as gw
-        up = gw.gateway_running()
-    except Exception:
-        up = False
+    up = _port_open("127.0.0.1", 4002)
     rows.append(("IB Gateway (paper 4002)", "UP" if up else "DOWN"))
     try:
         _t, _u, free = shutil.disk_usage("C:\\")
@@ -375,8 +386,10 @@ SECTIONS = [build_forward, build_thetadata, build_tiingo, build_gex, build_syste
 def _overall(sections):
     worst = "ok"
     for s in sections:
-        if SEVERITY.index(s["status"]) > SEVERITY.index(worst):
-            worst = s["status"]
+        st = s.get("status", "fail")
+        idx = SEVERITY.index(st) if st in SEVERITY else len(SEVERITY) - 1
+        if idx > SEVERITY.index(worst):
+            worst = st if st in SEVERITY else "fail"
     return worst
 
 
@@ -415,23 +428,70 @@ def render_html(sections, overall):
         f'Automated end-of-day digest · TradingDesk\\dailyreport\\eod_report.py</div></div>')
 
 
+def _run_section(build, timeout: float = 30.0):
+    """Run one section builder with a hard timeout so no single builder (a slow file
+    read, a wedged probe) can stall or crash the whole report. Returns a section dict;
+    never raises. A builder that overruns is abandoned (daemon thread) and rendered as
+    a 'fail: timed out' section so the email still goes out."""
+    result: dict = {}
+
+    def worker():
+        try:
+            result["sec"] = build()
+        except Exception as e:
+            result["err"] = f"{type(e).__name__}: {e}"
+
+    t = threading.Thread(target=worker, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return _sec(build.__name__, build.__name__, "fail",
+                    f"section timed out after {int(timeout)}s (skipped so the report could send)", [])
+    if "sec" in result:
+        return result["sec"]
+    return _sec(build.__name__, build.__name__, "fail",
+                f"section error: {result.get('err', 'unknown')}", [])
+
+
 def main() -> None:
     _log(f"=== EOD report {TODAY_STR} start ===")
-    sections = []
-    for build in SECTIONS:
+    try:
+        sections = [_run_section(build) for build in SECTIONS]
+        overall = _overall(sections)
+        html = render_html(sections, overall)
+        subject = f"Trading Desk EOD — {TODAY.strftime('%b %d')} — {overall.upper()}"
+        sent = mailer.send_html(subject, html)
+        _log(f"sections={[s['status'] for s in sections]} overall={overall} "
+             f"emailed={'YES' if sent else 'NO'} -> {mailer.recipient()}")
+        status.write("eod_report", "ok" if sent else "fail",
+                     metrics={"overall": overall, "emailed": sent}, day=TODAY_STR)
+    except Exception as e:
+        # Last-resort guard: the generator itself failed. Still send SOMETHING and
+        # record a fail status so the independent watchdog also alarms.
+        import traceback
+        tb = traceback.format_exc()
+        _log(f"FATAL in main(): {type(e).__name__}: {e}\n{tb}")
+        sent = False
         try:
-            sections.append(build())
-        except Exception as e:
-            sections.append(_sec(build.__name__, build.__name__, "fail",
-                                 f"section error: {type(e).__name__}: {e}", []))
-    overall = _overall(sections)
-    html = render_html(sections, overall)
-    subject = f"Trading Desk EOD — {TODAY.strftime('%b %d')} — {overall.upper()}"
-    sent = mailer.send_html(subject, html)
-    _log(f"sections={[s['status'] for s in sections]} overall={overall} "
-         f"emailed={'YES' if sent else 'NO'} -> {mailer.recipient()}")
-    status.write("eod_report", "ok" if sent else "fail",
-                 metrics={"overall": overall, "emailed": sent}, day=TODAY_STR)
+            fb_html = (
+                f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
+                f'max-width:640px;margin:0 auto;color:#111827;">'
+                f'<div style="font-size:16px;font-weight:700;color:#ef4444;">'
+                f'Trading Desk EOD — generator error</div>'
+                f'<div style="font-size:13px;margin-top:8px;">The end-of-day report failed to '
+                f'build. Raw error below.</div>'
+                f'<pre style="font-size:12px;white-space:pre-wrap;background:#f9fafb;'
+                f'border:1px solid #e5e7eb;border-radius:6px;padding:10px;">'
+                f'{type(e).__name__}: {e}\n\n{tb}</pre></div>')
+            sent = mailer.send_html(f"Trading Desk EOD — {TODAY.strftime('%b %d')} — ERROR", fb_html)
+        except Exception as e2:
+            _log(f"FATAL fallback email also failed: {type(e2).__name__}: {e2}")
+        try:
+            status.write("eod_report", "fail",
+                         metrics={"overall": "fail", "emailed": sent,
+                                  "error": f"{type(e).__name__}: {e}"}, day=TODAY_STR)
+        except Exception:
+            pass
     _log(f"=== EOD report {TODAY_STR} done ===")
 
 
