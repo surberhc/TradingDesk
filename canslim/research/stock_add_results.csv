@@ -1,0 +1,9 @@
+section,arm,n,n_added,total_ret,cagr,max_dd,win_rate,median_ret,mean_ret,losing_tail_mean,p10,worst,final_equity,total_add_dollars
+arm,BASELINE,118,0,0.3223,0.0973,-0.0924,0.3136,-0.0607,0.0629,-0.1892,-0.1502,-0.2325,859522,0
+arm,DOUG_MEASURED,115,95,0.4008,0.1185,-0.148,0.287,-0.0496,0.0571,-0.188,-0.1484,-0.2356,910506,2959491
+arm,ONEIL_UPTREND,115,89,0.3766,0.1121,-0.1546,0.2957,-0.0596,0.0568,-0.188,-0.1484,-0.2356,894822,2765787
+arm,ONEIL_HALF,118,93,0.3762,0.112,-0.1413,0.2881,-0.0533,0.0542,-0.1881,-0.1495,-0.235,894560,2400487
+
+cohort,which,n,win_rate,mean_ret,median_ret
+cohort,added,95,0.2842,0.0664,-0.0465
+cohort,single,20,0.3,0.0127,-0.07
