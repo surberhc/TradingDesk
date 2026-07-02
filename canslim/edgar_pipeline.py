@@ -68,6 +68,12 @@ QUARTERLY_CSV = WAREHOUSE / "quarterly_fundamentals.csv"
 UNRESOLVED_CSV = WAREHOUSE / "unresolved_concepts.csv"     # tags we couldn't canonicalize
 COVERAGE_CSV = WAREHOUSE / "phase1_coverage.csv"           # per-ticker resolution status
 
+# --- Phase 2: full-market artifacts (partitioned; keyed by CIK, not watch-list ticker) ---
+PIT_FACTS_FULL_DIR = WAREHOUSE / "pit_facts_full"          # partitioned parquet dataset
+QUARTERLY_FULL_DIR = WAREHOUSE / "quarterly_fundamentals_full"  # partitioned parquet dataset
+FULL_COVERAGE_CSV = WAREHOUSE / "phase2_coverage.csv"      # per-CIK resolution status
+FULL_UNRESOLVED_CSV = WAREHOUSE / "phase2_unresolved_concepts.csv"
+
 # SEC fair-access: descriptive User-Agent (or 403) and <=10 req/sec. companyfacts.zip is a
 # single bulk grab, so we're well under the cap; the header is the binding requirement.
 USER_AGENT = "Surber HC Trading Research andrew@surberhc.com"
@@ -724,6 +730,342 @@ def _demo_asof(facts: pd.DataFrame) -> None:
               f"latest period_end visible = {latest_period}")
 
 
+# ======================================================================================
+# PHASE 2 — FULL US MARKET
+# Same proven parser (canonical mapping, YTD->quarter differencing, as-of layer) applied to
+# ALL ~20k companyfacts JSONs, not just the resolved watch-list CIKs. Output is partitioned
+# by CIK-modulo shard so the parquet stays manageable and re-buildable in chunks.
+# ======================================================================================
+
+# How many output shards to spread the full market across (CIK % N).
+FULL_SHARDS = 20
+
+
+def _shard_of(cik: int) -> int:
+    return cik % FULL_SHARDS
+
+
+def _cik_from_zipname(name: str) -> int | None:
+    # 'CIK0000320193.json' -> 320193
+    if not (name.startswith("CIK") and name.endswith(".json")):
+        return None
+    try:
+        return int(name[3:-5])
+    except ValueError:
+        return None
+
+
+def build_full() -> None:
+    """
+    FULL-MARKET build: iterate EVERY companyfacts JSON in the zip through the unchanged Phase-1
+    parser and write a partitioned point-in-time fact store. Each company's ticker label is its
+    CURRENT primary ticker from the identity index if known, else its bare CIK (fundamentals are
+    keyed by CIK regardless; the ticker is only a convenience label).
+
+    Delisted/renamed names are INCLUDED here automatically: companyfacts.zip contains the facts
+    file for every CIK that ever filed us-gaap XBRL, so a delisted company's fundamentals are
+    parsed whether or not it still has a live ticker. The resolver's job is only to let a backtest
+    look those CIKs up by an OLD ticker — see edgar_resolver.py.
+    """
+    print("BUILD FULL (all companyfacts JSONs)")
+    # Best-effort CIK->ticker label from the fuller identity map (resolver) or the classic map.
+    try:
+        import edgar_resolver as er
+        tmap = er.load_ticker_to_cik()
+    except Exception:
+        tmap = load_ticker_cik_map()
+    cik_to_ticker: dict[int, str] = {}
+    for tk, ck in tmap.items():
+        cik_to_ticker.setdefault(int(ck), tk)  # first ticker wins as the label
+
+    PIT_FACTS_FULL_DIR.mkdir(parents=True, exist_ok=True)
+    # clear any prior shards to avoid stale mixing
+    for p in PIT_FACTS_FULL_DIR.glob("shard=*.parquet"):
+        p.unlink()
+
+    shard_buffers: dict[int, list[dict]] = {s: [] for s in range(FULL_SHARDS)}
+    coverage_rows: list[dict] = []
+    tail_counter: dict[str, int] = {}
+    parsed_ok = 0
+    empty = 0
+    total = 0
+    FLUSH_EVERY = 2000  # companies between shard flushes (bounds memory)
+
+    def _flush():
+        for s, buf in shard_buffers.items():
+            if not buf:
+                continue
+            out = PIT_FACTS_FULL_DIR / f"shard={s}.parquet"
+            df_new = pd.DataFrame(buf)
+            if out.exists():
+                df_new = pd.concat([pd.read_parquet(out), df_new], ignore_index=True)
+            df_new.to_parquet(out, index=False)
+            buf.clear()
+
+    with zipfile.ZipFile(COMPANYFACTS_ZIP) as zf:
+        names = [n for n in zf.namelist() if n.endswith(".json")]
+        for i, name in enumerate(names):
+            cik = _cik_from_zipname(name)
+            if cik is None:
+                continue
+            total += 1
+            ticker = cik_to_ticker.get(cik, f"CIK{cik}")
+            doc = _cik_json_from_zip(zf, cik)
+            if doc is None:
+                continue
+            facts, used_tags = _extract_company_facts(ticker, cik, doc)
+            if not facts:
+                empty += 1
+                coverage_rows.append({"cik": cik, "ticker": ticker,
+                                      "status": "no_canonical_facts",
+                                      "entity": doc.get("entityName", "")})
+            else:
+                parsed_ok += 1
+                coverage_rows.append({"cik": cik, "ticker": ticker, "status": "ok",
+                                      "entity": doc.get("entityName", "")})
+                s = _shard_of(cik)
+                shard_buffers[s].extend(f.__dict__ for f in facts)
+            for tg in used_tags:
+                if (("Revenue" in tg or "Sales" in tg or "IncomeLoss" in tg
+                     or "EarningsPerShare" in tg) and tg not in _ALL_MAPPED_TAGS):
+                    tail_counter[tg] = tail_counter.get(tg, 0) + 1
+            if (i + 1) % FLUSH_EVERY == 0:
+                _flush()
+                print(f"    parsed {i+1}/{len(names)} "
+                      f"(ok={parsed_ok}, empty={empty})...", flush=True)
+        _flush()
+
+    print(f"  companies iterated: {total:,}")
+    print(f"  with >=1 canonical fact: {parsed_ok:,}; empty (foreign/sparse/non-corp): {empty:,}")
+
+    pd.DataFrame(coverage_rows).to_csv(FULL_COVERAGE_CSV, index=False)
+    tail = (pd.DataFrame(sorted(tail_counter.items(), key=lambda kv: -kv[1]),
+                         columns=["unmapped_tag", "num_companies"])
+            if tail_counter else pd.DataFrame(columns=["unmapped_tag", "num_companies"]))
+    tail.to_csv(FULL_UNRESOLVED_CSV, index=False)
+    print(f"  wrote {FULL_COVERAGE_CSV.name} and {FULL_UNRESOLVED_CSV.name}")
+    print(f"  wrote partitioned fact store -> {PIT_FACTS_FULL_DIR} ({FULL_SHARDS} shards)")
+
+
+def _q4_eps_from_annual(orig: pd.DataFrame) -> pd.DataFrame:
+    """
+    Q4-EPS CONVENTION (Phase 2, documented). Filers routinely report only a FULL-YEAR diluted
+    EPS in the 10-K and no discrete Q4 EPS. Phase 1 left Q4 EPS null. We now DERIVE Q4 EPS as
+        Q4_EPS = FY_EPS  -  (Q1_EPS + Q2_EPS + Q3_EPS)
+    ONLY when all three interim discrete-quarter EPS AND the annual EPS are present and as-first-
+    filed. This is a DERIVED, clearly-flagged figure (eps_source='derived_q4'), not synthesized
+    from net income / shares — it uses only as-reported EPS numbers. Where the inputs are missing
+    it stays null (never fabricated). Caveat carried in docs: EPS is not perfectly additive across
+    quarters (diluted share count drifts intra-year), so a derived Q4 EPS can differ slightly from
+    a company's own later-disclosed Q4; we keep it flagged so the backtest can drop it if desired.
+
+    Input `orig` is the as-first-filed frame (one row per ticker/concept/period_end/qtrs).
+    Returns rows: ticker, fy, fq(=4), eps_diluted, filed, eps_source.
+    """
+    eps = orig[orig["concept"] == "eps_diluted"].copy()
+    if eps.empty:
+        return pd.DataFrame(columns=["ticker", "fy", "fq", "eps_diluted", "filed", "eps_source"])
+    # discrete-quarter interim EPS (qtrs==1) mapped to fq by fiscal period
+    interim = eps[(eps["qtrs"] == 1) & eps["fp"].isin(["Q1", "Q2", "Q3"])].copy()
+    interim["fq"] = interim["fp"].map({"Q1": 1, "Q2": 2, "Q3": 3})
+    # full-year EPS: annual duration (qtrs==4) reported on the FY period
+    annual = eps[(eps["qtrs"] == 4)].copy()
+    if interim.empty or annual.empty:
+        return pd.DataFrame(columns=["ticker", "fy", "fq", "eps_diluted", "filed", "eps_source"])
+    # sum interim per (ticker, fy) — require all three present
+    piv = interim.pivot_table(index=["ticker", "fy"], columns="fq", values="value",
+                              aggfunc="first")
+    have_all3 = piv.dropna(subset=[c for c in (1, 2, 3) if c in piv.columns], how="any")
+    have_all3 = have_all3[[c for c in (1, 2, 3) if c in have_all3.columns]]
+    if have_all3.shape[1] < 3:
+        return pd.DataFrame(columns=["ticker", "fy", "fq", "eps_diluted", "filed", "eps_source"])
+    interim_sum = have_all3.sum(axis=1).rename("interim_sum").reset_index()
+    ann = (annual.groupby(["ticker", "fy"])
+           .agg(fy_eps=("value", "first"), filed=("filed", "max"),
+                period_end=("period_end", "first")).reset_index())
+    m = ann.merge(interim_sum, on=["ticker", "fy"], how="inner")
+    m["eps_diluted"] = m["fy_eps"] - m["interim_sum"]
+    m["fq"] = 4
+    m["eps_source"] = "derived_q4"
+    return m[["ticker", "fy", "fq", "eps_diluted", "filed", "eps_source"]]
+
+
+def table_full() -> None:
+    """
+    Build the clean quarterly fundamentals table for the FULL market from the partitioned PIT
+    fact store, shard by shard (bounded memory), applying the same as-first-filed / YTD-diff
+    logic as Phase 1, PLUS the Phase-2 conventions:
+      * Q4 EPS derived from FY - (Q1+Q2+Q3) as-reported EPS (flagged eps_source), else null.
+      * TTM ROE = trailing-4-quarter net income / average of the two bounding equity snapshots,
+        all as-first-filed (documented; not synthesized).
+    Writes a partitioned quarterly dataset mirroring the fact-store shards.
+    """
+    print("TABLE FULL")
+    QUARTERLY_FULL_DIR.mkdir(parents=True, exist_ok=True)
+    for p in QUARTERLY_FULL_DIR.glob("shard=*.parquet"):
+        p.unlink()
+
+    shards = sorted(PIT_FACTS_FULL_DIR.glob("shard=*.parquet"))
+    if not shards:
+        print("  no fact-store shards — run build_full first")
+        return
+    total_rows = 0
+    total_tickers = 0
+    for sp in shards:
+        facts = pd.read_parquet(sp)
+        out = _build_quarterly_table(facts)
+        if out.empty:
+            continue
+        dest = QUARTERLY_FULL_DIR / sp.name
+        out.to_parquet(dest, index=False)
+        total_rows += len(out)
+        total_tickers += out["ticker"].nunique()
+        print(f"    {sp.name}: {len(out):,} rows, {out['ticker'].nunique()} tickers", flush=True)
+    print(f"  wrote {QUARTERLY_FULL_DIR} — {total_rows:,} rows across shards")
+
+
+def _build_quarterly_table(facts: pd.DataFrame) -> pd.DataFrame:
+    """
+    Core table builder factored out of table() so both Phase-1 and Phase-2 use ONE code path.
+    Given a raw PIT fact frame, return the clean as-first-filed quarterly table with derived
+    metrics, Q4-EPS convention, and TTM ROE. (Phase-1 table() logic, generalized.)
+    """
+    orig = _as_first_filed(facts)
+    flows = orig[orig["concept"].isin(FLOW_CONCEPTS)].copy()
+    disc = _difference_ytd_to_quarters(flows)
+    if disc.empty:
+        return pd.DataFrame()
+
+    flow_wide = disc.pivot_table(index=["ticker", "fy", "fq", "period_end"],
+                                 columns="concept", values="value",
+                                 aggfunc="first").reset_index()
+    filed_map = disc.groupby(["ticker", "fy", "fq"])["filed"].max().reset_index()
+    flow_wide = flow_wide.merge(filed_map, on=["ticker", "fy", "fq"], how="left")
+
+    # EPS: as-reported discrete-quarter (Q1-Q3), then derived Q4 (flagged).
+    eps = orig[(orig["concept"] == "eps_diluted") & (orig["qtrs"] == 1)].copy()
+    eps_q = eps.rename(columns={"value": "eps_diluted"})[
+        ["ticker", "fy", "fp", "eps_diluted"]]
+    eps_q["fq"] = eps_q["fp"].map({"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4})
+    eps_q = eps_q.dropna(subset=["fq"]); eps_q["fq"] = eps_q["fq"].astype(int)
+    eps_q["eps_source"] = "as_reported"
+    eps_q = eps_q[["ticker", "fy", "fq", "eps_diluted", "eps_source"]]
+    q4 = _q4_eps_from_annual(orig)[["ticker", "fy", "fq", "eps_diluted", "eps_source"]]
+    # only add derived Q4 where no as-reported Q4 EPS exists
+    have_q4 = set(map(tuple, eps_q[eps_q["fq"] == 4][["ticker", "fy"]].values))
+    if not q4.empty:
+        q4 = q4[~q4.apply(lambda r: (r["ticker"], r["fy"]) in have_q4, axis=1)]
+    eps_all = pd.concat([eps_q, q4], ignore_index=True) if not q4.empty else eps_q
+
+    inst = orig[orig["concept"].isin(INSTANT_CONCEPTS) & (orig["qtrs"] == 0)].copy()
+    inst_wide = inst.pivot_table(index=["ticker", "period_end"], columns="concept",
+                                 values="value", aggfunc="first").reset_index()
+
+    tbl = flow_wide.copy()
+    if not eps_all.empty:
+        tbl = tbl.merge(eps_all, on=["ticker", "fy", "fq"], how="left")
+    if not inst_wide.empty:
+        tbl = tbl.merge(inst_wide, on=["ticker", "period_end"], how="left")
+
+    tbl["period_end_ts"] = pd.to_datetime(tbl["period_end"])
+    tbl = tbl.sort_values(["ticker", "period_end_ts"]).reset_index(drop=True)
+
+    def col(name):
+        return tbl[name] if name in tbl.columns else pd.Series([pd.NA] * len(tbl))
+    for c in ("revenue", "net_income", "gross_profit", "operating_income", "equity"):
+        tbl[c] = col(c)
+
+    rev = pd.to_numeric(tbl["revenue"], errors="coerce")
+    tbl["gross_margin"] = pd.to_numeric(tbl["gross_profit"], errors="coerce") / rev
+    tbl["net_margin"] = pd.to_numeric(tbl["net_income"], errors="coerce") / rev
+    tbl["operating_margin"] = pd.to_numeric(tbl["operating_income"], errors="coerce") / rev
+
+    # crude quarterly ROE (kept for continuity/comparison)
+    ni = pd.to_numeric(tbl["net_income"], errors="coerce")
+    eq = pd.to_numeric(tbl["equity"], errors="coerce")
+    tbl["roe_q"] = ni / eq
+
+    # TTM ROE CONVENTION: trailing-4-quarter net income over AVERAGE bounding equity, per ticker,
+    # in period order. Uses only as-first-filed figures. Null until 4 quarters + both equities.
+    tbl["ni_ttm"] = tbl.groupby("ticker")["net_income"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").rolling(4, min_periods=4).sum())
+    eq_num = tbl.groupby("ticker")["equity"].transform(lambda s: pd.to_numeric(s, errors="coerce"))
+    eq_lag4 = tbl.groupby("ticker")["equity"].transform(
+        lambda s: pd.to_numeric(s, errors="coerce").shift(4))
+    tbl["roe_ttm"] = tbl["ni_ttm"] / ((eq_num + eq_lag4) / 2.0)
+    # keep the old name too (now properly TTM-based, not 4x-quarter)
+    tbl["roe_ttm_annualized"] = tbl["roe_ttm"]
+
+    tbl = _add_yoy(tbl, "revenue", "sales_growth_yoy")
+    tbl = _add_yoy(tbl, "eps_diluted", "eps_growth_yoy")
+    tbl["sales_growth_qoq"] = tbl.groupby("ticker")["revenue"].pct_change(fill_method=None)
+
+    cols = ["ticker", "cik", "fy", "fq", "period_end", "filed", "revenue", "net_income",
+            "eps_diluted", "eps_source", "gross_profit", "operating_income", "equity",
+            "gross_margin", "operating_margin", "net_margin", "roe_q", "roe_ttm",
+            "roe_ttm_annualized", "ni_ttm", "sales_growth_yoy", "sales_growth_qoq",
+            "eps_growth_yoy"]
+    # attach cik if present in facts
+    if "cik" in facts.columns:
+        cikmap = facts.groupby("ticker")["cik"].first()
+        tbl["cik"] = tbl["ticker"].map(cikmap)
+    cols = [c for c in cols if c in tbl.columns]
+    return tbl[cols].copy()
+
+
+def validate_full() -> None:
+    """Full-market coverage counts, cross-cap spot-checks, and one concrete restatement proof."""
+    print("VALIDATE FULL")
+    cov = pd.read_csv(FULL_COVERAGE_CSV)
+    n_total = len(cov)
+    n_ok = (cov["status"] == "ok").sum()
+    print(f"\n== FULL-MARKET COVERAGE ==")
+    print(f"  companyfacts JSONs iterated : {n_total:,}")
+    print(f"  produced canonical facts    : {n_ok:,} ({100*n_ok/max(n_total,1):.1f}%)")
+    print(f"  no canonical us-gaap facts  : {n_total-n_ok:,} (foreign/IFRS 20-F, funds, sparse)")
+
+    shards = sorted(QUARTERLY_FULL_DIR.glob("shard=*.parquet"))
+    if shards:
+        nt = 0; nr = 0
+        for sp in shards:
+            q = pd.read_parquet(sp, columns=["ticker"])
+            nt += q["ticker"].nunique(); nr += len(q)
+        print(f"  companies in quarterly table: {nt:,}")
+        print(f"  total quarterly rows        : {nr:,}")
+
+    # spot-checks across caps: read only shards that contain the target CIKs.
+    print(f"\n== SPOT-CHECKS (across large/mid/small cap) ==")
+    for tk in ["AAPL", "MSFT", "AAON", "ADMA", "PLAB"]:
+        row = _find_ticker_full(tk)
+        if row is None or row.empty:
+            print(f"  {tk}: (not found)")
+            continue
+        r = row.sort_values(["fy", "fq"]).tail(4)
+        print(f"\n  {tk} — last 4 discrete quarters:")
+        show = r[["fy", "fq", "period_end", "revenue", "eps_diluted", "eps_source",
+                  "sales_growth_yoy", "roe_ttm"]]
+        with pd.option_context("display.width", 180, "display.max_columns", 20):
+            print(show.to_string(index=False))
+
+    # as-of proof at scale: find a real restatement inside one shard's raw facts.
+    print(f"\n== AS-OF / NO-LOOKAHEAD PROOF (at scale) ==")
+    fshards = sorted(PIT_FACTS_FULL_DIR.glob("shard=*.parquet"))
+    if fshards:
+        for sp in fshards[:3]:
+            facts = pd.read_parquet(sp)
+            _demo_asof(facts)
+            break
+
+
+def _find_ticker_full(ticker: str) -> pd.DataFrame | None:
+    for sp in sorted(QUARTERLY_FULL_DIR.glob("shard=*.parquet")):
+        q = pd.read_parquet(sp)
+        sub = q[q["ticker"] == ticker]
+        if not sub.empty:
+            return sub
+    return None
+
+
 # --------------------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------------------
@@ -738,6 +1080,15 @@ def main() -> None:
         table()
     if stage in ("validate", "all"):
         validate()
+    # Phase 2 — full market (run explicitly; not part of 'all' which is the Phase-1 flow)
+    if stage == "build_full":
+        build_full()
+    if stage == "table_full":
+        table_full()
+    if stage == "validate_full":
+        validate_full()
+    if stage == "full":
+        build_full(); table_full(); validate_full()
 
 
 if __name__ == "__main__":
