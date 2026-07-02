@@ -95,24 +95,6 @@ JOBS: list[dict] = [
         "threshold_s": 15 * 60,
         "task_name": "Spxw1mCollector",
     },
-    {
-        # SPX-ROOT 1-min parallel backfill (spx_1m_parallel.py). Its combined
-        # heartbeat IS the progress.json — the supervisor atomically rewrites it
-        # every ~30s (TICK) via os.replace, so the file's mtime == last heartbeat.
-        # No separate .txt heartbeat and no "COMPLETE" text marker: completion is
-        # detected structurally by _progress_complete (days_done >= days_total),
-        # which this same JSON carries. So pointing both `heartbeat` and
-        # `progress` at spx_1m_parallel_progress.json is correct — freshness comes
-        # from the mtime, completion-suppression from days_done/days_total.
-        "name": "spx_1m_parallel",
-        "label": "SPX-root 1-min parallel backfill",
-        "heartbeat": config.DATA_ROOT / "spx_1m_parallel_progress.json",
-        "progress": config.DATA_ROOT / "spx_1m_parallel_progress.json",
-        # supervisor writes every 30s; a 15-min cold heartbeat means the
-        # supervisor process is dead, not merely mid-tick.
-        "threshold_s": 15 * 60,
-        "task_name": "Spx1mParallel",
-    },
 ]
 
 
