@@ -21,6 +21,7 @@ import datetime as dt
 import json
 import os
 import shutil
+import sys
 import threading
 from pathlib import Path
 
@@ -32,6 +33,7 @@ RAW_OPTIONS = WAREHOUSE / "raw" / "options"
 DERIVED = WAREHOUSE / "derived"
 SUPERVISOR_HB = WAREHOUSE / "supervisor_heartbeat.txt"
 FORWARD_HB = WAREHOUSE / "forward_heartbeat.txt"
+ALARM_RAN_MARKER = WAREHOUSE / "heartbeat_alarm_ran.txt"
 TIINGO_MANIFEST = Path(r"C:\Users\andre\My Drive (andrew@surberhc.com)"
                        r"\TradingDesk\backtester\data\_manifest.json")
 LOG = Path(r"C:\TradingDesk-Local\state\dailyreport\eod_report.log")
@@ -377,7 +379,40 @@ def build_gex():
     return _sec("gex", "Dealer Gamma", st, headline, rows)
 
 
-SECTIONS = [build_forward, build_thetadata, build_tiingo, build_gex, build_system, build_strategy]
+def build_alarm():
+    """Staleness-alarm watchdog (mutual coverage). The heartbeat_alarm task stamps
+    warehouse\\heartbeat_alarm_ran.txt every sweep (~15 min). If that marker is stale
+    (>30 min) or missing, the alarm itself may be dead — turn this section red so the
+    digest the user reads flags it. This is the reciprocal of the alarm's own
+    handle_deadline check on the EOD report."""
+    now = dt.datetime.now()
+    if not ALARM_RAN_MARKER.exists():
+        return _sec("alarm", "Staleness Alarm (watchdog)", "fail",
+                    "Staleness alarm has never run — heartbeat_alarm_ran.txt is missing. "
+                    "The watchdog itself may be dead (task HeartbeatStalenessAlarm).", [])
+    try:
+        mtime = dt.datetime.fromtimestamp(ALARM_RAN_MARKER.stat().st_mtime)
+        age_min = (now - mtime).total_seconds() / 60.0
+        last_line = ALARM_RAN_MARKER.read_text().strip().splitlines()[-1] if \
+            ALARM_RAN_MARKER.read_text().strip() else "(empty)"
+    except Exception as e:
+        return _sec("alarm", "Staleness Alarm (watchdog)", "fail",
+                    f"Could not read the alarm marker: {type(e).__name__}: {e}", [])
+
+    rows = [("Last ran", mtime.strftime("%Y-%m-%d %H:%M:%S")),
+            ("Age", f"{int(age_min)}m"),
+            ("Marker", str(ALARM_RAN_MARKER)),
+            ("Owning task", "HeartbeatStalenessAlarm")]
+    if age_min > 30:
+        return _sec("alarm", "Staleness Alarm (watchdog)", "fail",
+                    f"Staleness alarm has not run in {int(age_min)}m — the watchdog "
+                    f"itself may be dead. Check task HeartbeatStalenessAlarm.", rows)
+    return _sec("alarm", "Staleness Alarm (watchdog)", "ok",
+                f"Alarm is alive — last ran {int(age_min)}m ago ({last_line}).", rows)
+
+
+SECTIONS = [build_forward, build_thetadata, build_tiingo, build_gex, build_system,
+            build_strategy, build_alarm]
 
 
 # --------------------------------------------------------------------------- #
@@ -453,8 +488,11 @@ def _run_section(build, timeout: float = 30.0):
                 f"section error: {result.get('err', 'unknown')}", [])
 
 
-def main() -> None:
+def main() -> bool:
+    """Build + email the EOD digest. Returns whether the email was actually sent
+    (so __main__ can exit non-zero -> Task Scheduler shows the run red)."""
     _log(f"=== EOD report {TODAY_STR} start ===")
+    sent = False
     try:
         sections = [_run_section(build) for build in SECTIONS]
         overall = _overall(sections)
@@ -471,7 +509,7 @@ def main() -> None:
         import traceback
         tb = traceback.format_exc()
         _log(f"FATAL in main(): {type(e).__name__}: {e}\n{tb}")
-        sent = False
+        sent = False   # generator failed; the fallback below re-computes this
         try:
             fb_html = (
                 f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
@@ -492,8 +530,9 @@ def main() -> None:
                                   "error": f"{type(e).__name__}: {e}"}, day=TODAY_STR)
         except Exception:
             pass
-    _log(f"=== EOD report {TODAY_STR} done ===")
+    _log(f"=== EOD report {TODAY_STR} done (emailed={'YES' if sent else 'NO'}) ===")
+    return sent
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(0 if main() else 1)

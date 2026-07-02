@@ -70,6 +70,10 @@ STATE_FILE = config.DATA_ROOT / "heartbeat_alarm_state.json"
 LOG = config.DATA_ROOT / "heartbeat_alarm.log"
 COOLDOWN_SECS = 3 * 3600            # at most one alert per job per 3h while cold
 
+# Proof-of-life marker written at the end of every sweep. The EOD digest reads its
+# mtime (build_alarm) so the report the user reads turns red if the alarm dies.
+RAN_MARKER = config.DATA_ROOT / "heartbeat_alarm_ran.txt"
+
 # --------------------------------------------------------------------------- #
 # Monitored jobs — extensible. Add a collector = append one dict here.
 #   name        : short id (state-file key + log)
@@ -95,48 +99,80 @@ JOBS: list[dict] = [
 
 
 # --------------------------------------------------------------------------- #
-# EOD digest deadline watchdog — distinct from the rolling-freshness JOBS above.
-# The EOD report runs ONCE daily at 21:00 (task EodReport) and writes an
-# 'eod_report' status JSON only when it finishes+sends. If it crashes before
-# sending (as it did silently 2026-06-27..07-01), no fresh status appears and
-# nobody was told. So: after a grace deadline each day, if today's eod_report
-# status is missing or not a confirmed send, alarm. Rides this same 15-min task —
-# no new scheduled task needed.
+# Per-job DEADLINE watchdogs — distinct from the rolling-freshness JOBS above.
+# These jobs each run ONCE daily and write a status JSON (status.py) only when they
+# finish. If one crashes before writing (as the EOD report did silently
+# 2026-06-27..07-01), no fresh status appears and nobody is told. So: after each
+# job's grace deadline, if today's status JSON is missing OR stale (date != today)
+# OR status == "fail", alarm. These all ride this same 15-min task — no new
+# scheduled tasks needed.
+#
+# Each entry:
+#   name          : status-file stem + state-file key + log id
+#   label         : human name used in the alert
+#   status_file   : Path to the status JSON (status.py output)
+#   deadline_hhmm : (H, M) local (CT) time by which the job must have run
+#   task_name     : the Windows scheduled task that owns the job (named in the alert)
 # --------------------------------------------------------------------------- #
-EOD_STATUS = Path(r"C:\TradingDesk-Local\state\dailyreport\status\eod_report.json")
-EOD_DEADLINE_HHMM = (21, 15)   # local (CT) time by which the EOD email must be out
+_STATUS_DIR = Path(r"C:\TradingDesk-Local\state\dailyreport\status")
+
+DEADLINE_JOBS: list[dict] = [
+    {"name": "eod_report", "label": "nightly EOD email",
+     "status_file": _STATUS_DIR / "eod_report.json",
+     "deadline_hhmm": (21, 15), "task_name": "EodReport"},
+    {"name": "forward", "label": "IBKR forward options collector",
+     "status_file": _STATUS_DIR / "forward.json",
+     "deadline_hhmm": (19, 0), "task_name": "ThetaEodDaily"},
+    {"name": "tiingo", "label": "Tiingo daily data refresh",
+     "status_file": _STATUS_DIR / "tiingo.json",
+     "deadline_hhmm": (17, 15), "task_name": "TiingoDailyUpdate"},
+    {"name": "gex", "label": "GEX dealer-gamma build",
+     "status_file": _STATUS_DIR / "gex.json",
+     "deadline_hhmm": (20, 0), "task_name": "GexDailyBuild"},
+    {"name": "account_monitor", "label": "account-cashflow monitor",
+     "status_file": _STATUS_DIR / "account_monitor.json",
+     "deadline_hhmm": (17, 15), "task_name": "AccountMonitorDaily"},
+]
 
 
-def handle_eod(state: dict, now: float, dry_run: bool) -> str:
-    """Assert that today's EOD email actually went out. One-line status string."""
-    name = "eod_report"
+def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
+    """Assert that a once-daily job ran by its deadline. Mirrors the old handle_eod
+    logic, generalized. After the deadline, alarm if the status JSON's date != today
+    OR its status == 'fail' OR it's missing/unreadable. One-line status string.
+    Reuses the same COOLDOWN de-dupe + pre-deadline cooldown reset as handle_job."""
+    name = job["name"]
+    label = job["label"]
+    status_file = Path(job["status_file"])
+    dh, dm = job["deadline_hhmm"]
+    task_name = job["task_name"]
+
     js = state.setdefault(name, {})
     now_dt = dt.datetime.fromtimestamp(now)
-    deadline = now_dt.replace(hour=EOD_DEADLINE_HHMM[0], minute=EOD_DEADLINE_HHMM[1],
-                              second=0, microsecond=0)
+    deadline = now_dt.replace(hour=dh, minute=dm, second=0, microsecond=0)
     today = now_dt.strftime("%Y%m%d")
-    hhmm = f"{EOD_DEADLINE_HHMM[0]:02d}:{EOD_DEADLINE_HHMM[1]:02d}"
+    hhmm = f"{dh:02d}:{dm:02d}"
 
     if now_dt < deadline:
-        # New day / pre-deadline: clear any prior cooldown so tonight re-alarms.
+        # New day / pre-deadline: clear any prior cooldown so today re-alarms.
         js.pop("last_alert_ts", None)
         return f"{name}: pre-deadline ({now_dt:%H:%M} < {hhmm}) — no check"
 
     ok, detail = False, "status file absent/unreadable"
     try:
-        s = json.loads(EOD_STATUS.read_text())
-        emailed = bool(s.get("metrics", {}).get("emailed"))
-        if s.get("date") == today and s.get("status") == "ok" and emailed:
+        s = json.loads(status_file.read_text())
+        st = s.get("status")
+        date_ok = s.get("date") == today
+        if date_ok and st != "fail":
             ok = True
         else:
-            detail = f"date={s.get('date')} status={s.get('status')} emailed={emailed}"
+            detail = f"date={s.get('date')} status={st}"
     except (OSError, ValueError):
         pass
 
     if ok:
         if js.pop("last_alert_ts", None) is not None:
             log(f"{name}: recovered — cleared alert cooldown")
-        return f"{name}: OK (today's EOD email confirmed sent)"
+        return f"{name}: OK (today's {label} confirmed by status file)"
 
     last = js.get("last_alert_ts")
     cool_remaining = (last + COOLDOWN_SECS - now) if last else 0
@@ -144,22 +180,23 @@ def handle_eod(state: dict, now: float, dry_run: bool) -> str:
         return (f"{name}: MISSING ({detail}) — alert SUPPRESSED "
                 f"(cooldown {int(cool_remaining // 60)}m left)")
 
-    subject = "[TradingDesk ALARM] nightly EOD email did NOT send tonight"
+    subject = f"[TradingDesk ALARM] {label} did NOT run today"
     html = (
         f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
         f'max-width:640px;margin:0 auto;color:#111827;">'
         f'<div style="font-size:18px;font-weight:700;color:#ef4444;">'
-        f'&#9679; TradingDesk ALARM — nightly EOD email did not send</div>'
+        f'&#9679; TradingDesk ALARM — {label} did not run</div>'
         f'<div style="font-size:13px;color:#374151;margin:8px 0;">'
-        f'It is past {hhmm} and no confirmed end-of-day digest was recorded for today. '
-        f'The EodReport task may have crashed before sending. Check '
-        f'<b>C:\\TradingDesk-Local\\state\\dailyreport\\eod_report.log</b> and run '
-        f'<b>C:\\TradingDesk-Local\\warehouse\\run_eod.bat</b> manually.</div>'
+        f'It is past {hhmm} and no fresh, healthy status was recorded today for '
+        f'<b>{label}</b>. The <b>{task_name}</b> task may have crashed or not fired. '
+        f'Check its log and run it manually.</div>'
         f'<table style="border-collapse:collapse;font-size:13px;">'
         f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Detail</td>'
         f'<td style="padding:2px 0;color:#111827;">{detail}</td></tr>'
+        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Status file</td>'
+        f'<td style="padding:2px 0;color:#111827;">{status_file}</td></tr>'
         f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Owning task</td>'
-        f'<td style="padding:2px 0;color:#111827;">EodReport</td></tr></table>'
+        f'<td style="padding:2px 0;color:#111827;">{task_name}</td></tr></table>'
         f'<div style="font-size:11px;color:#9ca3af;margin-top:10px;">'
         f'Automated staleness alarm · TradingDesk\\datacollector\\heartbeat_alarm.py</div></div>')
 
@@ -208,6 +245,19 @@ def _save_state(state: dict) -> None:
         os.replace(tmp, STATE_FILE)
     except OSError as e:
         log(f"WARN could not write state file: {e!r}")
+
+
+def _write_ran_marker(now: float) -> None:
+    """Atomically stamp RAN_MARKER with the current time — proof the alarm itself is
+    alive (read by eod_report.build_alarm for mutual watchdog coverage). Never raises."""
+    try:
+        RAN_MARKER.parent.mkdir(parents=True, exist_ok=True)
+        stamp = dt.datetime.fromtimestamp(now).isoformat(timespec="seconds")
+        tmp = RAN_MARKER.with_name(RAN_MARKER.name + ".tmp")
+        tmp.write_text(stamp + "\n")
+        os.replace(tmp, RAN_MARKER)
+    except Exception:
+        pass
 
 
 # --------------------------------------------------------------------------- #
@@ -433,15 +483,21 @@ def main() -> int:
         lines.append(line)
         log(line)
 
-    try:
-        eod_line = handle_eod(state, now, args.dry_run)
-    except Exception as e:  # noqa: BLE001 — one bad check must not kill the sweep
-        eod_line = f"eod_report: CHECK ERROR — {type(e).__name__}: {e}"
-    lines.append(eod_line)
-    log(eod_line)
+    for job in DEADLINE_JOBS:
+        try:
+            line = handle_deadline(job, state, now, args.dry_run)
+        except Exception as e:  # noqa: BLE001 — one bad check must not kill the sweep
+            line = f"{job.get('name', '?')}: CHECK ERROR — {type(e).__name__}: {e}"
+        lines.append(line)
+        log(line)
 
     if not args.dry_run:
         _save_state(state)
+
+    # Mutual-watchdog proof-of-life: record that THIS alarm actually ran, so the EOD
+    # digest (which the user reads) can turn red if the alarm itself dies. Atomic
+    # write, wrapped so it can never raise / slow the sweep.
+    _write_ran_marker(now)
 
     # One consolidated status line every run (in addition to per-job lines).
     log("sweep done: " + " | ".join(lines))

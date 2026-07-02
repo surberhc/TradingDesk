@@ -23,13 +23,80 @@ full build_symbol() for that one symbol. Full-rebuild behavior is unchanged.
 
 from __future__ import annotations
 
+import datetime as dt
 import sys
+from pathlib import Path
 
 import pandas as pd
 
 import config
 import storage
 from features import gex
+
+# --------------------------------------------------------------------------- #
+# Python-side log — run_gex.bat runs windowless (pythonw, no stdout capture), so
+# a small self-contained log keeps gex failures debuggable. Mirrors the _log()
+# helper in dailyreport/eod_report.py. Fully exception-wrapped; never raises.
+# --------------------------------------------------------------------------- #
+_GEX_LOG = Path(r"C:\TradingDesk-Local\warehouse\gex.log")
+
+
+def _log(msg: str) -> None:
+    try:
+        line = f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}"
+        _GEX_LOG.parent.mkdir(parents=True, exist_ok=True)
+        with open(_GEX_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except Exception:
+        pass
+
+# --------------------------------------------------------------------------- #
+# Status artifact — same import trick heartbeat_alarm uses for the mailer: put
+# the sibling dailyreport package dir on sys.path and import its `status` module.
+# Every status.write here is wrapped so it can NEVER break the GEX build.
+# --------------------------------------------------------------------------- #
+_DAILYREPORT_DIR = config.CODE_ROOT.parent / "dailyreport"
+if str(_DAILYREPORT_DIR) not in sys.path:
+    sys.path.insert(0, str(_DAILYREPORT_DIR))
+try:
+    import status as _status
+except Exception:  # never let a missing import break the build
+    _status = None
+
+
+def _write_gex_status(st: str, metrics: dict | None = None, message: str = "") -> None:
+    """Write the 'gex' status JSON so the EOD digest + heartbeat_alarm can see it.
+    Never raises into the caller."""
+    if _status is None:
+        return
+    try:
+        import datetime as _dt
+        _status.write("gex", st, metrics=metrics or {}, message=message,
+                      day=_dt.datetime.now().strftime("%Y%m%d"))
+    except Exception:
+        pass
+
+
+def _gex_table_summary() -> dict:
+    """Newest date + row count across the report symbols' derived tables, for the
+    status metrics. Best-effort; returns {} on any trouble."""
+    newest = None
+    rows = 0
+    try:
+        for sym in REPORT_SYMBOLS:
+            p = config.DERIVED / f"{sym}_gex_daily.parquet"
+            if not p.exists():
+                continue
+            df = pd.read_parquet(p, columns=["date"])
+            if df.empty:
+                continue
+            rows += len(df)
+            d = str(df["date"].astype(str).max())
+            if newest is None or d > newest:
+                newest = d
+    except Exception:
+        pass
+    return {"newest_date": newest, "rows": rows}
 
 # Symbols the EOD report's Dealer Gamma section actually reads (SPX->SPXW->SPY),
 # plus QQQ. The nightly incremental defaults to these so the report is always fresh.
@@ -129,6 +196,21 @@ def main_incremental(roots: list[str]) -> None:
 if __name__ == "__main__":
     args = [a.upper() for a in sys.argv[1:]]
     if args and args[0] == "--LATEST":
-        main_incremental(args[1:])
+        # The nightly incremental path (run by run_gex.bat). Write a 'gex' status
+        # artifact so the EOD digest + per-job alarm can see whether it ran/failed.
+        _log("incremental build start")
+        try:
+            main_incremental(args[1:])
+            summary = _gex_table_summary()
+            _write_gex_status("ok", metrics=summary,
+                              message=f"incremental build ok "
+                                      f"(newest {summary.get('newest_date')}, "
+                                      f"{summary.get('rows')} rows)")
+            _log(f"incremental build done "
+                 f"(newest {summary.get('newest_date')}, {summary.get('rows')} rows)")
+        except Exception as e:
+            _write_gex_status("fail", message=f"{type(e).__name__}: {e}")
+            _log(f"incremental build FAILED: {type(e).__name__}: {e}")
+            raise
     else:
         main(args)

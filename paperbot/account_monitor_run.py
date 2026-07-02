@@ -52,6 +52,30 @@ import version
 from connections import clientids, ibkr
 from gateway_lock import GatewayBusySkip, gateway_lock
 
+# --- daily status artifact (read by the EOD digest + heartbeat_alarm) ----------
+# Same import trick heartbeat_alarm uses for the mailer: put the sibling dailyreport
+# package dir on sys.path and import its `status` module. Every write is wrapped so
+# it can NEVER break this read-only monitor cycle.
+_DAILYREPORT_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "dailyreport")
+if _DAILYREPORT_DIR not in sys.path:
+    sys.path.insert(0, _DAILYREPORT_DIR)
+try:
+    import status as _status
+except Exception:
+    _status = None
+
+
+def _write_monitor_status(st: str, metrics: dict | None = None, message: str = "") -> None:
+    """Write the 'account_monitor' status JSON. Never raises into the caller."""
+    if _status is None:
+        return
+    try:
+        _status.write("account_monitor", st, metrics=metrics or {}, message=message,
+                      day=date.today().strftime("%Y%m%d"))
+    except Exception:
+        pass
+
 # --- STATE_DIR artifacts (off Drive, same dir/pattern as ledger.py) ------------
 BASELINES_JSON = os.path.join(config.STATE_DIR, "monitor_baselines.json")
 EARMARKS_JSON = os.path.join(config.STATE_DIR, "monitor_earmarks.json")
@@ -457,7 +481,26 @@ def simulate() -> int:
     return 0
 
 
+def _run_with_status() -> int:
+    """Run the daily cycle and write an 'account_monitor' status artifact on BOTH the
+    success and failure paths (rc==0 -> ok, else fail; an exception -> fail). The status
+    write is best-effort and never changes the return code / never raises."""
+    try:
+        rc = main()
+    except Exception as e:
+        _write_monitor_status("fail", metrics={"rc": None},
+                              message=f"cycle raised {type(e).__name__}: {e}")
+        raise
+    if rc == 0:
+        _write_monitor_status("ok", metrics={"rc": rc},
+                              message="read-only monitor cycle completed (or cleanly skipped)")
+    else:
+        _write_monitor_status("fail", metrics={"rc": rc},
+                              message=f"monitor cycle returned non-zero rc={rc}")
+    return rc
+
+
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "--simulate":
         sys.exit(simulate())
-    sys.exit(main())
+    sys.exit(_run_with_status())
