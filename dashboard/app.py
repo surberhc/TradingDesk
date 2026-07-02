@@ -6,8 +6,10 @@ whole desk by reusing the existing Python directly. It NEVER places, arms, or
 transmits an order, never writes to the warehouse/config, never calls replaceFA.
 
 Four sections (tabs):
-  1. Health      — SPXW 1-min collector progress, EOD warehouse coverage, the
-                   status JSONs (forward/tiingo/gex/eod_report), Windows task states.
+  1. Health      — EDGAR fundamentals freshness/coverage (periodic refresh), EOD
+                   warehouse coverage, the status JSONs (forward/tiingo/gex/
+                   eod_report), Windows task states. (The SPXW 1-min one-time-grab
+                   panel is retired — backfill complete 2026-07.)
   2. Gamma (GEX) — latest SPX/SPXW/SPY dealer-gamma snapshot + a history chart.
   3. Backtests   — latest CAGR/maxDD/Calmar/Sortino/down-capture for the 3 versions
                    (computed via the validated run_backtest, cached) + links to the
@@ -52,13 +54,19 @@ if str(_conn) not in sys.path:
 # --- Local data locations (off-Drive, on C:) -----------------------------------
 WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse")
 DERIVED = WAREHOUSE / "derived"
-PROGRESS_JSON = WAREHOUSE / "spxw_1m_progress.json"
+PROGRESS_JSON = WAREHOUSE / "spxw_1m_progress.json"  # retired panel (backfill done 2026-07); kept for reversibility
 STATUS_DIR = Path(r"C:\TradingDesk-Local\state\dailyreport\status")
 BACKTEST_OUTPUT = REPO / "backtester" / "output"
 
+# EDGAR point-in-time fundamentals warehouse (off-Drive, on C:). A PERIODIC
+# (monthly-ish) refresh — monitored here as freshness/coverage, not a daily feed.
+EDGAR = Path(r"C:\TradingDesk-Local\canslim\edgar")
+EDGAR_FUNDAMENTALS = EDGAR / "quarterly_fundamentals.parquet"
+EDGAR_STALE_DAYS = 45   # periodic-refresh threshold
+
 # Windows scheduled tasks that drive the desk (name -> friendly label).
+# (Spxw1mCollector retired — the SPXW 1-min one-time backfill is complete 2026-07.)
 SCHEDULED_TASKS = {
-    "Spxw1mCollector": "SPXW 1-min collector",
     "ThetaEodDaily": "EOD options (ThetaData)",
     "ThetaForwardDaily": "Forward EOD grab",
     "TiingoDailyUpdate": "Tiingo equity EOD",
@@ -229,6 +237,88 @@ def eod_coverage() -> tuple[pd.DataFrame, dict]:
     return df, summary
 
 
+@st.cache_data(ttl=120)
+def edgar_coverage() -> dict:
+    """EDGAR point-in-time fundamentals freshness/coverage, read straight from the
+    warehouse dir (no import of edgar_pipeline). Returns a summary dict; degrades
+    gracefully to an 'info: build landing' state when the table isn't there yet.
+
+    tier: good (fresh) / warn (stale or in-progress) / unknown (not landed yet)."""
+    if not EDGAR.exists():
+        return {"tier": "unknown", "state": "build landing",
+                "companies": None, "size_gb": 0.0, "n_files": 0,
+                "table_present": False, "last_refresh": "—", "age_days": None,
+                "newest_file": "—", "headline": "EDGAR warehouse dir not present yet."}
+
+    # Directory-wide size + newest mtime (the freshness heartbeat).
+    size = 0
+    newest_mtime = 0.0
+    newest_name = None
+    n_files = 0
+    for f in EDGAR.rglob("*"):
+        if not f.is_file():
+            continue
+        try:
+            stt = f.stat()
+        except OSError:
+            continue
+        n_files += 1
+        size += stt.st_size
+        if stt.st_mtime > newest_mtime:
+            newest_mtime = stt.st_mtime
+            newest_name = f.name
+
+    now = datetime.now()
+    recent_activity = bool(newest_mtime) and (now.timestamp() - newest_mtime) < 15 * 60
+
+    companies = None
+    table_mtime = None
+    table_present = EDGAR_FUNDAMENTALS.exists()
+    if table_present:
+        try:
+            table_mtime = datetime.fromtimestamp(EDGAR_FUNDAMENTALS.stat().st_mtime)
+        except OSError:
+            table_mtime = None
+        try:
+            cols = pd.read_parquet(EDGAR_FUNDAMENTALS).columns
+            key = next((c for c in ("ticker", "cik", "symbol") if c in cols), None)
+            if key is not None:
+                companies = int(pd.read_parquet(
+                    EDGAR_FUNDAMENTALS, columns=[key])[key].nunique())
+        except Exception:
+            companies = None
+
+    refresh_dt = table_mtime or (datetime.fromtimestamp(newest_mtime)
+                                 if newest_mtime else None)
+    age_days = (now - refresh_dt).days if refresh_dt else None
+
+    if recent_activity:
+        tier, state = "warn", "refresh in progress"
+        headline = (f"Build/refresh in progress — newest file {newest_name} "
+                    "updated in the last 15 min. Table not final.")
+    elif not table_present:
+        tier, state = "unknown", "build landing"
+        headline = "Fundamentals table not written yet."
+    elif age_days is not None and age_days > EDGAR_STALE_DAYS:
+        tier, state = "warn", "stale"
+        headline = (f"Stale — last refresh {age_days}d ago "
+                    f"(> {EDGAR_STALE_DAYS}d periodic threshold). Time to re-pull EDGAR.")
+    else:
+        tier, state = "good", "fresh"
+        headline = (f"Fresh — {companies:,} companies, last refresh {age_days}d ago."
+                    if companies is not None else f"Fresh — last refresh {age_days}d ago.")
+
+    return {
+        "tier": tier, "state": state, "companies": companies,
+        "size_gb": size / 1e9, "n_files": n_files, "table_present": table_present,
+        "last_refresh": refresh_dt.strftime("%Y-%m-%d %H:%M") if refresh_dt else "—",
+        "age_days": age_days,
+        "newest_file": f"{newest_name} @ {datetime.fromtimestamp(newest_mtime):%Y-%m-%d %H:%M}"
+                       if newest_name else "—",
+        "headline": headline,
+    }
+
+
 def _parse_ts(s: str | None) -> datetime | None:
     if not s:
         return None
@@ -246,11 +336,13 @@ def last_refreshed() -> str:
     """Newest of every available data timestamp: collector `updated`, the status
     JSON `ts` values, latest GEX `date`, and the newest backtest report mtime."""
     cands: list[datetime] = []
-    prog = load_json(str(PROGRESS_JSON))
-    if prog:
-        d = _parse_ts(prog.get("updated"))
+    try:
+        ec = edgar_coverage()
+        d = _parse_ts(ec.get("last_refresh"))
         if d:
             cands.append(d)
+    except Exception:
+        pass
     for name in ("forward", "tiingo", "gex", "eod_report"):
         js = load_json(str(STATUS_DIR / f"{name}.json"))
         if js:
@@ -293,10 +385,10 @@ def desk_status() -> dict:
     if not any_status:
         worst = "unknown"
 
-    prog = load_json(str(PROGRESS_JSON)) or {}
-    done = prog.get("days_done", 0)
-    total = prog.get("days_total", 0) or 1
-    pct = prog.get("pct", round(100 * done / total, 2))
+    try:
+        ec = edgar_coverage()
+    except Exception:
+        ec = {"tier": "unknown", "state": "—", "companies": None, "age_days": None}
 
     try:
         _, summ = eod_coverage()
@@ -310,7 +402,8 @@ def desk_status() -> dict:
 
     return {
         "overall_tier": worst, "overall_name": worst_name,
-        "collector_pct": pct, "collector_eta": prog.get("eta", "—"),
+        "edgar_tier": ec.get("tier", "unknown"), "edgar_state": ec.get("state", "—"),
+        "edgar_companies": ec.get("companies"), "edgar_age_days": ec.get("age_days"),
         "latest_day": latest_day,
         "tasks_not_ready": not_ready, "tasks_total": n_tasks,
     }
@@ -330,8 +423,13 @@ def render_health() -> None:
         if tier in ("warn", "bad") and s["overall_name"] != "—":
             st.caption(f"worst: {s['overall_name']}")
     with cols[1]:
-        st.metric("Collector", f"{s['collector_pct']:.1f}%", border=True)
-        st.caption(str(s["collector_eta"]))
+        et = s["edgar_tier"]
+        companies = s.get("edgar_companies")
+        val = f"{companies:,}" if companies is not None else "—"
+        st.metric("EDGAR companies", f"{_TIER_DOT[et]} {val}", border=True)
+        age = s.get("edgar_age_days")
+        st.caption(f"{s['edgar_state']}"
+                   + (f" · {age}d old" if age is not None else ""))
     with cols[2]:
         st.metric("Latest warehouse day", s["latest_day"], border=True)
     with cols[3]:
@@ -346,26 +444,27 @@ def render_health() -> None:
 
     st.divider()
 
-    # --- SPXW 1-min collector progress ---
-    prog = load_json(str(PROGRESS_JSON))
-    st.markdown("#### SPXW 1-minute collector")
-    if not prog:
-        st.warning("Collector progress file not found.")
-    else:
-        done = prog.get("days_done", 0)
-        total = prog.get("days_total", 0) or 1
-        pct = prog.get("pct", round(100 * done / total, 2))
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Days done", f"{done} / {total}")
-        c2.metric("Percent", f"{pct:.1f}%")
-        c3.metric("On disk", f"{prog.get('gb_on_disk_so_far', 0):.2f} GB")
-        c4.metric("Errors", prog.get("errors_count", 0))
-        st.progress(min(max(pct / 100.0, 0.0), 1.0))
-        st.caption(
-            f"Updated {_fmt_dt(prog.get('updated'))} · current day "
-            f"{prog.get('current_day','—')} · ETA: {prog.get('eta','—')}")
-        if prog.get("errors_count"):
-            st.caption(f"Last error: {prog.get('last_error','')}")
+    # --- EDGAR fundamentals freshness / coverage ---
+    # (The SPXW 1-min one-time-grab panel is retired: backfill complete 2026-07.)
+    # EDGAR is a PERIODIC (monthly-ish) refresh — shown as freshness/coverage, not a
+    # nightly download. Handles a partially-built (mid-refresh) warehouse gracefully.
+    ec = edgar_coverage()
+    st.markdown("#### EDGAR fundamentals (point-in-time)")
+    et = ec["tier"]
+    st.markdown(
+        f"{_TIER_DOT[et]} **{_color_text(ec['state'], et)}** — {ec['headline']}",
+        unsafe_allow_html=True)
+    c1, c2, c3, c4 = st.columns(4)
+    comp = ec["companies"]
+    c1.metric("Companies", f"{comp:,}" if comp is not None else "—")
+    c2.metric("Warehouse size", f"{ec['size_gb']:.2f} GB")
+    age = ec["age_days"]
+    c3.metric("Refresh age", f"{age}d" if age is not None else "—")
+    c4.metric("Files", f"{ec['n_files']:,}")
+    st.caption(
+        f"Last refresh {ec['last_refresh']} · "
+        f"table {'present' if ec['table_present'] else 'not built yet'} · "
+        f"newest file: {ec['newest_file']}")
 
     st.divider()
 

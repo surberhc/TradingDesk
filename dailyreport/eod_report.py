@@ -8,9 +8,11 @@ like the supervisor heartbeat and the Tiingo manifest) and renders a section per
 job. A job that crashed or never ran shows as ❌/stale rather than taking the
 report down.
 
-Sections today: IBKR forward collector · ThetaData warehouse · Tiingo refresh ·
-System/Gateway health · (Strategies — reserved, lights up once strategies run).
-Adding a section later = write one build_*() and append it to SECTIONS.
+Sections today: IBKR forward collector · EDGAR fundamentals (periodic freshness) ·
+Tiingo refresh · Dealer gamma · System/Gateway health · (Strategies — reserved,
+lights up once strategies run). The ThetaData one-time-grab section is retired
+(SPXW 1-min backfill complete 2026-07); build_thetadata is left defined but out of
+SECTIONS. Adding a section later = write one build_*() and append it to SECTIONS.
 
 Run manually any time:  <venv python> eod_report.py
 """
@@ -29,6 +31,11 @@ import mailer
 import status
 
 WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse")
+EDGAR = Path(r"C:\TradingDesk-Local\canslim\edgar")
+# The full-market point-in-time fundamentals table (one row per company-quarter).
+EDGAR_FUNDAMENTALS = EDGAR / "quarterly_fundamentals.parquet"
+# Periodic-refresh threshold: EDGAR is a monthly-ish rebuild, not a daily feed.
+EDGAR_STALE_DAYS = 45
 RAW_OPTIONS = WAREHOUSE / "raw" / "options"
 DERIVED = WAREHOUSE / "derived"
 SUPERVISOR_HB = WAREHOUSE / "supervisor_heartbeat.txt"
@@ -196,6 +203,112 @@ def build_thetadata():
     return _sec("thetadata", "ThetaData Warehouse (one-time grab)", st, headline, rows)
 
 
+def build_edgar():
+    """EDGAR point-in-time fundamentals — a PERIODIC (monthly-ish) refresh, monitored
+    as freshness/coverage, NOT as a nightly download. Inspects the warehouse dir
+    directly (never imports canslim/edgar_pipeline.py). Reports company/partition count
+    in the full-market fundamentals table, warehouse size, and last-refresh age.
+
+    Status:
+      info  — a build is in progress (recent file activity; table not yet final),
+              or the table hasn't landed yet ("build landing").
+      ok    — table present and freshly refreshed (last refresh <= EDGAR_STALE_DAYS).
+      stale — last refresh older than the periodic threshold (needs a rebuild).
+    Never raises."""
+    title = "EDGAR Fundamentals (point-in-time)"
+    try:
+        if not EDGAR.exists():
+            return _sec("edgar", title, "info",
+                        "info: build landing — EDGAR warehouse dir not present yet.", [])
+
+        # Directory-wide size + newest mtime (freshness heartbeat) across all files.
+        size = 0
+        newest_mtime = 0.0
+        newest_name = None
+        n_files = 0
+        for root, _dirs, fnames in os.walk(EDGAR):
+            for fn in fnames:
+                fp = os.path.join(root, fn)
+                try:
+                    stt = os.stat(fp)
+                except OSError:
+                    continue
+                n_files += 1
+                size += stt.st_size
+                if stt.st_mtime > newest_mtime:
+                    newest_mtime = stt.st_mtime
+                    newest_name = fn
+
+        now = dt.datetime.now()
+        # "Build in progress" = something in the dir was touched in the last ~15 min.
+        recent_activity = bool(newest_mtime) and (now.timestamp() - newest_mtime) < 15 * 60
+        newest_str = (dt.datetime.fromtimestamp(newest_mtime).strftime("%Y-%m-%d %H:%M:%S")
+                      if newest_mtime else "—")
+
+        # The fundamentals table itself: company/partition count + its own age.
+        companies = None
+        table_mtime = None
+        table_present = EDGAR_FUNDAMENTALS.exists()
+        if table_present:
+            try:
+                table_mtime = dt.datetime.fromtimestamp(EDGAR_FUNDAMENTALS.stat().st_mtime)
+            except OSError:
+                table_mtime = None
+            try:
+                import pandas as pd
+                key = None
+                # one row per company-quarter; count distinct companies (ticker/cik).
+                cols = pd.read_parquet(EDGAR_FUNDAMENTALS, columns=None).columns
+                for cand in ("ticker", "cik", "symbol"):
+                    if cand in cols:
+                        key = cand
+                        break
+                if key is not None:
+                    companies = int(pd.read_parquet(EDGAR_FUNDAMENTALS,
+                                                    columns=[key])[key].nunique())
+            except Exception:
+                companies = None
+
+        # Age of the last real refresh = the fundamentals table's own mtime if we have
+        # it, else the newest file in the dir.
+        refresh_dt = table_mtime or (dt.datetime.fromtimestamp(newest_mtime)
+                                     if newest_mtime else None)
+        age_days = (now - refresh_dt).days if refresh_dt else None
+
+        rows = [
+            ("Companies (partitions)", f"{companies:,}" if companies is not None else "—"),
+            ("Warehouse size", f"{size/1e9:.2f} GB"),
+            ("Warehouse files", f"{n_files:,}"),
+            ("Fundamentals table", "present" if table_present else "not built yet"),
+            ("Last refresh", refresh_dt.strftime("%Y-%m-%d %H:%M:%S") if refresh_dt else "—"),
+            ("Refresh age", f"{age_days}d" if age_days is not None else "—"),
+            ("Newest file", f"{newest_name} @ {newest_str}" if newest_name else "—"),
+        ]
+
+        if recent_activity:
+            st = "info"
+            headline = ("info: build/refresh in progress — files updated in the last "
+                        f"15 min (newest {newest_name}). Table not final.")
+        elif not table_present:
+            st = "info"
+            headline = "info: build landing — fundamentals table not written yet."
+        elif age_days is not None and age_days > EDGAR_STALE_DAYS:
+            st = "stale"
+            headline = (f"stale — last refresh was {age_days}d ago "
+                        f"(> {EDGAR_STALE_DAYS}d periodic threshold). Time to re-pull EDGAR.")
+        else:
+            st = "ok"
+            headline = (f"fresh — {companies:,} companies, "
+                        f"last refresh {age_days}d ago." if companies is not None
+                        else f"fresh — last refresh {age_days}d ago.")
+        return _sec("edgar", title, st, headline, rows)
+    except Exception as e:
+        # Match the other builders: degrade, never raise.
+        return _sec("edgar", title, "info",
+                    f"info: build landing — could not read EDGAR warehouse "
+                    f"({type(e).__name__}: {e}).", [])
+
+
 def build_tiingo():
     s = status.read("tiingo")
     if s:
@@ -262,6 +375,40 @@ def build_strategy():
     m = s.get("metrics", {})
     rows = [(k, v) for k, v in m.items()] + [("Last update", s.get("ts"))]
     return _sec("strategy", "Strategy EOD Update", st, s.get("message", ""), rows)
+
+
+def build_account():
+    """Account cash-flow monitor — the propose-only, read-only per-account cycle
+    (paperbot\\account_monitor_run.py) that runs ~4:30 PM CT. It writes an
+    'account_monitor' status JSON (status.write) on both its success and failure
+    paths: metrics={'rc': <int|None>} plus a human message. This section MIRRORS the
+    other status-backed builders (read → freshness → ok/stale/fail) and NEVER raises.
+
+    fresh + rc==0 → ok; a non-zero rc / raised cycle → fail (carried in the status
+    'status' field); a status from a previous day → stale. Missing entirely → a
+    graceful 'not yet reported' line (the monitor may not have run today)."""
+    title = "Account Cash-Flow Monitor"
+    s = status.read("account_monitor")
+    if not s:
+        return _sec("account", title, "stale",
+                    "No status written yet — did the 4:30 PM monitor cycle run? "
+                    "(paperbot\\account_monitor_run.py writes this on every run.)", [])
+    fresh = s.get("date") == TODAY_STR
+    st = s.get("status", "fail") if fresh else "stale"
+    m = s.get("metrics", {})
+    rc = m.get("rc")
+    rc_label = {0: "0 (clean cycle or clean skip)"}.get(rc, rc)
+    # Surface any richer metrics the monitor may add later (deposits/withdrawals
+    # detected, buffer %, proposals) without hard-coding a schema it doesn't yet
+    # write — anything beyond 'rc' is rendered generically.
+    extra = [(k, v) for k, v in m.items() if k != "rc"]
+    rows = ([("Run date", s.get("date")),
+             ("Return code", rc_label if rc_label is not None else "—")]
+            + extra
+            + [("Posture", "read-only / propose-only (transmits nothing)"),
+               ("Last update", s.get("ts"))])
+    headline = s.get("message", "") + ("" if fresh else "  ⚠ status is from a previous day")
+    return _sec("account", title, st, headline, rows)
 
 
 # Dealer-gamma reads the derived GEX tables (features/gex.py output) directly.
@@ -411,8 +558,12 @@ def build_alarm():
                 f"Alarm is alive — last ran {int(age_min)}m ago ({last_line}).", rows)
 
 
-SECTIONS = [build_forward, build_thetadata, build_tiingo, build_gex, build_system,
-            build_strategy, build_alarm]
+# build_thetadata is retired from SECTIONS: SPXW 1-min one-time backfill complete
+# 2026-07. Function left defined (out of SECTIONS) so it's reversible. build_forward
+# (LIVE daily options collector) stays. build_edgar added: EDGAR fundamentals is a
+# PERIODIC refresh, monitored as freshness/coverage — see build_edgar().
+SECTIONS = [build_forward, build_edgar, build_tiingo, build_gex, build_system,
+            build_strategy, build_account, build_alarm]
 
 
 # --------------------------------------------------------------------------- #
