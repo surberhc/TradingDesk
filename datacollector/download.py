@@ -42,12 +42,41 @@ def _business_days(start: str, end: str) -> list[str]:
     return [d.strftime("%Y%m%d") for d in rng]
 
 
-def pull_day(symbol: str, daystr: str) -> pd.DataFrame:
-    """Greeks ⨝ open_interest for one root on one day. Empty if no data (holiday)."""
-    greeks = td.eod_greeks(symbol, daystr, daystr)
-    if greeks.empty:
-        return greeks
-    oi = td.eod_open_interest(symbol, daystr, daystr)
+def _live_expirations_for_day(symbol: str, daystr: str) -> list[str]:
+    """Expirations for `symbol` that are still open on `daystr` (>= that day).
+
+    Used ONLY on the current-day path. Returns YYYYMMDD strings (the format the
+    history endpoints take, matching `daystr`); the catalog endpoint hands back
+    dashed strings, so we strip the dashes. Expirations that already expired before
+    `daystr` are dropped — they carry no current-day data and only waste requests.
+    """
+    exps = td.list_expirations(symbol)          # dashed, all-time
+    out = [e.replace("-", "") for e in exps]
+    return sorted(e for e in out if e >= daystr)
+
+
+def pull_day(symbol: str, daystr: str, current_day: bool = False) -> pd.DataFrame:
+    """Greeks ⨝ open_interest for one root on one day. Empty if no data (holiday).
+
+    `current_day=True` switches to the per-expiration path required for the CURRENT
+    (unsettled) trading day: the history endpoints reject expiration=* for today
+    (HTTP 400 "Cannot fetch current-day data without specifying an expiration"), so
+    we enumerate the root's live expirations and request each explicitly. Historical
+    (settled) days keep the single fast expiration=* call unchanged.
+    """
+    if current_day:
+        exps = _live_expirations_for_day(symbol, daystr)
+        if not exps:
+            return pd.DataFrame()               # unknown root / nothing live -> empty
+        greeks = td.eod_greeks_current_day(symbol, daystr, exps)
+        if greeks.empty:
+            return greeks
+        oi = td.eod_open_interest_current_day(symbol, daystr, exps)
+    else:
+        greeks = td.eod_greeks(symbol, daystr, daystr)
+        if greeks.empty:
+            return greeks
+        oi = td.eod_open_interest(symbol, daystr, daystr)
     if not oi.empty and "open_interest" in oi.columns:
         greeks = greeks.merge(oi[JOIN_KEYS + ["open_interest"]], on=JOIN_KEYS, how="left")
     greeks = greeks.drop(columns=[c for c in DROP_COLS if c in greeks.columns])

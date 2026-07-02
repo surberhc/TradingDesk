@@ -92,40 +92,83 @@ def _target_days(today: date, lookback: int) -> list[str]:
     return days
 
 
-def run(roots: list[str], days: list[str]) -> dict:
-    """Pull+write every missing (root, day). Returns metric counts for the status."""
+def run(roots: list[str], days: list[str], current_daystr: str | None = None) -> dict:
+    """Pull+write every missing (root, day). Returns metric counts for the status.
+
+    `current_daystr` (YYYYMMDD) is the CURRENT trading day inside `days`, if any. That
+    day is pulled via the per-expiration current-day path (expiration=* is 400 for
+    today) and its outcomes are tracked SEPARATELY (cur_ok / cur_empty / cur_fail) so
+    the status logic can tell "today wrote nothing because it errored" (a real red
+    failure) apart from prior-day self-heal happening to have written rows.
+    """
     ok = skip = empty = fail = 0
+    cur_ok = cur_empty = cur_fail = 0
     fail_detail: list[str] = []
     n = len(roots)
     for i, sym in enumerate(roots, 1):
-        try:
-            wrote_any = False
-            for daystr in days:
+        for daystr in days:
+            is_current = (daystr == current_daystr)
+            try:
                 if storage.have_day(sym, daystr):
                     skip += 1
                     continue
-                df = download.pull_day(sym, daystr)      # FULL chain — no strike band
+                df = download.pull_day(sym, daystr, current_day=is_current)
                 rows = storage.write_day(sym, daystr, df)
                 if rows == 0:
                     empty += 1
+                    if is_current:
+                        cur_empty += 1
                     log(f"  {sym:6} {daystr} empty (holiday/no-data)")
                 else:
                     ok += 1
-                    wrote_any = True
+                    if is_current:
+                        cur_ok += 1
                     log(f"  {sym:6} {daystr} wrote rows={rows:,}")
-            if not wrote_any:
-                # nothing new for this root across the whole window (all on disk)
-                pass
-        except Exception as e:               # one bad root never aborts the run
-            fail += 1
-            msg = f"{sym}: {type(e).__name__}: {e}"
-            fail_detail.append(msg)
-            log(f"  {sym:6} FAIL {msg}")
+            except Exception as e:           # one bad (root, day) never aborts the run
+                fail += 1
+                if is_current:
+                    cur_fail += 1
+                msg = f"{sym} {daystr}: {type(e).__name__}: {e}"
+                fail_detail.append(msg)
+                log(f"  {sym:6} FAIL {msg}")
         HEARTBEAT.write_text(
             f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {days[-1]}  {i}/{n} roots  "
             f"ok={ok} skip={skip} empty={empty} fail={fail}")
     return {"ok": ok, "skip": skip, "empty": empty, "fail": fail,
+            "cur_ok": cur_ok, "cur_empty": cur_empty, "cur_fail": cur_fail,
             "fail_detail": fail_detail}
+
+
+def compute_status(m: dict, has_current_day: bool) -> str:
+    """Map the run metrics to an EOD-report status: "ok" | "partial" | "fail".
+
+    The critical rule (the bug this fixes): when there WAS a current trading day and
+    it wrote ZERO roots because its requests ERRORED (cur_ok == 0 and cur_fail > 0),
+    the day's dealer-gamma inputs never landed — that is a hard "fail" (red), even if
+    prior-day self-heal wrote rows (ok > 0). The old logic called that "partial"
+    (amber) because ok > 0, masking a 100%-current-day failure.
+
+    Distinctions preserved:
+      * current day errored (cur_fail > 0, cur_ok == 0)      -> fail   (red)
+      * current day legitimately empty (holiday/not settled;
+        cur_empty > 0, cur_ok == 0, cur_fail == 0)           -> not a failure by itself
+      * prior-day self-heal accounting (ok / skip / fail)    -> partial/ok as before
+    """
+    cur_ok = m.get("cur_ok", 0)
+    cur_fail = m.get("cur_fail", 0)
+    fail = m.get("fail", 0)
+    ok = m.get("ok", 0)
+    skip = m.get("skip", 0)
+
+    # Current day present but wrote nothing AND at least one current-day request
+    # errored -> today's inputs are missing due to failure. Red.
+    if has_current_day and cur_ok == 0 and cur_fail > 0:
+        return "fail"
+    if fail == 0:
+        return "ok"
+    if ok > 0 or skip > 0:
+        return "partial"
+    return "fail"
 
 
 def main() -> None:
@@ -159,6 +202,12 @@ def main() -> None:
     else:
         days = _target_days(today, lookback)
 
+    # Which day in the window is the CURRENT (unsettled) trading day, if any. Only
+    # `today` on a weekday is "current" — a forced --date or a weekend run is always
+    # a settled/historical day and takes the fast expiration=* path.
+    current_daystr = None if (weekend or forced_day) else (
+        daystr if daystr in days else None)
+
     log(f"=== eod_daily {daystr} start (full-chain ThetaData; "
         f"{len(roots)} roots; days={days[0]}..{days[-1]}; "
         f"{'WEEKEND — today skipped, self-heal only' if weekend else 'weekday'}) ===")
@@ -177,7 +226,7 @@ def main() -> None:
         return
 
     # ---- do the work ----------------------------------------------------- #
-    m = run(roots, days)
+    m = run(roots, days, current_daystr=current_daystr)
     ok, skip, empty, fail = m["ok"], m["skip"], m["empty"], m["fail"]
 
     log(f"=== eod_daily {daystr} done: ok={ok} skip={skip} empty={empty} fail={fail} ===")
@@ -194,19 +243,16 @@ def main() -> None:
     # in this environment — a fatal crash bypasses try/except entirely, so anything
     # after it never runs. The status JSON is the contract the EOD email depends on,
     # so it must be durable before we touch DuckDB.
-    # status: ok = no failures and we either wrote or had everything; partial = some
-    # writes but also failures; fail = nothing written and failures present.
-    if fail == 0:
-        overall = "ok"
-    elif ok > 0 or skip > 0:
-        overall = "partial"
-    else:
-        overall = "fail"
+    overall = compute_status(m, has_current_day=current_daystr is not None)
     msg_bits = [f"{ok} root-days written", f"{skip} already had"]
     if empty:
         msg_bits.append(f"{empty} empty/holiday")
     if fail:
-        msg_bits.append(f"{fail} roots FAILED")
+        msg_bits.append(f"{fail} root-days FAILED")
+    if current_daystr is not None:
+        msg_bits.append(
+            f"current day {current_daystr}: "
+            f"{m['cur_ok']} written / {m['cur_empty']} empty / {m['cur_fail']} FAILED")
     message = "Full-chain EOD grab (ThetaData) · " + ", ".join(msg_bits)
     jobstatus.write("forward", overall, day=daystr,
                     metrics={"roots": len(roots), "ok": ok, "skip": skip,

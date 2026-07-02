@@ -47,6 +47,21 @@ def _get(path: str, params: dict) -> pd.DataFrame:
     raise RuntimeError(f"GET {url} failed after {_RETRIES} tries: {last}")
 
 
+def list_expirations(symbol: str) -> list[str]:
+    """Every expiration THIS root has ever had, as dashed strings (oldest first).
+
+    Uses the /option/list/expirations catalog endpoint, which — unlike the history
+    endpoints — does NOT take a date and never needs expiration=*, so it is the one
+    way to enumerate a root's expirations for the CURRENT (unsettled) trading day.
+    (The history endpoints reject expiration=* for the current day: HTTP 400
+    "Cannot fetch current-day data without specifying an expiration".)
+    """
+    df = _get("/option/list/expirations", {"symbol": symbol})
+    if df.empty or "expiration" not in df.columns:
+        return []
+    return sorted({str(x) for x in df["expiration"].dropna().unique()})
+
+
 def connected() -> bool:
     """Is the local Terminal up and serving?"""
     try:
@@ -75,3 +90,35 @@ def eod_open_interest(symbol: str, start: str, end: str,
         "start_date": start, "end_date": end,
         "strike": "*", "right": right,
     })
+
+
+def _looped_over_expirations(pull, symbol: str, day: str,
+                             expirations: list[str]) -> pd.DataFrame:
+    """Call `pull(symbol, day, day, expiration=exp)` for each exp, concatenate.
+
+    Shared inner loop for the CURRENT-day path, where expiration=* is rejected so we
+    must request one explicit expiration at a time. An empty part (472/no-data) is
+    simply skipped; a transport error inside a single expiration propagates (via
+    _get's own retry-then-raise) so the day is left un-done and retried next pass —
+    we never persist a partial current-day file as if it were complete.
+    """
+    frames: list[pd.DataFrame] = []
+    for exp in expirations:
+        part = pull(symbol, day, day, expiration=exp)
+        if not part.empty:
+            frames.append(part)
+    if not frames:
+        return pd.DataFrame()
+    return pd.concat(frames, ignore_index=True)
+
+
+def eod_greeks_current_day(symbol: str, day: str,
+                           expirations: list[str]) -> pd.DataFrame:
+    """Current-day EOD greeks: loop per explicit expiration (expiration=* is 400)."""
+    return _looped_over_expirations(eod_greeks, symbol, day, expirations)
+
+
+def eod_open_interest_current_day(symbol: str, day: str,
+                                  expirations: list[str]) -> pd.DataFrame:
+    """Current-day EOD open interest: loop per explicit expiration (=* is 400)."""
+    return _looped_over_expirations(eod_open_interest, symbol, day, expirations)
