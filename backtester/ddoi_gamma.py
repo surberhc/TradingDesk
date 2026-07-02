@@ -86,6 +86,22 @@ NEUTRAL_BAND_FRAC = 0.05    # |net_gex| within this fraction of gross -> Neutral
 EOD_WAREHOUSE = r"C:\TradingDesk-Local\warehouse\raw\options"
 SYMBOL = "SPXW"
 
+
+def set_symbol(symbol: str) -> None:
+    """Run the WHOLE DDOI pipeline on a different underlying root (SPX vs SPXW).
+
+    This repoints BOTH the EOD chain read (raw\\options\\{SYMBOL}) here AND the intraday
+    tape reader (s5_intraday_data) at the matching 1-minute subtree, so the classifier,
+    the per-contract dealer-sign inference, and the net-GEX thresholding are byte-for-byte
+    the same -- the ONLY thing that changes is which symbol's tape+chain feed them. That
+    isolation is the point of the cross-symbol test: any accuracy change is attributable to
+    the symbol, not to a method change. Default stays "SPXW" so existing callers/tests are
+    unaffected.
+    """
+    global SYMBOL
+    SYMBOL = symbol
+    s5.set_symbol(symbol)
+
 # Mid-band for the quote rule: a print within this fraction of the half-spread of the
 # mid is treated as "at mid" -> tick-rule fallback. This is the standard Lee-Ready
 # treatment of at-the-mid prints, NOT a tuned signal knob (it only routes a print to

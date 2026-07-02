@@ -53,11 +53,30 @@ import pandas as pd
 # Hardcoded here to match the standalone s5_*.py convention in this folder and to
 # keep this reader importable without the collector's `config` module on sys.path.
 # --------------------------------------------------------------------------- #
-WAREHOUSE_ROOT = Path(r"C:\TradingDesk-Local\warehouse\raw\options_1m\SPXW")
+_WAREHOUSE_1M_BASE = Path(r"C:\TradingDesk-Local\warehouse\raw\options_1m")
+
+WAREHOUSE_ROOT = _WAREHOUSE_1M_BASE / "SPXW"
 QUOTE_DIR = WAREHOUSE_ROOT / "quote"
 OHLC_DIR = WAREHOUSE_ROOT / "ohlc"
 
 SYMBOL = "SPXW"
+
+
+def set_symbol(symbol: str) -> None:
+    """Repoint this reader at a DIFFERENT 1-minute warehouse subtree (SPX vs SPXW).
+
+    The warehouse stores each root under raw\\options_1m\\{SYMBOL}\\{quote,ohlc}, with
+    an IDENTICAL schema and the SAME lossless storage contract (store-on-change NBBO,
+    trades-only OHLC, no back-fill). Switching the symbol therefore changes ONLY the
+    input tree the classifier reads -- no logic changes -- which is exactly what makes
+    the DDOI cross-symbol test clean. Default stays "SPXW" so every existing caller and
+    the standalone tests are unaffected unless they opt in.
+    """
+    global SYMBOL, WAREHOUSE_ROOT, QUOTE_DIR, OHLC_DIR
+    SYMBOL = symbol
+    WAREHOUSE_ROOT = _WAREHOUSE_1M_BASE / symbol
+    QUOTE_DIR = WAREHOUSE_ROOT / "quote"
+    OHLC_DIR = WAREHOUSE_ROOT / "ohlc"
 
 # The four columns that identify a single option contract (the "contract key").
 CONTRACT_KEY = ["symbol", "expiration", "strike", "right"]

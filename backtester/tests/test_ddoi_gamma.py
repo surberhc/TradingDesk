@@ -207,3 +207,42 @@ def test_empty_inputs():
     assert empty.empty
     g = d.dealer_sign_by_contract(empty)
     assert g.empty
+
+
+# --------------------------------------------------------------------------- #
+# 9. Cross-symbol switch: set_symbol repoints BOTH the EOD chain path and the
+#    intraday tape reader to the matching root, and NOTHING ELSE changes. This is
+#    the plumbing that makes the SPX-vs-SPXW comparison a clean single-variable test.
+# --------------------------------------------------------------------------- #
+def test_set_symbol_repoints_both_readers_and_restores():
+    import s5_intraday_data as s5
+    orig = d.SYMBOL
+    try:
+        d.set_symbol("SPX")
+        # EOD chain path now points at the SPX subtree...
+        p = d._eod_chain_path(DAY)
+        assert p.replace("/", "\\").endswith(r"options\SPX\20220331.parquet")
+        # ...and the intraday reader followed to the SPX 1-min subtree.
+        assert s5.SYMBOL == "SPX"
+        assert s5.QUOTE_DIR.name == "quote" and s5.QUOTE_DIR.parent.name == "SPX"
+        assert s5.OHLC_DIR.parent.name == "SPX"
+    finally:
+        d.set_symbol(orig)  # restore SPXW default for the rest of the suite
+    assert d.SYMBOL == "SPXW"
+    assert s5.SYMBOL == "SPXW"
+    assert s5.QUOTE_DIR.parent.name == "SPXW"
+
+
+# --------------------------------------------------------------------------- #
+# 10. The classifier + net-GEX logic are symbol-agnostic: swapping SYMBOL does not
+#     touch the constants that define the method (only the input tree changes).
+# --------------------------------------------------------------------------- #
+def test_method_constants_are_symbol_invariant():
+    import s5_intraday_data as s5
+    before = (d.CALL_SIGN, d.PUT_SIGN, d.NEUTRAL_BAND_FRAC, d.CONTRACT_MULT, d._MID_EPS_FRAC)
+    try:
+        d.set_symbol("SPX")
+        after = (d.CALL_SIGN, d.PUT_SIGN, d.NEUTRAL_BAND_FRAC, d.CONTRACT_MULT, d._MID_EPS_FRAC)
+        assert before == after  # the method is untouched; only the symbol/tree moved
+    finally:
+        d.set_symbol("SPXW")

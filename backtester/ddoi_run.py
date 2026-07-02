@@ -42,12 +42,32 @@ import pandas as pd
 import ddoi_gamma as dg
 import s5_intraday_data as s5
 
-EOD_WAREHOUSE = r"C:\TradingDesk-Local\warehouse\raw\options\SPXW"
+EOD_WAREHOUSE_BASE = r"C:\TradingDesk-Local\warehouse\raw\options"
 VENDOR_CSV = r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\msr\_msr_features_market.csv"
-CACHE_PARQUET = r"C:\TradingDesk-Local\warehouse\derived\ddoi_spxw_daily.parquet"
+CACHE_BASE = r"C:\TradingDesk-Local\warehouse\derived"
 OUTPUT_DIR = r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\backtester\output"
 
+# Filled in by configure_symbol() below; default is SPXW so the module is drop-in
+# compatible with the original SPXW run.
+SYMBOL = "SPXW"
+EOD_WAREHOUSE = os.path.join(EOD_WAREHOUSE_BASE, SYMBOL)
+CACHE_PARQUET = os.path.join(CACHE_BASE, "ddoi_spxw_daily.parquet")
+
 STATES = ["Negative", "Neutral", "Positive"]
+
+
+def configure_symbol(symbol: str) -> None:
+    """Point the whole driver (day discovery, EOD chain, cache, DDOI pipeline) at one root.
+
+    Keeps the SPXW cache filename verbatim so the existing SPXW run is untouched; SPX (and
+    any other root) gets its own derived cache. Also flips the shared ddoi_gamma/s5 readers
+    via dg.set_symbol so the classifier reads the MATCHING intraday+EOD symbol.
+    """
+    global SYMBOL, EOD_WAREHOUSE, CACHE_PARQUET
+    SYMBOL = symbol
+    EOD_WAREHOUSE = os.path.join(EOD_WAREHOUSE_BASE, symbol)
+    CACHE_PARQUET = os.path.join(CACHE_BASE, f"ddoi_{symbol.lower()}_daily.parquet")
+    dg.set_symbol(symbol)
 
 
 # --------------------------------------------------------------------------- #
@@ -182,7 +202,7 @@ def build_report(df: pd.DataFrame, vendor: pd.DataFrame) -> str:
 
     p("# DDOI inferred-dealer-direction gamma -- honest comparison")
     p()
-    p(f"Generated: {_dt.date.today().isoformat()}  (PAPER / research; SPXW 1-min tape)")
+    p(f"Generated: {_dt.date.today().isoformat()}  (PAPER / research; {SYMBOL} 1-min tape)")
     p()
     p(f"Days computed: {len(df)}  "
       f"({df['date'].min().date()} -> {df['date'].max().date()})")
@@ -221,9 +241,14 @@ def build_report(df: pd.DataFrame, vendor: pd.DataFrame) -> str:
         return "\n".join(L)
     p(f"Vendor overlap: {len(j)} days "
       f"({j['date'].min().date()} -> {j['date'].max().date()}).")
-    p("NOTE: vendor labels the SPX-ROOT market regime; our tape is SPXW. This is the")
-    p("same cross-symbol caveat the production calibration lives with -- read directional,")
-    p("not as an exact target.")
+    if SYMBOL == "SPX":
+        p("NOTE: vendor labels the SPX-ROOT market regime and this run's tape+chain are")
+        p("also SPX-ROOT -- the SAME symbol. This resolves the cross-symbol caveat from the")
+        p("SPXW run: any accuracy gap here is a genuine method result, not a symbol artifact.")
+    else:
+        p("NOTE: vendor labels the SPX-ROOT market regime; our tape is " + SYMBOL + ". This is")
+        p("the cross-symbol caveat the production calibration lives with -- read directional,")
+        p("not as an exact target.")
     p()
 
     def block(sub: pd.DataFrame, title: str) -> None:
@@ -289,16 +314,20 @@ def build_report(df: pd.DataFrame, vendor: pd.DataFrame) -> str:
 # --------------------------------------------------------------------------- #
 def main() -> int:
     ap = argparse.ArgumentParser(description="DDOI batch + comparison")
+    ap.add_argument("--symbol", default="SPXW", choices=["SPX", "SPXW"],
+                    help="underlying root to run on: SPXW (default) or SPX-ROOT")
     ap.add_argument("--start", default=None)
     ap.add_argument("--end", default=None)
     ap.add_argument("--limit", type=int, default=0)
     ap.add_argument("--refresh", action="store_true")
     args = ap.parse_args()
 
+    configure_symbol(args.symbol)
+
     days = usable_days(args.start, args.end)
     if args.limit:
         days = days[: args.limit]
-    print(f"[start] {len(days)} usable SPXW days (EOD chain AND 1-min tape)", flush=True)
+    print(f"[start] {len(days)} usable {SYMBOL} days (EOD chain AND 1-min tape)", flush=True)
 
     df = compute(days, refresh=args.refresh)
     if df.empty:
@@ -310,7 +339,8 @@ def main() -> int:
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     stamp = _dt.date.today().strftime("%Y%m%d")
-    out_md = os.path.join(OUTPUT_DIR, f"ddoi_gamma_{stamp}.md")
+    suffix = "_spxroot" if SYMBOL == "SPX" else ""
+    out_md = os.path.join(OUTPUT_DIR, f"ddoi_gamma{suffix}_{stamp}.md")
     with open(out_md, "w", encoding="ascii", errors="replace") as f:
         f.write(report)
     print(f"\n[done] report -> {out_md}", flush=True)
