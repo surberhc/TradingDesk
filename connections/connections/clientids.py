@@ -33,6 +33,7 @@ CLIENT_IDS = {
     "paperbot_monitor": 40,         # paperbot: account-cashflow MONITOR shell (account_monitor_run.py) — connects READ-ONLY, reads SettledCashByDate/TotalCashValue + today's fills (reqExecutions), persists per-account baselines, runs the pure decide() and PRINTS propose-only verdicts. Transmits nothing; no whatIfOrder. Own id so it never collides with any other consumer
     "capabilities_introspect": 41,  # connections: IBKR CAPABILITIES auto-updater (refresh_ibkr_capabilities.py) — connects READ-ONLY, calls reqScannerParameters() to snapshot the live scan-code/filter tag set, diffs against the prior snapshot, and keeps IBKR_CAPABILITIES.md honest. Transmits nothing; monthly schedule. Own id so it never collides with any other consumer
     "canslim_research_hist": 42,    # canslim research: one-off READ-ONLY historical daily-bar puller for the hard-stop counterfactual (reqHistoricalData TRADES, ~90d pre-entry through sell for ~120 tickers). Transmits nothing. Own id so it never collides with any desk task
+    "canslim_price_gapfill": 43,    # canslim full-market selection Phase 1: READ-ONLY IBKR gap-fill puller for the survivorship-free daily price/volume warehouse (reqHistoricalData TRADES, 2010-2026, ONLY for symbols Tiingo/Stooq missed). Transmits nothing; yields to the Gateway mutex + AccountMonitorDaily. Own id so it never collides with any desk task
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.
