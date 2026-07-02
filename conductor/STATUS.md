@@ -1,10 +1,20 @@
-# LANE STATUS  (last updated by: Conductor, 2026-06-30 ~16:30 CT — SESSION CLOSE)
+# LANE STATUS  (last updated by: Conductor, 2026-07-02 ~10:30 CT — SESSION CLOSE)
 
 > Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` + dated `docs/SESSION_HANDOFF_*.md`.
 > **PICK UP HERE NEXT SESSION → `docs/SESSION_HANDOFF_2026-07-01.md`** (full 2026-06-30 session-close handoff).
 > **First multi-account PAPER rebalance: DONE 2026-06-29 — all 5 accounts (DU142-146) in-band.** Built + proved live a dynamic laddered order router + self-verifying hands-free gateway arming + `--only-account` scope flag (memory `dynamic-order-router`, `paper-arming-and-fills`). Gateway disarmed + verified-locked.
 > Desk runs on its own: collector + ThetaData **terminal-watchdog (NEW, live)** + dashboard survive session close. **Collector ~59%, ETA 2026-06-30 ~18:19 CT** — gates S5 harvest + S2/S3.
 > **Regime config still UNTOUCHED.** `sharp_recovery` refinement TESTED 2026-06-29 → SHELVED (clean negative; GFC fails −118bp filter-independently). Re-entry stays MAX_LAG=6. 2008 GFC audit CLOSED.
+
+### 2026-07-02 — EOD email silent-death FIXED + full scheduler/alerting audit & hardening
+- **Nightly EOD email died silently 5 nights (6/27–7/01) — ROOT-CAUSED + FIXED (commit `efb25c9`).** TWO independent triggers, both fixed: (1) `build_system()` opened a live `ib_async` asyncio gateway socket inside a report builder — crashed the process under the non-interactive pythonw/Task-Scheduler context BEFORE the email sent (per-section try/except can't catch a process-level death); (2) `_overall()` raised `ValueError` on status `"partial"` (forward/tiingo write "partial" nightly; not in SEVERITY) — deterministic every night, likely the primary. Fix: TCP port-check replaces the ib_async probe (a status report must NEVER open a trading socket); main() fully wrapped so any failure still sends a fallback error email + 30s per-section timeouts; `_overall` hardened. EodReport task triggers were already fine (StartWhenAvailable, run-whether-logged-on) — the trigger was never the problem.
+- **Adversarial 3-worker audit** of every desk task / launcher / entry-point / watchdog / timing-dependency + a pattern-sweep for the ib_async-in-report bug class. No other live-socket-in-report holes; that class is closed on all ACTIVE scheduled paths (the only remaining instance is the DISABLED `ThetaForwardDaily` orphan).
+- **Alerting hardening (commit `e735894`):** (1) `mailer.py` drops a Desktop `TRADINGDESK_EMAIL_DOWN.txt` on send-failure + `last_email_ok.txt` on success = the FIRST out-of-band signal — previously EVERY report AND alarm shared the one Gmail path, so a revoked app-password blinded the whole system silently; (2) `eod_report` exits non-zero on failed send (Scheduler shows red) + new `build_alarm()` section goes red if the staleness alarm itself hasn't run in 30 min; (3) `heartbeat_alarm` generalized to `DEADLINE_JOBS` — forward/tiingo/gex/account_monitor each now get an independent daily-deadline alarm (was only spxw_1m+eod) and it writes `heartbeat_alarm_ran.txt` so the digest watches it back (mutual coverage); (4) `build_features`(gex) + `account_monitor_run` now write status JSONs (+ gex.log) — both were fully invisible before.
+- **REAL DATA BUG fixed (commit `b94717b`):** the daily options grab requested the unsettled current day with `expiration=*` → HTTP 400 on EVERY current-day root → same-day dealer-gamma never landed, masked as amber "partial" by prior-day self-heal. Now enumerates live expirations per current day (settled days keep the fast `expiration=*` path); `compute_status()` returns fail/red on current-day-zero. Verified live: SPY current-day OI 410 rows, no 400; settled SPX day still 13,962 rows. No warehouse writes during testing.
+- **OPEN — needs Andrew (can't be done programmatically):** run `C:\Users\andre\Desktop\harden_desk_tasks.ps1` once (prompts for Windows password) — adds ExecutionTimeLimit (PT1H, Tiingo PT2H) to the 5 nightly tasks + deletes the disabled `ThetaForwardDaily` orphan. Windows blocks changing run-whether-logged-on (Password-principal) tasks without the password. Belt-and-suspenders — in-process timeouts already cover most hang risk.
+- **OPEN — optional:** `eod_daily.py --date 20260701` to backfill the one genuinely-missing same-day file (nightly self-heal will otherwise close it).
+- **WATCH tonight:** the 21:00 EodReport run is the end-to-end real-world confirmation; sections should read fresh/green for the first time under the new status writes. If no email arrives, check the Desktop for `TRADINGDESK_EMAIL_DOWN.txt` (now distinguishes an email-channel failure from a silent death).
+- Memory `rrg-email-pipeline` updated. NOTE: warehouse `.bat` launchers (run_eod/run_gex/etc.) live off-repo on `C:\TradingDesk-Local\` and are NOT in git.
 
 ### 2026-07-01 — S5 real harvest engine (post-1-min-data build) — HARVEST REFUTED as financing leg
 - Now that the SPXW 1-min backfill is COMPLETE, spun up 3 data-gated workers: **S5 harvest engine (done), S2/S3 intraday condor (done), DDOI negative-gamma (done).** All three data-gated by the 1-min feed; all three REFUTED honestly (no curve-fit, frozen config untouched).
@@ -159,7 +169,8 @@
   Paper gateway hard read-only lock is OFF (software arming is the control).
 
 ## D — Reporting
-- UNCHANGED. RRG retired; harness repurposed into the EOD status digest (`eod_report.py`), scheduled (CT).
+- RRG retired; harness = the EOD status digest (`eod_report.py`), scheduled 21:00 CT.
+- **HARDENED 2026-07-02** (commits `efb25c9`/`e735894`): the digest no longer opens a live IB socket (TCP port-check), always sends (fallback email + per-section timeouts), exits non-zero on send failure, and now has 7 sections incl. Dealer-Gamma + a self-watching Staleness-Alarm section. Out-of-band failure signal = Desktop `TRADINGDESK_EMAIL_DOWN.txt`. Independent per-job deadline alarms now cover forward/tiingo/gex/account_monitor (not just spxw_1m+eod). See the 2026-07-02 session section above.
 - `daily_run.py` + `connections/ibkr.py` carry the gateway `java_version=17` launch fix.
 
 ## Shared plumbing
