@@ -174,7 +174,8 @@ def rescaled_path(bars, buy_date, raw_entry):
     """Tiingo/IBKR paths may be split/div-continuous; anchor them to his RAW entry price so
     % moves are measured off the price HE paid. scale = raw_entry / (close nearest buy_date).
     Correct for non-split holds; a split mid-hold makes the post-split ratio off, but those
-    trades carry split_flag and are excluded from $ aggregates (return still uses his path)."""
+    trades carry split_flag and simulate_exit short-circuits them to HIS actual exit under every
+    rule (see the SPLIT-EXCLUSION guard there), so this broken ratio is never used for them."""
     near_c, best = None, 10 ** 9
     for (d, o, h, l, c) in bars:
         if c is None:
@@ -203,6 +204,17 @@ def simulate_exit(trade, path, rule, decision_max_date=None):
     Returns exit at the LAST available bar if the rule never triggers (mark-to-last)."""
     entry = trade["entry_px"]; bd = trade["buy"]
     if rule == "E1":
+        return trade["sell"], trade["actual_ret"]
+
+    # SPLIT-EXCLUSION (correctness): trades flagged as split/ticker-mismatch have a forward RAW
+    # price path that is NOT on his entry frame (a split mid-hold breaks the entry-day rescale
+    # ratio, injecting a phantom ~split-ratio drop that the engine would read as a catastrophic
+    # stop). We CANNOT honestly simulate a disciplined exit on a path we can't trust, so under
+    # EVERY non-E1 rule these fall back to HIS actual exit + return -- identical to how the
+    # committed stop-analysis treated NVDA (kept at his realized result, excluded from the
+    # disciplined-exit dollar aggregates). This is the honest, split-adjusted-not-feasible path,
+    # NOT a silent drop: the trade still counts at his real P&L.
+    if trade.get("split_flag"):
         return trade["sell"], trade["actual_ret"]
 
     # bars strictly after entry (hold window is open-ended for E3/E4; capped at his sell for E2? NO

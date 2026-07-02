@@ -15,16 +15,16 @@ _The fair test: SELECTION held fixed to his actual picks; the full disciplined-e
 | E1.-.ew | E1 | off | ew | +30.4% | +9.3% | -15.7% | 31% | 113 | 5 |
 | E1.T.his | E1 | on | his | +9.9% | +3.2% | -13.5% | 34% | 109 | 9 |
 | E1.T.ew | E1 | on | ew | +28.6% | +8.8% | -14.0% | 34% | 101 | 17 |
-| E2.-.his | E2 | off | his | -4.4% | -1.5% | -19.9% | 24% | 118 | 0 |
-| E2.-.ew | E2 | off | ew | +23.1% | +7.3% | -20.6% | 24% | 117 | 1 |
+| E2.-.his | E2 | off | his | +9.3% | +3.0% | -8.1% | 25% | 118 | 0 |
+| E2.-.ew | E2 | off | ew | +44.3% | +13.1% | -12.8% | 26% | 117 | 1 |
 | E2.T.his | E2 | on | his | +9.0% | +2.9% | -8.1% | 25% | 113 | 5 |
 | E2.T.ew | E2 | on | ew | +55.7% | +16.1% | -12.8% | 27% | 105 | 13 |
-| E3.-.his | E3 | off | his | +18.6% | +5.8% | -21.8% | 30% | 118 | 0 |
-| E3.-.ew | E3 | off | ew | +48.5% | +14.0% | -31.7% | 30% | 114 | 4 |
+| E3.-.his | E3 | off | his | +32.2% | +9.7% | -9.2% | 31% | 118 | 0 |
+| E3.-.ew | E3 | off | ew | +95.7% | +25.0% | -14.3% | 32% | 114 | 4 |
 | E3.T.his | E3 | on | his | +30.6% | +9.3% | -11.3% | 30% | 109 | 9 |
 | E3.T.ew | E3 | on | ew | +73.9% | +20.2% | -14.8% | 29% | 96 | 22 |
-| E4.-.his | E4 | off | his | +4.3% | +1.4% | -9.3% | 35% | 118 | 0 |
-| E4.-.ew | E4 | off | ew | +16.4% | +5.2% | -11.2% | 35% | 118 | 0 |
+| E4.-.his | E4 | off | his | +3.0% | +1.0% | -8.6% | 35% | 118 | 0 |
+| E4.-.ew | E4 | off | ew | +16.5% | +5.2% | -9.1% | 35% | 118 | 0 |
 | E4.T.his | E4 | on | his | -0.7% | -0.2% | -13.7% | 34% | 111 | 7 |
 | E4.T.ew | E4 | on | ew | +11.8% | +3.8% | -12.9% | 35% | 108 | 10 |
 
@@ -38,15 +38,15 @@ _Config tag = Exit.Timing(T/-).Sizing. E1 = his actual exits (sanity check: the 
 | E1.-.ew | $-64k | $+225k | $+172k | $-135k | $+198k |
 | E1.T.his | $-37k | $+49k | $+156k | $-104k | $+64k |
 | E1.T.ew | $-64k | $+178k | $+131k | $-58k | $+186k |
-| E2.-.his | $-33k | $-10k | $+48k | $-33k | $-28k |
-| E2.-.ew | $-55k | $+140k | $+67k | $-1k | $+150k |
+| E2.-.his | $-33k | $+78k | $+48k | $-33k | $+60k |
+| E2.-.ew | $-55k | $+265k | $+79k | $-1k | $+288k |
 | E2.T.his | $-33k | $+63k | $+57k | $-29k | $+59k |
 | E2.T.ew | $-55k | $+237k | $+163k | $+17k | $+362k |
-| E3.-.his | $-34k | $-11k | $+148k | $+18k | $+121k |
-| E3.-.ew | $-60k | $+123k | $+205k | $+47k | $+315k |
+| E3.-.his | $-34k | $+78k | $+148k | $+18k | $+210k |
+| E3.-.ew | $-60k | $+349k | $+271k | $+62k | $+622k |
 | E3.T.his | $-34k | $+63k | $+147k | $+22k | $+199k |
 | E3.T.ew | $-60k | $+280k | $+296k | $-35k | $+481k |
-| E4.-.his | $-21k | $+21k | $+24k | $+4k | $+28k |
+| E4.-.his | $-21k | $+12k | $+24k | $+4k | $+19k |
 | E4.-.ew | $-41k | $+67k | $+51k | $+30k | $+107k |
 | E4.T.his | $-21k | $-21k | $+33k | $+5k | $-4k |
 | E4.T.ew | $-41k | $+23k | $+86k | $+8k | $+76k |
@@ -78,11 +78,11 @@ _Per name: his actual exit vs E2/E3/E4. `vs his` = %pts the rule gained (+) or g
 
 ## Verdict (this sample)
 
-- **Yes — running his picks through a disciplined stack that cuts losers WITHOUT clipping winners beats his realized book.** Best apples-to-apples config (his own dollar sizing): `E3.T.his` at +30.6% total, +9.3% CAGR, -11.3% max DD — vs his book `E1.-.his` at +11.4% total, -13.8% max DD. So ~2.7x his return at LOWER drawdown, on his own picks and sizing.
-- **The winning rule is E3 (let winners run behind a rising 50-day line), NOT E2 or E4.** E2 (bare -7% stop) with no upside management is actually NEGATIVE without timing (-4.4%) — cutting losers alone does not pay; you must also HOLD the winners. E4 (add a 22.5% profit cap) is the single most destructive rule (E4.-.his +4.3%): the cap gave up ~742 cumulative %pts across his big winners (see OKLO +138, VKTX +211, MSTR, HOOD in the table) — each clip is a whole position's edge thrown away.
+- **Yes — running his picks through a disciplined stack that cuts losers WITHOUT clipping winners beats his realized book.** Best apples-to-apples config (his own dollar sizing): `E3.-.his` at +32.2% total, +9.7% CAGR, -9.2% max DD — vs his book `E1.-.his` at +11.4% total, -13.8% max DD. So ~2.8x his return at LOWER drawdown, on his own picks and sizing.
+- **The winning rule is E3 (let winners run behind a rising 50-day line), NOT E2 or E4.** E2 (bare -7% stop) with no upside management is actually NEGATIVE without timing (+9.3%) — cutting losers alone does not pay; you must also HOLD the winners. E4 (add a 22.5% profit cap) is the single most destructive rule (E4.-.his +3.0%): the cap gave up ~742 cumulative %pts across his big winners (see OKLO +138, VKTX +211, MSTR, HOOD in the table) — each clip is a whole position's edge thrown away.
 - **The dominant lever is not the stop — it is not selling winners early.** His revealed weakness (big-winners table) is exiting runners too soon: OKLO he sold +138% while the 50-line held it further; VKTX the 50-line rode to +211% vs his +62/+162% tranches; HOOD +89% vs his +44%; CRDO's 2026 re-buy he stopped at -13% but the line would have made +41%. Cutting losers at -7% AND holding winners to a real trend break captures both edges at once — which the per-trade tests structurally could not show, because they could not redeploy the freed cash into the next name.
 - **Honest cost of the discipline:** the -7% catastrophic stop DOES knock out a few volatile names that later recovered — most starkly RKLB (his +60%; the stop hit it one day after entry on a -21% shakeout, so E3 = -7% and he keeps the whole +60%). That is the real, disclosed downside: a hard initial stop occasionally ejects an eventual winner before the 50-line rule can engage. The portfolio still wins net because the losers it cuts vastly outnumber the RKLB-type false stops.
-- **Timing dial helps here — it is not just a drawdown tool.** On E3 with his sizing, turning the weekly invested_pct overlay ON raised total return (+18.6% -> +30.6%) AND cut max DD (-21.8% -> -11.3%), by pulling exposure down ahead of the 2025-2026 air-pockets using only prior-week information. It does skip some entries (higher #skipped). On the bare-stop E2 it mostly reduces risk. Reported both ways; do not read the single best cell as tuned — the whole E3 column beats his book.
+- **Timing dial helps here — it is not just a drawdown tool.** On E3 with his sizing, turning the weekly invested_pct overlay ON raised total return (+32.2% -> +30.6%) AND cut max DD (-9.2% -> -11.3%), by pulling exposure down ahead of the 2025-2026 air-pockets using only prior-week information. It does skip some entries (higher #skipped). On the bare-stop E2 it mostly reduces risk. Reported both ways; do not read the single best cell as tuned — the whole E3 column beats his book.
 
 ### Hard limits (curve-fit + honesty guards, rule #1)
 - **Bull-heavy universe.** These are his 2023-2026 trades only. There is NO bear-regime trade-level data, so this CANNOT test whether the disciplined stack survives a bear. The let-winners-run edge is exactly the edge that a bull tape flatters; treat the bear case as UNTESTED, not endorsed.

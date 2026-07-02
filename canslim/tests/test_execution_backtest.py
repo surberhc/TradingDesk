@@ -128,6 +128,30 @@ def test_e4_caps_a_big_winner():
     assert xr_e3 > xr_e4, "E3 (no cap) should keep more than E4 on a runner"
 
 
+# --------------------------------------------------------------------------- split-exclusion (regression)
+def test_split_flagged_trade_falls_back_to_his_actual_under_every_rule():
+    """A split-flagged trade must NOT be simulated on its (untrustworthy) forward path: a split
+    mid-hold breaks the entry-day rescale ratio and injects a phantom ~split-ratio drop the
+    engine would read as a catastrophic stop. Under EVERY non-E1 rule the trade must instead
+    fall back to HIS actual exit + return (same treatment as the committed stop-analysis).
+    Regression guard for the NVDA phantom -87% bug."""
+    entry = 100.0
+    # forward path that CRASHES to a 10th of entry (simulates the raw post-split drop). Without
+    # the split guard, E2/E3/E4 would read this as ~-90% and return a phantom catastrophic loss.
+    path = _path([100, 100, 10, 10, 10, 10], vol=0.0)
+    t = _trade(entry, "2024-01-02", "2024-01-05", 0.25)   # his actual: he made +25%
+    t["split_flag"] = True
+    for rule in ("E2", "E3", "E4"):
+        xd, xr = eb.simulate_exit(t, path, rule)
+        assert xd == t["sell"], f"{rule}: split-flagged should exit at his sell, not the phantom crash"
+        assert xr == pytest.approx(0.25, abs=1e-9), f"{rule}: split-flagged should keep his +25%, got {xr}"
+    # sanity: with the flag OFF the same path DOES trigger the catastrophic stop (proves the
+    # guard is what protects it, not the path being benign).
+    t["split_flag"] = False
+    _, xr_unflagged = eb.simulate_exit(t, path, "E3")
+    assert xr_unflagged < -0.5, "unflagged trade on a crashing path SHOULD take the big loss"
+
+
 # --------------------------------------------------------------------------- 2 + 4. portfolio
 def test_e1_reproduces_his_realized_book():
     """The whole comparison rests on this: E1 (his actual exits) + his sizing must reproduce
