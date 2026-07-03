@@ -39,3 +39,18 @@ Failing any one of these is recorded as a refutation — a valid and valuable ou
 
 ## Provenance
 Follows the honest-testing playbook. Related findings: the gamma signal is awareness-not-alpha; the warehouse IV corruption (2020-2021); the S2/S3 intraday condor refuted four ways (static gating already dead — this is profit-target MODULATION, a different and untested knob).
+
+## Addendum (2026-07-03) — Fill-model pre-commitment (recorded before the friendlier-fill results exist)
+
+The base 0DTE managed-condor terrain map (running now) uses the engine's existing HONEST-FILL model: every leg crosses the full bid-ask spread on both entry and exit (sell-at-bid / buy-at-ask on the way in, buy-at-ask / sell-at-bid on the way out) — i.e. 100% of the quoted spread on all legs, the pessimistic bound. That over-models cost for a strategy actually executed as a single 4-leg SPX combo, which fills near NET MID because the market maker hedges the package as one unit.
+
+Committed BEFORE seeing any friendlier-fill numbers:
+- Execution is a REPORTED SENSITIVITY AXIS on the NET COMBO package, not one hard-coded assumption. Levels: net-mid (0% of net spread, optimistic bound) / 25% of net spread / 50% of net spread / 100% (worst-side every leg, the current run).
+- HEADLINE = 50% of the net spread (conservative-but-fair). Mid and 25% reported around it; 100% retained as the worst-case bound.
+- PASS RULE: a positive verdict must HOLD ACROSS THE net-mid -> 50% band. A result that survives only at pure mid is recorded as execution-fragile, NOT an edge.
+- ANTI-CURVE-FIT-THE-COST-MODEL: the fill fraction is fixed by execution reality and chosen INDEPENDENTLY of the P&L. It is never selected because it makes the strategy profitable — doing so would be curve-fitting the cost assumption, the same sin as curve-fitting the strategy.
+- The fill fraction is a REAL ENGINE PARAMETER that propagates through the profit-target management (more credit collected in + a cheaper close shifts when the 25/50/75% target is actually touched), NOT a post-hoc multiplier on final P&L.
+
+This pre-commitment applies to the base 0DTE condor terrain map and to the regime-conditioned profit-target modulation described above.
+
+---
