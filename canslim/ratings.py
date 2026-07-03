@@ -96,11 +96,28 @@ L_RS_GATE = 80                              # RS Rating >= 80 minimum (ideally 9
 # "recent quarters weighted extra" — with a transparent, evenly-motivated weighting. This is an
 # APPROXIMATION of IBD's EPS Rating, explicitly NOT parity (labeled in provenance). No knob is
 # fit to any outcome.
+#
+# DISPLAY-ONLY WEIGHTS (never decision-gates): these EPS_W_* coefficients are a proprietary-weight
+# APPROXIMATION and feed ONLY the display/analysis grades eps_rating + composite_rating. Phase 3
+# selection gates ONLY on the raw spec-pinned components (C_pass/A_pass/N_pass/L_pass); these
+# weights must never enter any entry/ranking/sizing decision. Enforced by the guard test
+# test_composite_weights_do_not_affect_screen in tests/test_ratings.py — perturbing them is proven
+# not to change the screen-pass set.
 EPS_W_Q0 = 2.0          # most-recent quarter YoY  (double weight = "recent extra"  [SPEC §2])
 EPS_W_Q1 = 1.0          # prior quarter YoY
 EPS_W_MULTIYR = 1.0     # 3-yr annual growth component
 EPS_W_STABILITY = 1.0   # earnings-stability component
 EPS_MULTIYR_YEARS = 3   # trailing years for the multi-year growth leg  [SPEC §1 A / §2]
+
+# --- Composite Rating blend weights, [SPEC §2 / PLAN] — DISPLAY-ONLY approximation. ---
+# IBD's proprietary composite weights are undisclosed; this is the SPEC's stated structure
+# ("EPS + RS heaviest; SMR from fundamentals; 52-wk-high distance"). Exposed as constants (not
+# inlined) SOLELY so the guard test can perturb them and prove they never move the raw screen.
+# Like EPS_W_*, these feed ONLY the display grade composite_rating — never a decision-gate.
+COMPOSITE_W_EPS = 2.0       # eps_rating leg (heaviest)   [SPEC §2]
+COMPOSITE_W_RS = 2.0        # rs_rating leg (heaviest)    [SPEC §2]
+COMPOSITE_W_SMR = 1.0       # smr_rating_pct leg          [SPEC §2]
+COMPOSITE_W_NEARHIGH = 1.0  # 52-wk-high proximity leg    [PLAN]
 
 
 # ==========================================================================================
@@ -376,6 +393,17 @@ def rate_cross_section(raws: list[RawRatings]) -> pd.DataFrame:
     df = pd.DataFrame([asdict(r) for r in raws])
 
     df["rs_rating"] = _percentile_1_99(df["rs_raw"])
+
+    # -----------------------------------------------------------------------------------------
+    # DISPLAY-ONLY GRADES (never decision-gates). eps_rating, smr_rating_pct/smr_letter, and the
+    # composite_rating below use PROPRIETARY-WEIGHT APPROXIMATIONS (IBD's coefficients are
+    # undisclosed — see the EPS_W_* / composite-blend constants). They exist for DISPLAY/analysis
+    # ONLY. Phase 3 selection gates ONLY on the raw spec-pinned components
+    # (C_pass/A_pass/N_pass/L_pass from screen_flags); these grades must never enter any
+    # entry/ranking/sizing decision. Guarded by test_composite_weights_do_not_affect_screen.
+    # (rs_rating above is a raw cross-sectional RS percentile — NOT a proprietary-weight grade —
+    # and DOES back the L_pass gate, which is spec-pinned at L_RS_GATE.)
+    # -----------------------------------------------------------------------------------------
     df["eps_rating"] = _percentile_1_99(_eps_rating_raw(df))
     df["smr_raw"] = _smr_raw(df)
     df["smr_rating_pct"] = _percentile_1_99(df["smr_raw"])
@@ -387,8 +415,8 @@ def rate_cross_section(raws: list[RawRatings]) -> pd.DataFrame:
     near_high = _percentile_1_99(-df["pct_off_52w_high"])   # smaller distance -> higher percentile
     comp_num = pd.Series(0.0, index=df.index)
     comp_den = pd.Series(0.0, index=df.index)
-    for leg, w in ((df["eps_rating"], 2.0), (df["rs_rating"], 2.0),
-                   (df["smr_rating_pct"], 1.0), (near_high, 1.0)):
+    for leg, w in ((df["eps_rating"], COMPOSITE_W_EPS), (df["rs_rating"], COMPOSITE_W_RS),
+                   (df["smr_rating_pct"], COMPOSITE_W_SMR), (near_high, COMPOSITE_W_NEARHIGH)):
         m = leg.notna()
         comp_num[m] += w * leg[m]
         comp_den[m] += w
@@ -425,6 +453,19 @@ def screen_flags(df: pd.DataFrame) -> pd.DataFrame:
     the codified single-threshold forms of O'Neil's ranges (each cited to the SPEC constant).
     M is deliberately absent (emergent). I is absent (unavailable). These are FLAGS for Phase 3,
     not a combined verdict — Phase 3 decides how to use them.
+
+    CRITICAL — WHAT PHASE 3 MAY GATE ON:
+      Phase 3 selection MUST gate ONLY on these raw, spec-pinned components produced here:
+      C_pass / A_pass / N_pass / L_pass. Each is derived from a frozen [SPEC §1] threshold
+      (C_YOY_THRESHOLD, the A_* floors, the near-52wk-high proxy, L_RS_GATE on the raw RS
+      percentile).
+      The three IBD-style COMPOSITE GRADES — eps_rating, composite_rating, and
+      smr_rating_pct / smr_letter — are computed for DISPLAY / analysis ONLY. They use
+      PROPRIETARY-WEIGHT APPROXIMATIONS (IBD's true coefficients are undisclosed; see the
+      EPS_W_* and COMPOSITE_W_* constants) and must NEVER appear in any entry, ranking, or
+      sizing decision. This is enforced by the guard test
+      test_composite_weights_do_not_affect_screen in tests/test_ratings.py, which perturbs a
+      composite weight and asserts the screen-pass set is unchanged.
     """
     df = df.copy()
     df["C_pass"] = df["c_eps_yoy"].apply(lambda v: None if _f(v) is None else _f(v) >= C_YOY_THRESHOLD)

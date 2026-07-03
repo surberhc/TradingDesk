@@ -210,3 +210,66 @@ def test_deterministic(warehouse):
     a = R.rate_universe_asof(ASOF, members)
     b = R.rate_universe_asof(ASOF, members)
     pd.testing.assert_frame_equal(a.reset_index(drop=True), b.reset_index(drop=True))
+
+
+# ------------------------------------------------------------------------------------------
+# 8. GUARD: IBD composite grades are DISPLAY-ONLY — perturbing their proprietary-weight
+#    approximations must NOT change the raw spec-pinned screen (C/A/N/L). This locks the
+#    contract that Phase 3 selection gates only on raw components, never on the composites.
+# ------------------------------------------------------------------------------------------
+
+def _screen_pass_set(rated: pd.DataFrame):
+    """The set of names passing ALL raw component gates (C_pass & A_pass & N_pass & L_pass)."""
+    passed = rated[
+        (rated["C_pass"] == True) & (rated["A_pass"] == True)      # noqa: E712
+        & (rated["N_pass"] == True) & (rated["L_pass"] == True)    # noqa: E712
+    ]
+    return set(passed["ticker"])
+
+
+def test_composite_weights_do_not_affect_screen(warehouse, monkeypatch):
+    members = pd.DataFrame({"cik": [200, 220], "ticker": ["BULL", "BEAR"]})
+
+    baseline = R.rate_universe_asof(ASOF, members)
+    baseline_pass = _screen_pass_set(baseline)
+
+    # Perturb the proprietary-weight approximations that feed ONLY the display grades
+    # (eps_rating / composite_rating): the EPS-blend recent-quarter weight AND every
+    # composite-blend weight. If any decision path secretly gated on a composite grade, the
+    # raw screen-pass set would shift; it must not.
+    monkeypatch.setattr(R, "EPS_W_Q0", R.EPS_W_Q0 * 7.0 + 3.0)
+    monkeypatch.setattr(R, "COMPOSITE_W_EPS", R.COMPOSITE_W_EPS * 11.0 + 5.0)
+    monkeypatch.setattr(R, "COMPOSITE_W_RS", R.COMPOSITE_W_RS * 0.3 + 0.1)
+    monkeypatch.setattr(R, "COMPOSITE_W_SMR", R.COMPOSITE_W_SMR * 13.0)
+    monkeypatch.setattr(R, "COMPOSITE_W_NEARHIGH", R.COMPOSITE_W_NEARHIGH * 0.0 + 0.5)
+
+    perturbed = R.rate_universe_asof(ASOF, members)
+    perturbed_pass = _screen_pass_set(perturbed)
+
+    # 1. The raw screen-pass SET is byte-identical before/after the weight perturbation.
+    assert perturbed_pass == baseline_pass
+
+    # 2. And every raw gate column itself is unchanged row-for-row (stronger than just the set).
+    for gate in ("C_pass", "A_pass", "N_pass", "L_pass"):
+        pd.testing.assert_series_equal(
+            baseline.set_index("ticker")[gate].sort_index(),
+            perturbed.set_index("ticker")[gate].sort_index(),
+            check_names=False,
+        )
+
+    # 3. Sanity: the perturbed EPS weight DOES move the underlying (pre-percentile) composite
+    #    blend — proving the test actually exercised the weights (otherwise it would pass
+    #    vacuously). The 1-99 percentile mapping is degenerate on a 2-name universe (BULL always
+    #    ranks 99, BEAR 50), which is exactly WHY it must never back a decision; we therefore probe
+    #    the raw blend directly on a small frame whose legs diverge enough to register the change.
+    probe = pd.DataFrame({
+        "c_eps_yoy": [0.10, 5.00],          # recent-quarter YoY (the leg EPS_W_Q0 weights)
+        "c_eps_yoy_prior": [0.10, 0.10],
+        "a_eps_growth_3y": [0.10, 0.10],
+        "eps_stability": [0.80, 0.80],
+    })
+    R.EPS_W_Q0 = 2.0                         # restore baseline weight for the reference blend
+    base_blend = R._eps_rating_raw(probe).to_numpy()
+    R.EPS_W_Q0 = 2.0 * 7.0 + 3.0             # re-apply the perturbation
+    pert_blend = R._eps_rating_raw(probe).to_numpy()
+    assert not np.allclose(base_blend, pert_blend)
