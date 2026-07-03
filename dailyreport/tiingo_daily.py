@@ -25,7 +25,17 @@ from pathlib import Path
 import status
 
 BT_ROOT = Path(r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\backtester")
-MANIFEST = BT_ROOT / "data" / "_manifest.json"
+# The downloader writes the manifest wherever config points — the dataset was moved
+# off Drive (C:\TradingDesk-Local\bt_data) because Drive sync corrupts it, so the old
+# BT_ROOT/data path is dead. Resolve the SAME manifest the downloader writes, or the
+# status will forever read empty and report a false "partial". Fall back to the known
+# local path if the config import isn't reachable in the scheduled-task context.
+try:
+    sys.path.insert(0, str(BT_ROOT.parent))  # TradingDesk root, so `strategies` imports
+    from strategies import config as _bt_config
+    MANIFEST = Path(_bt_config.MANIFEST_FILE)
+except Exception:
+    MANIFEST = Path(r"C:\TradingDesk-Local\bt_data\_manifest.json")
 LOG = Path(r"C:\TradingDesk-Local\state\dailyreport\tiingo_daily.log")
 # Off-Drive secrets — the downloader reads TIINGO_API_KEY (and optional FRED_API_KEY)
 # from the environment; a scheduled-task context may not inherit the user env var,

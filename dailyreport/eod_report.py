@@ -50,8 +50,8 @@ TODAY_STR = TODAY.strftime("%Y%m%d")
 
 # status -> (dot color, label). Severity order used for the overall headline.
 DOT = {"ok": "#22c55e", "info": "#3b82f6", "stale": "#9ca3af",
-       "warn": "#f59e0b", "fail": "#ef4444"}
-SEVERITY = ["ok", "info", "stale", "warn", "fail"]
+       "partial": "#fbbf24", "warn": "#f59e0b", "fail": "#ef4444"}
+SEVERITY = ["ok", "info", "stale", "partial", "warn", "fail"]
 
 
 def _log(msg: str) -> None:
@@ -582,7 +582,7 @@ def _overall(sections):
 def render_html(sections, overall):
     def dot(st):
         return (f'<span style="display:inline-block;width:11px;height:11px;'
-                f'border-radius:50%;background:{DOT[st]};margin-right:8px;"></span>')
+                f'border-radius:50%;background:{DOT.get(st, "#9ca3af")};margin-right:8px;"></span>')
 
     blocks = []
     for s in sections:
@@ -598,7 +598,7 @@ def render_html(sections, overall):
             f'<div style="font-size:15px;font-weight:600;color:#111827;">'
             f'{dot(s["status"])}{s["title"]}'
             f'<span style="float:right;font-size:11px;text-transform:uppercase;'
-            f'letter-spacing:.05em;color:{DOT[s["status"]]};">{s["status"]}</span></div>'
+            f'letter-spacing:.05em;color:{DOT.get(s["status"], "#9ca3af")};">{s["status"]}</span></div>'
             f'<div style="font-size:13px;color:#374151;margin-top:4px;">{s["headline"]}</div>'
             f'{table}</div>')
 
@@ -608,7 +608,7 @@ def render_html(sections, overall):
         f'max-width:640px;margin:0 auto;color:#111827;">'
         f'<div style="font-size:18px;font-weight:700;">{dot(overall)}Trading Desk — End of Day</div>'
         f'<div style="font-size:12px;color:#6b7280;margin:2px 0 6px;">{stamp} · '
-        f'overall: <b style="color:{DOT[overall]};text-transform:uppercase;">{overall}</b></div>'
+        f'overall: <b style="color:{DOT.get(overall, "#9ca3af")};text-transform:uppercase;">{overall}</b></div>'
         f'{"".join(blocks)}'
         f'<div style="font-size:11px;color:#9ca3af;margin-top:10px;">'
         f'Automated end-of-day digest · TradingDesk\\dailyreport\\eod_report.py</div></div>')
