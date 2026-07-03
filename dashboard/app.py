@@ -39,6 +39,7 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
+import plotly.graph_objects as go
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
 REPO = Path(__file__).resolve().parent.parent
@@ -57,6 +58,10 @@ DERIVED = WAREHOUSE / "derived"
 PROGRESS_JSON = WAREHOUSE / "spxw_1m_progress.json"  # retired panel (backfill done 2026-07); kept for reversibility
 STATUS_DIR = Path(r"C:\TradingDesk-Local\state\dailyreport\status")
 BACKTEST_OUTPUT = REPO / "backtester" / "output"
+# S5 convexity-ledger experiment summary (head-to-head + tail-sizing frontier tables).
+# The full per-day NAV/ledger time series is recomputed live via simulate_s5 (fast, cached).
+S5_LEDGER_CSV = BACKTEST_OUTPUT / "s5_ledger_experiment_20260630.csv"
+S5_TAIL_SWEEP_MD = BACKTEST_OUTPUT / "s5_tail_sweep_20260628.md"
 
 # EDGAR point-in-time fundamentals warehouse (off-Drive, on C:). A PERIODIC
 # (monthly-ish) refresh — monitored here as freshness/coverage, not a daily feed.
@@ -134,6 +139,25 @@ def _fmt_dt(ts: str | None) -> str:
     if not ts:
         return "—"
     return str(ts).replace("T", " ")
+
+
+def _fmt_big(x: float, nd: int = 2) -> str:
+    """One shared magnitude formatter: raw dollars/notional -> a compact B/M/K string.
+    Used so GEX numbers read consistently across the snapshot tiles, chart and history."""
+    try:
+        v = float(x)
+    except (TypeError, ValueError):
+        return "—"
+    if v != v:  # NaN
+        return "—"
+    a = abs(v)
+    if a >= 1e9:
+        return f"{v/1e9:,.{nd}f}B"
+    if a >= 1e6:
+        return f"{v/1e6:,.{nd}f}M"
+    if a >= 1e3:
+        return f"{v/1e3:,.{nd}f}K"
+    return f"{v:,.{nd}f}"
 
 
 def _status_tier(status: str) -> str:
@@ -569,7 +593,7 @@ def render_gamma() -> None:
             net = snap.get("net_gex", 0) or 0
             net_tier = "good" if net > 0 else ("bad" if net < 0 else "unknown")
             st.metric("Spot", f"{snap.get('spot', float('nan')):,.2f}", border=True)
-            st.metric("Net GEX", f"{net/1e9:,.2f} B",
+            st.metric("Net GEX", f"{_fmt_big(net)}",
                       delta=("positive" if net > 0 else "negative" if net < 0 else None),
                       delta_color=("normal" if net > 0 else "inverse" if net < 0 else "off"),
                       border=True)
@@ -580,24 +604,96 @@ def render_gamma() -> None:
 
     st.divider()
 
-    # --- History chart ---
+    # --- L1: GEX zero-line / flip chart -------------------------------------
+    # The headline viz. Replaces the bare line chart with a proper plotly chart:
+    #   * net GEX drawn as a signed area with a ZERO LINE marked (green above /
+    #     red below) — the "are we long or short gamma" read at a glance;
+    #   * spot vs gamma_flip on a secondary y-axis, so you see how far price is
+    #     from the flip level (positive- vs negative-gamma regime boundary).
+    # Pure frontend on the existing *_gex_daily.parquet (net_gex, spot,
+    # gamma_flip already present) — no new data, no writes.
+    st.markdown("#### GEX zero-line / flip chart")
     all_syms = sorted(p.name.replace("_gex_daily.parquet", "")
                       for p in DERIVED.glob("*_gex_daily.parquet"))
     default_idx = all_syms.index("SPX") if "SPX" in all_syms else 0
     c1, c2 = st.columns([1, 1])
     sym = c1.selectbox("Symbol", all_syms, index=default_idx)
-    field = c2.selectbox("Series", ["net_gex", "spot", "dist_to_flip_pct",
-                                    "expected_move_pct"], index=0)
-    hist = gex_history(sym)
+    lookback_label = c2.selectbox("Lookback", ["30", "90", "250", "All"], index=2)
+    n = 100_000 if lookback_label == "All" else int(lookback_label)
+
+    hist = gex_history(sym, n=n)
     if hist is None or hist.empty:
         st.caption("no history")
     else:
-        chart_df = hist.set_index("date")[[field]]
-        if field == "net_gex":
-            chart_df = chart_df / 1e9
-            chart_df.columns = ["net_gex (B)"]
-        st.line_chart(chart_df, use_container_width=True)
-        st.caption(f"{sym}: last {len(hist)} sessions")
+        have_flip = "gamma_flip" in hist.columns and hist["gamma_flip"].notna().any()
+        have_spot = "spot" in hist.columns and hist["spot"].notna().any()
+
+        # --- Panel 1: net GEX with a zero line (sign = gamma regime) ---
+        gb = hist["net_gex"] / 1e9
+        pos = gb.where(gb >= 0)
+        neg = gb.where(gb < 0)
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(
+            x=hist["date"], y=pos, name="net GEX ≥ 0 (long gamma)",
+            fill="tozeroy", mode="lines", line=dict(color=_TIER_COLOR["good"], width=1),
+            connectgaps=False))
+        fig.add_trace(go.Scatter(
+            x=hist["date"], y=neg, name="net GEX < 0 (short gamma)",
+            fill="tozeroy", mode="lines", line=dict(color=_TIER_COLOR["bad"], width=1),
+            connectgaps=False))
+        fig.add_hline(y=0, line_width=1.4, line_color="#c9ccd1")
+        last_g = gb.iloc[-1]
+        fig.update_layout(
+            height=300, margin=dict(l=10, r=10, t=28, b=10),
+            template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            title=dict(text=f"{sym} net GEX ($B) — last {len(hist)} sessions "
+                            f"(latest {_fmt_big(hist['net_gex'].iloc[-1])})", font=dict(size=13)),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+            yaxis=dict(title="net GEX ($B)"))
+        st.plotly_chart(fig, use_container_width=True)
+        regime = ("positive gamma (mean-reverting)" if last_g > 0 else
+                  "negative gamma (trend-amplifying)" if last_g < 0 else "flat")
+        st.caption(f"Latest net GEX {_fmt_big(hist['net_gex'].iloc[-1])} → **{regime}**. "
+                   "Above the zero line = dealers long gamma (dampen moves); "
+                   "below = short gamma (amplify moves).")
+
+        # --- Panel 2: spot vs the gamma-flip level ---
+        if have_spot and have_flip:
+            f2 = go.Figure()
+            f2.add_trace(go.Scatter(
+                x=hist["date"], y=hist["spot"], name="spot",
+                mode="lines", line=dict(color="#5b9dff", width=1.4)))
+            f2.add_trace(go.Scatter(
+                x=hist["date"], y=hist["gamma_flip"], name="gamma flip",
+                mode="lines", line=dict(color="#f5c451", width=1.2, dash="dot")))
+            sp, fl = hist["spot"].iloc[-1], hist["gamma_flip"].iloc[-1]
+            above = sp >= fl
+            f2.update_layout(
+                height=260, margin=dict(l=10, r=10, t=28, b=10),
+                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                title=dict(text=f"{sym} spot vs gamma-flip level", font=dict(size=13)),
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+                yaxis=dict(title="index level"))
+            st.plotly_chart(f2, use_container_width=True)
+            dist = hist["dist_to_flip_pct"].iloc[-1] if "dist_to_flip_pct" in hist.columns else float("nan")
+            st.caption(
+                f"Spot {sp:,.2f} is **{'ABOVE' if above else 'BELOW'}** the flip "
+                f"{fl:,.2f}"
+                + (f" ({dist:+.2f}% away)" if dist == dist else "")
+                + " — spot above flip ≈ positive-gamma regime; below ≈ negative-gamma.")
+        else:
+            st.caption("spot / gamma_flip not available for this symbol — "
+                       "showing net-GEX zero-line only.")
+
+    # --- L2 (gamma-by-strike grid): blocked. The derived *_gex_daily.parquet
+    # tables are daily AGGREGATES (net/call/put GEX + a single focal_strike) —
+    # there is no per-strike GEX profile persisted, so the strike-ladder heat
+    # strip cannot be built from data on disk yet. It needs a small build in
+    # datacollector features to persist the strike-level profile first.
+    st.caption("⚠ Gamma-by-strike grid (roadmap L2) is blocked: the derived tables "
+               "are daily aggregates only — no per-strike GEX profile is persisted yet.")
 
 
 # ============================== 3. BACKTESTS ==================================
@@ -815,6 +911,202 @@ def render_accounts() -> None:
                 pass
 
 
+# ============================ 5. S5 CONVEXITY =================================
+@st.cache_data(ttl=3600, show_spinner="Computing S5 convexity ledger (EOD prototype)...")
+def s5_ledger() -> dict | None:
+    """Recompute the S5 EOD convexity prototype ONCE (cached 1h) and return its
+    per-day ledger/NAV time series + roll-up totals. Read-only research compute —
+    imports the backtester's own s5_convexity_overlay.simulate_s5 unmodified and
+    touches no broker/warehouse/config. The run is <1s; recomputing live avoids
+    persisting a stale curve. Returns None if the module/data isn't importable."""
+    try:
+        s5dir = REPO / "backtester"
+        if str(s5dir) not in sys.path:
+            sys.path.insert(0, str(s5dir))
+        import s5_convexity_overlay as s5
+        with contextlib.redirect_stdout(io.StringIO()):
+            panel = s5.build_panel()
+            res = s5.simulate_s5(panel)
+        out = res["df"].copy()
+        # SPY total-return buy&hold NAV on the same index (the honest benchmark).
+        spy_nav = (1.0 + panel["r_spy"].reindex(out.index).fillna(0.0)).cumprod()
+        return {
+            "df": out,
+            "spy_nav": spy_nav,
+            "reserve_target": res.get("reserve_target"),
+            "total_harvest": res.get("total_harvest"),
+            "total_tail_carry": res.get("total_tail_carry"),
+            "total_upside_spent": res.get("total_upside_spent"),
+            "total_upside_payoff": res.get("total_upside_payoff"),
+            "upside_fund_count": res.get("upside_fund_count"),
+        }
+    except Exception as exc:  # pragma: no cover - defensive display path
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+@st.cache_data(ttl=3600)
+def s5_frontier() -> pd.DataFrame | None:
+    """The pre-computed head-to-head summary (ENDOGENOUS vs FIXED vs S4 vs SPY)
+    from the S5 ledger-experiment CSV. Display-only read."""
+    if not S5_LEDGER_CSV.exists():
+        return None
+    try:
+        return pd.read_csv(S5_LEDGER_CSV)
+    except Exception:
+        return None
+
+
+def _s5_metric_block(r: pd.Series, spy_nav: pd.Series) -> dict:
+    """Headline CAGR/maxDD/Calmar off the S5 fund-return series (self-contained so
+    the panel doesn't depend on the backtester's metrics wiring)."""
+    import numpy as np
+    rr = r.dropna()
+    nav = (1.0 + rr.fillna(0.0)).cumprod()
+    yrs = len(rr) / 252.0
+    cagr = float(nav.iloc[-1] ** (1.0 / yrs) - 1.0) if yrs > 0 and len(nav) else float("nan")
+    dd = float((nav / nav.cummax() - 1.0).min()) if len(nav) else float("nan")
+    calmar = float(cagr / abs(dd)) if dd < 0 else float("nan")
+    vol = float(rr.std(ddof=0) * np.sqrt(252.0)) if len(rr) else float("nan")
+    return {"cagr": cagr, "maxdd": dd, "calmar": calmar, "vol": vol}
+
+
+def render_s5() -> None:
+    st.subheader("S5 — financed-convexity overlay (EOD ledger)")
+    st.caption("Read-only research view. Recomputes the EOD convexity prototype live "
+               "(cached 1h) from the backtester's own simulate_s5 — no broker, no "
+               "writes. Numbers are a STRUCTURAL prototype on assumed harvest income "
+               "and flat-skew BSM pricing (optimistic in absolutes; the honest reads "
+               "are relative). Nothing here is adopted or wired into any strategy.")
+
+    if st.button("↻ Recompute S5 ledger (cached 1h)"):
+        s5_ledger.clear()
+
+    led = s5_ledger()
+    if led is None:
+        st.warning("S5 prototype module not importable on this host.")
+        return
+    if "error" in led:
+        st.error(f"Could not compute S5 ledger: {led['error']}")
+        return
+
+    out = led["df"]
+    spy_nav = led["spy_nav"]
+    m = _s5_metric_block(out["r_fund"], spy_nav)
+
+    # --- Headline metric row ---
+    c = st.columns(5)
+    c[0].metric("CAGR", f"{m['cagr']*100:.2f}%", border=True)
+    c[1].metric("Max drawdown", f"{m['maxdd']*100:.1f}%", border=True)
+    c[2].metric("Calmar", f"{m['calmar']:.2f}", border=True)
+    c[3].metric("Ann vol", f"{m['vol']*100:.1f}%", border=True)
+    c[4].metric("Cum. harvest (assumed)",
+                f"{(led.get('total_harvest') or 0)*100:.0f}%", border=True)
+    st.caption(f"EOD window {out.index.min().date()} → {out.index.max().date()} "
+               f"({len(out):,} trading days). CAGR is optimistic (flat-skew BSM + "
+               "assumed harvest); read it against SPY below, not in isolation.")
+
+    st.divider()
+
+    # --- Equity curve: S5 vs SPY buy&hold (TR) ---
+    st.markdown("#### Equity curve — S5 vs SPY buy & hold (TR)")
+    s5_nav = (1.0 + out["r_fund"].fillna(0.0)).cumprod()
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=out.index, y=s5_nav, name="S5 fund",
+                             mode="lines", line=dict(color=_TIER_COLOR["good"], width=1.4)))
+    fig.add_trace(go.Scatter(x=spy_nav.index, y=spy_nav, name="SPY buy&hold (TR)",
+                             mode="lines", line=dict(color="#5b9dff", width=1.1)))
+    fig.update_layout(
+        height=320, margin=dict(l=10, r=10, t=24, b=10),
+        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+        yaxis=dict(title="growth of $1", type="log"))
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Log-scale growth of $1. The S5 story is a smoother path (shallower "
+               "crash drawdowns via the always-on tail), not beating SPY on raw return.")
+
+    st.divider()
+
+    # --- Convexity ledger: core vs tail + the self-funding ledger/reserve ---
+    st.markdown("#### Convexity ledger — core vs tail, and the self-funding buffer")
+    lc, rc = st.columns(2)
+    with lc:
+        # Net book delta = the passive de-risk engine (1.0 = fully invested core,
+        # ~0 = fully hedged at a crash bottom). This is the "convexity" dial.
+        fdel = go.Figure()
+        fdel.add_trace(go.Scatter(x=out.index, y=out["net_delta"], name="net delta",
+                                  mode="lines", line=dict(color="#f5c451", width=1)))
+        fdel.add_hline(y=1.0, line_width=1, line_color="#5b9dff", line_dash="dot")
+        fdel.add_hline(y=0.0, line_width=1, line_color="#c9ccd1")
+        fdel.update_layout(
+            height=240, margin=dict(l=10, r=10, t=26, b=10), template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            title=dict(text="Net book delta (1.0 = full core · ~0 = hedged at bottom)",
+                       font=dict(size=12)),
+            showlegend=False, yaxis=dict(title="net delta"))
+        st.plotly_chart(fdel, use_container_width=True)
+        st.caption("The passive convexity engine: net delta falls toward ~0 as the "
+                   "uncapped tail goes ITM in a crash, then re-rises on recovery — "
+                   "no signal, no timing.")
+    with rc:
+        flg = go.Figure()
+        flg.add_trace(go.Scatter(x=out.index, y=out["ledger"] * 100, name="ledger",
+                                 mode="lines", line=dict(color=_TIER_COLOR["good"], width=1)))
+        flg.add_trace(go.Scatter(x=out.index, y=out["reserve"] * 100, name="reserve",
+                                 mode="lines", line=dict(color="#5b9dff", width=1)))
+        rt = led.get("reserve_target")
+        if rt is not None:
+            flg.add_hline(y=rt * 100, line_width=1, line_color="#c9ccd1",
+                          line_dash="dot")
+        flg.update_layout(
+            height=240, margin=dict(l=10, r=10, t=26, b=10), template="plotly_dark",
+            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+            title=dict(text="Self-funding ledger & reserve (% of NAV)", font=dict(size=12)),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
+            yaxis=dict(title="% of NAV"))
+        st.plotly_chart(flg, use_container_width=True)
+        st.caption("Harvested-premium ledger funds the discretionary hedge spend via "
+                   "the priority waterfall; the reserve is the senior buffer (dotted "
+                   "= target).")
+
+    # --- Ledger roll-up totals ---
+    tc = st.columns(4)
+    tc[0].metric("Cum. tail carry paid",
+                 f"{(led.get('total_tail_carry') or 0)*100:.1f}%")
+    tc[1].metric("Upside fundings", f"{led.get('upside_fund_count') or 0}")
+    tc[2].metric("Upside premium spent",
+                 f"{(led.get('total_upside_spent') or 0)*100:.2f}%")
+    tc[3].metric("Upside payoff",
+                 f"{(led.get('total_upside_payoff') or 0)*100:.2f}%")
+
+    st.divider()
+
+    # --- Tail-sizing frontier / head-to-head (pre-computed) ---
+    st.markdown("#### Head-to-head (pre-registered ledger experiment)")
+    fr = s5_frontier()
+    if fr is None or fr.empty:
+        st.caption("Frontier summary CSV not found.")
+    else:
+        disp = fr.copy()
+        for col, pct in (("cagr", True), ("maxdd", True), ("calmar", False),
+                         ("sharpe", False), ("vol", True)):
+            if col in disp.columns:
+                disp[col] = disp[col].map(
+                    (lambda v: f"{v*100:.2f}%") if pct else (lambda v: f"{v:.2f}"))
+        st.dataframe(disp, use_container_width=True, hide_index=True)
+        st.caption("ENDOGENOUS waterfall ledger vs a FIXED flat budget (2%/yr spec "
+                   "seed), S4 vol-control and SPY. Verdict: endogenous wins on "
+                   "twitchy-market bleed; ~tie on the full cycle at a like budget. "
+                   "See s5_ledger_experiment / s5_tail_sweep reports for the full study.")
+
+    # --- Blocked note: the offensive/harvest half ---
+    st.info("⚠ **Offensive / harvest half is blocked-for-real-data.** The harvest "
+            "income above is an ASSUMED knob and the tail is flat-skew-BSM priced "
+            "(optimistic). The active-monetization 0DTE harvest engine needs the "
+            "1-min SPXW feed (now backfilled) wired through before those numbers are "
+            "real P&L. This panel shows the EOD / defensive half only.")
+
+
 # ================================= LAYOUT =====================================
 def main() -> None:
     st.title("📊 Trading Desk")
@@ -824,7 +1116,8 @@ def main() -> None:
     st.caption("Read-only dashboard · Phase 1 · paper account only · nothing here "
                "places, arms, or transmits any order.")
 
-    tabs = st.tabs(["🩺 Health", "📈 Gamma (GEX)", "🧪 Backtests", "💼 Accounts"])
+    tabs = st.tabs(["🩺 Health", "📈 Gamma (GEX)", "🧪 Backtests",
+                    "🛡 S5 Convexity", "💼 Accounts"])
     with tabs[0]:
         render_health()
     with tabs[1]:
@@ -832,6 +1125,8 @@ def main() -> None:
     with tabs[2]:
         render_backtests()
     with tabs[3]:
+        render_s5()
+    with tabs[4]:
         render_accounts()
 
 
