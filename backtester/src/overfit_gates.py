@@ -19,10 +19,14 @@ Two diagnostics:
      "the asset did the work, not the strategy" (or a leak / survivorship /
      look-ahead bug), not genuine edge.
 
-THRESHOLDS ARE PROPOSALS, NOT GATES. Every tolerance below is a documented,
-overridable default argument — a starting point for Andrew to bless, tighten,
-or reject. None of them live in the frozen config, and none of them decide
-pass/fail on their own; they decide what gets a second look.
+THRESHOLDS ARE ALERTS, NOT GATES. Every tolerance below is a documented,
+overridable default argument. None of them live in the frozen config, and none
+of them decide pass/fail on their own; they decide what gets a second look.
+
+BLESSED 2026-07-03 by Andrew as accepted diagnostic defaults. The blessing is
+explicit that DEFAULT_DEGRADATION_TOL and DEFAULT_SHARPE_CEILING are intended as
+ALERT / FLAG lines ("look closer") — NOT as an automatic pass/fail reject gate.
+A flagged result gets human scrutiny; it is never auto-rejected on the threshold.
 """
 
 from __future__ import annotations
@@ -30,18 +34,19 @@ from __future__ import annotations
 import math
 
 # ---------------------------------------------------------------------------
-# Proposed defaults (all overridable per-call; NONE are enshrined gates).
+# Blessed diagnostic defaults (all overridable per-call; ALERTS, not gates).
+# BLESSED 2026-07-03 by Andrew — accepted as ALERT / FLAG lines that mark a
+# result for a closer look, NOT automatic pass/fail reject thresholds.
 #
 #   DEFAULT_DEGRADATION_TOL — how much an OOS metric may fall below its IS value
-#       before we flag "overfit-suspect". 0.30 => OOS must retain >= ~70% of IS.
+#       before we FLAG "overfit-suspect". 0.30 => OOS must retain >= ~70% of IS.
 #       Symmetric on the other side: OOS more than this fraction ABOVE IS is
-#       flagged "lucky-suspect". A round, defensible starting point; needs
-#       Andrew's blessing before it means anything.
+#       flagged "lucky-suspect". A round, defensible line — blessed as an alert.
 #
 #   DEFAULT_SHARPE_CEILING — the "too-good-to-be-true" Sharpe line. 2.5 is the
 #       value called out in the source video as the point where a long-horizon
-#       daily-rebalanced strategy's Sharpe stops being plausibly skill. Also a
-#       proposal pending Andrew's blessing.
+#       daily-rebalanced strategy's Sharpe stops being plausibly skill. Blessed
+#       as an alert that flags "look closer," not as an auto-reject gate.
 # ---------------------------------------------------------------------------
 DEFAULT_DEGRADATION_TOL: float = 0.30
 DEFAULT_SHARPE_CEILING: float = 2.5
@@ -90,8 +95,9 @@ def is_oos_divergence(
     loss-style metric (e.g. max drawdown magnitude, higher = worse) set
     higher_is_better=False and "degraded" flips to mean OOS got worse (larger).
 
-    `tol` is a PROPOSED default (0.30 => retain >= ~70% of IS), overridable and
-    non-binding — it decides what gets a second look, not pass/fail.
+    `tol` is a BLESSED (2026-07-03) default (0.30 => retain >= ~70% of IS),
+    overridable and non-binding — it is an ALERT that decides what gets a second
+    look, not a pass/fail reject gate.
 
     Pure: no I/O, no globals mutated. Never raises on bad input — returns a
     verdict of "undefined" with a human-readable reason instead.
@@ -191,8 +197,9 @@ def is_too_good(
     once-in-a-generation run) than durable edge. This does NOT prove a bug — it
     marks the result for scrutiny.
 
-    `ceiling` is a PROPOSED default (2.5, from the source video), overridable
-    and non-binding.
+    `ceiling` is a BLESSED (2026-07-03) default (2.5, from the source video),
+    overridable and non-binding — an ALERT that flags "look closer," not an
+    auto-reject gate.
 
     Pure and total: never raises; non-finite / missing input returns a verdict
     of "undefined".

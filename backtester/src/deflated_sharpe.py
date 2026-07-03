@@ -7,6 +7,11 @@ an observed Sharpe was SELECTED as the best (or one of many) out of N trials, an
 given the return series is non-normal (skewed, fat-tailed) and finite-length, how
 likely is the true Sharpe actually positive? That is the anti-curve-fit yardstick.
 
+REVIEWED / ACCEPTED 2026-07-03 by Andrew as the project's formal
+multiple-comparisons statistic. There are no free thresholds to bless here — the
+DSR/PSR/E[max SR] formulas are principled (Bailey/López de Prado), not tuned
+knobs — so the acceptance is of the method itself, not of any parameter value.
+
 Reference
 ---------
 Bailey, D. H., & López de Prado, M. (2014). "The Deflated Sharpe Ratio:

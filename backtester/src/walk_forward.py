@@ -38,15 +38,22 @@ surfaced in the result, and any window whose OOS length < THIN_N (default 30 tra
 days, mirroring s6_matrix.THIN_N) is flagged with a WARNING. The stitched OOS is also
 checked. Thin results are made LOUD, never silent.
 
-DESIGN CHOICES that need Andrew's blessing (NOT enshrined)
-----------------------------------------------------------
+DESIGN CHOICES — BLESSED 2026-07-03 by Andrew (accepted defaults, NOT frozen config)
+------------------------------------------------------------------------------------
   * n_windows = 5   — how many sequential windows to cut. More windows = more regimes
-                      sampled but thinner tails. Proposed, not frozen.
-  * is_frac   = 0.70 — in-sample fraction inside each window (70/30 train/test). Proposed.
-  * mode      = "rolling" — rolling vs anchored default. Proposed.
-  * THIN_N    = 30  — reused from s6_matrix's convention (min usable trade-days).
-These are function parameters with documented defaults precisely so they are easy to
-change once blessed — nothing here is tuned to a period.
+                      sampled but thinner tails. Blessed default.
+  * is_frac   = 0.70 — in-sample fraction inside each window (70/30 train/test). Blessed.
+  * mode      = "rolling" — rolling vs anchored default. Blessed.
+  * THIN_N    = 30  — reused from s6_matrix's convention (min usable trade-days). Blessed.
+These are function parameters with documented defaults so they stay easy to change —
+nothing here is tuned to a period.
+
+OPERATIONAL NOTE — WHAT THIS HARNESS IS FOR (and what it is NOT)
+---------------------------------------------------------------
+This harness is intended for CAN SLIM and other higher-frequency signals that generate
+enough observations to fill 5 OOS tails. It is NOT to be run on S0 (a slow allocator):
+5 windows x 30% OOS slices fall below THIN_N, so the result is noise, not a finding.
+S0's validation stays episode/regime + block bootstrap — do not walk-forward S0 here.
 """
 
 from __future__ import annotations
@@ -203,10 +210,11 @@ def rolling_walk_forward(
         result must depend only on data at/after oos_start — no peeking past the OOS tail.
         Defaults to a passthrough that re-bases the OOS slice of the input (the common case
         where the input is an already-run NAV path).
-    n_windows : int, default 5   (DESIGN CHOICE — needs Andrew's blessing)
-    is_frac   : float, default 0.70  (DESIGN CHOICE — needs Andrew's blessing)
-    mode      : {"rolling", "anchored"}, default "rolling"  (DESIGN CHOICE)
+    n_windows : int, default 5   (DESIGN CHOICE — blessed 2026-07-03)
+    is_frac   : float, default 0.70  (DESIGN CHOICE — blessed 2026-07-03)
+    mode      : {"rolling", "anchored"}, default "rolling"  (DESIGN CHOICE — blessed)
     thin_n    : int, default THIN_N (30)  min OOS trade-days for a trustworthy score.
+        Intended for CAN SLIM / higher-frequency signals — NOT for S0 (see module docstring).
 
     Returns
     -------
