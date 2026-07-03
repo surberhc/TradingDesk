@@ -55,6 +55,22 @@ PULL_HB = STATE_DIR / "pull_equity_options_heartbeat.json"
 PULL_SCRIPT = HERE / "pull_equity_options.py"
 BT_SCRIPT = HERE / "run_options_overlay_real.py"
 
+
+def _expected_job() -> dict:
+    """The identity of the FULL production pull the supervisor is supposed to run:
+    the liquid overlay universe over 2023-01-01..today. A "complete" heartbeat is
+    only trusted if its job_id matches this — a stale 1-name / short-window smoke
+    test can NEVER satisfy it (that bug skipped the real 55-name pull on 2026-07-02)."""
+    # Import the exact same universe + job_id function the pull uses (no drift).
+    sys.path.insert(0, str(HERE))
+    import pull_equity_options as pull  # type: ignore
+    import options_overlay_backtest as ovb  # type: ignore
+    names = sorted(ovb.LIQUID)
+    start = pull.START_DEFAULT
+    end = dt.date.today().strftime("%Y%m%d")
+    return {"job_id": pull.job_id(names, start, end), "n_names": len(names),
+            "start": start, "end": end}
+
 # Use the base interpreter (this venv's python.exe is a relauncher STUB — spawning
 # via it double-launches). Put venv site-packages on PYTHONPATH so deps import.
 PY = getattr(sys, "_base_executable", None) or sys.executable
@@ -204,11 +220,29 @@ def _pull_hb_mtime() -> float:
 
 
 def _pull_complete() -> bool:
+    """True only if the pull heartbeat says phase=='complete' AND it is THIS full
+    production job (universe + date range). Guards against a stale smoke-test
+    heartbeat (e.g. a 1-name/8-day NVDA window) being mistaken for the real pull."""
     try:
         hb = json.loads(PULL_HB.read_text())
-        return hb.get("phase") == "complete"
     except Exception:
         return False
+    if hb.get("phase") != "complete":
+        return False
+    try:
+        want = _expected_job()
+    except Exception as e:
+        # Can't compute the expected job -> refuse to trust a "complete" (fail closed).
+        log(f"WARN could not compute expected pull job ({e!r}) — treating pull as NOT complete")
+        return False
+    jid = hb.get("job_id")
+    if jid == want["job_id"]:
+        return True
+    log(f"pull heartbeat is 'complete' but for a DIFFERENT job "
+        f"(hb job_id={jid} names={hb.get('n_names')} {hb.get('start')}..{hb.get('end')} "
+        f"vs expected job_id={want['job_id']} names={want['n_names']} "
+        f"{want['start']}..{want['end']}) — NOT accepting as complete (stale test heartbeat).")
+    return False
 
 
 def run_pull_stage() -> str:
@@ -285,11 +319,40 @@ def do_backtest() -> dict | None:
         summary = {"stock_final": stock_final,
                    "base_cell": base_row[1] if base_row else None,
                    "base_final": float(base_row[10]) if base_row else None,
+                   "base_priced": int(float(base_row[14])) if base_row and len(base_row) > 14
+                                  and base_row[14] not in ("", None) else None,
                    "base_medIV": base_row[15] if base_row and len(base_row) > 15 else None}
         return summary
     except Exception as e:
         log(f"WARN could not parse results CSV: {e!r}")
         return {}
+
+
+# --------------------------------------------------------------------------- #
+# Coverage gate — an all-no-quote book must NEVER report ok
+# --------------------------------------------------------------------------- #
+def _coverage_failure(summary: dict) -> str | None:
+    """Return a human reason string if the base cell did NOT actually price real
+    options (so status must be FAIL), else None. Two independent tripwires:
+      - base_priced == 0  (no name yielded a usable real contract), or
+      - base_final == START_CAPITAL (the option book never moved off the start)."""
+    if not summary:
+        return "backtest returned no summary metrics"
+    priced = summary.get("base_priced")
+    if priced is not None and priced <= 0:
+        return "0 names priced (base cell)"
+    base_final = summary.get("base_final")
+    if base_final is None:
+        return "base cell missing from results"
+    try:
+        sys.path.insert(0, str(HERE))
+        import options_overlay_backtest as ovb  # type: ignore
+        start_cap = float(ovb.START_CAPITAL)
+    except Exception:
+        start_cap = None
+    if start_cap is not None and abs(float(base_final) - start_cap) < 1.0:
+        return f"base_final == START_CAPITAL (${int(start_cap):,}); option book never priced"
+    return None
 
 
 # --------------------------------------------------------------------------- #
@@ -361,6 +424,24 @@ def main() -> int:
                        "The equity-options pull completed but run_options_overlay_real.py failed. "
                        "See C:\\TradingDesk-Local\\state\\canslim\\overlay_pipeline.log.")
             write_summary({}, ok=False)
+            return 1
+
+        # COVERAGE GATE (kill the false-OK): the backtest can "succeed" on an EMPTY
+        # warehouse — every name is no-quote, the option book never leaves START_CAPITAL,
+        # and it used to report "ok". Refuse to call that ok.
+        cov = _coverage_failure(summary)
+        if cov:
+            heartbeat("coverage_failed", summary)
+            write_status("fail", metrics=summary,
+                         message=f"ALARM: overlay backtest ran but priced NO real options ({cov}). "
+                                 "The warehouse looks empty/stale — status is FAIL, not ok. "
+                                 "See overlay_pipeline.log.")
+            send_email("[TradingDesk ALARM] overlay produced an ALL-NO-QUOTE book",
+                       f"The real-quote overlay backtest completed but {cov}. This means the "
+                       "equity-options warehouse had no usable quotes (empty/stale pull), so the "
+                       "option book never moved off the start capital. Reporting FAIL, not ok. "
+                       "See C:\\TradingDesk-Local\\state\\canslim\\overlay_pipeline.log.")
+            write_summary(summary, ok=False)
             return 1
 
         # success

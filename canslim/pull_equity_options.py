@@ -55,6 +55,7 @@ from __future__ import annotations
 
 import argparse
 import datetime as dt
+import hashlib
 import json
 import os
 import sys
@@ -97,6 +98,23 @@ DROP_COLS = ["bid_exchange", "bid_condition", "ask_exchange", "ask_condition"]
 TERMINAL_WAIT_TICK = 30            # seconds between Terminal reachability retries
 TERMINAL_MAX_WAIT = 1800           # give up a *cycle* after 30 min unreachable (supervisor re-runs)
 
+# Set False by a --test / --no-hb smoke run so a manual 1-name window can NEVER write
+# the production pull heartbeat (a stale "complete" there is exactly what poisoned the
+# 19:00 supervisor into skipping the real 55-name pull).
+WRITE_HEARTBEAT = True
+
+
+# --------------------------------------------------------------------------- #
+# Job identity — a "complete" heartbeat must prove it is THIS full job (universe +
+# date range), not a leftover smoke test. The supervisor validates job_id against
+# the full production job before it trusts a "complete".
+# --------------------------------------------------------------------------- #
+def job_id(names: list[str], start: str, end: str) -> str:
+    """Stable id for a (universe, window) pull. Same names+range -> same id, so a
+    resume of the real job matches, but a 1-name test window never does."""
+    canon = ",".join(sorted(n.upper() for n in names)) + f"|{start}|{end}"
+    return hashlib.sha256(canon.encode("utf-8")).hexdigest()[:16]
+
 
 # --------------------------------------------------------------------------- #
 # Logging + heartbeat
@@ -116,6 +134,8 @@ def log(msg: str) -> None:
 
 
 def write_heartbeat(payload: dict) -> None:
+    if not WRITE_HEARTBEAT:
+        return   # test / --no-hb run: never touch the production pull heartbeat
     try:
         STATE_DIR.mkdir(parents=True, exist_ok=True)
         payload = {**payload, "ts": dt.datetime.now().isoformat(timespec="seconds")}
@@ -374,17 +394,19 @@ def run_pull(names: list[str], start: str, end: str, workers: int) -> dict:
     log(f"=== equity-options pull start: {len(names)} names, {start}..{end}, "
         f"{workers} workers, {total} name-months to do ===")
 
+    jid = job_id(names, start, end)
+    ident = {"job_id": jid, "n_names": len(names), "start": start, "end": end}
+
     done = 0
     rows_total = 0
     per_name_done = defaultdict(int)
-    write_heartbeat({"phase": "running", "names": len(names), "workers": workers,
-                     "months_total": total, "months_done": 0, "rows": 0,
-                     "start": start, "end": end})
+    write_heartbeat({**ident, "phase": "running", "workers": workers,
+                     "months_total": total, "months_done": 0, "rows": 0})
 
     if total == 0:
         log("nothing to do — all name-months already on disk (resume: full skip)")
-        write_heartbeat({"phase": "complete", "months_total": 0, "months_done": 0,
-                         "rows": 0, "start": start, "end": end})
+        write_heartbeat({**ident, "phase": "complete", "months_total": 0,
+                         "months_done": 0, "rows": 0})
         return {"months_total": 0, "months_done": 0, "rows": 0, "failed": []}
 
     failed = []
@@ -404,15 +426,13 @@ def run_pull(names: list[str], start: str, end: str, workers: int) -> dict:
                 # written -> it stays in the resume set for the next run.
                 failed.append((sym, ym, str(e)[:200]))
                 log(f"  FAIL {sym} {ym}: {e} (will retry on resume)")
-            write_heartbeat({"phase": "running", "names": len(names),
-                             "workers": workers, "months_total": total,
-                             "months_done": done, "rows": rows_total,
-                             "current": f"{sym} {ym}", "start": start, "end": end})
+            write_heartbeat({**ident, "phase": "running", "workers": workers,
+                             "months_total": total, "months_done": done,
+                             "rows": rows_total, "current": f"{sym} {ym}"})
 
     phase = "complete" if not failed else "partial"
-    write_heartbeat({"phase": phase, "months_total": total, "months_done": done,
-                     "rows": rows_total, "failed": len(failed),
-                     "start": start, "end": end})
+    write_heartbeat({**ident, "phase": phase, "months_total": total,
+                     "months_done": done, "rows": rows_total, "failed": len(failed)})
     log(f"=== pull {phase}: {done}/{total} name-months, {rows_total:,} rows, "
         f"{len(failed)} failed ===")
     return {"months_total": total, "months_done": done, "rows": rows_total,
@@ -431,7 +451,15 @@ def main() -> int:
     ap.add_argument("--workers", type=int, default=DEFAULT_WORKERS)
     ap.add_argument("--no-lock", action="store_true",
                     help="skip the singleton lock (for a supervised tiny test)")
+    ap.add_argument("--test", "--no-hb", dest="no_hb", action="store_true",
+                    help="smoke-test mode: do NOT write the production pull heartbeat "
+                         "(so a manual --names window can't poison the supervisor)")
     args = ap.parse_args()
+
+    if args.no_hb:
+        global WRITE_HEARTBEAT
+        WRITE_HEARTBEAT = False
+        log("TEST mode — production pull heartbeat DISABLED (no complete flag will be written)")
 
     names = [n.upper() for n in args.names] if args.names else sorted(ovb.LIQUID)
     end = args.end or dt.date.today().strftime("%Y%m%d")
