@@ -48,6 +48,35 @@ LOG = Path(r"C:\TradingDesk-Local\state\dailyreport\eod_report.log")
 TODAY = dt.date.today()
 TODAY_STR = TODAY.strftime("%Y%m%d")
 
+# Freshness anchor — the most recent session whose EOD data should already exist
+# when this nightly report runs (after the close). On a trading day that's today;
+# on a weekend/holiday it's the last real session. Every "is this fresh?" check
+# below measures against THIS, not the literal calendar day, so holidays and
+# weekends no longer false-flag as stale. See connections/market_calendar.py.
+try:
+    from connections import market_calendar as _mktcal
+    _IS_TRADING_TODAY = _mktcal.is_trading_day(TODAY)
+    EXPECTED_SESSION = _mktcal.last_trading_day(TODAY)
+    _HOLIDAY_TODAY = _mktcal.holiday_name(TODAY)          # None unless full closure
+    _EARLY_CLOSE_TODAY = _mktcal.early_close_name(TODAY)  # None unless a 1pm close
+    _CAL_ERR = None
+except Exception as _e:  # unknown year / import issue -> degrade to a weekday rule, loudly
+    _IS_TRADING_TODAY = TODAY.weekday() < 5
+    EXPECTED_SESSION = TODAY
+    _HOLIDAY_TODAY = None
+    _EARLY_CLOSE_TODAY = None
+    _CAL_ERR = f"{type(_e).__name__}: {_e}"
+EXPECTED_SESSION_STR = EXPECTED_SESSION.strftime("%Y%m%d")
+
+
+def _is_fresh(date_str) -> bool:
+    """A status/heartbeat date (YYYYMMDD string) is fresh if it is from the expected
+    session or later. Uses '>=' not '==' so a job that ALSO ran today on a holiday
+    (stamping today) still counts, while a genuinely old status still fails."""
+    if not date_str:
+        return False
+    return str(date_str) >= EXPECTED_SESSION_STR
+
 # status -> (dot color, label). Severity order used for the overall headline.
 DOT = {"ok": "#22c55e", "info": "#3b82f6", "stale": "#9ca3af",
        "partial": "#fbbf24", "warn": "#f59e0b", "fail": "#ef4444"}
@@ -119,7 +148,7 @@ def _build_forward_from_heartbeat():
     h = _parse_forward_heartbeat()
     if not h:
         return None
-    fresh = h["date"] == TODAY_STR
+    fresh = _is_fresh(h["date"])
     fail = h.get("fail") or 0
     if not fresh:
         st = "stale"
@@ -164,7 +193,7 @@ def build_forward():
     # to the heartbeat the collector writes after every root, so a partial/aborted
     # run (which never writes forward.json) still renders a meaningful line instead
     # of reading as "missing/stale".
-    if not s or s.get("date") != TODAY_STR:
+    if not s or not _is_fresh(s.get("date")):
         hb_sec = _build_forward_from_heartbeat()
         if hb_sec is not None:
             return hb_sec
@@ -172,7 +201,7 @@ def build_forward():
         return _sec("forward", "Daily Options Grab (ThetaData)", "stale",
                     "No status written — did the 5:30 PM run fire?", [])
     m = s.get("metrics", {})
-    fresh = s.get("date") == TODAY_STR
+    fresh = _is_fresh(s.get("date"))
     st = s.get("status", "fail") if fresh else "stale"
     rows = [("Run date", s.get("date")), ("Roots written", m.get("ok")),
             ("Already had", m.get("skip")), ("Empty/holiday", m.get("empty")),
@@ -312,7 +341,7 @@ def build_edgar():
 def build_tiingo():
     s = status.read("tiingo")
     if s:
-        fresh = s.get("date") == TODAY_STR
+        fresh = _is_fresh(s.get("date"))
         st = s.get("status", "fail") if fresh else "stale"
         m = s.get("metrics", {})
         rows = [("Run date", s.get("date")), ("Tickers", m.get("tickers")),
@@ -325,7 +354,7 @@ def build_tiingo():
         try:
             mani = json.loads(TIINGO_MANIFEST.read_text())
             gen = mani.get("generated_at", "")
-            fresh = gen[:10] == TODAY.isoformat()
+            fresh = gen[:10] >= EXPECTED_SESSION.isoformat()
             st = "ok" if fresh else "stale"
             n = len(mani.get("tickers", {}))
             return _sec("tiingo", "Tiingo Data Refresh", st,
@@ -370,7 +399,7 @@ def build_strategy():
     if not s:
         return _sec("strategy", "Strategy EOD Update", "info",
                     "Not yet active — appears here once strategies are running.", [])
-    fresh = s.get("date") == TODAY_STR
+    fresh = _is_fresh(s.get("date"))
     st = s.get("status", "fail") if fresh else "stale"
     m = s.get("metrics", {})
     rows = [(k, v) for k, v in m.items()] + [("Last update", s.get("ts"))]
@@ -393,7 +422,7 @@ def build_account():
         return _sec("account", title, "stale",
                     "No status written yet — did the 4:30 PM monitor cycle run? "
                     "(paperbot\\account_monitor_run.py writes this on every run.)", [])
-    fresh = s.get("date") == TODAY_STR
+    fresh = _is_fresh(s.get("date"))
     st = s.get("status", "fail") if fresh else "stale"
     m = s.get("metrics", {})
     rc = m.get("rc")
@@ -519,7 +548,7 @@ def build_gex():
         rows.append((f"{GEX_ETF} line", "no table yet"))
 
     # stale if the primary table's last day isn't today's run date.
-    if str(primary.get("date")) != TODAY_STR:
+    if not _is_fresh(primary.get("date")):
         st = "stale" if st in ("ok", "info") else st
         headline += f"  ⚠ latest GEX is {primary.get('date')}, not today"
 
@@ -579,6 +608,31 @@ def _overall(sections):
     return worst
 
 
+def _session_banner() -> str:
+    """A one-line context banner shown when today isn't a normal full session, so a
+    report that looks quiet on a holiday/weekend reads as expected, not broken."""
+    exp = EXPECTED_SESSION.strftime("%a %b %d")
+    if _CAL_ERR is not None:
+        msg = (f"⚠ No verified market calendar for {TODAY.year} — using a weekday-only "
+               f"rule (holidays may mis-flag). Update connections/market_calendar.py. [{_CAL_ERR}]")
+        bg, fg = "#fef3c7", "#92400e"
+    elif _HOLIDAY_TODAY:
+        msg = (f"\U0001f3e6 Market holiday today — {_HOLIDAY_TODAY}. No new session; freshness "
+               f"is measured against the last session ({exp}).")
+        bg, fg = "#e0f2fe", "#075985"
+    elif not _IS_TRADING_TODAY:
+        msg = (f"\U0001f5d3 Weekend — no session today. Freshness is measured against the "
+               f"last session ({exp}).")
+        bg, fg = "#e0f2fe", "#075985"
+    elif _EARLY_CLOSE_TODAY:
+        msg = f"\U0001f550 Early close today (1:00pm ET) — {_EARLY_CLOSE_TODAY}."
+        bg, fg = "#e0f2fe", "#075985"
+    else:
+        return ""
+    return (f'<div style="font-size:12px;background:{bg};color:{fg};border-radius:6px;'
+            f'padding:7px 10px;margin:6px 0;">{msg}</div>')
+
+
 def render_html(sections, overall):
     def dot(st):
         return (f'<span style="display:inline-block;width:11px;height:11px;'
@@ -609,6 +663,7 @@ def render_html(sections, overall):
         f'<div style="font-size:18px;font-weight:700;">{dot(overall)}Trading Desk — End of Day</div>'
         f'<div style="font-size:12px;color:#6b7280;margin:2px 0 6px;">{stamp} · '
         f'overall: <b style="color:{DOT.get(overall, "#9ca3af")};text-transform:uppercase;">{overall}</b></div>'
+        f'{_session_banner()}'
         f'{"".join(blocks)}'
         f'<div style="font-size:11px;color:#9ca3af;margin-top:10px;">'
         f'Automated end-of-day digest · TradingDesk\\dailyreport\\eod_report.py</div></div>')
