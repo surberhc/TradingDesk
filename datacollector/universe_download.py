@@ -239,40 +239,50 @@ def _dte_ok(exp_dashed: str, d: dt.date) -> bool:
 def snap_pull_day(symbol: str, d: dt.date) -> dict[str, pd.DataFrame]:
     """Return {HHMM: dataframe} of the near-money band at each target minute.
 
-    ONE greeks/eod call resolves spot + expirations, then per in-window expiration
-    we pull the 15m quote grid (strike=* for that exp), filter to the +/-15% band
-    and the target minutes. This minimizes transfer: only the 0-60 DTE expirations,
-    only the near-money strikes we keep, and only the grid that contains the target
-    times. Missing target-minute rows for a contract are simply absent (the last
-    kept 15m quote before that minute is the NBBO; the grid guarantees the exact
-    boundary rows exist when the contract quoted).
+    The quote endpoint ACCEPTS expiration=* with a coarse interval (verified: SPXW's
+    whole 15m chain — 37 expirations — comes back in ONE ~17s call, vs ~256s looping
+    per-expiration). So we make ONE greeks/eod call (for the day's consistent spot)
+    and ONE expiration=* quote call for the 15m grid, then filter IN MEMORY to:
+      * the target minutes (10:00/12:00/14:00/15:45) — exact 15m grid boundaries,
+      * the 0-60 DTE expirations, and
+      * the near-money band (+/-15% of spot).
+    Filtering after a single call trades a larger transfer (the full chain) for far
+    fewer round-trips — a big net win on the heavy indices where the per-expiration
+    loop dominated. Missing target-minute rows for a contract are simply absent (the
+    grid guarantees the boundary row exists whenever the contract quoted).
     """
-    spot, exps = _day_spot(symbol, d)
     out: dict[str, pd.DataFrame] = {t: pd.DataFrame() for t in uni.SNAP_TIMES}
+    # Spot for the band (consistent settlement underlying_price). One greeks/eod call.
+    spot, _ = _day_spot(symbol, d)
     if spot is None:
         return out                       # legit empty day -> caller writes 0-row markers
     lo, hi = spot * (1 - uni.SNAP_BAND_PCT), spot * (1 + uni.SNAP_BAND_PCT)
-    want_exps = [e for e in exps if _dte_ok(e, d)]
-    # Target timestamps as full ISO strings for this date (terminal session clock).
     ds_iso = _dashed(d)
     target_ts = {t: f"{ds_iso}T{t}:00.000" for t in uni.SNAP_TIMES}
 
-    frames: list[pd.DataFrame] = []
-    for exp in want_exps:
-        part = _get_csv("/option/history/quote", {
-            "symbol": symbol, "expiration": exp,
-            "start_date": ds_iso, "end_date": ds_iso,
-            "strike": "*", "right": "both", "interval": uni.SNAP_INTERVAL,
-        }, timeout=QUOTE_TIMEOUT)
-        if part.empty or "strike" not in part.columns:
-            continue
-        strike = pd.to_numeric(part["strike"], errors="coerce")
-        band = part[(strike >= lo) & (strike <= hi)]
-        if not band.empty:
-            frames.append(band)
-    if not frames:
+    # ONE expiration=* call for the whole 15m grid.
+    allrows = _get_csv("/option/history/quote", {
+        "symbol": symbol, "expiration": "*",
+        "start_date": ds_iso, "end_date": ds_iso,
+        "strike": "*", "right": "both", "interval": uni.SNAP_INTERVAL,
+    }, timeout=QUOTE_TIMEOUT)
+    if allrows.empty or "strike" not in allrows.columns:
         return out
-    allrows = pd.concat(frames, ignore_index=True)
+
+    # Filter 1: only the target-minute rows (collapses ~26 grid points to 4).
+    allrows = allrows[allrows["timestamp"].astype(str).isin(target_ts.values())]
+    if allrows.empty:
+        return out
+    # Filter 2: near-money band.
+    strike = pd.to_numeric(allrows["strike"], errors="coerce")
+    allrows = allrows[(strike >= lo) & (strike <= hi)]
+    # Filter 3: 0-60 DTE window (vectorized over the exp column).
+    if not allrows.empty:
+        exp_dte_ok = allrows["expiration"].astype(str).map(lambda e: _dte_ok(e, d))
+        allrows = allrows[exp_dte_ok]
+    if allrows.empty:
+        return out
+
     keep = [c for c in SNAP_KEEP_COLS if c in allrows.columns]
     for t, ts in target_ts.items():
         sub = allrows[allrows["timestamp"].astype(str) == ts]
