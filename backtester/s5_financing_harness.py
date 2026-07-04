@@ -690,9 +690,22 @@ def mark_position(pos: Position, d: _dt.date,
     """
     if chain is None:
         chain = load_chain(d)
+    return mark_legs(pos.legs, d, chain)
+
+
+def mark_legs(legs: list[ResolvedLeg], d: _dt.date,
+              chain: pd.DataFrame) -> tuple[float, float]:
+    """Honest cost to CLOSE a LIST of legs on day `d`, as (close_cash, close_commission) in $.
+
+    Same mechanics as mark_position but on a leg subset: after a multi-expiry structure's
+    front leg has already cash-settled on its own expiry, the walk marks only the REMAINING
+    active legs. For a single-/co-expiry structure `legs` is the whole position, so this is
+    identical to the original mark_position behavior.
+
+    Raises NotFillableError if ANY leg is not two-sided on `d` (can't honestly close)."""
     close_cash = 0.0
     close_commission = 0.0
-    for rl in pos.legs:
+    for rl in legs:
         row = contract_row(chain, rl.expiration, rl.strike, rl.right)
         if row is None:
             raise NotFillableError(
@@ -706,18 +719,31 @@ def mark_position(pos: Position, d: _dt.date,
     return close_cash, close_commission
 
 
-def settle_position(pos: Position, settle_underlying: float) -> tuple[float, float]:
-    """Cash-settle EVERY leg of `pos` at expiry against `settle_underlying`.
+def settle_legs(legs: list[ResolvedLeg], settle_underlying: float) -> tuple[float, float]:
+    """Cash-settle a LIST of legs at expiry against `settle_underlying`.
     Returns (settle_cash, settle_commission) in $. settle_cash is signed from the account
-    view (long ITM receives +, short ITM pays -). Commission charged only on ITM legs."""
+    view (long ITM receives +, short ITM pays -). Commission charged only on ITM legs.
+
+    This is the per-leg-expiry primitive: a multi-expiry structure settles the subset of
+    legs whose OWN expiration is `d` against `d`'s underlying, then keeps managing the rest."""
     settle_cash = 0.0
     settle_commission = 0.0
-    for rl in pos.legs:
+    for rl in legs:
         cash, comm = leg_expiry_cashflow(rl.strike, rl.right, rl.action,
                                          settle_underlying, rl.n_contracts)
         settle_cash += cash
         settle_commission += comm
     return settle_cash, settle_commission
+
+
+def settle_position(pos: Position, settle_underlying: float) -> tuple[float, float]:
+    """Cash-settle EVERY leg of `pos` at expiry against `settle_underlying`.
+    Returns (settle_cash, settle_commission) in $. settle_cash is signed from the account
+    view (long ITM receives +, short ITM pays -). Commission charged only on ITM legs.
+
+    Kept for co-/single-expiry callers where every leg shares one expiry; equivalent to
+    settle_legs(pos.legs, ...)."""
+    return settle_legs(pos.legs, settle_underlying)
 
 
 # --------------------------------------------------------------------------- #
@@ -764,6 +790,7 @@ def run_trade(structure: Structure, entry_date: _dt.date,
     Returns a TradeResult, or None if entry could not be taken (dead day / not fillable /
     unselectable) -- downstream can skip such days.
     """
+    global TRUNCATED_DROPPED
     try:
         entry_chain = chain_loader(entry_date)
     except (DeadWindowError, FileNotFoundError):
@@ -783,16 +810,28 @@ def run_trade(structure: Structure, entry_date: _dt.date,
     mgmt = structure.management
     marks: list[tuple[_dt.date, float]] = []
 
-    def _settle_result(d: _dt.date, chain: pd.DataFrame) -> TradeResult:
-        """Cash-settle every leg at expiry against `chain`'s underlying (or the injected
-        settle fn) on day `d`, and build the terminal 'settle' TradeResult."""
+    # --- PER-LEG-EXPIRY SETTLEMENT STATE ------------------------------------- #
+    # `active` is the set of legs NOT yet resolved. As each leg reaches ITS OWN expiry we
+    # cash-settle it against THAT day's underlying, fold its cashflow into the running
+    # `settled_cash`/`settled_commission`, and drop it from `active`. Marking + management
+    # then operate on the REMAINING active legs only. For single-/co-expiry structures every
+    # leg shares `last_expiration`, so no leg ever settles early: `active` stays the whole
+    # position until the terminal day and `settled_cash`/`settled_commission` stay 0 -- the
+    # math reduces EXACTLY to the pre-change single-settlement behavior (byte-identical).
+    active: list[ResolvedLeg] = list(pos.legs)
+    settled_cash = 0.0
+    settled_commission = 0.0
+    # the distinct expiries actually present across legs (sorted earliest -> latest)
+    leg_expiries = sorted({rl.expiration for rl in pos.legs})
+
+    def _settle_und_on(d: _dt.date, chain: pd.DataFrame) -> float:
+        """The settlement underlying to use for legs expiring on day `d`."""
         if settle_underlying_fn is not None:
-            settle_und = settle_underlying_fn(d, pos)
-        else:
-            settle_und = float(chain["underlying_price"].dropna().iloc[0])
-        settle_cash, settle_comm = settle_position(pos, settle_und)
-        net_pnl = (pos.entry_credit - pos.entry_commission) + settle_cash - settle_comm
-        total_comm = pos.entry_commission + settle_comm
+            return settle_underlying_fn(d, pos)
+        return float(chain["underlying_price"].dropna().iloc[0])
+
+    def _terminal_result(d: _dt.date, net_pnl: float, settle_und: float,
+                         total_comm: float) -> TradeResult:
         marks.append((d, net_pnl))
         return TradeResult(
             name=pos.name, entry_date=entry_date, exit_date=d,
@@ -802,67 +841,105 @@ def run_trade(structure: Structure, entry_date: _dt.date,
             hold_days=(d - entry_date).days, marks=marks,
         )
 
-    # SAME-DAY (0DTE) SETTLEMENT: if the position expires ON the entry day, it must settle
-    # that same day -- there is no "future" day to walk to. (Convention: on a 0DTE trade we
-    # DECIDE the entry and take the honest fill from the entry-day chain, then cash-settle
-    # against that same chain's EOD underlying. Both use ONLY entry-day data, so there is no
-    # look-ahead: the settlement spot is the same EOD mark that priced the fills.) Before
-    # fix #2 the walk list `[d for d in chain_days if entry_date < d <= last_expiration]`
+    def _settle_due_legs(d: _dt.date, chain: pd.DataFrame) -> float:
+        """Cash-settle every ACTIVE leg whose OWN expiration is `d`, against `d`'s settlement
+        underlying. Mutates `active`/`settled_cash`/`settled_commission` in place and returns
+        the settlement underlying used (for reporting on the terminal leg)."""
+        nonlocal settled_cash, settled_commission, active
+        due = [rl for rl in active if rl.expiration == d]
+        settle_und = _settle_und_on(d, chain)
+        cash, comm = settle_legs(due, settle_und)
+        settled_cash += cash
+        settled_commission += comm
+        active = [rl for rl in active if rl.expiration != d]
+        return settle_und
+
+    # SAME-DAY (0DTE) SETTLEMENT: if the WHOLE position expires ON the entry day, it must
+    # settle that same day -- there is no "future" day to walk to. (Convention: on a 0DTE
+    # trade we DECIDE the entry and take the honest fill from the entry-day chain, then
+    # cash-settle against that same chain's EOD underlying. Both use ONLY entry-day data, so
+    # there is no look-ahead: the settlement spot is the same EOD mark that priced the fills.)
+    # Before fix #2 the walk list `[d for d in chain_days if entry_date < d <= last_expiration]`
     # was EMPTY for 0DTE, so every 0DTE trade returned None and was silently dropped.
     if pos.last_expiration <= entry_date:
-        return _settle_result(entry_date, entry_chain)
+        settle_und = _settle_due_legs(entry_date, entry_chain)
+        net_pnl = (pos.entry_credit - pos.entry_commission) + settled_cash - settled_commission
+        total_comm = pos.entry_commission + settled_commission
+        return _terminal_result(entry_date, net_pnl, settle_und, total_comm)
 
     # days strictly after entry, up to and including the last expiration
     future = [d for d in chain_days if entry_date < d <= pos.last_expiration]
 
+    # A leg's OWN expiry day must be a reachable (present) walk day to settle it honestly.
+    # If any leg's expiry falls in a gap (missing/dead day never appears in `future`), that
+    # leg can never cash-settle on real data -> the trade is UNRESOLVED (truncation path).
+    future_set = set(future)
+    if any(exp not in future_set for exp in leg_expiries):
+        TRUNCATED_DROPPED += 1
+        return None
+
     for d in future:
-        # is this day the expiry? (all legs share last_expiration here, or a calendar's
-        # final leg -- we treat expiry as the day == last_expiration)
-        is_expiry = (d == pos.last_expiration)
+        is_terminal = (d == pos.last_expiration)
         try:
             chain = chain_loader(d)
         except (DeadWindowError, FileNotFoundError):
             # can't mark/settle honestly on this day; skip marking, keep holding.
+            # (leg_expiries were pre-checked to be present, so this is a mid-life gap only.)
             continue
         if not day_is_fillable(chain):
             continue
 
-        # DTE of the (governing) expiration as of day d
+        # DTE of the (governing / last) expiration as of day d -- governs management timing.
         gov_dte = (pos.last_expiration - d).days
 
-        if not is_expiry:
-            # mark the open position honestly
-            try:
-                close_cash, close_comm = mark_position(pos, d, chain)
-            except NotFillableError:
-                continue   # a leg lost its two-sided quote today; hold, try tomorrow
-            open_pnl = _open_pnl(pos, close_cash, close_comm)
-            marks.append((d, open_pnl))
+        # PER-LEG EXPIRY: settle any active leg whose OWN expiry is today, BEFORE marking the
+        # remainder. This is where a multi-expiry front leg cash-settles on its true date and
+        # stops distorting the P&L of the surviving back leg(s).
+        if any(rl.expiration == d for rl in active):
+            _settle_due_legs(d, chain)
 
-            exit_reason = _check_management(mgmt, pos, open_pnl, gov_dte)
-            if exit_reason is not None:
-                net_pnl = open_pnl
-                total_comm = pos.entry_commission + close_comm
-                exit_und = float(chain["underlying_price"].dropna().iloc[0])
-                return TradeResult(
-                    name=pos.name, entry_date=entry_date, exit_date=d,
-                    exit_reason=exit_reason, entry_credit=pos.entry_credit,
-                    net_pnl=net_pnl, total_commission=total_comm,
-                    entry_underlying=pos.entry_underlying, exit_underlying=exit_und,
-                    hold_days=(d - entry_date).days, marks=marks,
-                )
-        else:
-            # EXPIRY: cash-settle every leg at intrinsic against this day's chain.
-            return _settle_result(d, chain)
+        if is_terminal:
+            # TERMINAL DAY: the last expiry. Every leg is now resolved (the day==d legs just
+            # settled above; earlier legs settled on their own dates). Book the terminal
+            # 'settle' result summing ALL settled cashflows.
+            settle_und = _settle_und_on(d, chain)
+            net_pnl = (pos.entry_credit - pos.entry_commission) \
+                + settled_cash - settled_commission
+            total_comm = pos.entry_commission + settled_commission
+            return _terminal_result(d, net_pnl, settle_und, total_comm)
 
-    # Fell off the end of chain_days without reaching expiry: the position's expiry lies
-    # PAST the last available clean day, so it can NEVER honestly settle -- the data does not
-    # exist there. This happens for entries in the final ~45 DTE of each clean window (near
+        # Not the terminal day: mark the REMAINING active legs honestly and run management.
+        # (If a front leg settled today, `active` already excludes it; the mark reflects only
+        # the still-open legs, and realized P&L includes the settled cashflows.)
+        try:
+            close_cash, close_comm = mark_legs(active, d, chain)
+        except NotFillableError:
+            continue   # a live leg lost its two-sided quote today; hold, try tomorrow
+        # open P&L = entry net + already-settled cashflows + close of the remaining active legs
+        open_pnl = (pos.entry_credit - pos.entry_commission) \
+            + settled_cash - settled_commission + close_cash - close_comm
+        marks.append((d, open_pnl))
+
+        exit_reason = _check_management(mgmt, pos, open_pnl, gov_dte)
+        if exit_reason is not None:
+            net_pnl = open_pnl
+            total_comm = pos.entry_commission + settled_commission + close_comm
+            exit_und = float(chain["underlying_price"].dropna().iloc[0])
+            return TradeResult(
+                name=pos.name, entry_date=entry_date, exit_date=d,
+                exit_reason=exit_reason, entry_credit=pos.entry_credit,
+                net_pnl=net_pnl, total_commission=total_comm,
+                entry_underlying=pos.entry_underlying, exit_underlying=exit_und,
+                hold_days=(d - entry_date).days, marks=marks,
+            )
+
+    # Fell off the end of chain_days without reaching the last expiry: the position's expiry
+    # lies PAST the last available clean day, so it can NEVER honestly settle -- the data does
+    # not exist there. This happens for entries in the final ~45 DTE of each clean window (near
     # the 2020-08-13 dead-window boundary and near end-of-data). Booking the last stale mark
     # as realized P&L would emit non-real P&L into the trade frame, so we DO NOT do that:
     # the trade is UNRESOLVED. Count it (TRUNCATED_DROPPED, surfaced by backtest_structure)
     # for coverage transparency and return None so it is excluded from the tidy output.
-    global TRUNCATED_DROPPED
     TRUNCATED_DROPPED += 1
     return None
 
