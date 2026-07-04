@@ -206,14 +206,24 @@ def eod_have(symbol: str, d: dt.date) -> bool:
 
 
 def eod_pull_and_write(symbol: str, d: dt.date) -> int:
-    """Reuses download.pull_day (greeks join open_interest) + storage.write_day.
+    """Reuse download.pull_day (greeks join open_interest); write the parquet directly.
 
-    Byte-identical to the existing warehouse product; a 0-row holiday file is a
-    valid 'done' marker exactly as in download.main.
+    Byte-identical PARQUET to the existing warehouse product (same schema, same atomic
+    temp+os.replace, same per-(symbol,day) path via storage.partition_path). A 0-row
+    holiday file is a valid 'done' marker exactly as in download.main.
+
+    We do NOT call storage.write_day here: that also updates the SINGLE shared
+    raw/options/_manifest.json, and with K=4 shards racing to os.replace one global file
+    Windows raises PermissionError (verified in the first launch). The manifest is
+    non-authoritative — have_day()/eod_have() key off FILE PRESENCE, not the manifest,
+    and the DuckDB catalog is rebuilt from the parquet tree — so writing the parquet and
+    skipping the manifest is fully correct and collision-free. The manifest is rebuilt
+    once at the end of the whole pull (see storage.rebuild_catalog / a manifest rebuild).
     """
     ds = _daystr(d)
-    df = eod_dl.pull_day(symbol, ds)          # same JOIN_KEYS / DROP_COLS / schema
-    return storage.write_day(symbol, ds, df)  # atomic; records manifest row count
+    df = eod_dl.pull_day(symbol, ds)              # same JOIN_KEYS / DROP_COLS / schema
+    _write_atomic(storage.partition_path(symbol, ds), df)   # per-symbol-day; no shared file
+    return len(df)
 
 
 # =========================================================================== #
