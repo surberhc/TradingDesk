@@ -116,6 +116,27 @@ JOBS: list[dict] = [
         "threshold_s": 15 * 60,
         "task_name": "Spxw1mCollector",
     },
+    {
+        # Expanded-universe options bulk pull (universe_download.py --launcher). The
+        # supervisor rewrites this heartbeat every ~30s while alive and stamps a
+        # 'COMPLETE' line when the whole scope is on disk (suppresses the alarm on a
+        # legit finish). Progress JSON carries done_units/total_units (its 'complete'
+        # flag also suppresses via _progress_complete once done==total).
+        #
+        # THRESHOLD 60 min (vs 15 for the 1-min collector): this pull DELIBERATELY backs
+        # off during the nightly ThetaData-terminal contention window (ThetaEodDaily 17:30
+        # +1h, CanslimOverlayPipeline 18:00 up to 8h) — a shard can be paused/slow for a
+        # stretch while still alive. A supervisor that is merely backing off still rewrites
+        # this heartbeat every ~30s, so 60 min COLD means the supervisor PROCESS is gone
+        # (crashed/killed and the scheduled task didn't revive it), not just throttled.
+        # This is the #1 protection against the 15.5h-silent-death recurrence.
+        "name": "universe_dl",
+        "label": "expanded-universe options downloader",
+        "heartbeat": config.DATA_ROOT / "universe_dl_state" / "universe_dl_heartbeat.txt",
+        "progress": config.DATA_ROOT / "universe_dl_state" / "universe_dl_progress.json",
+        "threshold_s": 60 * 60,
+        "task_name": "UniverseDownloadEod",
+    },
 ]
 
 
@@ -296,14 +317,20 @@ def _write_ran_marker(now: float) -> None:
 # Assessment
 # --------------------------------------------------------------------------- #
 def _progress_complete(progress_path) -> bool:
-    """True if progress.json shows days_done >= days_total (legit finish)."""
+    """True if progress.json shows the job legitimately finished.
+
+    Handles both progress schemas: the SPXW collector's days_done/days_total AND the
+    universe downloader's done_units/total_units (or its explicit 'complete': true flag)."""
     if not progress_path:
         return False
     try:
         p = json.loads(Path(progress_path).read_text())
     except (OSError, ValueError):
         return False
-    done, total = p.get("days_done"), p.get("days_total")
+    if p.get("complete") is True:
+        return True
+    done = p.get("days_done", p.get("done_units"))
+    total = p.get("days_total", p.get("total_units"))
     try:
         return total is not None and done is not None and int(done) >= int(total)
     except (TypeError, ValueError):

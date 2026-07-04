@@ -75,6 +75,13 @@ SNAP_ROOT = config.DATA_ROOT / "raw" / "options_snap"
 STATE_DIR = config.DATA_ROOT / "universe_dl_state"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
+# Durable, machine-side reliability artifacts (read by the independent staleness alarm
+# and the scheduled-task launcher). Kept LOCAL (never on Drive).
+HEARTBEAT = STATE_DIR / "universe_dl_heartbeat.txt"      # mtime advances per sym-day; "COMPLETE" on finish
+COMBINED = STATE_DIR / "universe_dl_progress.json"       # {done_units,total_units,pct,...}
+SINGLETON_LOCK = STATE_DIR / "universe_dl_supervisor.lock"
+SUPERVISOR_LOG = STATE_DIR / "universe_dl_supervisor.log"
+
 HERE = config.CODE_ROOT
 THIS = HERE / "universe_download.py"
 
@@ -102,6 +109,24 @@ def _log(logpath: Path, msg: str) -> None:
         logpath.parent.mkdir(parents=True, exist_ok=True)
         with open(logpath, "a", encoding="utf-8") as f:
             f.write(line + "\n")
+    except Exception:
+        pass
+
+
+def _write_heartbeat(text: str) -> None:
+    """Rewrite the top-level heartbeat file (mtime = proof of forward progress).
+
+    The independent staleness alarm reads this file's mtime + text. The supervisor
+    rewrites it every monitor tick with the latest progress; on full completion it
+    writes a line containing 'COMPLETE' so the alarm suppresses (legit finish, not a
+    stall). Atomic write so a kill can never leave a torn heartbeat. Never raises.
+    """
+    try:
+        stamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        tmp = HEARTBEAT.with_name(HEARTBEAT.name + ".tmp")
+        HEARTBEAT.parent.mkdir(parents=True, exist_ok=True)
+        tmp.write_text(f"{stamp}  {text}\n")
+        os.replace(tmp, HEARTBEAT)
     except Exception:
         pass
 
@@ -423,10 +448,11 @@ def _write_progress(path: Path, done: int, total: int, sym: str, day: str,
 # =========================================================================== #
 def run_supervisor(roots: list[str], start: str, end: str, layer: str,
                    k: int) -> int:
-    log = STATE_DIR / "universe_dl_supervisor.log"
-    combined = STATE_DIR / "universe_dl_progress.json"
+    log = SUPERVISOR_LOG
+    combined = COMBINED
     _log(log, f"=== supervisor start === {len(roots)} roots | {start}..{end} | "
               f"layer={layer} | K={k}")
+    _write_heartbeat(f"supervisor start: {len(roots)} roots {start}..{end} layer={layer} K={k}")
 
     def child_cmd(shard: int) -> list[str]:
         return [PY, "-u", str(THIS),
@@ -471,34 +497,160 @@ def run_supervisor(roots: list[str], start: str, end: str, layer: str,
             except Exception:
                 pass
         pct = round(100.0 * agg["done"] / agg["total"], 2) if agg["total"] else 0.0
+        all_done = agg["total"] > 0 and agg["done"] >= agg["total"]
         try:
             combined.write_text(json.dumps(
                 {"updated": f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}",
-                 "alive_shards": alive, **agg, "pct": pct}, indent=2))
+                 "alive_shards": alive, **agg, "pct": pct,
+                 "complete": all_done}, indent=2))
         except Exception:
             pass
+        # Heartbeat: mtime advances every tick while alive (proof of forward progress).
+        # The alarm reads mtime + text; "COMPLETE" suppresses on a legit finish.
+        _write_heartbeat(f"progress {agg['done']}/{agg['total']} ({pct}%) | {alive} shard(s) alive"
+                         + ("  COMPLETE" if all_done else ""))
         _log(log, f"progress {agg['done']}/{agg['total']} ({pct}%) | {alive} shard(s) alive")
-        # restart a dead-but-unfinished shard (child skips done -> resumes)
-        for i, p in list(procs.items()):
-            if p.poll() is not None:
-                sp = STATE_DIR / f"universe_dl_shard{i}.json"
-                unfinished = True
-                try:
-                    j = json.loads(sp.read_text())
-                    unfinished = j.get("done_units", 0) < j.get("total_units", 1)
-                except Exception:
-                    pass
-                if unfinished:
-                    _log(log, f"shard{i} DEAD + unfinished -> restart")
-                    np = subprocess.Popen(child_cmd(i), cwd=str(HERE), env=child_env(),
-                                         creationflags=DETACH_FLAGS,
-                                         stdin=subprocess.DEVNULL,
-                                         stdout=subprocess.DEVNULL,
-                                         stderr=subprocess.DEVNULL)
-                    procs[i] = np
-        if alive == 0:
-            _log(log, "=== all shards exited === supervisor done")
+        # restart a dead-but-unfinished shard (child skips done -> resumes). Do NOT
+        # restart once the whole scope is complete (avoid a relaunch race at the finish).
+        if not all_done:
+            for i, p in list(procs.items()):
+                if p.poll() is not None:
+                    sp = STATE_DIR / f"universe_dl_shard{i}.json"
+                    unfinished = True
+                    try:
+                        j = json.loads(sp.read_text())
+                        unfinished = j.get("done_units", 0) < j.get("total_units", 1)
+                    except Exception:
+                        pass
+                    if unfinished:
+                        _log(log, f"shard{i} DEAD + unfinished -> restart")
+                        np = subprocess.Popen(child_cmd(i), cwd=str(HERE), env=child_env(),
+                                             creationflags=DETACH_FLAGS,
+                                             stdin=subprocess.DEVNULL,
+                                             stdout=subprocess.DEVNULL,
+                                             stderr=subprocess.DEVNULL)
+                        procs[i] = np
+        if all_done or alive == 0:
+            _log(log, f"=== supervisor done === done={agg['done']}/{agg['total']} "
+                      f"complete={all_done} alive={alive}")
+            _write_heartbeat(f"progress {agg['done']}/{agg['total']} ({pct}%)  COMPLETE")
             return 0
+
+
+# =========================================================================== #
+# LAUNCHER — the scheduled-task entry point (singleton-guarded, idempotent)
+# =========================================================================== #
+def _load_gateway_lock():
+    """Import paperbot.gateway_lock cleanly despite the `config` module-name collision.
+
+    Both datacollector and paperbot ship a top-level `config` module; ours is already
+    bound as sys.modules['config'] here, but gateway_lock needs PAPERBOT's config (for
+    config.STATE_DIR). So we load paperbot's config from its file under a private name,
+    temporarily bind it as `config` for the duration of the gateway_lock import, then
+    restore ours. importlib is used so nothing depends on sys.path ordering. Returns the
+    loaded gateway_lock module."""
+    import importlib.util
+    pb = config.CODE_ROOT.parent / "paperbot"
+    # Load paperbot's config under a private module name.
+    spec_c = importlib.util.spec_from_file_location("_pb_config", pb / "config.py")
+    pb_config = importlib.util.module_from_spec(spec_c)
+    spec_c.loader.exec_module(pb_config)
+    saved = sys.modules.get("config")
+    sys.modules["config"] = pb_config           # gateway_lock's `import config` -> paperbot's
+    try:
+        spec_g = importlib.util.spec_from_file_location("_pb_gateway_lock", pb / "gateway_lock.py")
+        gl = importlib.util.module_from_spec(spec_g)
+        spec_g.loader.exec_module(gl)
+    finally:
+        if saved is not None:
+            sys.modules["config"] = saved       # restore OUR config
+        else:
+            sys.modules.pop("config", None)
+    return gl
+
+
+_GL = None                                       # cached paperbot.gateway_lock module
+
+
+def _gl():
+    """Return the (cached) paperbot.gateway_lock module — one load, so GatewayBusySkip
+    raised by _singleton_lock() is the SAME class the launcher's except-clause catches."""
+    global _GL
+    if _GL is None:
+        _GL = _load_gateway_lock()
+    return _GL
+
+
+def _singleton_lock():
+    """Cross-process SINGLETON lock for the supervisor role, on the PROVEN
+    paperbot.gateway_lock reclaim machinery (atomic O_EXCL + dead-PID / stale-heartbeat
+    reclaim) pointed at our own dedicated lock path. NON-blocking: if a live supervisor
+    already holds it, the caller gets GatewayBusySkip and no-ops (no duplicate instance).
+    A crashed supervisor's lock (dead pid, or its lock-heartbeat silent > ~300s) is
+    auto-reclaimed, so the next scheduled trigger cleanly takes over.
+
+    We pass a dummy client_id — this download uses NO IBKR connection; client_id is only
+    metadata in the lock JSON here (kept distinct from any live clientId so it can't be
+    confused with a real gateway holder)."""
+    return _gl().gateway_lock(
+        purpose="universe_download_supervisor",
+        client_id=999,                 # metadata only; NOT an IBKR clientId
+        on_busy="skip",
+        wait_secs=0.0,
+        lock_path=str(SINGLETON_LOCK),
+    )
+
+
+def _scope_complete(roots: list[str], days: list[dt.date], layer: str) -> bool:
+    """True iff every (root, day, layer) unit in scope is already on disk.
+
+    Cheap disk checks only (have_day / snap_have) — no network. A leftover scheduled
+    trigger then no-ops instead of spinning up shards for nothing."""
+    do_eod = layer in ("eod", "both")
+    do_snap = layer in ("snap", "both")
+    for r in roots:
+        for d in days:
+            if do_eod and not eod_have(r, d):
+                return False
+            if do_snap and not snap_have(r, d):
+                return False
+    return True
+
+
+def launcher(roots: list[str], start: str, end: str, layer: str, k: int) -> int:
+    """SCHEDULED-TASK entry point. Idempotent + singleton-safe:
+
+      1. If the whole scope is already on disk -> clean no-op (leftover trigger).
+      2. Verify the terminal is reachable; if not, log + no-op (do NOT spin) so the
+         next trigger retries — the independent alarm catches a persistent outage.
+      3. Acquire the singleton with a NON-BLOCKING attempt. If a live supervisor holds
+         it, no-op (no duplicate). Otherwise hold it and run the K=4 supervisor, which
+         resumes from the on-disk checkpoint (skip-done). The lock releases on exit
+         (even on crash), so the next trigger takes over.
+    """
+    GatewayBusySkip = _gl().GatewayBusySkip
+
+    days = _business_days(start, end)
+    if _scope_complete(roots, days, layer):
+        _log(SUPERVISOR_LOG, "LAUNCHER: scope already complete on disk — no-op.")
+        _write_heartbeat("scope already complete on disk  COMPLETE")
+        return 0
+    if not connected():
+        _log(SUPERVISOR_LOG, "LAUNCHER: terminal not reachable — no-op; next trigger retries.")
+        return 0
+    try:
+        cm = _singleton_lock()
+    except Exception as e:                       # noqa: BLE001
+        _log(SUPERVISOR_LOG, f"LAUNCHER: could not build singleton lock ({e!r}); no-op to be safe.")
+        return 0
+    try:
+        with cm:
+            _log(SUPERVISOR_LOG, f"LAUNCHER: acquired singleton (pid {os.getpid()}) — supervising.")
+            return run_supervisor(roots, start, end, layer, k)
+    except GatewayBusySkip as e:
+        _log(SUPERVISOR_LOG, f"LAUNCHER: a live supervisor already holds the singleton ({e}); "
+                             "no-op — NOT starting a duplicate.")
+        return 0
 
 
 # --------------------------------------------------------------------------- #
@@ -517,6 +669,9 @@ def main() -> int:
                     help="parallel shards (supervisor mode); 1 = single foreground worker")
     ap.add_argument("--calibrate", action="store_true",
                     help="single foreground worker + emit detailed per-symbol-day timing")
+    ap.add_argument("--launcher", action="store_true",
+                    help="SCHEDULED-TASK entry: singleton-guarded, idempotent, resumable "
+                         "supervisor. Overlapping triggers no-op; a crashed one is reclaimed.")
     # internal (child) flags
     ap.add_argument("--shard", type=int, default=None)
     ap.add_argument("--of", type=int, default=None)
@@ -528,6 +683,10 @@ def main() -> int:
         roots = [r for r in roots if r not in uni.EXISTING_ROOTS]
     end = args.end or _default_end()
     days = _business_days(args.start, end)
+
+    # ---- scheduled-task launcher (singleton-guarded) ----
+    if args.launcher:
+        return launcher(roots, args.start, end, args.layer, max(1, args.shards))
 
     # ---- child (one shard) ----
     if args.child and args.shard is not None and args.of:
