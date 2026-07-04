@@ -74,6 +74,7 @@ from __future__ import annotations
 import argparse
 import csv
 import datetime as _dt
+import gc
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -586,7 +587,8 @@ def run_day(d: _dt.date, clf: mx.DayClassifier,
 # Full-history run -- crash-resilient + resumable + heartbeat.
 # --------------------------------------------------------------------------- #
 def run_history(days: list[_dt.date] | None = None, verbose: bool = True,
-                save: bool = True, resume: bool = True) -> pd.DataFrame:
+                save: bool = True, resume: bool = True,
+                max_new_days: int = 0) -> pd.DataFrame:
     if days is None:
         days = s5.available_days()
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
@@ -618,9 +620,21 @@ def run_history(days: list[_dt.date] | None = None, verbose: bool = True,
         if write_header:
             writer.writeheader()
         n_crash_skips = 0
+        n_new = 0                     # not-yet-done days actually processed this invocation
+        hit_chunk_cap = False
         for i, d in enumerate(days, 1):
             if str(d) in done_days:
                 continue
+            # CHUNK CAP: process at most `max_new_days` not-yet-done days, then exit cleanly
+            # (the partial CSV is flushed per day, so the resume point is already durable).
+            # This is how a FRESH process per chunk beats the OOM: RAM resets between chunks.
+            if max_new_days and n_new >= max_new_days:
+                hit_chunk_cap = True
+                if verbose:
+                    print(f"chunk cap reached: {n_new} new day(s) this run; exiting cleanly "
+                          f"(resume next chunk from here).", flush=True)
+                break
+            dd = None
             # HARDENING: wrap the ENTIRE per-day pipeline. A single malformed tape / unquoted
             # chain / transient read error is logged with a skip_reason and SKIPPED -- it can
             # never kill the whole run (the failure mode that silently died at ~75% before).
@@ -636,12 +650,20 @@ def run_history(days: list[_dt.date] | None = None, verbose: bool = True,
                     print(f"[{i}/{n}] {d} CRASH-SKIP {rec.skip_reason}", flush=True)
             writer.writerow(rec.flat())
             fh.flush()
+            n_new += 1
+            last = rec.arms.get("A_hold", {}).get("pnl") if rec.arms else None
             if verbose and (i % 25 == 0 or i == n):
-                last = rec.arms.get("A_hold", {}).get("pnl") if rec.arms else None
                 print(f"[{i}/{n}] {d} done  (A_hold pnl={last}) "
                       f"[crash-skips so far: {n_crash_skips}]", flush=True)
+            # MEMORY HYGIENE: the ~5M-row 1-min NBBO quote frame for the day lives inside `dd`
+            # (and the chain/nbbo derived from it). Drop every big reference and force a GC each
+            # iteration so RAM does not climb across days (the OOM that killed prior runs).
+            del dd, rec
+            gc.collect()
         if verbose:
-            print(f"run_history complete: {n_crash_skips} crash-skipped day(s).", flush=True)
+            done_msg = "chunk done" if hit_chunk_cap else "run_history complete"
+            print(f"{done_msg}: {n_new} new day(s) processed, "
+                  f"{n_crash_skips} crash-skipped day(s).", flush=True)
 
     df = pd.read_csv(_PARTIAL_CSV)
     df["traded"] = df["traded"].astype(str).str.lower().isin(["true", "1"])
@@ -1297,6 +1319,11 @@ if __name__ == "__main__":
     ap.add_argument("--quiet", action="store_true")
     ap.add_argument("--limit", type=int, default=0, help="run only the first N days (smoke test)")
     ap.add_argument("--history-only", action="store_true", help="run the 0DTE history, skip report")
+    ap.add_argument("--resume", action="store_true",
+                    help="resume from the partial CSV (default behavior; explicit for clarity)")
+    ap.add_argument("--max-new-days", type=int, default=0,
+                    help="process at most N not-yet-done days this run, then exit cleanly "
+                         "(fresh-process chunk loop to beat OOM). 0 = no cap.")
     ap.add_argument("--no-benchmark", action="store_true")
     ap.add_argument("--report-only", action="store_true",
                     help="load the finished days CSV and (re)build the dated markdown report")
@@ -1313,11 +1340,12 @@ if __name__ == "__main__":
             _df, _fb, _bm, _crash,
             OUTPUT_DIR.parent / f"condor_management_{_dt.date.today():%Y%m%d}.md")
         print(f"Report written: {_out}", flush=True)
-    elif args.history_only or args.limit:
+    elif args.history_only or args.limit or args.resume or args.max_new_days:
         days = s5.available_days()
         if args.limit:
             days = days[: args.limit]
-        run_history(days=days, verbose=not args.quiet, save=not args.no_save)
+        run_history(days=days, verbose=not args.quiet, save=not args.no_save,
+                    max_new_days=args.max_new_days)
     else:
         run(verbose=not args.quiet, save=not args.no_save,
             do_benchmark=not args.no_benchmark)
