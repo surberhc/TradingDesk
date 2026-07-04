@@ -166,3 +166,30 @@ spot via BSM (`features/gex.py`). **No tier upgrade required.**
   (Tier1 tail → Tier2 protection → T-bill reserve → surplus→upside calls). **STILL PENDING (the OFFENSIVE /
   harvest half): the harvest engine + Phase-2 active monetization + dynamic-throttle layer, all gated on the
   intraday SPXW pull.** See docs/S5_SPEC.md
+
+## S6 — SPX Cash-Flow 0DTE (Brandon W)  *(refuted)*
+- **Family:** intraday 0DTE SPX defined-risk credit-spread income.
+- **Data:** SPXW 1-min NBBO warehouse (intraday). No new pull.
+- **Status:** **REFUTED** — honest backtest shows NO edge on the documented chassis (all
+  36 exit×gamma×VIX cells lose; hold-to-settle worst). Strike-selection variant was the
+  only residual and never greenlit. See memory `s6-spx-cashflow-0dte`, `s2s3-intraday-condor-refuted`.
+
+## S7 — SPX 45-DTE Managed Premium-Income Condor  *(`backtester/s7_income_condor.py`; prereg `docs/PREREG_S7_income_condor_2026-07-04.md`)*
+- **Family:** monthly-style **defined-risk premium income** — the volatility-risk-premium
+  harvester income traders actually run. Lineage S2/S3 iron-condor income; distinct chassis
+  (multi-week tenor, held-and-managed, weekly-laddered book). NOT 0DTE (that whole family
+  is refuted); own strategy number per Andrew.
+- **Thesis (to be PROVEN, not assumed):** implied≈1.43×realized VRP can be harvested net of
+  honest half-spread fills across a full cycle (incl. 2018-Q4 / 2020 COVID / 2022 bear) by a
+  45-DTE weekly-laddered iron condor, actively managed (50% profit-take + 21-DTE time-stop).
+- **Chassis:** symmetric IC (short put/call ≈ target delta, fixed 25-pt long wings),
+  weekly-laddered 1 lot/week, cash-settled European (no assignment), managed daily.
+- **Data — EOD only, buildable NOW:** warehouse EOD SPX chains 2018-2026 (bid/ask + greeks).
+  **KNOWN CAVEAT:** vendor delta/IV are CORRUPT (2021 total, 2020 partial) — pricing off
+  clean bid/ask, strikes off a clean BSM re-inversion where the delta column is degenerate.
+- **Grid (prereg, plateau-not-peak):** DTE{30,45} × short-delta{10,16} × mgmt{hold/25%/50%}
+  × fill{0,0.25,0.50 headline,1.0}. Headline 45/16/50%/f.50.
+- **Pass bar:** net-positive across mid→50% fill AND OOS AND as a grid plateau; managed arms
+  must beat hold-to-expiry AND the random-exit-matched placebo on TOTAL P&L; crisis-survivable.
+- **Status:** **in-progress** — prereg committed; engine + honest backtest + report + tests
+  in build. A clean refutation is a valid outcome.
