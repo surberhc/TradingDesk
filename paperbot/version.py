@@ -15,10 +15,23 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.12.0"
+VERSION = "0.13.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.13.0", "2026-07-04", "S4 (SPX vol-control fund) single-account daily REVIEW path, "
+                             "shelf-ready. New S4-only siblings (frozen S0 paths untouched): "
+                             "s4_strategy_target (shared-brain adapter -> Target, profile "
+                             "runtime dial + stale-data guard), s4_sizing (REAL-margin "
+                             "leverage sizing: SPY notional = NAV*exposure, exposure may "
+                             "exceed 1.0x, borrow leg carried NOT dropped), s4_risk (guard "
+                             "permits up to the profile leverage_cap + fail-closed margin "
+                             "preflight refusing the >1.0 path on a cash/insufficient-BP "
+                             "account), s4_rebalance_run (single-account, gateway-locked, "
+                             "place(armed=False)), s4_daily_run (calendar-gated entry point). "
+                             "clientIds 44 (paperbot_s4) + 45 (paperbot_s4_exec, reserved). "
+                             "Order-affecting: introduces the levered S4 sizing/risk path. "
+                             "Transmits nothing; no scheduled task registered; not armed."),
     ("0.12.0", "2026-06-30", "Rebalance run/execute acquire the gateway lock for the whole "
                              "session and wait-then-refuse (naming the holder) if it's held; "
                              "monitor skips on busy. Single-process gateway interlock now "
