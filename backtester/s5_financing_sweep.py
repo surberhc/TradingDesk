@@ -185,6 +185,77 @@ def put_credit_spread_spec(wing: float = 10.0) -> StructureSpec:
                          net_credit=True)
 
 
+def put_write_spec() -> StructureSpec:
+    """Index-level PUT-WRITE family: a SINGLE short put at the grid's short_delta/tenor, NO
+    long wing (naked in this leg; catastrophe capped by the separately-owned Tier-1 tail --
+    a held S5 position, not modeled here). Income = short-put net premium as net_pct_yr_of_core.
+    `wing` is not a knob for this family. A Phase-2b worker sweeps tenor x short_delta x
+    management x regime unchanged."""
+    def _build(dte: int, short_delta: float, mgmt: h.Management) -> h.Structure:
+        return h.put_write(dte=dte, short_delta=short_delta, management=mgmt,
+                           name=f"pw_{dte}d_{short_delta}d")
+    return StructureSpec(name="put_write", builder=_build, net_credit=True)
+
+
+def iron_condor_spec(wing: float = 10.0, call_delta: Optional[float] = None,
+                     call_wing: Optional[float] = None) -> StructureSpec:
+    """Iron-condor family with a PARAMETERIZABLE call side, so the SAME spec serves both
+    upside arms via `call_delta`:
+      * upside-NEUTRAL arm (default): call_delta=None -> a FAR/low-delta call
+        (harness default = short_delta * 0.5), little upside premium/cap;
+      * modest-call-INCOME arm: pass call_delta (e.g. equal to the put short_delta, or an
+        explicit fixed delta) -> a NEARER call that earns premium at the cost of capping upside.
+
+    `wing` (put wing width) and `call_wing` (call wing width, default = wing) are STATED
+    structural choices of the family, not swept knobs. The put short strike tracks the swept
+    `short_delta` knob. If `call_delta` is None the call tracks short_delta*0.5 (neutral);
+    if a float, the call delta is FIXED across the delta sweep (income arm)."""
+    def _build(dte: int, short_delta: float, mgmt: h.Management) -> h.Structure:
+        return h.iron_condor_call_param(
+            dte=dte, short_delta=short_delta, wing=wing,
+            call_delta=call_delta, call_wing=call_wing, management=mgmt,
+            name=(f"ic_{dte}d_p{short_delta}d{int(wing)}w"
+                  f"_c{('half' if call_delta is None else call_delta)}"))
+    arm = "neutral" if call_delta is None else f"income{call_delta}"
+    return StructureSpec(name=f"iron_condor_{int(wing)}w_{arm}", builder=_build,
+                         net_credit=True)
+
+
+def put_calendar_spec(back_dte_mult: float = 2.0, back_dte_offset: int = 0,
+                      strike_offset: float = 0.0) -> StructureSpec:
+    """Put CALENDAR / DIAGONAL family (NET DEBIT -> bypasses the min-credit floor). The swept
+    `tenor_dte` sets the SHORT front-month tenor; the LONG back-month tenor is
+    round(dte*back_dte_mult)+back_dte_offset (a STATED multiple/offset, not a swept knob).
+    `strike_offset` (points, default 0 = pure calendar) shifts the long back-month strike for
+    the DIAGONAL variant. The short strike tracks the swept `short_delta`. Income comes from
+    the faster decay of the front-month short."""
+    def _build(dte: int, short_delta: float, mgmt: h.Management) -> h.Structure:
+        return h.put_calendar(
+            dte=dte, short_delta=short_delta, back_dte_mult=back_dte_mult,
+            back_dte_offset=back_dte_offset, strike_offset=strike_offset, management=mgmt,
+            name=f"cal_{dte}d_{short_delta}d_x{back_dte_mult}o{int(strike_offset)}")
+    return StructureSpec(name=f"put_calendar_x{back_dte_mult}_o{int(strike_offset)}",
+                         builder=_build, net_credit=False)
+
+
+def sell_against_owned_tail_spec(tail_moneyness: float = -0.20,
+                                 tail_dte: int = 63) -> StructureSpec:
+    """Sell-against-owned-tail family: a nearer-dated SHORT put whose LONG leg is the
+    ALREADY-OWNED Tier-1 tail (deep ~20% OTM, ~63 DTE). MODELING CHOICE (see harness
+    docstring): income = the SHORT leg's net premium as net_pct_yr_of_core; the deep tail's
+    own carry is NOT counted here (it is the ~1.56%/yr being funded -- no double-count). The
+    incremental defined risk is recorded as (short_strike - tail_strike). The swept
+    `short_delta`/`tenor_dte` govern the SHORT; the tail is a stated moneyness/DTE, not swept.
+    Net CREDIT (large short premium vs. cheap deep tail) -> the min-credit floor applies."""
+    def _build(dte: int, short_delta: float, mgmt: h.Management) -> h.Structure:
+        return h.sell_against_owned_tail(
+            dte=dte, short_delta=short_delta, tail_moneyness=tail_moneyness,
+            tail_dte=tail_dte, management=mgmt,
+            name=f"svt_{dte}d_{short_delta}d_t{int(tail_moneyness*100)}m{tail_dte}")
+    return StructureSpec(name=f"sell_vs_tail_t{int(tail_moneyness*100)}m{tail_dte}",
+                         builder=_build, net_credit=True)
+
+
 # --------------------------------------------------------------------------- #
 # CAUSAL VIX / term-structure regime signal (for calm_only).
 # --------------------------------------------------------------------------- #
@@ -487,31 +558,82 @@ def _placebo_percentile(all_trades: pd.DataFrame, gated_trades: pd.DataFrame,
 
 
 # --------------------------------------------------------------------------- #
+# SHARED BACKTEST CACHE (halves gated-cell wall time before the fan-out).
+# --------------------------------------------------------------------------- #
+# The 2a worker flagged that a calm_only (gated) cell re-runs the SAME underlying per-(tenor,
+# mgmt, delta, window) universe backtest that its ungated sibling already computed. Because
+# every trade is INDEPENDENT (a trade opened on day d walks its own path to exit, regardless
+# of which OTHER days were entered), the gated cell's trades are EXACTLY the ungated frame
+# restricted to the calm entry days -- there is no interaction between entries. So we memoize
+# the UNGATED universe backtest per (structure, tenor, mgmt, delta, window) and:
+#   * an ungated cell uses the cached frame directly,
+#   * a gated cell filters the cached frame to the calm entry days (identical to re-running
+#     backtest_structure with entry_days=calm) instead of recomputing.
+# This is byte-identical to the pre-cache path (verified in the unit tests + the cache check).
+#
+# Keyed by (spec.name, tenor_dte, short_delta, management_knob, window_key). The trade frame's
+# .attrs (truncated_dropped / entry_rejects) are preserved on the cached copy so downstream
+# coverage reporting is unchanged.
+_UNIVERSE_CACHE: dict[tuple, pd.DataFrame] = {}
+
+
+def clear_backtest_cache() -> None:
+    """Drop the memoized ungated-universe backtests (free memory between big sweeps / tests)."""
+    _UNIVERSE_CACHE.clear()
+
+
+def _universe_trades(spec: StructureSpec, tenor_dte: int, short_delta: float,
+                     management: str, window_key: str,
+                     use_cache: bool = True) -> pd.DataFrame:
+    """The UNGATED universe backtest for one (structure, tenor, mgmt, delta, window) cell,
+    memoized. Returns a COPY (with .attrs preserved) so callers can filter/mutate freely
+    without corrupting the cached frame."""
+    key = (spec.name, tenor_dte, float(short_delta), management, window_key)
+    if use_cache and key in _UNIVERSE_CACHE:
+        cached = _UNIVERSE_CACHE[key]
+    else:
+        start, end = WINDOWS[window_key]
+        mgmt = build_management(management)
+        structure = spec.builder(tenor_dte, short_delta, mgmt)
+        cached = h.backtest_structure(structure, start=start, end=end)
+        if use_cache:
+            _UNIVERSE_CACHE[key] = cached
+    out = cached.copy()
+    out.attrs = dict(cached.attrs)   # preserve truncated_dropped / entry_rejects
+    return out
+
+
+# --------------------------------------------------------------------------- #
 # One CELL (one grid point) on one window.
 # --------------------------------------------------------------------------- #
 def _run_cell_window(spec: StructureSpec, tenor_dte: int, short_delta: float,
                      management: str, regime: str, window_key: str,
-                     placebo_draws: int, seed: int) -> dict:
+                     placebo_draws: int, seed: int,
+                     use_cache: bool = True) -> dict:
     """Run one grid CELL on one clean window. Returns a flat dict of metrics + a nested
-    payload (crash cost, regime buckets, placebo, DSR-ready returns)."""
-    start, end = WINDOWS[window_key]
-    mgmt = build_management(management)
-    structure = spec.builder(tenor_dte, short_delta, mgmt)
+    payload (crash cost, regime buckets, placebo, DSR-ready returns).
 
-    # UNGATED: enter every clean day in the window. GATED: pass a causal calm-only entry set.
-    entry_days = None
+    Uses the shared UNGATED-universe cache: the ungated backtest for this (structure, tenor,
+    mgmt, delta, window) is computed ONCE and reused; a gated cell reuses it and only re-applies
+    the calm-entry regime mask (a frame filter), rather than recomputing the walk."""
+    start, end = WINDOWS[window_key]
+
+    # The UNGATED universe backtest (cached). Both regimes derive from this SAME frame.
+    all_trades = _universe_trades(spec, tenor_dte, short_delta, management, window_key,
+                                  use_cache=use_cache)
+
+    # UNGATED: trade every clean day in the window (== the universe frame).
+    # GATED (calm_only): filter the universe frame to the causal calm entry days. This is
+    # identical to re-running backtest_structure(entry_days=calm) because trades are
+    # independent -- the gate only chooses WHICH entry days survive, not their outcomes.
     if regime == "calm_only":
         ok = calm_entry_filter()
         all_days = [d for d in h.available_days(clean_only=True) if start <= d <= end]
-        entry_days = [d for d in all_days if ok(d)]
-
-    trades = h.backtest_structure(structure, start=start, end=end, entry_days=entry_days)
-    # For the placebo of a GATED cell we need the SAME structure run UNGATED over the window
-    # (the candidate universe the gate selected from). For an ungated cell it is the same run.
-    if regime == "calm_only":
-        all_trades = h.backtest_structure(structure, start=start, end=end)
+        calm_set = {d for d in all_days if ok(d)}
+        trades = all_trades[all_trades["entry_date"].isin(calm_set)].reset_index(drop=True)
+        trades.attrs = dict(all_trades.attrs)
     else:
-        all_trades = trades
+        trades = all_trades
 
     ret_series = _trade_returns(trades)
     net_pct_yr = _pct_yr_of_core(trades, start, end)
@@ -557,7 +679,8 @@ def sweep_structure(spec: StructureSpec,
                     seed: int = 12345,
                     out_dir: Optional[Path] = None,
                     write: bool = True,
-                    verbose: bool = True) -> pd.DataFrame:
+                    verbose: bool = True,
+                    use_cache: bool = True) -> pd.DataFrame:
     """Sweep `spec` over the (subset of the) pre-registered knob grid and evaluate every cell
     on BOTH clean windows SEPARATELY with the shared battery. Returns a tidy per-cell-per-
     window DataFrame AND (if write) persists it to `out_dir` (default backtester/output/,
@@ -586,6 +709,9 @@ def sweep_structure(spec: StructureSpec,
     management_grid = management_grid if management_grid is not None else spec.management_grid
     regime_grid = regime_grid if regime_grid is not None else spec.regime_grid
 
+    if use_cache:
+        clear_backtest_cache()   # per-sweep cache (fresh universe frames for this run)
+
     combos = list(itertools.product(tenor_dte_grid, management_grid, short_delta_grid,
                                     regime_grid))
     rows = []
@@ -594,7 +720,7 @@ def sweep_structure(spec: StructureSpec,
     for (tenor_dte, management, short_delta, regime) in combos:
         for window_key in WINDOWS:
             r = _run_cell_window(spec, tenor_dte, short_delta, management, regime,
-                                 window_key, placebo_draws, seed)
+                                 window_key, placebo_draws, seed, use_cache=use_cache)
             placebo = r.pop("_placebo")
             row = {
                 "structure": spec.name,

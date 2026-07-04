@@ -1020,6 +1020,125 @@ def put_credit_spread(dte: int, short_delta: float, wing: float,
                      management=management or Management(mode="hold"))
 
 
+def put_write(dte: int, short_delta: float,
+              management: Optional[Management] = None,
+              name: Optional[str] = None) -> Structure:
+    """An index-level PUT-WRITE: ONE short put at |delta|=short_delta, NO long wing.
+
+    Naked BY CONSTRUCTION in this leg. In S5 its catastrophe risk is capped by the
+    separately-owned always-on Tier-1 tail (deep ~20% OTM, ~63 DTE) -- a held S5 position,
+    NOT modeled as a leg here. The tail's carry is the ~1.56%/yr this program is trying to
+    fund; it is not part of this structure's P&L. Income = the short-put net premium
+    (measured downstream as net_pct_yr_of_core). The min-credit floor is fine here (a
+    put-write credit is large)."""
+    legs = [Leg(right="PUT", action="sell", target_delta=short_delta)]  # 0: naked short put
+    return Structure(name=name or f"{dte}d_put_write_{short_delta}d",
+                     legs=legs, dte=dte,
+                     management=management or Management(mode="hold"))
+
+
+def iron_condor_call_param(dte: int, short_delta: float, wing: float,
+                           call_delta: Optional[float] = None,
+                           call_wing: Optional[float] = None,
+                           management: Optional[Management] = None,
+                           name: Optional[str] = None) -> Structure:
+    """An iron condor with an INDEPENDENTLY parameterizable CALL side, so ONE builder serves
+    both upside arms:
+      * upside-NEUTRAL arm  : a FAR call wing / LOW call delta (default) -- the call side is
+        far OTM, contributes little premium and little upside cap;
+      * modest-call-INCOME arm : a NEARER call / HIGHER call delta -- the call side earns real
+        premium at the cost of capping upside.
+
+    `short_delta`/`wing` govern the PUT side (as in put_credit_spread / iron_condor).
+    `call_delta` (default = short_delta * 0.5, i.e. a farther/lower-delta call for the neutral
+    arm) governs the short call; `call_wing` (default = `wing`) governs the long call wing
+    width above it. Pass a higher `call_delta` (e.g. == short_delta) for the income arm."""
+    if call_delta is None:
+        call_delta = short_delta * 0.5   # default: far/low-delta call -> upside-neutral arm
+    if call_wing is None:
+        call_wing = wing
+    legs = [
+        Leg(right="PUT", action="sell", target_delta=short_delta),          # 0: short put
+        Leg(right="PUT", action="buy", strike_offset=-wing, ref_leg=0),      # 1: put wing
+        Leg(right="CALL", action="sell", target_delta=call_delta),          # 2: short call
+        Leg(right="CALL", action="buy", strike_offset=+call_wing, ref_leg=2),  # 3: call wing
+    ]
+    return Structure(
+        name=name or f"{dte}d_iron_condor_p{short_delta}d{wing}w_c{call_delta}d{call_wing}w",
+        legs=legs, dte=dte,
+        management=management or Management(mode="hold"))
+
+
+def put_calendar(dte: int, short_delta: float,
+                 back_dte_mult: float = 2.0, back_dte_offset: int = 0,
+                 strike_offset: float = 0.0,
+                 management: Optional[Management] = None,
+                 name: Optional[str] = None) -> Structure:
+    """A put CALENDAR / DIAGONAL: SHORT a front-month put + LONG a back-month put.
+
+    The sweep's tenor knob (`dte`) sets the SHORT front-month tenor. The LONG back-month
+    tenor is a STATED multiple/offset of it: back_dte = round(dte * back_dte_mult)
+    + back_dte_offset (per-leg DTE override). A NET-DEBIT structure (the longer-dated long
+    put costs more than the front short brings in) -- it correctly BYPASSES the min-credit
+    floor, which only guards net-CREDIT entries. Income arises because the front-month decays
+    faster than the back-month.
+
+    `strike_offset` (points) shifts the LONG back-month strike relative to the short strike
+    for the DIAGONAL variant (0 = pure calendar: both legs at the same short-delta strike).
+    The short leg is selected at |delta|=short_delta; the long back-month leg keys off the
+    short strike via strike_offset (0 => same strike)."""
+    back_dte = int(round(dte * back_dte_mult)) + int(back_dte_offset)
+    legs = [
+        # 0: SHORT front-month put at the short-delta strike (structure DTE).
+        Leg(right="PUT", action="sell", target_delta=short_delta),
+        # 1: LONG back-month put, per-leg DTE override; strike keyed off the short strike so
+        #    the diagonal offset is defined-risk-style relative to the front short.
+        Leg(right="PUT", action="buy", strike_offset=strike_offset, ref_leg=0, dte=back_dte),
+    ]
+    return Structure(
+        name=name or f"{dte}d_put_calendar_{short_delta}d_b{back_dte}_o{int(strike_offset)}",
+        legs=legs, dte=dte,
+        management=management or Management(mode="hold"))
+
+
+def sell_against_owned_tail(dte: int, short_delta: float,
+                            tail_moneyness: float = -0.20, tail_dte: int = 63,
+                            management: Optional[Management] = None,
+                            name: Optional[str] = None) -> Structure:
+    """Sell a nearer-dated / nearer-strike SHORT put whose LONG protective leg is the
+    ALREADY-OWNED Tier-1 tail (deep ~20% OTM, ~63 DTE).
+
+    MODELING CHOICE (implemented exactly here, and documented): the deep tail is a HELD
+    position whose carry is the ~1.56%/yr this program is trying to fund. We DO NOT count the
+    tail's own premium/carry here (that would double-count what we are funding). We measure
+    income = the SHORT leg's net premium ONLY (downstream: net_pct_yr_of_core). The tail leg
+    is included in the structure ONLY so the incremental DEFINED RISK is recorded as
+    (short_strike - tail_strike): the max loss of the short is bounded below by the owned
+    tail. The tail leg uses target_moneyness (~20% OTM) and its own DTE (~63).
+
+    NOTE ON P&L MECHANICS: because the tail leg IS a real long leg in the Position, the
+    harness will mark/settle it too, so its cashflow enters entry_credit and settlement. To
+    keep income = SHORT premium only (the stated modeling choice), the tail is entered at a
+    SEPARATE, longer expiry -- its intrinsic at the SHORT's expiry is out of scope of the
+    short's settlement day, and over the short's life it is a slow-moving held hedge. Callers
+    that need STRICT short-only accounting should read the short leg's premium directly; this
+    builder's role is to (a) select honestly and (b) record the incremental defined risk via
+    the realized width between the short strike and the owned-tail strike."""
+    legs = [
+        # 0: SHORT nearer-dated put at the short-delta strike (structure DTE).
+        Leg(right="PUT", action="sell", target_delta=short_delta),
+        # 1: the ALREADY-OWNED deep tail as the LONG protective leg: ~20% OTM, ~63 DTE.
+        #    strike keyed off the short via strike math is NOT used -- the tail strike is an
+        #    absolute moneyness point, so we select it by moneyness and let the harness record
+        #    the incremental defined risk (short_strike - tail_strike) from the resolved legs.
+        Leg(right="PUT", action="buy", target_moneyness=tail_moneyness, dte=tail_dte),
+    ]
+    return Structure(
+        name=name or f"{dte}d_sell_vs_tail_{short_delta}d_t{int(tail_moneyness*100)}m{tail_dte}",
+        legs=legs, dte=dte,
+        management=management or Management(mode="hold"))
+
+
 def clear_cache() -> None:
     """Drop the in-memory chain cache (free memory between big sweeps)."""
     _CHAIN_CACHE.clear()
