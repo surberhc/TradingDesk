@@ -63,6 +63,27 @@ import config
 # The project email path — same helper + creds the EOD digest uses. Imported
 # lazily inside _send() so --dry-run self-tests never even need it importable.
 
+# Shared trading calendar — used to skip market-dependent deadline checks on days
+# the market is closed (weekends + holidays), so a job that legitimately has no
+# session to run is never mis-alarmed as "did NOT run today". Imported defensively:
+# if it's unavailable or the year isn't tabled, _is_trading_day degrades to a plain
+# weekday rule (Mon-Fri) so a missing calendar makes the alarm slightly noisier on
+# holidays, NEVER silently wrong or crashed.
+try:
+    from connections import market_calendar as _mktcal
+except Exception:  # noqa: BLE001 — the alarm must import even if the calendar is missing
+    _mktcal = None
+
+
+def _is_trading_day(d: "dt.date") -> bool:
+    """Calendar-aware 'is the US market open on day d' that NEVER raises."""
+    if _mktcal is not None:
+        try:
+            return _mktcal.is_trading_day(d)
+        except Exception:  # noqa: BLE001 — un-tabled year etc. -> weekday fallback
+            pass
+    return d.weekday() < 5
+
 # --------------------------------------------------------------------------- #
 # Paths / tunables
 # --------------------------------------------------------------------------- #
@@ -119,19 +140,24 @@ _STATUS_DIR = Path(r"C:\TradingDesk-Local\state\dailyreport\status")
 DEADLINE_JOBS: list[dict] = [
     {"name": "eod_report", "label": "nightly EOD email",
      "status_file": _STATUS_DIR / "eod_report.json",
-     "deadline_hhmm": (21, 15), "task_name": "EodReport"},
+     "deadline_hhmm": (21, 15), "task_name": "EodReport",
+     "market_dependent": False},
     {"name": "forward", "label": "IBKR forward options collector",
      "status_file": _STATUS_DIR / "forward.json",
-     "deadline_hhmm": (19, 0), "task_name": "ThetaEodDaily"},
+     "deadline_hhmm": (19, 0), "task_name": "ThetaEodDaily",
+     "market_dependent": True},
     {"name": "tiingo", "label": "Tiingo daily data refresh",
      "status_file": _STATUS_DIR / "tiingo.json",
-     "deadline_hhmm": (17, 15), "task_name": "TiingoDailyUpdate"},
+     "deadline_hhmm": (17, 15), "task_name": "TiingoDailyUpdate",
+     "market_dependent": True},
     {"name": "gex", "label": "GEX dealer-gamma build",
      "status_file": _STATUS_DIR / "gex.json",
-     "deadline_hhmm": (20, 0), "task_name": "GexDailyBuild"},
+     "deadline_hhmm": (20, 0), "task_name": "GexDailyBuild",
+     "market_dependent": True},
     {"name": "account_monitor", "label": "account-cashflow monitor",
      "status_file": _STATUS_DIR / "account_monitor.json",
-     "deadline_hhmm": (17, 15), "task_name": "AccountMonitorDaily"},
+     "deadline_hhmm": (17, 15), "task_name": "AccountMonitorDaily",
+     "market_dependent": True},
 ]
 
 
@@ -151,6 +177,12 @@ def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
     deadline = now_dt.replace(hour=dh, minute=dm, second=0, microsecond=0)
     today = now_dt.strftime("%Y%m%d")
     hhmm = f"{dh:02d}:{dm:02d}"
+
+    if job.get("market_dependent") and not _is_trading_day(now_dt.date()):
+        # Market closed today (weekend/holiday): this job has no session to run,
+        # so its absence is expected, not a fault. Clear any cooldown and skip.
+        js.pop("last_alert_ts", None)
+        return f"{name}: market closed today — {label} not expected (no check)"
 
     if now_dt < deadline:
         # New day / pre-deadline: clear any prior cooldown so today re-alarms.
