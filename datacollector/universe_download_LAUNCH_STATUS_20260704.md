@@ -1,5 +1,38 @@
 # Expanded-universe options pull — LAUNCH STATUS + reliability (2026-07-04)
 
+## >>> FOR ANDREW WHEN BACK — one action <<<
+**Right-click `C:\TradingDesk-Local\warehouse\register_universe_tasks.ps1` → "Run as
+administrator".** It will prompt once for your Windows password (for the whether-logged-on
+task; never stored) and register two tasks idempotently. That's the whole job.
+
+**What that one click ARMS** (the durable, machine-side, reboot-proof legs — liveness modes
+7–10 + the terminal boot-hole):
+- `UniverseDownloadEod` — the pull auto-resumes after a **reboot / power outage / logoff**
+  (AtStartup + AtLogon + every-15-min triggers, run-whether-logged-on, resume-from-checkpoint).
+- `ThetaTerminalWatchdogBoot` — restarts the ThetaData terminal **at boot with nobody logged
+  in** (fills the AtStartup gap in the existing watchdog; non-destructive — a separate task).
+Both are singleton-guarded, so the extra/boot triggers are safe no-ops.
+
+**Why it's not already done:** registering these needs an elevated shell AND your account
+password — neither the coordinator nor I can/should do it (you reserved scheduled-task
+registration for yourself, and the harness guard correctly enforced that). The script makes
+your part a single copy-paste-free click.
+
+*(The runnable copy sits next to the launcher bats at
+`C:\TradingDesk-Local\warehouse\register_universe_tasks.ps1`; a version-tracked copy is in the
+repo at `datacollector\register_universe_tasks.ps1`. Run the warehouse one.)*
+
+**Current interim state is SAFE — you are not racing a clock:**
+- The Priority-1 EOD pull is **LIVE and running now** (detached; survives app/session close).
+- The independent stall alarm is **already armed and reboot-surviving** (it rides the existing
+  boot-triggered `HeartbeatStalenessAlarm`). If the pull dies for any reason you get an email.
+- **Worst case before you run the script:** a reboot stops the detached pull → you get an
+  alarm email → running the script (or just relaunching) resumes **from the on-disk
+  checkpoint with ZERO data loss** (every completed symbol-day is already on disk; nothing
+  re-pulls). No corruption, no silent death.
+
+---
+
 ## What is LIVE right now
 - **Priority-1 EOD pull is RUNNING**: `universe_download.py --launcher --layer eod --only-new
   --shards 4`, detached supervisor **pid 21388** + 4 shards, pulling the **90 new roots**
