@@ -1,5 +1,18 @@
 # Expanded-universe options pull — LAUNCH STATUS + reliability (2026-07-04)
 
+## UPDATE 2026-07-05 — EOD layer DONE; snapshot layer running; eod->snap now AUTOMATED
+- **EOD layer COMPLETE**: finished **2026-07-05 00:24, 100%, all 140 roots**.
+- **Snapshot layer is now RUNNING** (Priority 2; `raw\options_snap\{SYM}\{HHMM}\{YYYYMMDD}.parquet`).
+- **Automation gap closed**: the launcher (`run_universe_download_eod.bat`, driven by the
+  `UniverseDownloadEod` scheduled task) was changed from `--layer eod --only-new` to
+  **`--layer both --only-new`**. `--only-new` still affects the EOD pass only; snap always runs
+  all roots. The task now **auto-progresses eod->snap with no manual handoff** AND **resumes the
+  snapshot layer after a reboot**. It is still singleton-guarded / idempotent / resumable, so
+  the next 15-min task fire simply busy-skips while the current snapshot supervisor holds the
+  lock — no conflict, no duplicate. Previously the snapshot layer had to be kicked by hand
+  (it sat idle ~12 h after the EOD pull finished); that dependency is now gone.
+
+
 ## >>> FOR ANDREW WHEN BACK — one action <<<
 **Right-click `C:\TradingDesk-Local\warehouse\register_universe_tasks.ps1` → "Run as
 administrator".** It will prompt once for your Windows password (for the whether-logged-on
