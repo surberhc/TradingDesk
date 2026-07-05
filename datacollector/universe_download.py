@@ -274,33 +274,56 @@ def _dte_ok(exp_dashed: str, d: dt.date) -> bool:
 def snap_pull_day(symbol: str, d: dt.date) -> dict[str, pd.DataFrame]:
     """Return {HHMM: dataframe} of the near-money band at each target minute.
 
-    The quote endpoint ACCEPTS expiration=* with a coarse interval (verified: SPXW's
-    whole 15m chain — 37 expirations — comes back in ONE ~17s call, vs ~256s looping
-    per-expiration). So we make ONE greeks/eod call (for the day's consistent spot)
-    and ONE expiration=* quote call for the 15m grid, then filter IN MEMORY to:
-      * the target minutes (10:00/12:00/14:00/15:45) — exact 15m grid boundaries,
-      * the 0-60 DTE expirations, and
-      * the near-money band (+/-15% of spot).
-    Filtering after a single call trades a larger transfer (the full chain) for far
-    fewer round-trips — a big net win on the heavy indices where the per-expiration
-    loop dominated. Missing target-minute rows for a contract are simply absent (the
-    grid guarantees the boundary row exists whenever the contract quoted).
+    We DELIBERATELY do NOT ask the quote endpoint for the whole chain (expiration=*).
+    For heavy index roots (SPX/SPXW/VIX) in deep-chain crisis years (2020-2021) that
+    whole-chain intraday 15m response is enormous — it overran the 180s ReadTimeout and
+    swamped the terminal. But we only ever KEEP the 0-60 DTE window, which is just ~5-12
+    expirations. So we scope the request to exactly those expirations up front:
+
+      1. ONE greeks/eod call gives the day's consistent settlement spot AND the full
+         expiration list (already available from _day_spot — no extra round-trip).
+      2. Filter that list to the 0-60 DTE window (_dte_ok), the ONLY expirations we keep.
+      3. Fetch the 15m quote grid PER in-window expiration and concatenate. The v3 quote
+         endpoint takes ONE dashed expiration per call (same as the ohlc/1m collectors),
+         so this is a bounded ~5-12 small calls — far cheaper than transferring every
+         expiration out to years just to discard it. A single bad expiration is skipped;
+         it does not abort the day.
+      4. Filter IN MEMORY to the target minutes (10:00/12:00/14:00/15:45 — exact 15m grid
+         boundaries) and the near-money band (+/-15% of spot). The quote endpoint only
+         accepts strike=* (no strike-range param in v3), so the strike band stays an
+         in-memory filter as before; the expiration scoping is the timeout fix.
+
+    OUTPUT is identical to the prior expiration=* path (same SNAP_KEEP_COLS, same 4 target
+    times, same near-money band, same file paths) — already-written snapshot files stay
+    valid and resume/skip-done is unaffected.
     """
     out: dict[str, pd.DataFrame] = {t: pd.DataFrame() for t in uni.SNAP_TIMES}
-    # Spot for the band (consistent settlement underlying_price). One greeks/eod call.
-    spot, _ = _day_spot(symbol, d)
+    # Spot for the band + the day's expiration list, in ONE greeks/eod call.
+    spot, exps = _day_spot(symbol, d)
     if spot is None:
         return out                       # legit empty day -> caller writes 0-row markers
     lo, hi = spot * (1 - uni.SNAP_BAND_PCT), spot * (1 + uni.SNAP_BAND_PCT)
     ds_iso = _dashed(d)
     target_ts = {t: f"{ds_iso}T{t}:00.000" for t in uni.SNAP_TIMES}
 
-    # ONE expiration=* call for the whole 15m grid.
-    allrows = _get_csv("/option/history/quote", {
-        "symbol": symbol, "expiration": "*",
-        "start_date": ds_iso, "end_date": ds_iso,
-        "strike": "*", "right": "both", "interval": uni.SNAP_INTERVAL,
-    }, timeout=QUOTE_TIMEOUT)
+    # 0-60 DTE subset — the ONLY expirations we keep, so the ONLY ones we fetch.
+    in_window = [e for e in exps if _dte_ok(str(e), d)]
+    if not in_window:
+        return out
+
+    # Fetch the 15m quote grid for JUST the in-window expirations (bounded loop).
+    frames: list[pd.DataFrame] = []
+    for exp in in_window:
+        part = _get_csv("/option/history/quote", {
+            "symbol": symbol, "expiration": exp,
+            "start_date": ds_iso, "end_date": ds_iso,
+            "strike": "*", "right": "both", "interval": uni.SNAP_INTERVAL,
+        }, timeout=QUOTE_TIMEOUT)
+        if not part.empty:
+            frames.append(part)
+    if not frames:
+        return out
+    allrows = pd.concat(frames, ignore_index=True)
     if allrows.empty or "strike" not in allrows.columns:
         return out
 
@@ -308,13 +331,9 @@ def snap_pull_day(symbol: str, d: dt.date) -> dict[str, pd.DataFrame]:
     allrows = allrows[allrows["timestamp"].astype(str).isin(target_ts.values())]
     if allrows.empty:
         return out
-    # Filter 2: near-money band.
+    # Filter 2: near-money band (strike endpoint is *-only in v3 -> in-memory band).
     strike = pd.to_numeric(allrows["strike"], errors="coerce")
     allrows = allrows[(strike >= lo) & (strike <= hi)]
-    # Filter 3: 0-60 DTE window (vectorized over the exp column).
-    if not allrows.empty:
-        exp_dte_ok = allrows["expiration"].astype(str).map(lambda e: _dte_ok(e, d))
-        allrows = allrows[exp_dte_ok]
     if allrows.empty:
         return out
 
