@@ -39,7 +39,7 @@ GRAB_END = None          # None -> up to yesterday (today's expiration=* is HTTP
 # (verified: 09:30, 09:45, 10:00 ... 15:45, 16:00), so these four target times
 # are all exact grid points — we pull the 15m grid per expiration and KEEP only
 # these rows. All legs at one instant (unlike greeks/eod).
-SNAP_TIMES = ["10:00", "12:00", "14:00", "15:45"]   # ET (terminal-local session clock)
+SNAP_TIMES = ["12:00", "15:45"]   # ET (terminal-local session clock)
 SNAP_INTERVAL = "15m"        # coarse grid that contains every SNAP_TIME above
 # Near-money band + DTE window relevant to premium selling. We resolve the band
 # in STRIKE-DOLLAR terms off the day's underlying_price (from greeks/eod), so we
