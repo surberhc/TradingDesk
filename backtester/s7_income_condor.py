@@ -722,6 +722,120 @@ def manage_csp(c: CashSecuredPut, day_loader, all_days: list[_dt.date]) -> CashS
 
 
 # --------------------------------------------------------------------------- #
+# CSP daily book mark-to-market (alpha-vs-beta study, pre-registered 2026-07-06)
+#
+# Marks the WHOLE open short-put book each trading day at the EOD buy-back price (fill f),
+# producing a daily mark-to-market P&L series and a daily reserved-capital / dollar-delta
+# series. Reuses the SAME honest-fill helper (_buy_price) and price-map cache as the condor
+# forward-walk — no new pricing logic, no look-ahead (a day's mark uses only that day's
+# quotes; a put contributes marks only on days within [entry, expiry)).
+# --------------------------------------------------------------------------- #
+def _put_buyback_pm(pm: dict, expiration: _dt.date, strike: float,
+                    f: float) -> float | None:
+    """Buy-back debit for ONE short put from a price map at fill fraction f. None if unquoted."""
+    exp_map = pm.get(expiration)
+    if not exp_map:
+        return None
+    leg = exp_map.get((strike, "PUT"))
+    if leg is None:
+        return None
+    return float(_buy_price(leg[0], leg[1], f))
+
+
+def csp_book_daily_marks(csps: list["CashSecuredPut"], day_loader,
+                         all_days: list[_dt.date], f: float,
+                         price_maps: dict | None = None) -> pd.DataFrame:
+    """Daily mark-to-market of the whole weekly-laddered short-put book at fill fraction f.
+
+    For each trading day d, sum over every put that is OPEN on d (entry_day < d <= expiry):
+      * the put's book VALUE (liability) = current buy-back debit at fill f, in points; on the
+        expiry day the value is the settled intrinsic max(0, K - settle) (no quote needed).
+      * reserved capital = K * 100 dollars (cash-secured).
+      * dollar-delta = |clean entry delta| * spot(d) * 100  (short-put long-market exposure).
+
+    Book EQUITY on day d (dollars) = Σ entry_credit*100 (premium collected up-front)
+                                     − Σ current_value*100 (mark-to-market liability).
+    Daily P&L = equity(d) − equity(d-1). Daily return = daily P&L / reserved_capital(d).
+
+    A put enters the book the day AFTER its entry (first mark) and leaves after its expiry
+    mark. Strictly causal: day d's mark reads only day d's price map. Returns a DataFrame
+    indexed by date with columns [equity, pnl, reserved_capital, dollar_delta, n_open, ret].
+    """
+    if price_maps is None:
+        price_maps = {}
+    if not csps:
+        return pd.DataFrame(columns=["equity", "pnl", "reserved_capital",
+                                     "dollar_delta", "n_open", "ret"])
+
+    # Per-put static facts.
+    credit100 = {i: c.entry_credit * CONTRACT_MULTIPLIER for i, c in enumerate(csps)}
+    reserve100 = {i: c.strike * CONTRACT_MULTIPLIER for i, c in enumerate(csps)}
+    entry_absdelta = {i: (abs(c.entry_delta) if np.isfinite(c.entry_delta) else 0.50)
+                      for i, c in enumerate(csps)}
+
+    first_entry = min(c.entry_day for c in csps)
+    last_exp = max(c.expiration for c in csps)
+    marks_days = [d for d in all_days if first_entry < d <= last_exp]
+
+    rows = {}
+    for d in marks_days:
+        pm = _pm_get(price_maps, d, day_loader)
+        # spot for dollar-delta: any expiration's stored spot is that day's underlying close.
+        spot_d = None
+        if pm is not None and pm.get("_spot"):
+            spot_d = next(iter(pm["_spot"].values()))
+        equity = 0.0
+        reserved = 0.0
+        ddelta = 0.0
+        n_open = 0
+        for i, c in enumerate(csps):
+            if not (c.entry_day < d <= c.expiration):
+                continue
+            n_open += 1
+            reserved += reserve100[i]
+            if spot_d is not None:
+                ddelta += entry_absdelta[i] * spot_d * CONTRACT_MULTIPLIER
+            # current liability value (points)
+            if d == c.expiration:
+                # settled intrinsic — no quote needed (uses c.exit_debit set by manage_csp,
+                # or recompute from settle spot if not yet managed).
+                if np.isfinite(c.exit_debit):
+                    value = c.exit_debit
+                elif spot_d is not None:
+                    value = max(0.0, c.strike - spot_d)
+                else:
+                    value = 0.0
+            else:
+                bb = _put_buyback_pm(pm, c.expiration, c.strike, f) if pm is not None else None
+                if bb is None:
+                    # unquoted mid-life day (e.g. blackout): carry last known value by using
+                    # intrinsic vs current spot as a floor; if no spot, treat as full credit
+                    # retained (value ~ entry_credit) to avoid fabricating a gain.
+                    if spot_d is not None:
+                        value = max(0.0, c.strike - spot_d)
+                    else:
+                        value = c.entry_credit
+                else:
+                    value = bb
+            equity += credit100[i] - value * CONTRACT_MULTIPLIER
+        rows[d] = dict(equity=equity, reserved_capital=reserved,
+                       dollar_delta=ddelta, n_open=n_open)
+
+    df = pd.DataFrame.from_dict(rows, orient="index").sort_index()
+    if df.empty:
+        return pd.DataFrame(columns=["equity", "pnl", "reserved_capital",
+                                     "dollar_delta", "n_open", "ret"])
+    df.index = pd.to_datetime(df.index)
+    df["pnl"] = df["equity"].diff()
+    df.loc[df.index[0], "pnl"] = df["equity"].iloc[0]  # day-1 P&L = first-day equity change
+    # daily return on reserved capital (guard against 0 open days)
+    denom = df["reserved_capital"].replace(0.0, np.nan)
+    df["ret"] = df["pnl"] / denom
+    df["ret"] = df["ret"].fillna(0.0)
+    return df[["equity", "pnl", "reserved_capital", "dollar_delta", "n_open", "ret"]]
+
+
+# --------------------------------------------------------------------------- #
 # Weekly-laddered entry schedule
 # --------------------------------------------------------------------------- #
 def weekly_entry_days(days: list[_dt.date]) -> list[_dt.date]:
@@ -833,3 +947,68 @@ def run_csp_config(target_dte: int, f: float,
         rec["config"] = f"csp_dte{target_dte}_f{f}"
         trades.append(rec)
     return pd.DataFrame(trades)
+
+
+def run_csp_book(target_dte: int, f: float,
+                 days: list[_dt.date] | None = None,
+                 day_cache: dict | None = None) -> list["CashSecuredPut"]:
+    """Same weekly-laddered ATM CSP book as run_csp_config, but return the managed OBJECTS.
+
+    Identical entry/management path (byte-for-byte the same trades). The object list is what
+    the daily book mark-to-market (csp_book_daily_marks) needs. Kept separate so the existing
+    run_csp_config DataFrame API is untouched.
+    """
+    if days is None:
+        days = available_days()
+    if day_cache is None:
+        day_cache = {}
+
+    def loader(d: _dt.date):
+        if d not in day_cache:
+            day_cache[d] = load_day(d)
+        return day_cache[d]
+
+    out: list[CashSecuredPut] = []
+    for ed in weekly_entry_days(days):
+        day_df = loader(ed)
+        if day_df is None or len(day_df) == 0:
+            continue
+        c = build_csp(day_df, ed, target_dte, f)
+        if c is None:
+            continue
+        out.append(manage_csp(c, loader, days))
+    return out
+
+
+def spx_daily_returns(all_days: list[_dt.date], day_cache: dict,
+                      day_loader) -> pd.Series:
+    """SPX daily close + simple daily return from warehouse underlying_price.
+
+    The warehouse option chains carry `underlying_price` per day — that is a valid SPX close
+    series (the same close used to settle). We take one underlying_price per day (all rows on a
+    day share it) and form simple returns. READ-ONLY; no external series needed. Blackout days
+    still carry a valid underlying_price (only the NBBO was zeroed), so the SPX series is
+    continuous across the blackout even though the option book skips those entry-weeks.
+    Returns a Series indexed by Timestamp of daily simple returns (first day NaN dropped).
+    """
+    closes = {}
+    for d in all_days:
+        ddf = day_loader(d)
+        if ddf is None or len(ddf) == 0:
+            # blackout / empty chain: read underlying_price straight from the raw file.
+            p = _fpath(d)
+            if p.is_file():
+                try:
+                    raw = pd.read_parquet(p, columns=["underlying_price"])
+                    up = raw["underlying_price"].dropna()
+                    if len(up):
+                        closes[d] = float(up.iloc[0])
+                except Exception:
+                    pass
+            continue
+        up = float(ddf["underlying_price"].iloc[0])
+        if np.isfinite(up) and up > 0:
+            closes[d] = up
+    s = pd.Series(closes).sort_index()
+    s.index = pd.to_datetime(s.index)
+    return s.pct_change().dropna()

@@ -174,6 +174,98 @@ def test_csp_builds_atm_and_settles():
     assert c.entry_credit > 0
 
 
+# --------------------------------------------------------------------------- #
+# CSP daily book mark-to-market + the alpha detector (alpha-vs-beta study)
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="warehouse not present")
+def test_csp_book_daily_mark_is_causal():
+    """Truncating the day universe at the last mark date cannot change any earlier mark.
+
+    Build a small CSP book, mark it daily over the full window, then mark it again over a
+    window truncated to the book's last relevant day. Every overlapping day's equity/pnl
+    must be byte-identical — a future day never reaches back and changes a past mark."""
+    all_days = [d for d in s7.available_days()
+                if dt.date(2018, 6, 1) <= d <= dt.date(2018, 12, 31)]
+    cache: dict = {}
+
+    def loader(d):
+        if d not in cache:
+            cache[d] = s7.load_day(d)
+        return cache[d]
+
+    csps = s7.run_csp_book(45, 0.50, days=all_days, day_cache=cache)
+    assert len(csps) > 0
+    pm_full: dict = {}
+    book_full = s7.csp_book_daily_marks(csps, lambda d: cache.get(d), all_days, 0.50,
+                                        price_maps=pm_full)
+    assert not book_full.empty
+    cutoff = book_full.index[len(book_full) // 2]
+    trunc_days = [d for d in all_days if d <= cutoff.date()]
+    pm_tr: dict = {}
+    book_tr = s7.csp_book_daily_marks(csps, lambda d: cache.get(d), trunc_days, 0.50,
+                                      price_maps=pm_tr)
+    common = book_full.index.intersection(book_tr.index)
+    assert len(common) > 5
+    # equity on overlapping days must match exactly (marks are causal / path-independent)
+    np.testing.assert_allclose(book_full.loc[common, "equity"].to_numpy(),
+                               book_tr.loc[common, "equity"].to_numpy(), rtol=0, atol=1e-9)
+
+
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="warehouse not present")
+def test_csp_book_mark_is_cost_charged():
+    """A worse fill (f=1) never gives the seller a HIGHER book equity than mid (f=0).
+
+    The liability is the put buy-back price, which RISES with f (cost-charged), so equity
+    (premium − liability) can only fall as f grows. Checked on the aggregate final equity."""
+    all_days = [d for d in s7.available_days()
+                if dt.date(2018, 6, 1) <= d <= dt.date(2018, 12, 31)]
+    cache: dict = {}
+
+    def loader(d):
+        if d not in cache:
+            cache[d] = s7.load_day(d)
+        return cache[d]
+
+    # Build each book at its own fill (entry credit also depends on f) and compare final equity.
+    eq = {}
+    for f in (0.0, 1.0):
+        csps = s7.run_csp_book(45, f, days=all_days, day_cache=cache)
+        book = s7.csp_book_daily_marks(csps, lambda d: cache.get(d), all_days, f,
+                                       price_maps={})
+        eq[f] = float(book["equity"].iloc[-1])
+    assert eq[1.0] <= eq[0.0] + 1e-6, "full-cross fill must not beat mid on book equity"
+
+
+def test_alpha_detector_reports_no_edge_on_pure_beta():
+    """Sanity: a series built as beta*r_spx + noise with TRUE alpha=0 must recover a
+    bootstrap alpha 95% CI that INCLUDES 0 (the detector is not rigged to find edge)."""
+    import csp_alpha_beta as cab
+    rng = np.random.default_rng(12345)
+    n = 1500
+    r_spx = rng.normal(0.0004, 0.01, n)          # market daily returns
+    r_y = 0.5 * r_spx + rng.normal(0.0, 0.003, n)  # pure beta, ZERO alpha
+    reg = cab.ols_alpha_beta(r_y, r_spx)
+    assert abs(reg["beta"] - 0.5) < 0.05          # recovers the true beta
+    ci = cab.bootstrap_alpha_ci(r_y, r_spx, resamples=800, seed=99)
+    assert ci["alpha_ann_lo"] < 0 < ci["alpha_ann_hi"], "CI must span 0 when alpha is truly 0"
+
+
+def test_alpha_detector_finds_known_positive_drift():
+    """Sanity: add a known positive daily drift (true alpha>0) and the recovered annualized
+    alpha and its bootstrap CI must be positive (the detector CAN find real edge)."""
+    import csp_alpha_beta as cab
+    rng = np.random.default_rng(2020)
+    n = 1500
+    drift = 0.0006                                # +0.06%/day ~ +15%/yr alpha
+    r_spx = rng.normal(0.0004, 0.01, n)
+    r_y = drift + 0.5 * r_spx + rng.normal(0.0, 0.003, n)
+    reg = cab.ols_alpha_beta(r_y, r_spx)
+    assert reg["alpha_daily"] > 0
+    assert reg["alpha_daily"] * cab.TRADING_DAYS > 0.05   # clearly positive annualized
+    ci = cab.bootstrap_alpha_ci(r_y, r_spx, resamples=800, seed=7)
+    assert ci["alpha_ann_lo"] > 0, "CI must exclude 0 (positive) when a real drift is present"
+
+
 def test_ivr_series_is_causal_and_ranked():
     """IVR loads from the VIX parquet, is bounded 0..100, and each day's rank uses only
     closes up to that day (rolling window with raw last-value percentile)."""
