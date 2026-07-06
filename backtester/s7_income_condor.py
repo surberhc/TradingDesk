@@ -62,9 +62,15 @@ import s6_recon as recon  # audited BSM: implied_vol_from_mid, bs_delta
 WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse\raw\options\SPX")
 OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "s7_research"
 
+# VIX daily close series for the IV-rank entry filter (rebuild addendum). This parquet
+# carries a clean `date` + `spot` (the VIX index close) 2018-01 -> present. READ-ONLY.
+VIX_DAILY_PARQUET = Path(r"C:\TradingDesk-Local\warehouse\derived\VIX_gex_daily.parquet")
+
 CONTRACT_MULTIPLIER = 100.0   # SPX options are $100/point
-WING_WIDTH = 25.0             # fixed 25-pt protective wing each side (pre-registered)
+WING_WIDTH = 25.0             # default fixed protective-wing width (the 25-pt CONTROL arm)
 TIME_STOP_DTE = 21            # managed arms close at DTE <= 21 (pre-registered)
+IVR_WINDOW = 252              # trailing trading-day window for the IV-rank percentile
+IVR_HIGH_THRESHOLD = 50.0     # 'high-IVR-only' opens only when IVR >= 50 (top half)
 
 # Data-corruption guard (pre-registered): flag a day's vendor delta column as degenerate
 # when the share of rows with |delta| exactly in {0,1} exceeds this. Chosen to sit well
@@ -147,6 +153,51 @@ def day_quote_ok(d: _dt.date) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# IV-rank entry filter (rebuild addendum) — trailing VIX percentile, CAUSAL
+# --------------------------------------------------------------------------- #
+def load_ivr_series() -> pd.Series | None:
+    """Trailing-252-day IV-rank of the VIX close, indexed by date. None if VIX absent.
+
+    IVR on day t = percentile rank of the VIX close within the trailing IVR_WINDOW closes
+    UP TO AND INCLUDING t (0..100). Strictly causal: min_periods=window so early days are
+    NaN (the filter simply won't gate before it has a full lookback — treated as fail-high
+    below). If the VIX parquet cannot be found, returns None and the caller SKIPS the IVR
+    arm (never fabricates the series)."""
+    if not VIX_DAILY_PARQUET.is_file():
+        return None
+    try:
+        df = pd.read_parquet(VIX_DAILY_PARQUET, columns=["date", "spot"])
+    except Exception:
+        return None
+    if df is None or len(df) == 0 or "spot" not in df.columns:
+        return None
+    df = df.copy()
+    df["d"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d").dt.date
+    df = df.dropna(subset=["spot"]).sort_values("d")
+    vix = df.set_index("d")["spot"].astype(float)
+
+    def _pctile_rank(window_vals: np.ndarray) -> float:
+        # rank of the LAST value within its trailing window (causal), 0..100.
+        last = window_vals[-1]
+        return 100.0 * float(np.mean(window_vals <= last))
+
+    ivr = vix.rolling(IVR_WINDOW, min_periods=IVR_WINDOW).apply(_pctile_rank, raw=True)
+    return ivr
+
+
+def ivr_passes(ivr_series: pd.Series | None, d: _dt.date, ivr_filter: str) -> bool:
+    """Entry gate. 'always' -> always True. 'high' -> IVR(d) >= threshold using ONLY the
+    close on/before d (the series is precomputed causally). A missing/NaN IVR on d fails
+    the 'high' gate (we don't open a high-IVR trade we can't verify is high-IVR)."""
+    if ivr_filter == "always":
+        return True
+    if ivr_series is None:
+        return True  # no VIX data -> IVR arm is skipped upstream; be permissive if reached.
+    val = ivr_series.get(d, np.nan)
+    return bool(np.isfinite(val) and val >= IVR_HIGH_THRESHOLD)
+
+
+# --------------------------------------------------------------------------- #
 # Corruption guard + clean delta re-inversion
 # --------------------------------------------------------------------------- #
 def delta_column_is_degenerate(df: pd.DataFrame) -> bool:
@@ -222,6 +273,13 @@ class Condor:
     entry_short_call_delta: float
     entry_credit: float          # net credit received at fill fraction f (points)
     used_clean_delta: bool       # did strike selection use the re-inverted delta?
+    # wing geometry (rebuild addendum): realized point widths + long-leg deltas so the
+    # report can show the credit/max-loss ratio per config. put_width = short_put-long_put,
+    # call_width = long_call-short_call; max_loss (points) = max(put_width, call_width).
+    put_wing_width: float = float("nan")
+    call_wing_width: float = float("nan")
+    entry_long_put_delta: float = float("nan")
+    entry_long_call_delta: float = float("nan")
     # filled by management:
     traded: bool = True
     exit_day: _dt.date | None = None
@@ -312,13 +370,66 @@ def _choose_expiration(day_df: pd.DataFrame, target_dte: int) -> _dt.date | None
     return exps.sort_values("err").iloc[0]["expiration"]
 
 
+def _clean_delta_series(day_df: pd.DataFrame, sub: pd.DataFrame, d: _dt.date,
+                        expiration: _dt.date, spot: float) -> tuple[pd.Series, bool]:
+    """Return (clean delta series aligned to sub.index, used_clean flag).
+
+    Vendor delta if the day's column is not degenerate (with per-leg BSM re-inversion of
+    any missing/degenerate individual leg), else the full BSM re-inversion. Shared by the
+    condor and CSP builders so strike selection is IDENTICAL to the pre-registered path.
+    """
+    used_clean = delta_column_is_degenerate(day_df)
+    if used_clean:
+        return _clean_delta_for_exp(sub, d, expiration, spot), True
+    delta_series = sub["delta"].copy()
+    ad = delta_series.abs()
+    bad = delta_series.isna() | (ad == 0.0) | (ad == 1.0)
+    if bad.any():
+        clean = _clean_delta_for_exp(sub.loc[bad.index[bad]], d, expiration, spot)
+        delta_series.loc[clean.index] = clean.values
+    return delta_series, False
+
+
+def _pick_long_wing(sub: pd.DataFrame, right: str, short_strike: float, spot: float,
+                    wing_spec: tuple, delta_series: pd.Series) -> float | None:
+    """Select the long protective wing strike for one side.
+
+    wing_spec = ("points", W)  -> short_strike -/+ W (fixed-width control, the original path).
+    wing_spec = ("delta",  d0) -> nearest-|delta|-to-d0 strike that is STRICTLY further OTM
+      than the short (long_put < short_put < spot ; spot < short_call < long_call). If the
+      nearest-delta strike is not further OTM, step outward to the next valid strike. Returns
+      None if no valid further-OTM strike exists on this side.
+    """
+    kind, val = wing_spec
+    is_put = (right == "PUT")
+    if kind == "points":
+        return (short_strike - val) if is_put else (short_strike + val)
+    if kind != "delta":
+        raise ValueError(f"unknown wing_spec kind {kind!r}")
+    # delta-selected wing, restricted to strictly-further-OTM strikes on the correct side.
+    side = sub[sub["right"] == right].copy()
+    side = side.assign(_d=delta_series.reindex(side.index))
+    side = side[side["_d"].notna()]
+    if is_put:
+        side = side[side["strike"] < short_strike]   # further OTM = LOWER strike
+    else:
+        side = side[side["strike"] > short_strike]   # further OTM = HIGHER strike
+    if side.empty:
+        return None
+    side = side.assign(_err=(side["_d"].abs() - val).abs())
+    return float(side.sort_values("_err").iloc[0]["strike"])
+
+
 def build_condor(day_df: pd.DataFrame, d: _dt.date, target_dte: int,
-                 target_delta: float, f: float) -> Condor | None:
+                 target_delta: float, f: float,
+                 wing_spec: tuple = ("points", WING_WIDTH)) -> Condor | None:
     """Open a condor on day d for the given DTE/delta targets at fill fraction f.
 
     Strike selection uses a CLEAN delta: vendor delta if the day's column is not
     degenerate, else (and per-leg where vendor delta is missing) the BSM re-inversion.
-    Returns None if the structure cannot be built (missing legs / no expiration).
+    `wing_spec` picks the long wings: ("delta", 0.05) for the CBOE 5-delta wing (primary
+    hypothesis) or ("points", W) for a fixed-width control (25 or 50). Returns None if the
+    structure cannot be built (missing legs / no expiration / no valid further-OTM wing).
     """
     expiration = _choose_expiration(day_df, target_dte)
     if expiration is None:
@@ -330,19 +441,7 @@ def build_condor(day_df: pd.DataFrame, d: _dt.date, target_dte: int,
     if not np.isfinite(spot) or spot <= 0:
         return None
 
-    used_clean = delta_column_is_degenerate(day_df)
-    if used_clean:
-        delta_series = _clean_delta_for_exp(sub, d, expiration, spot)
-    else:
-        delta_series = sub["delta"].copy()
-        # belt-and-suspenders: re-invert any individual leg whose vendor delta is
-        # missing or degenerate (|delta| exactly 0 or 1), so a single bad leg near ATM
-        # can't silently mis-select the short strike.
-        ad = delta_series.abs()
-        bad = delta_series.isna() | (ad == 0.0) | (ad == 1.0)
-        if bad.any():
-            clean = _clean_delta_for_exp(sub.loc[bad.index[bad]], d, expiration, spot)
-            delta_series.loc[clean.index] = clean.values
+    delta_series, used_clean = _clean_delta_series(day_df, sub, d, expiration, spot)
 
     short_put = _pick_short_strike(sub, "PUT", target_delta, delta_series)
     short_call = _pick_short_strike(sub, "CALL", target_delta, delta_series)
@@ -351,8 +450,15 @@ def build_condor(day_df: pd.DataFrame, d: _dt.date, target_dte: int,
     if not (short_put < spot < short_call):
         # Degenerate placement (e.g. both strikes same side) — refuse to open.
         return None
-    long_put = short_put - WING_WIDTH
-    long_call = short_call + WING_WIDTH
+
+    long_put = _pick_long_wing(sub, "PUT", short_put, spot, wing_spec, delta_series)
+    long_call = _pick_long_wing(sub, "CALL", short_call, spot, wing_spec, delta_series)
+    if long_put is None or long_call is None:
+        return None
+    # Guarantee the defined-risk ordering (delta wings can, in pathological chains, land
+    # on/above the short even after the further-OTM filter — refuse to open if so).
+    if not (long_put < short_put < spot < short_call < long_call):
+        return None
 
     credit = _condor_open_credit(sub, expiration, short_put, long_put,
                                  short_call, long_call, f)
@@ -371,20 +477,85 @@ def build_condor(day_df: pd.DataFrame, d: _dt.date, target_dte: int,
         entry_short_put_delta=_dlt(short_put, "PUT"),
         entry_short_call_delta=_dlt(short_call, "CALL"),
         entry_credit=credit, used_clean_delta=used_clean,
+        put_wing_width=float(short_put - long_put),
+        call_wing_width=float(long_call - short_call),
+        entry_long_put_delta=_dlt(long_put, "PUT"),
+        entry_long_call_delta=_dlt(long_call, "CALL"),
     )
+
+
+# --------------------------------------------------------------------------- #
+# Fast per-(day, expiration) price map (memoized) — speed only, logic unchanged.
+# --------------------------------------------------------------------------- #
+def build_price_map(day_df: pd.DataFrame) -> dict:
+    """One dict per day: {expiration: {(strike, right): (bid, ask)}, '_spot': {exp: spot}}.
+
+    Turns the O(scan) `day_df[df.expiration==exp & df.strike==k & df.right==r]` lookups in
+    the forward-walk into O(1) dict gets. Pure repackaging of the SAME rows — no logic
+    change, no look-ahead. Memoized by the caller so it is built at most once per day.
+    """
+    out: dict = {}
+    spot: dict = {}
+    exp = day_df["expiration"].to_numpy()
+    strike = day_df["strike"].to_numpy(dtype=float)
+    right = day_df["right"].to_numpy()
+    bid = day_df["bid"].to_numpy(dtype=float)
+    ask = day_df["ask"].to_numpy(dtype=float)
+    und = day_df["underlying_price"].to_numpy(dtype=float)
+    for i in range(len(day_df)):
+        e = exp[i]
+        d = out.get(e)
+        if d is None:
+            d = {}
+            out[e] = d
+            spot[e] = float(und[i])
+        d[(strike[i], right[i])] = (bid[i], ask[i])
+    out["_spot"] = spot
+    return out
+
+
+def _pm_get(price_maps: dict, d: _dt.date, loader) -> dict | None:
+    """Memoized price map for day d (built lazily from the cached day_df)."""
+    if d in price_maps:
+        return price_maps[d]
+    ddf = loader(d)
+    pm = build_price_map(ddf) if (ddf is not None and len(ddf)) else None
+    price_maps[d] = pm
+    return pm
+
+
+def _close_debit_pm(pm: dict, c: Condor, f: float) -> float | None:
+    """Net debit to CLOSE the condor from a price map (buy shorts, sell longs). None if any
+    leg is not in the map for this expiration."""
+    exp_map = pm.get(c.expiration)
+    if not exp_map:
+        return None
+    sp = exp_map.get((c.short_put, "PUT"))
+    lp = exp_map.get((c.long_put, "PUT"))
+    sc = exp_map.get((c.short_call, "CALL"))
+    lc = exp_map.get((c.long_call, "CALL"))
+    if sp is None or lp is None or sc is None or lc is None:
+        return None
+    debit = (_buy_price(sp[0], sp[1], f) + _buy_price(sc[0], sc[1], f)
+             - _sell_price(lp[0], lp[1], f) - _sell_price(lc[0], lc[1], f))
+    return float(debit)
 
 
 # --------------------------------------------------------------------------- #
 # Management — walk days forward, causal, first rule wins
 # --------------------------------------------------------------------------- #
 def manage_condor(c: Condor, day_loader, all_days: list[_dt.date],
-                  management: str, target_frac: float, f: float) -> Condor:
+                  management: str, target_frac: float, f: float,
+                  price_maps: dict | None = None) -> Condor:
     """Manage one condor forward from the day AFTER entry to expiry.
 
     management: 'hold' (control) | 'managed' (target_frac profit-take + 21-DTE time-stop).
     day_loader(d) -> normalized day_df (cached by caller). Causal: only marks with days
-    strictly after entry and stops at the FIRST firing day.
+    strictly after entry and stops at the FIRST firing day. `price_maps` (optional) memoizes
+    the per-day (strike,right)->(bid,ask) lookup — a pure speed cache, identical results.
     """
+    if price_maps is None:
+        price_maps = {}
     future = [d for d in all_days if c.entry_day < d <= c.expiration]
     take_debit = (1.0 - target_frac) * c.entry_credit  # close when debit <= this
     last_mark_debit = float("nan")
@@ -394,13 +565,10 @@ def manage_condor(c: Condor, day_loader, all_days: list[_dt.date],
         # At/after expiration: cash-settle at intrinsic using that day's spot.
         if d >= c.expiration:
             break
-        day_df = day_loader(d)
-        if day_df is None:
+        pm = _pm_get(price_maps, d, day_loader)
+        if pm is None:
             continue
-        snap = day_df[day_df["expiration"] == c.expiration]
-        if snap.empty:
-            continue
-        debit = _condor_close_debit(snap, c, f)
+        debit = _close_debit_pm(pm, c, f)
         if debit is None:
             continue
         last_mark_debit = debit
@@ -415,18 +583,17 @@ def manage_condor(c: Condor, day_loader, all_days: list[_dt.date],
         # 'hold' arm: never closes early; falls through to settlement.
 
     # Ran to expiry (or ran out of marks before it): cash-settle at intrinsic.
-    settle_df = day_loader(c.expiration)
+    settle_pm = _pm_get(price_maps, c.expiration, day_loader)
     settle_price = None
-    if settle_df is not None:
-        s = settle_df[settle_df["expiration"] == c.expiration]
-        if not s.empty:
-            settle_price = float(s["underlying_price"].iloc[0])
+    if settle_pm is not None:
+        settle_price = settle_pm.get("_spot", {}).get(c.expiration)
     if settle_price is None:
         # No expiry-day file: settle at the last available underlying we can see.
         for d in reversed(future):
-            ddf = day_loader(d)
-            if ddf is not None and len(ddf):
-                settle_price = float(ddf["underlying_price"].iloc[0])
+            pm = _pm_get(price_maps, d, day_loader)
+            if pm is not None and pm.get("_spot"):
+                # any expiration's stored spot on that day is the same underlying close
+                settle_price = next(iter(pm["_spot"].values()))
                 last_mark_day = d
                 break
     if settle_price is None:
@@ -435,7 +602,9 @@ def manage_condor(c: Condor, day_loader, all_days: list[_dt.date],
             return _finalize(c, last_mark_day, (c.expiration - last_mark_day).days,
                              last_mark_debit, "settle", f)
         # No data whatsoever after entry: treat as unresolved max-defined-risk loss.
-        max_debit = WING_WIDTH  # worst case: full wing breached one side
+        # Worst case = the wider wing fully breached (defined risk on the losing side).
+        widths = [w for w in (c.put_wing_width, c.call_wing_width) if np.isfinite(w)]
+        max_debit = max(widths) if widths else WING_WIDTH
         return _finalize(c, c.expiration, 0, max_debit, "settle", f)
 
     intrinsic = _condor_intrinsic(settle_price, c)
@@ -449,6 +618,105 @@ def _finalize(c: Condor, exit_day: _dt.date, exit_dte: int, exit_debit: float,
     c.exit_debit = float(exit_debit)
     c.exit_reason = reason
     c.pnl_points = c.entry_credit - exit_debit
+    c.pnl_dollars = c.pnl_points * CONTRACT_MULTIPLIER
+    return c
+
+
+# --------------------------------------------------------------------------- #
+# ATM cash-secured PUT benchmark arm (rebuild addendum)
+# --------------------------------------------------------------------------- #
+@dataclass
+class CashSecuredPut:
+    """One cash-secured short put (a laddered-book entry). Held to expiry, cash-settled."""
+    entry_day: _dt.date
+    expiration: _dt.date
+    entry_dte: int
+    strike: float
+    entry_delta: float
+    entry_credit: float          # premium received at fill fraction f (points)
+    used_clean_delta: bool
+    exit_day: _dt.date | None = None
+    exit_dte: int | None = None
+    exit_debit: float = float("nan")   # intrinsic max(0, strike - settle) at expiry
+    exit_reason: str = ""
+    pnl_points: float = float("nan")
+    pnl_dollars: float = float("nan")
+
+
+def build_csp(day_df: pd.DataFrame, d: _dt.date, target_dte: int,
+              f: float) -> CashSecuredPut | None:
+    """Open an ATM (~0.50-delta) cash-secured put on day d at fill fraction f.
+
+    Reuses the SAME clean-delta selection path as the condor. Falls back to nearest strike
+    to spot if no clean delta is available. Sell the put (receive bid-side at fraction f).
+    Returns None if the structure can't be built.
+    """
+    expiration = _choose_expiration(day_df, target_dte)
+    if expiration is None:
+        return None
+    sub = day_df[day_df["expiration"] == expiration].copy()
+    if sub.empty:
+        return None
+    spot = float(sub["underlying_price"].iloc[0])
+    if not np.isfinite(spot) or spot <= 0:
+        return None
+
+    delta_series, used_clean = _clean_delta_series(day_df, sub, d, expiration, spot)
+
+    strike = _pick_short_strike(sub, "PUT", 0.50, delta_series)
+    if strike is None:
+        # fallback: nearest listed put strike to spot.
+        puts = sub[sub["right"] == "PUT"]
+        if puts.empty:
+            return None
+        strike = float(puts.iloc[(puts["strike"] - spot).abs().argsort().iloc[0]]["strike"])
+
+    row = _leg_row(sub, expiration, strike, "PUT")
+    if row is None:
+        return None
+    credit = _sell_price(row["bid"], row["ask"], f)
+    if not np.isfinite(credit) or credit <= 0:
+        return None
+
+    r = sub[(sub["strike"] == strike) & (sub["right"] == "PUT")]
+    entry_delta = float(delta_series.reindex(r.index).iloc[0]) if not r.empty else float("nan")
+
+    return CashSecuredPut(
+        entry_day=d, expiration=expiration, entry_dte=int((expiration - d).days),
+        strike=strike, entry_delta=entry_delta, entry_credit=float(credit),
+        used_clean_delta=used_clean,
+    )
+
+
+def manage_csp(c: CashSecuredPut, day_loader, all_days: list[_dt.date]) -> CashSecuredPut:
+    """Hold to expiry, cash-settle at intrinsic max(0, strike - settle_price).
+
+    Same forward-walk settlement machinery as the condor 'hold' arm: find the expiry-day
+    underlying (or the last available), settle at intrinsic. Causal.
+    """
+    future = [d for d in all_days if c.entry_day < d <= c.expiration]
+    settle_df = day_loader(c.expiration)
+    settle_price = None
+    if settle_df is not None:
+        s = settle_df[settle_df["expiration"] == c.expiration]
+        if not s.empty:
+            settle_price = float(s["underlying_price"].iloc[0])
+    if settle_price is None:
+        for d in reversed(future):
+            ddf = day_loader(d)
+            if ddf is not None and len(ddf):
+                settle_price = float(ddf["underlying_price"].iloc[0])
+                break
+    if settle_price is None:
+        # No post-entry data at all: worst-case cash-secured loss = full strike (put to 0)
+        # is unrealistic; use last-known entry spot as settle (no move) -> intrinsic 0.
+        settle_price = c.strike
+    intrinsic = max(0.0, c.strike - settle_price)
+    c.exit_day = c.expiration
+    c.exit_dte = 0
+    c.exit_debit = float(intrinsic)
+    c.exit_reason = "settle"
+    c.pnl_points = c.entry_credit - intrinsic
     c.pnl_dollars = c.pnl_points * CONTRACT_MULTIPLIER
     return c
 
@@ -469,12 +737,78 @@ def weekly_entry_days(days: list[_dt.date]) -> list[_dt.date]:
 # --------------------------------------------------------------------------- #
 # Full backtest for one (dte, delta, management, fill) config
 # --------------------------------------------------------------------------- #
+def _wing_tag(wing_spec: tuple) -> str:
+    kind, val = wing_spec
+    # delta wings tagged by delta*100 (0.05 -> w5d); point wings by width (25 -> w25p).
+    return f"w{int(round(val * 100))}d" if kind == "delta" else f"w{int(round(val))}p"
+
+
+def config_tag(target_dte: int, target_delta: float, wing_spec: tuple, management: str,
+               target_frac: float, ivr_filter: str, f: float) -> str:
+    """Stable config identifier used across the grid tables and CSVs."""
+    mgmt = management + (f"{int(target_frac*100)}" if management == "managed" else "")
+    return (f"dte{target_dte}_d{int(target_delta*100)}_{_wing_tag(wing_spec)}"
+            f"_{mgmt}_ivr{ivr_filter}_f{f}")
+
+
 def run_config(target_dte: int, target_delta: float, management: str,
                target_frac: float, f: float,
+               wing_spec: tuple = ("points", WING_WIDTH),
+               ivr_filter: str = "always",
+               ivr_series: pd.Series | None = None,
                days: list[_dt.date] | None = None,
                day_cache: dict | None = None,
+               price_maps: dict | None = None,
                verbose: bool = False) -> pd.DataFrame:
-    """Run the weekly-laddered condor book for one config. Returns a trade DataFrame."""
+    """Run the weekly-laddered condor book for one config. Returns a trade DataFrame.
+
+    wing_spec threads the wing construction (delta vs points). ivr_filter gates entries on
+    the causal IV-rank ('always' | 'high'); ivr_series is the precomputed trailing-VIX-rank.
+    price_maps is a SHARED per-day (strike,right)->(bid,ask) cache reused across configs
+    (pure speed; identical results). day_cache and price_maps should be passed by the runner
+    so the day load + repackage happen at most once for the whole grid.
+    """
+    if days is None:
+        days = available_days()
+    if day_cache is None:
+        day_cache = {}
+    if price_maps is None:
+        price_maps = {}
+
+    def loader(d: _dt.date):
+        if d not in day_cache:
+            day_cache[d] = load_day(d)
+        return day_cache[d]
+
+    entries = weekly_entry_days(days)
+    trades: list[dict] = []
+    n = len(entries)
+    tag = config_tag(target_dte, target_delta, wing_spec, management, target_frac,
+                     ivr_filter, f)
+    for i, ed in enumerate(entries, 1):
+        if not ivr_passes(ivr_series, ed, ivr_filter):
+            continue
+        day_df = loader(ed)
+        if day_df is None or len(day_df) == 0:
+            continue
+        c = build_condor(day_df, ed, target_dte, target_delta, f, wing_spec=wing_spec)
+        if c is None:
+            continue
+        c = manage_condor(c, loader, days, management, target_frac, f,
+                          price_maps=price_maps)
+        rec = asdict(c)
+        rec["config"] = tag
+        trades.append(rec)
+        if verbose and (i % 50 == 0 or i == n):
+            print(f"  [{i}/{n}] entries processed", flush=True)
+    return pd.DataFrame(trades)
+
+
+def run_csp_config(target_dte: int, f: float,
+                   days: list[_dt.date] | None = None,
+                   day_cache: dict | None = None,
+                   verbose: bool = False) -> pd.DataFrame:
+    """Run the weekly-laddered ATM cash-secured-put book for one (DTE, fill). Hold-to-expiry."""
     if days is None:
         days = available_days()
     if day_cache is None:
@@ -487,20 +821,15 @@ def run_config(target_dte: int, target_delta: float, management: str,
 
     entries = weekly_entry_days(days)
     trades: list[dict] = []
-    n = len(entries)
-    for i, ed in enumerate(entries, 1):
+    for ed in entries:
         day_df = loader(ed)
         if day_df is None or len(day_df) == 0:
             continue
-        c = build_condor(day_df, ed, target_dte, target_delta, f)
+        c = build_csp(day_df, ed, target_dte, f)
         if c is None:
             continue
-        c = manage_condor(c, loader, days, management, target_frac, f)
+        c = manage_csp(c, loader, days)
         rec = asdict(c)
-        rec["config"] = f"dte{target_dte}_d{int(target_delta*100)}_{management}" \
-                        + (f"{int(target_frac*100)}" if management == "managed" else "") \
-                        + f"_f{f}"
+        rec["config"] = f"csp_dte{target_dte}_f{f}"
         trades.append(rec)
-        if verbose and (i % 50 == 0 or i == n):
-            print(f"  [{i}/{n}] entries processed", flush=True)
     return pd.DataFrame(trades)

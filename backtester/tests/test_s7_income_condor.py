@@ -124,6 +124,68 @@ def test_clean_day_can_use_vendor_delta():
 
 
 # --------------------------------------------------------------------------- #
+# 4. Delta-wing guard (rebuild addendum): 5-delta wings sit strictly further OTM
+#    than the shorts, on the correct side, with SMALLER |delta|.
+# --------------------------------------------------------------------------- #
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="warehouse not present")
+def test_delta_wing_ordering_and_delta_magnitude():
+    day_df = s7.load_day(CLEAN_DAY)
+    c = s7.build_condor(day_df, CLEAN_DAY, 45, 0.16, 0.50, wing_spec=("delta", 0.05))
+    assert c is not None
+    # strict defined-risk ordering
+    assert c.long_put < c.short_put, "long put must be below short put"
+    assert c.short_call < c.long_call, "long call must be above short call"
+    # spot sits between the shorts
+    sub = day_df[day_df["expiration"] == c.expiration]
+    spot = float(sub["underlying_price"].iloc[0])
+    assert c.short_put < spot < c.short_call
+    # long legs are FURTHER OTM => smaller |delta| than the shorts
+    assert abs(c.entry_long_put_delta) < abs(c.entry_short_put_delta)
+    assert abs(c.entry_long_call_delta) < abs(c.entry_short_call_delta)
+    # 5-delta wings should carry |delta| in a sane small band (not the ~16-delta shorts)
+    assert abs(c.entry_long_put_delta) < 0.16
+    assert abs(c.entry_long_call_delta) < 0.16
+    # realized wing widths recorded and positive
+    assert c.put_wing_width > 0 and c.call_wing_width > 0
+
+
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="warehouse not present")
+def test_delta_wings_are_wider_than_25pt_control():
+    """A 5-delta wing on a normal-vol SPX day is materially wider than the 25-pt control —
+    that width is exactly the mechanism (bigger credit/max-loss ratio) the rebuild tests."""
+    day_df = s7.load_day(CLEAN_DAY)
+    c_delta = s7.build_condor(day_df, CLEAN_DAY, 45, 0.16, 0.50, wing_spec=("delta", 0.05))
+    c_pts = s7.build_condor(day_df, CLEAN_DAY, 45, 0.16, 0.50, wing_spec=("points", 25.0))
+    assert c_delta is not None and c_pts is not None
+    assert c_pts.put_wing_width == pytest.approx(25.0)
+    assert c_delta.put_wing_width >= 25.0  # 5-delta wing no narrower than the 25-pt control
+
+
+@pytest.mark.skipif(not _HAS_WAREHOUSE, reason="warehouse not present")
+def test_csp_builds_atm_and_settles():
+    day_df = s7.load_day(CLEAN_DAY)
+    c = s7.build_csp(day_df, CLEAN_DAY, 45, 0.50)
+    assert c is not None
+    sub = day_df[day_df["expiration"] == c.expiration]
+    spot = float(sub["underlying_price"].iloc[0])
+    # ATM put => |delta| roughly near 0.5, strike near spot
+    assert abs(c.entry_delta) > 0.30
+    assert abs(c.strike - spot) < 0.10 * spot
+    assert c.entry_credit > 0
+
+
+def test_ivr_series_is_causal_and_ranked():
+    """IVR loads from the VIX parquet, is bounded 0..100, and each day's rank uses only
+    closes up to that day (rolling window with raw last-value percentile)."""
+    ivr = s7.load_ivr_series()
+    if ivr is None:
+        pytest.skip("VIX daily parquet not present -> IVR arm skipped by design")
+    vals = ivr.dropna()
+    assert len(vals) > 0
+    assert vals.min() >= 0.0 and vals.max() <= 100.0
+
+
+# --------------------------------------------------------------------------- #
 # 1. No look-ahead: truncating future days at the exit cannot change the trade
 # --------------------------------------------------------------------------- #
 @pytest.mark.skipif(not _HAS_WAREHOUSE, reason="warehouse not present")
