@@ -44,12 +44,36 @@ GRID (PRE-REGISTERED base package -- NOT swept to a winner)
 
 This module is BUILD + MINI-VALIDATION scope. It does NOT launch the full grid on import.
 
-RESUMABLE + CRASH-SAFE
-----------------------
-One row per (entry, delta, wing, arm, fill) is appended+flushed to a partial CSV. On restart,
-any (entry, delta, wing) config already present is SKIPPED (config-level resume). --max-new-configs
-caps how many not-yet-done base packages a single process runs, for a fresh-process chunk loop.
-ASCII-only console; progress flushes each config.
+PERFORMANCE -- DAY-OUTER, LOAD EACH DAY ONCE (the refactor)
+-----------------------------------------------------------
+The original walked config-outer / day-inner, so every day's ~5M-row 0DTE quote parquet was
+RE-LOADED and RE-RECONSTRUCTED 36 times (once per base package) -- ~57.6h of pure redundant
+I/O. The runner now walks DAY-OUTER / CONFIG-INNER: each day is loaded and its NBBO minute
+grid reconstructed ONCE, then all 36 configs are evaluated against that in-memory frame. The
+per-config minute-walk still runs per config (different strikes -> a different walk); only the
+DATA LOAD + NBBO reconstruction is deduplicated. Byte-identical numbers -- the strike/fill/exit
+math is a pure function of the reconstructed NBBO + the dials, so which loop is outer cannot
+change a single P&L (pinned by tests/test_condor_base_grid.py::test_day_outer_parity).
+
+RESUMABLE + CRASH-SAFE + SHARDABLE
+----------------------------------
+The day-outer runner emits one row per (day, entry, delta, wing) to a resumable PARTIAL CSV
+(~1080*36 rows), flushed per day. Resume = skip days already fully present. At the end it
+AGGREGATES by config into the plateau map: per (entry, delta, wing, arm, fill) x scope
+(full/train/test) it computes n, total_pnl, avg_pnl, win_rate, avg_win, avg_loss, expectancy,
+and writes the aggregated grid to a final CSV.
+  * --shard i --nshards N : run a disjoint 1-in-N slice of the day list (round-robin), each
+    worker to its OWN partial CSV (suffix .shardXX). Merge = re-aggregate all shard partials.
+  * --day-start / --day-end : run an explicit inclusive index range of the day list instead.
+Run N parallel workers over disjoint days, then aggregate the union. ASCII-only console;
+progress flushes each day.
+
+LEGACY CONFIG-OUTER PATH (kept for parity + tests)
+--------------------------------------------------
+run_base_package / run_grid / run_mini are retained UNCHANGED as the reference implementation.
+The day-outer path is validated against them: on any day sample the two produce identical
+per-config P&L. --max-new-configs caps how many not-yet-done base packages the legacy path
+runs, for a fresh-process chunk loop. ASCII-only console; progress flushes each config.
 
 --mini MODE (fast self-validation)
 ----------------------------------
@@ -103,6 +127,10 @@ OUTPUT_DIR = Path(__file__).resolve().parent / "output" / "condor_base_grid"
 _PARTIAL_CSV = OUTPUT_DIR / "condor_base_grid_partial.csv"
 _MINI_CSV = OUTPUT_DIR / "condor_base_grid_mini.csv"
 
+# Day-outer (refactored) artifacts: a per-(day, config) partial + the aggregated grid.
+_DAYROWS_CSV = OUTPUT_DIR / "condor_base_grid_dayrows.csv"
+_GRID_CSV = OUTPUT_DIR / "condor_base_grid.csv"
+
 # --------------------------------------------------------------------------- #
 # MINI sub-grid (fast validation).
 # --------------------------------------------------------------------------- #
@@ -132,6 +160,17 @@ FIELDNAMES = [
     "entry", "delta", "wing", "arm", "fill", "scope",
     "n", "total_pnl", "avg_pnl", "win_rate", "avg_win", "avg_loss", "expectancy",
     "avg_hold_min", "avg_entry_credit",
+]
+
+# --------------------------------------------------------------------------- #
+# Day-outer partial schema: ONE row per (day, entry, delta, wing, arm, fill). This is the
+# resumable intermediate the day-outer runner flushes per day; the final grid is AGGREGATED
+# from it. Keeping the per-(day,config) grain lets N parallel shards write disjoint day slices
+# that merge losslessly by re-aggregation. `half` is train/test for the OOS split.
+# --------------------------------------------------------------------------- #
+DAYROW_FIELDNAMES = [
+    "day", "half", "entry", "delta", "wing", "arm", "fill",
+    "pnl", "hold_min", "entry_credit", "exit_reason",
 ]
 
 
@@ -308,6 +347,176 @@ def run_base_package(entry: _dt.time, delta: float, width: float,
     return rows
 
 
+# =========================================================================== #
+# DAY-OUTER PATH (the refactor): load each day ONCE, evaluate ALL 36 configs in memory.
+# =========================================================================== #
+CONFIGS = [(e, d, w) for e in ENTRY_TIMES for d in SHORT_DELTAS for w in WING_WIDTHS]  # 36
+
+
+def eval_day_all_configs(d: _dt.date, clf: mx.DayClassifier,
+                         configs: list[tuple] = CONFIGS) -> list[dict]:
+    """Load day `d` ONCE, then evaluate EVERY config against that single in-memory frame.
+
+    Returns a list of per-(day, config, arm, fill) rows (DAYROW_FIELDNAMES). Byte-identical
+    to the legacy config-outer path: for each config we set the SAME dials and call the SAME
+    `_run_day_base` on the SAME pre-loaded `DayData`, so which loop is outer cannot move a P&L.
+    A day that fails to load, or a config that is not tradeable that day, simply emits no rows
+    for that (day, config) -- exactly as the legacy path would drop it from the config's vector.
+    """
+    try:
+        dd = s5.load_day(d)                 # <-- THE deduplicated load: once per day, not 36x.
+    except Exception:
+        return []
+    half = "train" if d <= TRAIN_END else "test"
+    rows: list[dict] = []
+    for (entry, delta, width) in configs:
+        # Set the dials exactly as run_base_package does, then reuse _run_day_base verbatim on
+        # the shared DayData. No strike/fill/exit math is re-implemented here.
+        cm.ENTRY_TIME = entry
+        cm.TARGET_SHORT_DELTA = delta
+        ws.TARGET_SHORT_DELTA = delta
+        try:
+            res = _run_day_base(d, clf, width, day_data=dd)
+        except Exception:
+            res = None
+        if res is None:
+            continue
+        etag, dtag, wtag = _etag(entry), _dtag(delta), _wtag(width)
+        for tag, block in res["fills"].items():
+            credit = block["entry_credit"]
+            for a in ARM_NAMES:
+                if a not in block:
+                    continue
+                sub = block[a]
+                rows.append(dict(
+                    day=d.strftime("%Y-%m-%d"), half=half,
+                    entry=etag, delta=delta, wing=int(width), arm=a, fill=tag,
+                    pnl=sub["pnl"], hold_min=sub["hold_min"],
+                    entry_credit=credit, exit_reason=sub["exit_reason"],
+                ))
+    del dd
+    gc.collect()
+    return rows
+
+
+def _select_days(days: list[_dt.date], shard: int, nshards: int,
+                 day_start: int, day_end: int) -> list[_dt.date]:
+    """Pick this worker's disjoint day slice. Sharding takes precedence: --shard i --nshards N
+    is a round-robin 1-in-N slice (i in [0, N)). Otherwise an explicit inclusive index range
+    [day_start, day_end] (day_end<0 means 'to the end'). No overlap between shards by
+    construction, so their partials merge losslessly by re-aggregation."""
+    if nshards and nshards > 1:
+        if not (0 <= shard < nshards):
+            raise SystemExit(f"--shard must be in [0,{nshards}); got {shard}")
+        return days[shard::nshards]
+    if day_start or (day_end and day_end >= 0):
+        lo = max(0, day_start)
+        hi = len(days) if (day_end is None or day_end < 0) else min(len(days), day_end + 1)
+        return days[lo:hi]
+    return days
+
+
+def _dayrows_partial_path(csv_path: Path, shard: int, nshards: int) -> Path:
+    """Per-shard partial path so N workers never write the same file. shard 0 of 1 (or no
+    sharding) uses the base name; a real shard gets a .shardNN-of-MM suffix."""
+    if nshards and nshards > 1:
+        return csv_path.with_name(
+            f"{csv_path.stem}.shard{shard:02d}-of-{nshards:02d}{csv_path.suffix}")
+    return csv_path
+
+
+def run_grid_day_outer(days: list[_dt.date] | None = None,
+                       csv_path: Path = _DAYROWS_CSV,
+                       shard: int = 0, nshards: int = 1,
+                       day_start: int = 0, day_end: int = -1,
+                       resume: bool = True, verbose: bool = True) -> Path:
+    """DAY-OUTER runner: load each day ONCE, evaluate all 36 configs, append per-day rows to a
+    resumable partial CSV (per-shard file). Returns the partial CSV path it wrote. Does NOT
+    aggregate -- call aggregate_grid() on the union of partials to build the final grid (so
+    parallel shards merge cleanly)."""
+    if days is None:
+        days = s5.available_days()
+    day_slice = _select_days(days, shard, nshards, day_start, day_end)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    clf = mx.DayClassifier()
+    out_path = _dayrows_partial_path(csv_path, shard, nshards)
+
+    done_days: set[str] = set()
+    if resume and out_path.is_file():
+        try:
+            prev = pd.read_csv(out_path, usecols=["day"])
+            done_days = set(prev["day"].astype(str).unique())
+        except Exception:
+            done_days = set()
+    if verbose and done_days:
+        print(f"resume: {len(done_days)} day(s) already done; skipping", flush=True)
+
+    write_header = not out_path.is_file()
+    n = len(day_slice)
+    with open(out_path, "a", newline="") as fh:
+        writer = csv.DictWriter(fh, fieldnames=DAYROW_FIELDNAMES, restval="",
+                                extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        n_new = 0
+        for i, d in enumerate(day_slice, 1):
+            if d.strftime("%Y-%m-%d") in done_days:
+                continue
+            rows = eval_day_all_configs(d, clf)
+            for r in rows:
+                writer.writerow(r)
+            fh.flush()
+            n_new += 1
+            if verbose and (i % 10 == 0 or i == n):
+                print(f"[day {i}/{n}] {d} done ({len(rows)} config-rows) "
+                      f"[shard {shard}/{nshards}]", flush=True)
+        if verbose:
+            print(f"run_grid_day_outer done: {n_new} new day(s) -> {out_path.name}", flush=True)
+    return out_path
+
+
+# --------------------------------------------------------------------------- #
+# AGGREGATE the per-(day, config) partial(s) into the plateau grid.
+# One row per (entry, delta, wing, arm, fill) x scope in {full, train, test}.
+# --------------------------------------------------------------------------- #
+def aggregate_grid(partials: list[Path] | Path | None = None,
+                   out_csv: Path = _GRID_CSV, verbose: bool = True) -> pd.DataFrame:
+    """Aggregate one or more day-outer partial CSVs into the final grid. Passing several shard
+    partials just re-aggregates their union (disjoint days -> lossless merge). For each
+    (entry, delta, wing, arm, fill) and each scope (full/train/test) computes the same stats
+    as the legacy grid: n, total_pnl, avg_pnl, win_rate, avg_win, avg_loss, expectancy,
+    avg_hold_min, avg_entry_credit."""
+    if partials is None:
+        partials = [_DAYROWS_CSV]
+    elif isinstance(partials, Path):
+        partials = [partials]
+    frames = [pd.read_csv(p) for p in partials if Path(p).is_file()]
+    if not frames:
+        raise SystemExit(f"no partial CSV to aggregate: {partials}")
+    df = pd.concat(frames, ignore_index=True)
+    # A day could appear once per shard only (disjoint slices); drop any accidental dup rows.
+    df = df.drop_duplicates(subset=["day", "entry", "delta", "wing", "arm", "fill"])
+
+    rows: list[dict] = []
+    group_cols = ["entry", "delta", "wing", "arm", "fill"]
+    for (etag, delta, wing, arm, fill), g in df.groupby(group_cols, sort=True):
+        for scope in ("full", "train", "test"):
+            gs = g if scope == "full" else g[g["half"] == scope]
+            p = gs["pnl"].to_numpy(dtype=float)
+            hh = gs["hold_min"].to_numpy(dtype=float)
+            cc = gs["entry_credit"].to_numpy(dtype=float)
+            st = _stats(p, hh, cc)
+            rows.append(dict(entry=etag, delta=float(delta), wing=int(wing), arm=arm,
+                             fill=fill, scope=scope, **st))
+    grid = pd.DataFrame(rows, columns=FIELDNAMES)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    grid.to_csv(out_csv, index=False)
+    if verbose:
+        print(f"Saved {out_csv} ({len(grid)} grid rows from {len(df)} day-config rows)",
+              flush=True)
+    return grid
+
+
 # --------------------------------------------------------------------------- #
 # Full-grid orchestration -- resumable + crash-safe + chunk cap.
 # --------------------------------------------------------------------------- #
@@ -399,19 +608,53 @@ def run_mini(verbose: bool = True) -> pd.DataFrame:
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(description="0DTE iron-condor BASE-PACKAGE grid runner")
     ap.add_argument("--mini", action="store_true",
-                    help="run the tiny validation sub-grid over the first 40 days")
+                    help="run the tiny validation sub-grid over the first 40 days (legacy path)")
+    ap.add_argument("--day-outer", action="store_true",
+                    help="DEFAULT-EQUIVALENT refactored path: load each day ONCE, evaluate all "
+                         "36 configs in memory, write the per-(day,config) partial. Shardable.")
+    ap.add_argument("--legacy", action="store_true",
+                    help="use the OLD config-outer path (re-loads each day per config). For "
+                         "parity/reference only.")
+    ap.add_argument("--aggregate", nargs="*", default=None, metavar="PARTIAL",
+                    help="aggregate the given day-outer partial CSV(s) into the final grid and "
+                         "exit. With no argument, aggregates the default partial. Pass several "
+                         "shard partials to merge parallel workers.")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="this worker's shard index i in [0, nshards) (round-robin day slice).")
+    ap.add_argument("--nshards", type=int, default=1,
+                    help="number of parallel shards N (disjoint 1-in-N day slices).")
+    ap.add_argument("--day-start", type=int, default=0,
+                    help="explicit inclusive start index into the day list (alt to sharding).")
+    ap.add_argument("--day-end", type=int, default=-1,
+                    help="explicit inclusive end index into the day list (-1 = to the end).")
     ap.add_argument("--max-new-configs", type=int, default=0,
-                    help="process at most N not-yet-done base packages this run, then exit "
-                         "cleanly (fresh-process chunk loop). 0 = no cap.")
+                    help="[legacy] process at most N not-yet-done base packages this run, then "
+                         "exit cleanly (fresh-process chunk loop). 0 = no cap.")
     ap.add_argument("--limit-days", type=int, default=0,
                     help="run the grid over only the first N days (smoke test).")
     ap.add_argument("--quiet", action="store_true")
     args = ap.parse_args()
+    verbose = not args.quiet
 
-    if args.mini:
-        run_mini(verbose=not args.quiet)
-    else:
+    if args.aggregate is not None:
+        parts = [Path(p) for p in args.aggregate] if args.aggregate else None
+        aggregate_grid(partials=parts, verbose=verbose)
+    elif args.mini:
+        run_mini(verbose=verbose)
+    elif args.legacy:
         days = s5.available_days()
         if args.limit_days:
             days = days[: args.limit_days]
-        run_grid(days=days, max_new_configs=args.max_new_configs, verbose=not args.quiet)
+        run_grid(days=days, max_new_configs=args.max_new_configs, verbose=verbose)
+    else:
+        # DEFAULT is now the day-outer refactor (also selected explicitly by --day-outer).
+        days = s5.available_days()
+        if args.limit_days:
+            days = days[: args.limit_days]
+        part = run_grid_day_outer(days=days, shard=args.shard, nshards=args.nshards,
+                                  day_start=args.day_start, day_end=args.day_end,
+                                  verbose=verbose)
+        # Single-worker convenience: auto-aggregate when not sharding (no cross-shard merge
+        # needed). Sharded workers aggregate the union afterward via --aggregate.
+        if not (args.nshards and args.nshards > 1):
+            aggregate_grid(partials=part, verbose=verbose)

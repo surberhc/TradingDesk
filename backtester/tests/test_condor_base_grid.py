@@ -200,3 +200,106 @@ def test_run_base_package_emits_full_schema():
         assert r["arm"] in g.ARM_NAMES
         assert r["fill"] in g._FILL_TAG.values()
         assert r["scope"] in ("full", "train", "test")
+
+
+# --------------------------------------------------------------------------- #
+# DAY-OUTER PARITY (the refactor): the day-outer path (load each day once, all configs in
+# memory) must produce IDENTICAL per-config P&L to the legacy config-outer run_base_package.
+# We compare the aggregated grid built from eval_day_all_configs against run_base_package for
+# the SAME configs over the SAME days, on a small synthetic sample. Not one number may drift.
+# --------------------------------------------------------------------------- #
+@pytest.fixture(autouse=True)
+def _restore_dials():
+    """These tests reparameterize the shared engine's module globals (cm.ENTRY_TIME etc.) to
+    prove the dials move the output. Restore them afterward so we never leak a mutated global
+    into another test module (e.g. condor_management_experiment's verbatim-constants guard)."""
+    saved = (cm.ENTRY_TIME, cm.TARGET_SHORT_DELTA, ws.TARGET_SHORT_DELTA)
+    yield
+    cm.ENTRY_TIME, cm.TARGET_SHORT_DELTA, ws.TARGET_SHORT_DELTA = saved
+
+
+def test_day_outer_parity():
+    # A small config subset + multi-day synthetic sample. Same NBBO shape per day (the patch
+    # returns one frame), but different dates so the train/test split exercises both halves.
+    days = [dt.date(2024, 1, 2), dt.date(2024, 1, 3),  # test half (> 2024-06-30)
+            dt.date(2023, 5, 4), dt.date(2023, 5, 5)]  # train half (<= 2024-06-30)
+    configs = [(dt.time(14, 0), 0.15, 5.0),
+               (dt.time(14, 0), 0.30, 10.0),
+               (dt.time(11, 30), 0.15, 5.0)]
+
+    class _CLF:
+        def classify(self, d):
+            return {"day": d, "gamma_regime": "neutral", "vix_regime": "contango"}
+
+    # Each day's synthetic NBBO must contain BOTH entry minutes (11:30 and 14:00) so every
+    # config is tradeable; build a frame spanning the whole session for each date.
+    def _full_nbbo(d):
+        e = pd.Timestamp(dt.datetime.combine(d, dt.time(11, 30)))
+        # 156 forward minutes reaches past 14:00 so both entries have a snapshot + a walk.
+        return _bs_nbbo(e, n_forward=156)
+
+    nbbo_by_day = {d: _full_nbbo(d) for d in days}
+
+    # ---- Legacy config-outer reference: run_base_package per config over all days. ----
+    def _patch_multi():
+        orig_chain = g.s5.zero_dte_chain
+        orig_load = g.s5.load_day
+        # zero_dte_chain(d,...) returns that date's synthetic chain; load_day is a no-op stub.
+        g.s5.zero_dte_chain = lambda d, day_data=None: _Chain(nbbo_by_day[d])
+        g.s5.load_day = lambda d: None
+        return orig_chain, orig_load
+
+    legacy = {}  # (etag, delta, wing, arm, fill, scope) -> total_pnl
+    orig = _patch_multi()
+    try:
+        for (e, dl, w) in configs:
+            rows = g.run_base_package(e, dl, w, days, _CLF(), verbose=False)
+            for r in rows:
+                legacy[(r["entry"], r["delta"], r["wing"], r["arm"], r["fill"],
+                        r["scope"])] = (r["total_pnl"], r["n"], r["win_rate"])
+    finally:
+        _unpatch_chain(orig)
+
+    # ---- Day-outer path: eval_day_all_configs per day, then aggregate_grid. ----
+    orig = _patch_multi()
+    dayrows = []
+    try:
+        for d in days:
+            dayrows.extend(g.eval_day_all_configs(d, _CLF(), configs=configs))
+    finally:
+        _unpatch_chain(orig)
+
+    # Aggregate the day-rows the same way aggregate_grid does (in-memory, no file I/O).
+    import pandas as _pd
+    ddf = _pd.DataFrame(dayrows)
+    assert not ddf.empty, "day-outer produced no rows on the synthetic sample"
+    day_grid = {}
+    for (etag, delta, wing, arm, fill), grp in ddf.groupby(
+            ["entry", "delta", "wing", "arm", "fill"], sort=True):
+        for scope in ("full", "train", "test"):
+            gs = grp if scope == "full" else grp[grp["half"] == scope]
+            st = g._stats(gs["pnl"].to_numpy(float),
+                          gs["hold_min"].to_numpy(float),
+                          gs["entry_credit"].to_numpy(float))
+            day_grid[(etag, float(delta), int(wing), arm, fill, scope)] = (
+                st["total_pnl"], st["n"], st["win_rate"])
+
+    # ---- PARITY: every legacy cell must match the day-outer cell exactly. ----
+    def _eq(a, b):
+        # NaN == NaN for empty scopes (a scope with 0 trades has NaN win_rate on both paths).
+        if isinstance(a, float) and isinstance(b, float) and np.isnan(a) and np.isnan(b):
+            return True
+        return a == b
+
+    assert set(legacy.keys()) == set(day_grid.keys()), "config/arm/fill/scope grid mismatch"
+    n_checked = 0
+    for key, (tot, n, wr) in legacy.items():
+        dtot, dn, dwr = day_grid[key]
+        assert dn == n, f"n differs at {key}: {dn} vs {n}"
+        # total P&L must be bit-for-bit identical (same math, same order of days).
+        assert _eq(dtot, tot), f"total_pnl differs at {key}: {dtot} vs {tot}"
+        assert _eq(dwr, wr), f"win_rate differs at {key}: {dwr} vs {wr}"
+        n_checked += 1
+    # sanity: we actually compared a non-trivial number of populated cells.
+    populated = sum(1 for (_t, nn, _w) in legacy.values() if nn > 0)
+    assert populated > 0, "parity test never exercised a tradeable cell"
