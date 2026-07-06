@@ -26,10 +26,15 @@ WHY 15 MIN FOR THE SPXW COLLECTOR
   cannot be "just stalled": the supervisor PROCESS is gone. 15 min is comfortably
   past the 30s cadence yet catches a dead supervisor fast.
 
-SUPPRESSION (no alert) when ANY of:
-  * heartbeat text contains COMPLETE (supervisor finished the whole window), OR
-  * progress.json shows days_done >= days_total (job legitimately finished), OR
-  * the heartbeat file is FRESH (age < the job's threshold).
+SUPPRESSION (no alert) — FRESHNESS GATES COMPLETION (fix 2026-07-06):
+  * the heartbeat file is FRESH (age < the job's threshold) AND the heartbeat text
+    contains COMPLETE (supervisor finished the whole window), OR
+  * the heartbeat file is FRESH AND progress.json shows the job finished
+    (complete flag, or done >= total), OR
+  * the heartbeat file is FRESH with an ordinary (in-progress) heartbeat.
+  A COMPLETE marker or a progress 'complete' flag on a COLD/absent heartbeat does NOT
+  suppress — a stale leftover 'complete:true' beside a dead supervisor is exactly the
+  2026-07-05 silent-death this alarm now catches instead of logging "COMPLETE".
 
 DE-DUPE
   A small JSON state file records the last alert time per job so we email at most
@@ -329,26 +334,46 @@ def _progress_complete(progress_path) -> bool:
         return False
     if p.get("complete") is True:
         return True
-    done = p.get("days_done", p.get("done_units"))
-    total = p.get("days_total", p.get("total_units"))
+    done = p.get("days_done", p.get("done", p.get("done_units")))
+    total = p.get("days_total", p.get("total", p.get("total_units")))
     try:
         return total is not None and done is not None and int(done) >= int(total)
     except (TypeError, ValueError):
         return False
 
 
+def _progress_fresh(progress_path, now: float, threshold_s: float) -> bool:
+    """True if the progress file exists and its mtime is within the staleness
+    threshold. Used to gate 'complete'-flag suppression when there is no heartbeat
+    file: a leftover complete flag on a STALE progress file must not suppress."""
+    if not progress_path:
+        return False
+    try:
+        return (now - Path(progress_path).stat().st_mtime) < threshold_s
+    except OSError:
+        return False
+
+
 def _progress_pct(progress_path) -> str:
-    """A '89.7% (1052/1173)' progress string for the alert body, or 'unknown'."""
+    """A '6.47% (25866/399600)' progress string for the alert body, or 'unknown'.
+
+    Reads both progress schemas: the SPXW collector's days_done/days_total AND the
+    universe downloader's done/total (its actual keys; done_units/total_units also
+    accepted defensively). The 2026-07-05 audit found this only read days_* and so
+    showed 'progress unknown' for the universe job — fixed here."""
     if not progress_path:
         return "unknown"
     try:
         p = json.loads(Path(progress_path).read_text())
     except (OSError, ValueError):
         return "unknown"
-    done, total, pct = p.get("days_done"), p.get("days_total"), p.get("pct")
+    done = p.get("days_done", p.get("done", p.get("done_units")))
+    total = p.get("days_total", p.get("total", p.get("total_units")))
+    pct = p.get("pct")
+    unit = "days" if p.get("days_total") is not None else "units"
     if done is not None and total is not None:
         pct_str = f"{pct}%" if pct is not None else "?"
-        return f"{pct_str} ({done}/{total} days)"
+        return f"{pct_str} ({done}/{total} {unit})"
     return "unknown"
 
 
@@ -367,9 +392,13 @@ def assess(job: dict, now: float, heartbeat_override: str | None = None) -> dict
     progress = _progress_pct(job.get("progress"))
 
     if not hb_path.exists():
-        # No heartbeat file at all. If progress says the job finished, that's a
-        # legit finish (don't alert). Otherwise it never started / vanished.
-        if _progress_complete(job.get("progress")):
+        # No heartbeat file at all. A 'complete' progress flag is only a legit finish
+        # if the progress file that carries it is itself FRESH (written within the
+        # threshold). A STALE complete flag beside an absent heartbeat is the same
+        # silent-death trap as a cold heartbeat — it must NOT suppress. Otherwise the
+        # job never started / vanished.
+        if _progress_complete(job.get("progress")) and _progress_fresh(
+                job.get("progress"), now, job["threshold_s"]):
             return {"status": "complete", "alert": False, "age_s": None,
                     "last_ts": "(no heartbeat file; progress shows complete)",
                     "hb_path": str(hb_path), "progress": progress}
@@ -383,18 +412,18 @@ def assess(job: dict, now: float, heartbeat_override: str | None = None) -> dict
         text = ""
     last_line = text.splitlines()[-1].strip() if text else "(empty heartbeat)"
 
-    # Completion suppression #1: the literal COMPLETE marker.
-    if "COMPLETE" in text.upper():
-        return {"status": "complete", "alert": False, "age_s": None,
-                "last_ts": last_line, "hb_path": str(hb_path), "progress": progress}
-
-    # Completion suppression #2: progress.json says every day is done.
-    if _progress_complete(job.get("progress")):
-        return {"status": "complete", "alert": False, "age_s": None,
-                "last_ts": last_line, "hb_path": str(hb_path), "progress": progress}
-
-    # Freshness: mtime is the file's actual last-write time (the supervisor
-    # rewrites the whole file every ~30s, so mtime == last heartbeat).
+    # Freshness FIRST — mtime is the file's actual last-write time (the supervisor
+    # rewrites the whole file every ~30s, so mtime == last heartbeat). This MUST gate
+    # the completion suppressions below: a "COMPLETE" marker or a progress 'complete'
+    # flag is only trustworthy while the file that carries it is FRESH. A STALE
+    # complete flag (left over from a prior scope/run) beside a COLD heartbeat means
+    # the job died — it must NOT suppress the alert.
+    #
+    # THE 2026-07-05 SILENT DEATH THIS PREVENTS: during a ~3.75h terminal outage the
+    # supervisor was NOT running, yet a stale progress.json still carried a leftover
+    # 'complete: true'. The old ordering checked completion BEFORE freshness, so the
+    # alarm logged "universe_dl: COMPLETE — no alert" for hours over a dead job — the
+    # exact unnoticed-death the alarm exists to catch. Freshness now decides first.
     try:
         age = now - hb_path.stat().st_mtime
     except OSError:
@@ -404,10 +433,24 @@ def assess(job: dict, now: float, heartbeat_override: str | None = None) -> dict
         return {"status": "missing", "alert": True, "age_s": None,
                 "last_ts": last_line, "hb_path": str(hb_path), "progress": progress}
 
-    if age < job["threshold_s"]:
+    fresh = age < job["threshold_s"]
+
+    # Completion suppressions apply ONLY when the heartbeat is FRESH. A recently
+    # finished job (fresh file + COMPLETE marker or progress complete) is a legit
+    # finish and is correctly suppressed here; a cold file with either flag is NOT.
+    if fresh:
+        # Completion suppression #1: the literal COMPLETE marker.
+        if "COMPLETE" in text.upper():
+            return {"status": "complete", "alert": False, "age_s": age,
+                    "last_ts": last_line, "hb_path": str(hb_path), "progress": progress}
+        # Completion suppression #2: progress.json says every unit is done.
+        if _progress_complete(job.get("progress")):
+            return {"status": "complete", "alert": False, "age_s": age,
+                    "last_ts": last_line, "hb_path": str(hb_path), "progress": progress}
         return {"status": "fresh", "alert": False, "age_s": age,
                 "last_ts": last_line, "hb_path": str(hb_path), "progress": progress}
 
+    # Cold heartbeat: ALERT regardless of any stale COMPLETE / complete flag.
     return {"status": "stale", "alert": True, "age_s": age,
             "last_ts": last_line, "hb_path": str(hb_path), "progress": progress}
 
