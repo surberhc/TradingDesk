@@ -5,7 +5,7 @@ A single Streamlit app, phone- and desktop-friendly, that *shows* the state of t
 whole desk by reusing the existing Python directly. It NEVER places, arms, or
 transmits an order, never writes to the warehouse/config, never calls replaceFA.
 
-Four sections (tabs):
+Five sections (tabs):
   1. Health      — EDGAR fundamentals freshness/coverage (periodic refresh), EOD
                    warehouse coverage, the status JSONs (forward/tiingo/gex/
                    eod_report), Windows task states. (The SPXW 1-min one-time-grab
@@ -14,7 +14,9 @@ Four sections (tabs):
   3. Backtests   — latest CAGR/maxDD/Calmar/Sortino/down-capture for the 3 versions
                    (computed via the validated run_backtest, cached) + links to the
                    existing plotly HTML reports.
-  4. Accounts    — the 5 DU paper subs read read-only through the gateway, with a
+  4. S5 Convexity — read-only research view of the S5 financed-convexity overlay
+                   EOD prototype ledger (defensive half only; recomputed live).
+  5. Accounts    — the 5 DU paper subs read read-only through the gateway, with a
                    SHORT connect timeout so a weekend/feed-down gateway degrades to
                    "Gateway offline" instead of hanging. Drift vs target + the
                    rebalance PLAN preview (build-only). NO controls anywhere.
@@ -43,7 +45,7 @@ import plotly.graph_objects as go
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
 REPO = Path(__file__).resolve().parent.parent
-for sub in ("paperbot", "backtester", "connections", "strategies"):
+for sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport"):
     p = REPO / sub
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
@@ -51,6 +53,11 @@ for sub in ("paperbot", "backtester", "connections", "strategies"):
 _conn = REPO / "connections"
 if str(_conn) not in sys.path:
     sys.path.insert(0, str(_conn))
+
+# dailyreport is a flat sys.path addition (no __init__.py), same convention as
+# the other folders above — import its modules directly.
+import desk_health
+import status as dr_status
 
 # --- Local data locations (off-Drive, on C:) -----------------------------------
 WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse")
@@ -143,21 +150,9 @@ def _fmt_dt(ts: str | None) -> str:
 
 def _fmt_big(x: float, nd: int = 2) -> str:
     """One shared magnitude formatter: raw dollars/notional -> a compact B/M/K string.
-    Used so GEX numbers read consistently across the snapshot tiles, chart and history."""
-    try:
-        v = float(x)
-    except (TypeError, ValueError):
-        return "—"
-    if v != v:  # NaN
-        return "—"
-    a = abs(v)
-    if a >= 1e9:
-        return f"{v/1e9:,.{nd}f}B"
-    if a >= 1e6:
-        return f"{v/1e6:,.{nd}f}M"
-    if a >= 1e3:
-        return f"{v/1e3:,.{nd}f}K"
-    return f"{v:,.{nd}f}"
+    Used so GEX numbers read consistently across the snapshot tiles, chart and history.
+    Thin wrapper over the shared formatter — see desk_health.fmt_magnitude."""
+    return desk_health.fmt_magnitude(x, nd=nd)
 
 
 def _status_tier(status: str) -> str:
@@ -194,13 +189,12 @@ def _color_text(text: str, tier: str) -> str:
 
 @st.cache_data(ttl=60)
 def load_json(path_str: str) -> dict | None:
+    """Read one status JSON. Delegates to dailyreport.status.read() (the
+    already-correct shared reader) — this wrapper keeps the existing path-based
+    call sites unchanged and preserves the exact None-on-failure contract."""
     p = Path(path_str)
-    if not p.exists():
-        return None
-    try:
-        return json.loads(p.read_text(encoding="utf-8"))
-    except Exception:
-        return None
+    job = p.stem  # STATUS_DIR / f"{job}.json" -> job name status.read() expects
+    return dr_status.read(job)
 
 
 @st.cache_data(ttl=60)
@@ -263,67 +257,36 @@ def eod_coverage() -> tuple[pd.DataFrame, dict]:
 
 @st.cache_data(ttl=120)
 def edgar_coverage() -> dict:
-    """EDGAR point-in-time fundamentals freshness/coverage, read straight from the
-    warehouse dir (no import of edgar_pipeline). Returns a summary dict; degrades
-    gracefully to an 'info: build landing' state when the table isn't there yet.
+    """EDGAR point-in-time fundamentals freshness/coverage — presentation shaping
+    on top of the shared desk_health.edgar_coverage() computation (also used by
+    dailyreport/eod_report.py::build_edgar()). Returns a summary dict shaped for
+    the Streamlit tiles; degrades gracefully to an 'info: build landing' state
+    when the table isn't there yet.
 
     tier: good (fresh) / warn (stale or in-progress) / unknown (not landed yet)."""
-    if not EDGAR.exists():
+    ec = desk_health.edgar_coverage(EDGAR, EDGAR_FUNDAMENTALS, EDGAR_STALE_DAYS)
+
+    if not ec["dir_present"]:
         return {"tier": "unknown", "state": "build landing",
                 "companies": None, "size_gb": 0.0, "n_files": 0,
                 "table_present": False, "last_refresh": "—", "age_days": None,
                 "newest_file": "—", "headline": "EDGAR warehouse dir not present yet."}
 
-    # Directory-wide size + newest mtime (the freshness heartbeat).
-    size = 0
-    newest_mtime = 0.0
-    newest_name = None
-    n_files = 0
-    for f in EDGAR.rglob("*"):
-        if not f.is_file():
-            continue
-        try:
-            stt = f.stat()
-        except OSError:
-            continue
-        n_files += 1
-        size += stt.st_size
-        if stt.st_mtime > newest_mtime:
-            newest_mtime = stt.st_mtime
-            newest_name = f.name
+    companies = ec["n_companies"]
+    table_present = ec["table_present"]
+    refresh_dt = ec["refresh_dt"]
+    age_days = ec["age_days"]
+    newest_name = ec["newest_file"]
+    newest_mtime = ec["newest_mtime"]
 
-    now = datetime.now()
-    recent_activity = bool(newest_mtime) and (now.timestamp() - newest_mtime) < 15 * 60
-
-    companies = None
-    table_mtime = None
-    table_present = EDGAR_FUNDAMENTALS.exists()
-    if table_present:
-        try:
-            table_mtime = datetime.fromtimestamp(EDGAR_FUNDAMENTALS.stat().st_mtime)
-        except OSError:
-            table_mtime = None
-        try:
-            cols = pd.read_parquet(EDGAR_FUNDAMENTALS).columns
-            key = next((c for c in ("ticker", "cik", "symbol") if c in cols), None)
-            if key is not None:
-                companies = int(pd.read_parquet(
-                    EDGAR_FUNDAMENTALS, columns=[key])[key].nunique())
-        except Exception:
-            companies = None
-
-    refresh_dt = table_mtime or (datetime.fromtimestamp(newest_mtime)
-                                 if newest_mtime else None)
-    age_days = (now - refresh_dt).days if refresh_dt else None
-
-    if recent_activity:
+    if ec["recent_activity"]:
         tier, state = "warn", "refresh in progress"
         headline = (f"Build/refresh in progress — newest file {newest_name} "
                     "updated in the last 15 min. Table not final.")
     elif not table_present:
         tier, state = "unknown", "build landing"
         headline = "Fundamentals table not written yet."
-    elif age_days is not None and age_days > EDGAR_STALE_DAYS:
+    elif ec["state"] == "stale":
         tier, state = "warn", "stale"
         headline = (f"Stale — last refresh {age_days}d ago "
                     f"(> {EDGAR_STALE_DAYS}d periodic threshold). Time to re-pull EDGAR.")
@@ -334,7 +297,8 @@ def edgar_coverage() -> dict:
 
     return {
         "tier": tier, "state": state, "companies": companies,
-        "size_gb": size / 1e9, "n_files": n_files, "table_present": table_present,
+        "size_gb": ec["size_bytes"] / 1e9, "n_files": ec["n_files"],
+        "table_present": table_present,
         "last_refresh": refresh_dt.strftime("%Y-%m-%d %H:%M") if refresh_dt else "—",
         "age_days": age_days,
         "newest_file": f"{newest_name} @ {datetime.fromtimestamp(newest_mtime):%Y-%m-%d %H:%M}"
@@ -583,10 +547,11 @@ def render_gamma() -> None:
                 st.caption("no data")
                 continue
             state = str(snap.get("gamma_state", "—"))
-            sl = state.lower()
-            g_tier = ("good" if sl.startswith("pos") else
-                      "bad" if sl.startswith("neg") else
-                      "warn" if sl.startswith("neu") else "unknown")
+            # Shared with dailyreport/eod_report.py — see desk_health.GAMMA_STATE_TIER.
+            # Negative gamma is a market-condition/awareness signal, not a pipeline
+            # failure: maps to "warn" (amber), not "bad" (red).
+            dh_tier = desk_health.GAMMA_STATE_TIER.get(state, "info")
+            g_tier = {"ok": "good", "warn": "warn", "info": "unknown"}.get(dh_tier, "unknown")
             st.markdown(
                 f"{_TIER_DOT[g_tier]} **{_color_text(state + ' gamma', g_tier)}**",
                 unsafe_allow_html=True)

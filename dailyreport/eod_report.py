@@ -27,6 +27,7 @@ import sys
 import threading
 from pathlib import Path
 
+import desk_health
 import mailer
 import status
 
@@ -254,63 +255,22 @@ def build_edgar():
     Never raises."""
     title = "EDGAR Fundamentals (point-in-time)"
     try:
-        if not EDGAR.exists():
+        ec = desk_health.edgar_coverage(EDGAR, EDGAR_FUNDAMENTALS, EDGAR_STALE_DAYS)
+
+        if not ec["dir_present"]:
             return _sec("edgar", title, "info",
                         "info: build landing — EDGAR warehouse dir not present yet.", [])
 
-        # Directory-wide size + newest mtime (freshness heartbeat) across all files.
-        size = 0
-        newest_mtime = 0.0
-        newest_name = None
-        n_files = 0
-        for root, _dirs, fnames in os.walk(EDGAR):
-            for fn in fnames:
-                fp = os.path.join(root, fn)
-                try:
-                    stt = os.stat(fp)
-                except OSError:
-                    continue
-                n_files += 1
-                size += stt.st_size
-                if stt.st_mtime > newest_mtime:
-                    newest_mtime = stt.st_mtime
-                    newest_name = fn
-
-        now = dt.datetime.now()
-        # "Build in progress" = something in the dir was touched in the last ~15 min.
-        recent_activity = bool(newest_mtime) and (now.timestamp() - newest_mtime) < 15 * 60
+        companies = ec["n_companies"]
+        size = ec["size_bytes"]
+        n_files = ec["n_files"]
+        table_present = ec["table_present"]
+        refresh_dt = ec["refresh_dt"]
+        age_days = ec["age_days"]
+        newest_name = ec["newest_file"]
+        newest_mtime = ec["newest_mtime"]
         newest_str = (dt.datetime.fromtimestamp(newest_mtime).strftime("%Y-%m-%d %H:%M:%S")
                       if newest_mtime else "—")
-
-        # The fundamentals table itself: company/partition count + its own age.
-        companies = None
-        table_mtime = None
-        table_present = EDGAR_FUNDAMENTALS.exists()
-        if table_present:
-            try:
-                table_mtime = dt.datetime.fromtimestamp(EDGAR_FUNDAMENTALS.stat().st_mtime)
-            except OSError:
-                table_mtime = None
-            try:
-                import pandas as pd
-                key = None
-                # one row per company-quarter; count distinct companies (ticker/cik).
-                cols = pd.read_parquet(EDGAR_FUNDAMENTALS, columns=None).columns
-                for cand in ("ticker", "cik", "symbol"):
-                    if cand in cols:
-                        key = cand
-                        break
-                if key is not None:
-                    companies = int(pd.read_parquet(EDGAR_FUNDAMENTALS,
-                                                    columns=[key])[key].nunique())
-            except Exception:
-                companies = None
-
-        # Age of the last real refresh = the fundamentals table's own mtime if we have
-        # it, else the newest file in the dir.
-        refresh_dt = table_mtime or (dt.datetime.fromtimestamp(newest_mtime)
-                                     if newest_mtime else None)
-        age_days = (now - refresh_dt).days if refresh_dt else None
 
         rows = [
             ("Companies (partitions)", f"{companies:,}" if companies is not None else "—"),
@@ -322,14 +282,16 @@ def build_edgar():
             ("Newest file", f"{newest_name} @ {newest_str}" if newest_name else "—"),
         ]
 
-        if recent_activity:
+        # Map the shared computation's tier/state onto this file's status vocabulary
+        # (ok/info/stale/fail) and headline text, unchanged from the prior wording.
+        if ec["recent_activity"]:
             st = "info"
             headline = ("info: build/refresh in progress — files updated in the last "
                         f"15 min (newest {newest_name}). Table not final.")
         elif not table_present:
             st = "info"
             headline = "info: build landing — fundamentals table not written yet."
-        elif age_days is not None and age_days > EDGAR_STALE_DAYS:
+        elif ec["state"] == "stale":
             st = "stale"
             headline = (f"stale — last refresh was {age_days}d ago "
                         f"(> {EDGAR_STALE_DAYS}d periodic threshold). Time to re-pull EDGAR.")
@@ -620,7 +582,8 @@ def build_account():
 GEX_INDEX = ["SPX", "SPXW"]   # use whichever derived table exists; SPX preferred
 GEX_ETF = "SPY"
 # gamma_state -> dot color. Negative gamma is the fragile/high-vol regime.
-GEX_STATE_DOT = {"Positive": "ok", "Neutral": "info", "Negative": "warn"}
+# Shared with dashboard/app.py — see desk_health.GAMMA_STATE_TIER.
+GEX_STATE_DOT = desk_health.GAMMA_STATE_TIER
 
 
 def _gex_latest(symbol: str):
@@ -638,22 +601,9 @@ def _gex_latest(symbol: str):
 
 
 def _gex_fmt_mag(net_gex):
-    """Human $GEX magnitude (per 1% move): $1.2B / $345M / $12K, signed."""
-    try:
-        v = float(net_gex)
-    except (TypeError, ValueError):
-        return "—"
-    if v != v:  # NaN
-        return "—"
-    sign = "+" if v >= 0 else "−"
-    a = abs(v)
-    if a >= 1e9:
-        return f"{sign}${a/1e9:.2f}B"
-    if a >= 1e6:
-        return f"{sign}${a/1e6:.0f}M"
-    if a >= 1e3:
-        return f"{sign}${a/1e3:.0f}K"
-    return f"{sign}${a:,.0f}"
+    """Human $GEX magnitude (per 1% move): $1.2B / $345M / $12K, signed.
+    Thin wrapper over the shared formatter — see desk_health.fmt_magnitude."""
+    return desk_health.fmt_magnitude(net_gex, dollar_sign=True, show_plus=True)
 
 
 def _gex_num(v, suffix="", nd=2):
