@@ -8,11 +8,11 @@ like the supervisor heartbeat and the Tiingo manifest) and renders a section per
 job. A job that crashed or never ran shows as ❌/stale rather than taking the
 report down.
 
-Sections today: IBKR forward collector · EDGAR fundamentals (periodic freshness) ·
-Tiingo refresh · Dealer gamma · System/Gateway health · (Strategies — reserved,
-lights up once strategies run). The ThetaData one-time-grab section is retired
-(SPXW 1-min backfill complete 2026-07); build_thetadata is left defined but out of
-SECTIONS. Adding a section later = write one build_*() and append it to SECTIONS.
+Trimmed to S0-only sections on 2026-07-07 per Andrew's request — the email had
+become cluttered across strategies. Other sections (forward collector, EDGAR,
+gamma, system/gateway health, staleness alarm, the old generic Tiingo section)
+remain defined in this file, just out of SECTIONS — add them back (or build a
+per-strategy digest) when another strategy needs its own reporting.
 
 Run manually any time:  <venv python> eod_report.py
 """
@@ -29,6 +29,14 @@ from pathlib import Path
 
 import mailer
 import status
+
+# S0 (Adaptive All-Weather Core) reads the same shared-brain data path the
+# backtester and paperbot use — see paperbot\strategy_target.py for the
+# original pattern. The backtester is a local `src` package, not an installed
+# dependency; add its folder to sys.path exactly like strategy_target.py does.
+_BACKTESTER = Path(__file__).resolve().parent.parent / "backtester"
+if str(_BACKTESTER) not in sys.path:
+    sys.path.insert(0, str(_BACKTESTER))
 
 WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse")
 EDGAR = Path(r"C:\TradingDesk-Local\canslim\edgar")
@@ -406,6 +414,337 @@ def build_strategy():
     return _sec("strategy", "Strategy EOD Update", st, s.get("message", ""), rows)
 
 
+# --------------------------------------------------------------------------- #
+# S0 (Adaptive All-Weather Core regime engine) sections — added 2026-07-07.
+# Both read the shared brain's OWN price loader + regime scorer directly
+# (strategies.parts.regime.market_health_score over backtester/src/data_loader's
+# frame) rather than running a full run_backtest() — cheap file reads + one
+# vectorized score computation, safe to do inline in the nightly email job.
+# --------------------------------------------------------------------------- #
+S0_EQUITY_TICKERS = ["SPY", "RSP"] + [
+    "XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLRE", "XLK", "XLU"]
+S0_CREDIT_TICKERS = ["HYG", "IEF"]
+S0_TICKERS = S0_EQUITY_TICKERS + S0_CREDIT_TICKERS  # macro (_vix/_hy_oas) tracked separately
+
+
+def _s0_price_frame_and_regime():
+    """Load S0's price universe + the two macro series via the backtester's own
+    data_loader (same reads paperbot\\strategy_target.py relies on), then score
+    today via strategies.parts.regime.market_health_score directly — no
+    run_backtest(). Returns (scores_df, prices_df, vix_series, hy_oas_series,
+    vix_source, hy_oas_source). Raises on missing data; callers must catch."""
+    _BACKTESTER = Path(__file__).resolve().parent.parent / "backtester"
+    if str(_BACKTESTER) not in sys.path:
+        sys.path.insert(0, str(_BACKTESTER))
+    from src import data_loader  # local import: keeps sys.path mutation scoped to callers
+    from strategies.parts import regime as regime_mod
+
+    prices = data_loader.load_prices(S0_TICKERS)
+    vix, vix_src = data_loader.load_vix()
+    hy_oas, hy_oas_src = data_loader.load_hy_oas()
+    scores = regime_mod.market_health_score(
+        prices, hyg=prices.get("HYG"), credit_denom=prices.get("IEF"),
+        vix=vix, hy_oas=hy_oas)
+    return scores, prices, vix, hy_oas, vix_src, hy_oas_src
+
+
+def build_s0_regime():
+    """Today's S0 Market Health Score, regime/band, and the 3 component reads.
+    This is what build_strategy's placeholder was always meant to become. Writes
+    a 's0_regime' status artifact (mirroring the other builders) so other tooling
+    can read today's regime without recomputing it."""
+    title = "S0 Regime (Adaptive All-Weather Core)"
+    try:
+        import pandas as pd
+        scores, prices, vix, hy_oas, vix_src, hy_oas_src = _s0_price_frame_and_regime()
+        if scores.empty or scores["score"].dropna().empty:
+            return _sec("s0_regime", title, "fail",
+                        "Regime score computed but empty — check S0 price data.", [])
+        last = scores.dropna(subset=["score"]).iloc[-1]
+        as_of = last.name  # index is the date
+        as_of_str = pd.Timestamp(as_of).strftime("%Y-%m-%d")
+        price_date = prices.dropna(how="all").index[-1]
+        fresh = _is_fresh(pd.Timestamp(price_date).strftime("%Y%m%d"))
+
+        score_val = float(last["score"])
+        regime_name = str(last.get("regime", "?"))
+        trend = last.get("trend")
+        breadth = last.get("breadth")
+        stress = last.get("stress")
+
+        st = ("ok" if fresh else "stale")
+        headline = f"{regime_name} — score {score_val:.1f}/100, as of {as_of_str}"
+        if not fresh:
+            headline += "  ⚠ latest priced date is not today's expected session"
+
+        rows = [
+            ("Score (0-100)", f"{score_val:.1f}"),
+            ("Regime / band", regime_name),
+            ("Trend component", f"{trend:.2f}" if pd.notna(trend) else "—"),
+            ("Breadth component", f"{breadth:.2f}" if pd.notna(breadth) else "—"),
+            ("Stress component", f"{stress:.2f}" if pd.notna(stress) else "—"),
+            ("Data as-of", as_of_str),
+            ("VIX source", vix_src if vix is not None else f"missing ({vix_src})"),
+            ("HY OAS source", hy_oas_src if hy_oas is not None else f"missing ({hy_oas_src})"),
+        ]
+        status.write("s0_regime", st,
+                     metrics={"score": score_val, "regime": regime_name,
+                              "trend": None if pd.isna(trend) else float(trend),
+                              "breadth": None if pd.isna(breadth) else float(breadth),
+                              "stress": None if pd.isna(stress) else float(stress)},
+                     message=headline, day=pd.Timestamp(as_of).strftime("%Y%m%d"))
+        return _sec("s0_regime", title, st, headline, rows)
+    except Exception as e:
+        return _sec("s0_regime", title, "fail",
+                    f"Could not compute S0 regime: {type(e).__name__}: {e}", [])
+
+
+def build_s0_data():
+    """Tiingo/macro freshness SCOPED to just S0's inputs (SPY, RSP, 11 sector ETFs,
+    HYG, IEF, plus VIX + HY OAS) — answers 'was S0's data pulled today and is it
+    good', not the whole ~30-ticker universe (see build_tiingo for that, still
+    defined, just out of SECTIONS)."""
+    title = "S0 Data Freshness"
+    try:
+        _BACKTESTER = Path(__file__).resolve().parent.parent / "backtester"
+        if str(_BACKTESTER) not in sys.path:
+            sys.path.insert(0, str(_BACKTESTER))
+        from src import data_loader
+        manifest = data_loader.load_manifest()
+        tick_info = manifest.get("tickers", {})
+        rows = []
+        worst = "ok"
+
+        def _bump(st):
+            nonlocal worst
+            if SEVERITY.index(st) > SEVERITY.index(worst):
+                worst = st
+
+        stale_names = []
+        qc_flagged = []
+        missing = []
+        for t in S0_TICKERS:
+            info = tick_info.get(t)
+            if not info:
+                missing.append(t)
+                _bump("fail")
+                continue
+            last_date = str(info.get("last_date", ""))
+            fresh = _is_fresh(last_date.replace("-", ""))
+            qc = info.get("qc_flags") or []
+            if not fresh:
+                stale_names.append(t)
+                _bump("stale")
+            if qc:
+                qc_flagged.append(t)
+                _bump("warn")
+
+        for macro_key, label in (("_vix", "VIX"), ("_hy_oas", "HY OAS")):
+            info = tick_info.get(macro_key)
+            if not info:
+                missing.append(label)
+                _bump("fail")
+                continue
+            last_date = str(info.get("last_date", ""))
+            fresh = _is_fresh(last_date.replace("-", ""))
+            if not fresh:
+                stale_names.append(label)
+                _bump("stale")
+            rows.append((f"{label} last date", last_date or "—"))
+            rows.append((f"{label} source", info.get("source", "—")))
+
+        rows = ([("S0 tickers tracked", f"{len(S0_TICKERS)}"),
+                 ("Manifest generated", manifest.get("generated_at", "—")[:19])]
+                + rows
+                + [("Stale (not today's session)", ", ".join(stale_names) or "none"),
+                   ("QC flags present", ", ".join(qc_flagged) or "none"),
+                   ("Missing from manifest", ", ".join(missing) or "none")])
+
+        if missing:
+            headline = f"MISSING data for: {', '.join(missing)}"
+        elif stale_names:
+            headline = f"stale — not refreshed for today's session: {', '.join(stale_names)}"
+        elif qc_flagged:
+            headline = f"fresh but QC-flagged: {', '.join(qc_flagged)}"
+        else:
+            headline = f"all {len(S0_TICKERS)} S0 tickers + VIX/HY OAS fresh and clean"
+
+        return _sec("s0_data", title, worst, headline, rows)
+    except Exception as e:
+        return _sec("s0_data", title, "fail",
+                    f"Could not read S0 data freshness: {type(e).__name__}: {e}", [])
+
+
+def build_s0_regime():
+    """S0 (Adaptive All-Weather Core) — today's Market Health Score + regime.
+
+    Computes the score the SAME way the shared strategy brain does (see
+    strategies\\parts\\regime.py market_health_score(), the exact function
+    strategies.all_weather.AdaptiveAllWeather.warmup() calls) over the SAME
+    price/macro data paperbot\\strategy_target.py loads for the live target
+    book. This is NOT a second run_backtest() — it is the underlying causal,
+    vectorized score computation alone (sub-second), giving TODAY's raw daily
+    reading. The regime that actually governs today's portfolio (after the
+    confirmation-buffer/dead-zone hysteresis, SPEC §4) is also shown, since a
+    raw score can wiggle across a band boundary for a day or two without the
+    confirmed regime (and therefore the traded band) actually changing.
+
+    Never raises: any failure (missing data, import issue) degrades to a
+    'fail' section rather than taking the whole report down."""
+    title = "S0 Regime (Adaptive All-Weather Core)"
+    try:
+        from src import data_loader
+        from strategies import config as s_config
+        from strategies.parts import regime as s_regime
+
+        prices = data_loader.load_prices()
+        hyg = data_loader.load_prices([s_config.CREDIT_PROXY[0]])[s_config.CREDIT_PROXY[0]]
+        denom_t = s_config.CREDIT_PROXY[1]
+        credit_denom = (prices[denom_t] if denom_t in prices.columns
+                        else data_loader.load_prices([denom_t])[denom_t])
+        vix, vix_src = data_loader.load_vix()
+        hy_oas, hy_oas_src = data_loader.load_hy_oas()
+
+        score_df = s_regime.market_health_score(
+            prices, hyg=hyg, credit_denom=credit_denom, vix=vix, hy_oas=hy_oas)
+        confirmed = s_regime.apply_hysteresis(score_df["score"])
+
+        last = score_df.iloc[-1]
+        as_of = score_df.index[-1]
+        raw_regime = last["regime"]
+        confirmed_regime = confirmed.iloc[-1]
+        fresh = _is_fresh(as_of.strftime("%Y%m%d"))
+
+        band_lo, band_hi = s_regime.equity_band(confirmed_regime)
+
+        rows = [
+            ("Data as-of", as_of.strftime("%Y-%m-%d")),
+            ("Score (0-100)", f"{last['score']:.1f}"),
+            ("Raw regime (today's score)", raw_regime),
+            ("Confirmed regime (governs the book)", confirmed_regime),
+            ("Equity band (confirmed regime)", f"{band_lo:.0%}-{band_hi:.0%}"),
+            ("Trend component", f"{last['trend']:.2f}"),
+            ("Breadth component", f"{last['breadth']:.2f}"),
+            ("Stress component", f"{last['stress']:.2f}"),
+            ("VIX source", vix_src),
+            ("HY OAS source", hy_oas_src),
+        ]
+
+        if not fresh:
+            st = "stale"
+            headline = (f"score {last['score']:.1f} / {raw_regime} as of "
+                        f"{as_of.strftime('%Y-%m-%d')}  ⚠ not fresh (expected "
+                        f"session {EXPECTED_SESSION_STR})")
+        else:
+            st = "ok"
+            if raw_regime == confirmed_regime:
+                headline = (f"score {last['score']:.1f} — {confirmed_regime} "
+                            f"(equity band {band_lo:.0%}-{band_hi:.0%})")
+            else:
+                headline = (f"score {last['score']:.1f} reads {raw_regime} today, "
+                            f"but the CONFIRMED/traded regime is still "
+                            f"{confirmed_regime} (equity band {band_lo:.0%}-{band_hi:.0%}) "
+                            f"— hysteresis hasn't confirmed the move yet")
+
+        status.write("s0_regime", st, metrics={
+            "score": float(last["score"]), "raw_regime": raw_regime,
+            "confirmed_regime": confirmed_regime, "as_of": as_of.strftime("%Y%m%d"),
+        }, message=headline, day=as_of.strftime("%Y%m%d"))
+
+        return _sec("s0_regime", title, st, headline, rows)
+    except Exception as e:
+        return _sec("s0_regime", title, "fail",
+                    f"could not compute S0 regime: {type(e).__name__}: {e}", [])
+
+
+# S0's required tickers (strategies\config.py): the equity core + 11 sector
+# ETFs used for trend/breadth, plus HYG/IEF (credit proxy) — VIX and HY OAS
+# are checked separately since they're not per-ticker parquet files.
+_S0_TICKERS = ["SPY", "RSP", "XLC", "XLY", "XLP", "XLE", "XLF", "XLV",
+              "XLI", "XLB", "XLRE", "XLK", "XLU", "HYG", "IEF"]
+
+
+def build_s0_data():
+    """Tiingo/macro data freshness SCOPED to S0's own inputs only (SPY, RSP, the
+    11 sector ETFs, HYG, IEF, plus VIX and HY OAS) — not a generic warehouse-wide
+    check (that's build_tiingo, left defined but out of SECTIONS). Reads the
+    SAME manifest file strategies\\config.py / backtester\\src\\data_loader.py
+    resolve (config.MANIFEST_FILE, the authoritative LOCAL path — NOT the stale
+    Drive path build_tiingo's TIINGO_MANIFEST points at, see CLAUDE.md 2026-06-27
+    'data moved off Drive'). Never raises."""
+    title = "S0 Data Freshness"
+    try:
+        from strategies import config as s_config
+
+        manifest_path = Path(s_config.MANIFEST_FILE)
+        if not manifest_path.exists():
+            return _sec("s0_data", title, "fail",
+                        f"manifest not found at {manifest_path}", [])
+        mani = json.loads(manifest_path.read_text())
+        tickers = mani.get("tickers", {})
+
+        rows = []
+        problems = []
+        oldest_date = None
+        for t in _S0_TICKERS:
+            info = tickers.get(t)
+            if not info:
+                problems.append(f"{t} missing from manifest")
+                rows.append((t, "MISSING"))
+                continue
+            last_date = info.get("last_date", "")
+            qc = info.get("qc_flags") or []
+            fresh = _is_fresh(last_date.replace("-", "")) if last_date else False
+            if not fresh:
+                problems.append(f"{t} stale (last_date={last_date})")
+            if qc:
+                problems.append(f"{t} has QC flags: {qc}")
+            rows.append((t, f"{last_date}{'  QC:' + str(qc) if qc else ''}"))
+            if last_date and (oldest_date is None or last_date < oldest_date):
+                oldest_date = last_date
+
+        for name, key in (("VIX", "_vix"), ("HY OAS", "_hy_oas")):
+            info = tickers.get(key)
+            if not info:
+                problems.append(f"{name} missing from manifest")
+                rows.append((name, "MISSING"))
+                continue
+            last_date = info.get("last_date", "")
+            qc = info.get("qc_flags") or []
+            fresh = _is_fresh(last_date.replace("-", "")) if last_date else False
+            if not fresh:
+                problems.append(f"{name} stale (last_date={last_date})")
+            if qc:
+                problems.append(f"{name} has QC flags: {qc}")
+            rows.append((name, f"{last_date}  ({info.get('source', '?')})"
+                               f"{'  QC:' + str(qc) if qc else ''}"))
+
+        gen = mani.get("generated_at", "")
+        pulled_today = gen[:10] >= EXPECTED_SESSION.isoformat() if gen else False
+        rows.append(("Manifest generated", gen[:19] if gen else "—"))
+        rows.append(("Pulled today", "yes" if pulled_today else "no"))
+
+        if problems:
+            st = "warn"
+            headline = f"{len(problems)} issue(s): " + "; ".join(problems[:4])
+            if len(problems) > 4:
+                headline += f" (+{len(problems) - 4} more)"
+        else:
+            st = "ok"
+            headline = (f"S0's {len(_S0_TICKERS)} tickers + VIX/HY OAS all fresh, "
+                        f"no QC flags (oldest last_date {oldest_date})")
+
+        status.write("s0_data", st, metrics={
+            "n_tickers": len(_S0_TICKERS), "n_problems": len(problems),
+            "pulled_today": pulled_today,
+        }, message=headline, day=TODAY_STR)
+
+        return _sec("s0_data", title, st, headline, rows)
+    except Exception as e:
+        return _sec("s0_data", title, "fail",
+                    f"could not check S0 data freshness: {type(e).__name__}: {e}", [])
+
+
 def build_account():
     """Account cash-flow monitor — the propose-only, read-only per-account cycle
     (paperbot\\account_monitor_run.py) that runs ~4:30 PM CT. It writes an
@@ -587,12 +926,10 @@ def build_alarm():
                 f"Alarm is alive — last ran {int(age_min)}m ago ({last_line}).", rows)
 
 
-# build_thetadata is retired from SECTIONS: SPXW 1-min one-time backfill complete
-# 2026-07. Function left defined (out of SECTIONS) so it's reversible. build_forward
-# (LIVE daily options collector) stays. build_edgar added: EDGAR fundamentals is a
-# PERIODIC refresh, monitored as freshness/coverage — see build_edgar().
-SECTIONS = [build_forward, build_edgar, build_tiingo, build_gex, build_system,
-            build_strategy, build_account, build_alarm]
+# Trimmed to S0-only 2026-07-07 (see module docstring). build_forward, build_edgar,
+# build_gex, build_system, build_tiingo, build_strategy, build_alarm are all still
+# defined above/below — just not wired in — so they're one line away from coming back.
+SECTIONS = [build_s0_regime, build_s0_data, build_account]
 
 
 # --------------------------------------------------------------------------- #
