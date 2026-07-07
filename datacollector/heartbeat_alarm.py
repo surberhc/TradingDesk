@@ -111,16 +111,13 @@ RAN_MARKER = config.DATA_ROOT / "heartbeat_alarm_ran.txt"
 #                 alert so the reader knows exactly where to look)
 # --------------------------------------------------------------------------- #
 JOBS: list[dict] = [
-    {
-        "name": "spxw_1m",
-        "label": "SPXW 1-min collector",
-        "heartbeat": config.DATA_ROOT / "spxw_1m_supervisor_heartbeat.txt",
-        "progress": config.DATA_ROOT / "spxw_1m_progress.json",
-        # supervisor writes every 30s; its own stall window is 20 min, so 15 min
-        # cold => the supervisor process is dead, not merely stalled.
-        "threshold_s": 15 * 60,
-        "task_name": "Spxw1mCollector",
-    },
+    # spxw_1m (SPXW 1-min collector / Spxw1mCollector task) REMOVED 2026-07-07: the
+    # one-time historical backfill finished 2026-07-02 (1127/1127 days, 100%) and the
+    # job was intentionally superseded by universe_dl (UniverseDownloadEod) below. The
+    # Spxw1mCollector scheduled task is intentionally DISABLED (confirmed via
+    # Get-ScheduledTask) and its heartbeat is intentionally cold forever now, so
+    # monitoring it here produced a recurring false "heartbeat cold" page. See
+    # conductor/STATUS.md and memory `options-warehouse` for the backfill-complete record.
     {
         # Expanded-universe options bulk pull (universe_download.py --launcher). The
         # supervisor rewrites this heartbeat every ~30s while alive and stamps a

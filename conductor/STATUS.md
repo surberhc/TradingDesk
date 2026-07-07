@@ -20,7 +20,7 @@
   * **CanslimOverlayWatchdog** — every 20 min; overlay-pipeline watchdog (standing down; pipeline complete 2026-07-02).
   * **CanslimOverlayPipeline** — one-time task, last ran 2026-07-02, complete.
   * **HeartbeatStalenessAlarm** — every 15 min; alarms on stale collector heartbeats.
-  * **Spxw1mCollector is intentionally DISABLED** — 1-min SPXW backfill complete, superseded by UniverseDownloadEod.
+  * **Spxw1mCollector is intentionally DISABLED and fully RETIRED** (2026-07-07) — 1-min SPXW backfill complete (1127/1127 days), superseded by UniverseDownloadEod. Task confirmed Disabled in Task Scheduler; removed from `heartbeat_alarm.py` JOBS list so it no longer pages on its now-permanently-cold heartbeat (it had false-paged after 119+h stale).
 - **NEEDS ATTENTION / ANOMALIES (2026-07-06 audit):**
   1. **CAN SLIM IBKR gapfill thrash loop** — effectively complete, but the watchdog relaunches every ~65s to retry the 17 permanently-unpullable tickers. **FIX SPUN OFF to its own task.**
   2. **InvesTech Phase1 + Phase2 feeds failing** (exit code 1, 2026-07-05) — likely the H:→C: Drive-remount path break (memory `gdrive-remount-h-to-c`). **FIX SPUN OFF to its own task.**
@@ -248,7 +248,7 @@
   * `CanslimOverlayWatchdog` — every 20 min; overlay-pipeline watchdog (standing down; pipeline complete 2026-07-02).
   * `CanslimOverlayPipeline` — one-time task, last ran 2026-07-02, complete.
   * `HeartbeatStalenessAlarm` — every 15 min; alarms on stale collector heartbeats.
-  * `GatewayWatchdog` (every 5 min), `EodReport` (21:00 CT), `AccountMonitorDaily` (16:30 CT), plus the forward/tiingo/gex daily feeds + `ThetaTerminalWatchdog` round out the 13. **`Spxw1mCollector` is intentionally DISABLED** (1-min SPXW backfill complete, superseded by `UniverseDownloadEod`).
+  * `GatewayWatchdog` (every 5 min), `EodReport` (21:00 CT), `AccountMonitorDaily` (16:30 CT), plus the forward/tiingo/gex daily feeds + `ThetaTerminalWatchdog` round out the 13. **`Spxw1mCollector` is intentionally DISABLED and fully RETIRED** (2026-07-07: excluded from `heartbeat_alarm.py` JOBS — backfill complete, superseded by `UniverseDownloadEod`, no longer paged on).
   * External (non-TradingDesk): **InvesTech Phase1 + Phase2** feeds — both FAILING (exit code 1, 2026-07-05), likely the H:→C: Drive-remount path break (memory `gdrive-remount-h-to-c`); fix spun off.
 - **OUTAGE + RECOVERY 2026-06-28 ~14:47:** ThetaData terminal + collector + dashboard all died. Recovered —
   terminal relaunched via `datacollector/start_terminal.py`; collector RESUMED from day ~342 (not from scratch,
