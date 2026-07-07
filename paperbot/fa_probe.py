@@ -21,6 +21,7 @@ import sys
 
 import config
 from connections import clientids, ibkr
+from gateway_lock import GatewayBusySkip, gateway_lock
 
 # TWS API FA data types. 1=GROUPS, 2=PROFILES (de-supported on 983+), 3=ALIASES.
 FA_TYPES = {1: "GROUPS", 2: "PROFILES", 3: "ALIASES"}
@@ -32,34 +33,44 @@ def main() -> int:
     print("=" * 78)
 
     try:
-        ib = ibkr.connect("paperbot_fa", readonly=True, launch=True)
-    except Exception as exc:
-        print(f"\nCOULD NOT CONNECT: {exc}")
-        return 1
-
-    try:
-        accounts = ib.managedAccounts()
-        print(f"\nmanaged accounts: {accounts}")
-        masters = [a for a in accounts if a.startswith("DF")]
-        print(f"FA master(s): {masters or '(none - requestFA needs an advisor login)'}")
-
-        for code, name in FA_TYPES.items():
-            print(f"\n--- FA {name} (type {code}) ---")
+        with gateway_lock(purpose="fa_probe",
+                          client_id=clientids.get("paperbot_fa"), on_busy="skip"):
             try:
-                xml = ib.requestFA(code)
+                ib = ibkr.connect("paperbot_fa", readonly=True, launch=True)
             except Exception as exc:
-                print(f"  requestFA error (expected for PROFILES on build 983+): {exc}")
-                continue
-            if not xml or not str(xml).strip():
-                print("  (empty - nothing defined)")
-            else:
-                print(str(xml).strip())
+                print(f"\nCOULD NOT CONNECT: {exc}")
+                return 1
 
-        print("\nDone. Read-only: nothing was transmitted, no config was changed.")
+            try:
+                accounts = ib.managedAccounts()
+                print(f"\nmanaged accounts: {accounts}")
+                masters = [a for a in accounts if a.startswith("DF")]
+                print(f"FA master(s): {masters or '(none - requestFA needs an advisor login)'}")
+
+                for code, name in FA_TYPES.items():
+                    print(f"\n--- FA {name} (type {code}) ---")
+                    try:
+                        xml = ib.requestFA(code)
+                    except Exception as exc:
+                        print(f"  requestFA error (expected for PROFILES on build 983+): {exc}")
+                        continue
+                    if not xml or not str(xml).strip():
+                        print("  (empty - nothing defined)")
+                    else:
+                        print(str(xml).strip())
+
+                print("\nDone. Read-only: nothing was transmitted, no config was changed.")
+                return 0
+            finally:
+                ib.disconnect()
+                print("Read-only session closed.")
+    except GatewayBusySkip as busy:
+        holder = busy.holder or {}
+        print(f"\ngateway busy — held by {holder.get('purpose')} pid {holder.get('pid')} "
+              f"clientId {holder.get('client_id')} since "
+              f"{holder.get('acquired_at') or holder.get('acquired_ts')}; skipping this "
+              f"probe. (Read-only; nothing read or transmitted.)")
         return 0
-    finally:
-        ib.disconnect()
-        print("Read-only session closed.")
 
 
 if __name__ == "__main__":

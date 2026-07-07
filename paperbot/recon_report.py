@@ -32,6 +32,7 @@ import reconcile
 import strategy_target
 import version
 from connections import clientids, ibkr
+from gateway_lock import GatewayBusySkip, gateway_lock
 
 
 @dataclass
@@ -138,77 +139,87 @@ def main() -> int:
         print(f"  {v:13s} as_of={t.as_of.date()}  ({len(t.weights)} holdings)")
 
     try:
-        ib = ibkr.connect("paperbot_recon", readonly=True, launch=True)
-    except Exception as exc:
-        print(f"\nCOULD NOT CONNECT: {exc}")
-        return 1
+        with gateway_lock(purpose="recon",
+                          client_id=clientids.get("paperbot_recon"), on_busy="skip"):
+            try:
+                ib = ibkr.connect("paperbot_recon", readonly=True, launch=True)
+            except Exception as exc:
+                print(f"\nCOULD NOT CONNECT: {exc}")
+                return 1
 
-    try:
-        infos = accounts.discover(ib)
-        clients = [i for i in infos if i.enrolled and i.funded and not i.is_master]
-        if not clients:
-            print("\nNo enrolled + funded client accounts to reconcile.")
-            return 0
+            try:
+                infos = accounts.discover(ib)
+                clients = [i for i in infos if i.enrolled and i.funded and not i.is_master]
+                if not clients:
+                    print("\nNo enrolled + funded client accounts to reconcile.")
+                    return 0
 
-        plans: list[AccountPlan] = []
-        for info in sorted(clients, key=lambda x: x.number):
-            positions = {p.contract.symbol: p.position
-                         for p in ib.positions(info.number) if p.position != 0}
-            plans.append(plan_account(info.number, info.version, info.net_liq,
-                                      positions, targets[info.version]))
+                plans: list[AccountPlan] = []
+                for info in sorted(clients, key=lambda x: x.number):
+                    positions = {p.contract.symbol: p.position
+                                 for p in ib.positions(info.number) if p.position != 0}
+                    plans.append(plan_account(info.number, info.version, info.net_liq,
+                                              positions, targets[info.version]))
 
-        # --- Section A: per-account reconciliation ---
-        print(f"\n{'ACCOUNT':12s} {'TIER':13s} {'NETLIQ':>14s} {'RESERVE':>10s} "
-              f"{'INVESTABLE':>14s} {'DRIFTED':>7s}  {'ACTION':9s}  CASH FLOWS")
-        print("-" * 92)
-        for p in plans:
-            n_drift = sum(1 for ln in p.lines
-                          if ln.status in ("DRIFTED", "MISSING", "UNTRACKED"))
-            action = "REBALANCE" if p.needs_rebalance else "in-band"
-            print(f"{p.account:12s} {p.version:13s} {p.net_liq:>14,.0f} {p.reserve:>10,.0f} "
-                  f"{p.investable:>14,.0f} {n_drift:>7d}  {action:9s}  "
-                  f"{cashflows.describe(p.account, p.net_liq)}")
-        print("-" * 92)
+                # --- Section A: per-account reconciliation ---
+                print(f"\n{'ACCOUNT':12s} {'TIER':13s} {'NETLIQ':>14s} {'RESERVE':>10s} "
+                      f"{'INVESTABLE':>14s} {'DRIFTED':>7s}  {'ACTION':9s}  CASH FLOWS")
+                print("-" * 92)
+                for p in plans:
+                    n_drift = sum(1 for ln in p.lines
+                                  if ln.status in ("DRIFTED", "MISSING", "UNTRACKED"))
+                    action = "REBALANCE" if p.needs_rebalance else "in-band"
+                    print(f"{p.account:12s} {p.version:13s} {p.net_liq:>14,.0f} {p.reserve:>10,.0f} "
+                          f"{p.investable:>14,.0f} {n_drift:>7d}  {action:9s}  "
+                          f"{cashflows.describe(p.account, p.net_liq)}")
+                print("-" * 92)
 
-        # --- Section A.1: per-account holdings detail (incl. the CASH bucket) ---
-        # Slice 3: risk lines now reconcile against their TRUE model weight (no buffer
-        # haircut), and a synthetic CASH line carries the deliberate uninvested buffer.
-        # A correctly-invested account therefore reads MATCHED on every risk line and ~0
-        # drift on CASH, and TGT_W (incl. CASH) sums to ~100% — the phantom "everything is
-        # ~buffer% light" readout is gone. CASH places no order (it is readout-only).
-        print("\nPER-ACCOUNT HOLDINGS (risk lines vs TRUE model weight; CASH = uninvested "
-              "buffer bucket)")
-        for p in plans:
-            print(f"\n  {p.account}  [{p.version}]")
-            print(f"    {'STATUS':9s} {'SYM':6s} {'TGT_W':>7s} {'ACT_W':>7s} {'DRIFT':>7s}")
-            for ln in p.lines:
-                print(f"    {ln.status:9s} {ln.symbol:6s} {ln.target_weight*100:>6.2f}% "
-                      f"{ln.actual_weight*100:>6.2f}% {ln.drift_weight*100:>+6.2f}%")
-        print()
+                # --- Section A.1: per-account holdings detail (incl. the CASH bucket) ---
+                # Slice 3: risk lines now reconcile against their TRUE model weight (no buffer
+                # haircut), and a synthetic CASH line carries the deliberate uninvested buffer.
+                # A correctly-invested account therefore reads MATCHED on every risk line and ~0
+                # drift on CASH, and TGT_W (incl. CASH) sums to ~100% — the phantom "everything is
+                # ~buffer% light" readout is gone. CASH places no order (it is readout-only).
+                print("\nPER-ACCOUNT HOLDINGS (risk lines vs TRUE model weight; CASH = uninvested "
+                      "buffer bucket)")
+                for p in plans:
+                    print(f"\n  {p.account}  [{p.version}]")
+                    print(f"    {'STATUS':9s} {'SYM':6s} {'TGT_W':>7s} {'ACT_W':>7s} {'DRIFT':>7s}")
+                    for ln in p.lines:
+                        print(f"    {ln.status:9s} {ln.symbol:6s} {ln.target_weight*100:>6.2f}% "
+                              f"{ln.actual_weight*100:>6.2f}% {ln.drift_weight*100:>+6.2f}%")
+                print()
 
-        # --- Section B: aggregated block orders (fair single-price execution) ---
-        blocks = aggregate_blocks(plans)
-        print("\nAGGREGATED BLOCK ORDERS (one average price per block; per-account split fixed "
-              "at build time)")
-        if not blocks:
-            print("  none - every enrolled account is within the drift band. No trades.")
-        else:
-            cur_tier = None
-            for b in blocks:
-                if b.version != cur_tier:
-                    cur_tier = b.version
-                    print(f"\n  [{cur_tier}]")
-                split = "  ".join(f"{a[-4:]}:{q}" for a, q in sorted(b.per_account.items()))
-                print(f"    {b.side:4s} {b.symbol:6s} x{b.total_qty:<7d} {b.reason:18s} -> {split}")
-            print(f"\n  {len(blocks)} block order(s) across "
-                  f"{sum(1 for p in plans if p.needs_rebalance)} account(s) needing rebalance.")
+                # --- Section B: aggregated block orders (fair single-price execution) ---
+                blocks = aggregate_blocks(plans)
+                print("\nAGGREGATED BLOCK ORDERS (one average price per block; per-account split fixed "
+                      "at build time)")
+                if not blocks:
+                    print("  none - every enrolled account is within the drift band. No trades.")
+                else:
+                    cur_tier = None
+                    for b in blocks:
+                        if b.version != cur_tier:
+                            cur_tier = b.version
+                            print(f"\n  [{cur_tier}]")
+                        split = "  ".join(f"{a[-4:]}:{q}" for a, q in sorted(b.per_account.items()))
+                        print(f"    {b.side:4s} {b.symbol:6s} x{b.total_qty:<7d} {b.reason:18s} -> {split}")
+                    print(f"\n  {len(blocks)} block order(s) across "
+                          f"{sum(1 for p in plans if p.needs_rebalance)} account(s) needing rebalance.")
 
-        print("\nDone. READ-ONLY: nothing was transmitted, no orders were built. "
-              "Review-only readout.")
+                print("\nDone. READ-ONLY: nothing was transmitted, no orders were built. "
+                      "Review-only readout.")
+                return 0
+            finally:
+                ib.disconnect()
+                print("Read-only session closed.")
+    except GatewayBusySkip as busy:
+        holder = busy.holder or {}
+        print(f"\ngateway busy — held by {holder.get('purpose')} pid {holder.get('pid')} "
+              f"clientId {holder.get('client_id')} since "
+              f"{holder.get('acquired_at') or holder.get('acquired_ts')}; skipping this "
+              f"probe. (Read-only; nothing read or transmitted.)")
         return 0
-    finally:
-        ib.disconnect()
-        print("Read-only session closed.")
 
 
 if __name__ == "__main__":

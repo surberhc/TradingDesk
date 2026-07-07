@@ -31,6 +31,7 @@ from datetime import date, datetime
 
 import config
 from connections import clientids, ibkr
+from gateway_lock import GatewayBusySkip, gateway_lock
 
 
 # --- account-feed field parsing (PURE — no broker) -----------------------------
@@ -157,56 +158,66 @@ def main() -> int:
     print("=" * 86)
 
     try:
-        # Own clientId (paperbot_accounts) so discovery can run even while the
-        # execution engine (clientId 30) is connected.
-        ib = ibkr.connect("paperbot_accounts", readonly=True, launch=True)
-    except Exception as exc:
-        print("\nCOULD NOT CONNECT.")
-        print(f"  reason: {exc}")
-        print(f"  -> Is IB Gateway up and logged into PAPER, API on port {ibkr.PAPER_PORT}?")
-        return 1
+        with gateway_lock(purpose="accounts",
+                          client_id=clientids.get("paperbot_accounts"), on_busy="skip"):
+            try:
+                # Own clientId (paperbot_accounts) so discovery can run even while the
+                # execution engine (clientId 30) is connected.
+                ib = ibkr.connect("paperbot_accounts", readonly=True, launch=True)
+            except Exception as exc:
+                print("\nCOULD NOT CONNECT.")
+                print(f"  reason: {exc}")
+                print(f"  -> Is IB Gateway up and logged into PAPER, API on port {ibkr.PAPER_PORT}?")
+                return 1
 
-    try:
-        infos = discover(ib)
-        if not infos:
-            print("\nSTOP: the gateway reported no managed accounts.")
-            return 2
+            try:
+                infos = discover(ib)
+                if not infos:
+                    print("\nSTOP: the gateway reported no managed accounts.")
+                    return 2
 
-        # Confirm exactly one FA master, and that it ends in our configured suffix.
-        masters = [i for i in infos if i.is_master]
-        if len(masters) == 1 and masters[0].number.endswith(config.ACCOUNT_SUFFIX):
-            print(f"\nFA master: {masters[0].number} (suffix '{config.ACCOUNT_SUFFIX}' OK)")
-        else:
-            print(f"\nWARNING: expected one FA master ending in '{config.ACCOUNT_SUFFIX}', "
-                  f"found masters={[m.number for m in masters]}.")
+                # Confirm exactly one FA master, and that it ends in our configured suffix.
+                masters = [i for i in infos if i.is_master]
+                if len(masters) == 1 and masters[0].number.endswith(config.ACCOUNT_SUFFIX):
+                    print(f"\nFA master: {masters[0].number} (suffix '{config.ACCOUNT_SUFFIX}' OK)")
+                else:
+                    print(f"\nWARNING: expected one FA master ending in '{config.ACCOUNT_SUFFIX}', "
+                          f"found masters={[m.number for m in masters]}.")
 
-        # --- The account table ---
-        print(f"\n{'ACCOUNT':12s} {'KIND':13s} {'NETLIQ':>14s} {'CASH':>14s} "
-              f"{'POS':>4s}  {'FUNDED':>6s}  {'ENROLLED / VERSION'}")
-        print("-" * 86)
-        for i in sorted(infos, key=lambda x: (not x.is_master, x.number)):
-            enroll = (f"{i.version}" if i.enrolled
-                      else ("(advisor acct)" if i.is_master else "NOT ENROLLED"))
-            print(f"{i.number:12s} {i.kind:13s} {i.net_liq:>14,.2f} {i.total_cash:>14,.2f} "
-                  f"{i.n_positions:>4d}  {'yes' if i.funded else 'no':>6s}  {enroll}")
-        print("-" * 86)
+                # --- The account table ---
+                print(f"\n{'ACCOUNT':12s} {'KIND':13s} {'NETLIQ':>14s} {'CASH':>14s} "
+                      f"{'POS':>4s}  {'FUNDED':>6s}  {'ENROLLED / VERSION'}")
+                print("-" * 86)
+                for i in sorted(infos, key=lambda x: (not x.is_master, x.number)):
+                    enroll = (f"{i.version}" if i.enrolled
+                              else ("(advisor acct)" if i.is_master else "NOT ENROLLED"))
+                    print(f"{i.number:12s} {i.kind:13s} {i.net_liq:>14,.2f} {i.total_cash:>14,.2f} "
+                          f"{i.n_positions:>4d}  {'yes' if i.funded else 'no':>6s}  {enroll}")
+                print("-" * 86)
 
-        # --- Enrollment vs reality ---
-        warnings = reconcile_enrollment(infos)
-        print("\nEnrollment reconciliation:")
-        if not warnings:
-            print("  clean - every enrolled account is visible, valid, and funded.")
-        else:
-            for w in warnings:
-                print(f"  ! {w}")
-    # (ASCII only in console output - the paper Gateway console is cp1252.)
+                # --- Enrollment vs reality ---
+                warnings = reconcile_enrollment(infos)
+                print("\nEnrollment reconciliation:")
+                if not warnings:
+                    print("  clean - every enrolled account is visible, valid, and funded.")
+                else:
+                    for w in warnings:
+                        print(f"  ! {w}")
+            # (ASCII only in console output - the paper Gateway console is cp1252.)
 
-        n_ready = sum(1 for i in infos if i.enrolled and i.funded and not i.is_master)
-        print(f"\n{n_ready} client account(s) enrolled AND funded -> rebalanceable now.")
-        print("Done. Nothing was transmitted. Read-only session closing.")
+                n_ready = sum(1 for i in infos if i.enrolled and i.funded and not i.is_master)
+                print(f"\n{n_ready} client account(s) enrolled AND funded -> rebalanceable now.")
+                print("Done. Nothing was transmitted. Read-only session closing.")
+                return 0
+            finally:
+                ib.disconnect()
+    except GatewayBusySkip as busy:
+        holder = busy.holder or {}
+        print(f"\ngateway busy — held by {holder.get('purpose')} pid {holder.get('pid')} "
+              f"clientId {holder.get('client_id')} since "
+              f"{holder.get('acquired_at') or holder.get('acquired_ts')}; skipping this "
+              f"probe. (Read-only; nothing read or transmitted.)")
         return 0
-    finally:
-        ib.disconnect()
 
 
 if __name__ == "__main__":
