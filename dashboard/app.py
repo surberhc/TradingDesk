@@ -1,25 +1,31 @@
 """
-app.py — Trading Desk unified dashboard (Phase 1). READ-ONLY.
+app.py — Trading Desk dashboard, scoped to S0 (Adaptive All-Weather Core). READ-ONLY.
 
-A single Streamlit app, phone- and desktop-friendly, that *shows* the state of the
-whole desk by reusing the existing Python directly. It NEVER places, arms, or
-transmits an order, never writes to the warehouse/config, never calls replaceFA.
+Per Andrew's explicit direction (post-review session, 2026-07-07): this dashboard
+focuses on S0, the ONE strategy actually live-paper-tested, not a whole-desk
+monitor. Everything else (Gamma/GEX awareness panel, S5 Convexity research view,
+EDGAR/CAN SLIM fundamentals coverage, the full scheduled-task inventory) has been
+archived — physically moved, not deleted — to dashboard/archive/, ready to
+reinstate the moment another strategy needs its own dashboard presence. See the
+docstrings in dashboard/archive/*.py for what moved where and how to bring it back.
 
-Five sections (tabs):
-  1. Health      — EDGAR fundamentals freshness/coverage (periodic refresh), EOD
-                   warehouse coverage, the status JSONs (forward/tiingo/gex/
-                   eod_report), Windows task states. (The SPXW 1-min one-time-grab
-                   panel is retired — backfill complete 2026-07.)
-  2. Gamma (GEX) — latest SPX/SPXW/SPY dealer-gamma snapshot + a history chart.
-  3. Backtests   — latest CAGR/maxDD/Calmar/Sortino/down-capture for the 3 versions
-                   (computed via the validated run_backtest, cached) + links to the
-                   existing plotly HTML reports.
-  4. S5 Convexity — read-only research view of the S5 financed-convexity overlay
-                   EOD prototype ledger (defensive half only; recomputed live).
-  5. Accounts    — the 5 DU paper subs read read-only through the gateway, with a
-                   SHORT connect timeout so a weekend/feed-down gateway degrades to
-                   "Gateway offline" instead of hanging. Drift vs target + the
-                   rebalance PLAN preview (build-only). NO controls anywhere.
+A single Streamlit app, phone- and desktop-friendly, that *shows* the state of S0
+by reusing the existing Python directly. It NEVER places, arms, or transmits an
+order, never writes to the warehouse/config, never calls replaceFA.
+
+Three sections (tabs):
+  1. Health      — S0's own data pipeline (Tiingo EOD feed status), the S0-only
+                   nightly EOD email's own status, the account-monitor/rebalance
+                   task, gateway up/down (cheap TCP probe, no live ib_async
+                   connection), and disk free space.
+  2. Backtests   — latest CAGR/maxDD/Calmar/Sortino/down-capture for S0's 3
+                   versions (computed via the validated run_backtest, cached) +
+                   links to the existing plotly HTML reports.
+  3. Accounts    — the 5 DU paper subs (all enrolled in S0) read read-only through
+                   the gateway, with a SHORT connect timeout so a weekend/feed-down
+                   gateway degrades to "Gateway offline" instead of hanging. Drift
+                   vs target + the rebalance PLAN preview (build-only). NO controls
+                   anywhere.
 
 Launch (see run_dashboard.bat): binds 0.0.0.0 so a phone on the LAN can reach it.
 
@@ -41,7 +47,6 @@ from pathlib import Path
 
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
 REPO = Path(__file__).resolve().parent.parent
@@ -55,35 +60,30 @@ if str(_conn) not in sys.path:
     sys.path.insert(0, str(_conn))
 
 # dailyreport is a flat sys.path addition (no __init__.py), same convention as
-# the other folders above — import its modules directly.
-import desk_health
+# the other folders above — import its modules directly. (desk_health.py is
+# still the shared computation module for the archived Gamma/EDGAR panels —
+# see dashboard/archive/ — but app.py itself no longer needs it directly.)
 import status as dr_status
 
 # --- Local data locations (off-Drive, on C:) -----------------------------------
-WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse")
-DERIVED = WAREHOUSE / "derived"
-PROGRESS_JSON = WAREHOUSE / "spxw_1m_progress.json"  # retired panel (backfill done 2026-07); kept for reversibility
+# (WAREHOUSE/derived-GEX-parquet paths are no longer needed here — that's the
+# archived Gamma tab's territory; see dashboard/archive/gamma_tab.py.)
 STATUS_DIR = Path(r"C:\TradingDesk-Local\state\dailyreport\status")
 BACKTEST_OUTPUT = REPO / "backtester" / "output"
-# S5 convexity-ledger experiment summary (head-to-head + tail-sizing frontier tables).
-# The full per-day NAV/ledger time series is recomputed live via simulate_s5 (fast, cached).
-S5_LEDGER_CSV = BACKTEST_OUTPUT / "s5_ledger_experiment_20260630.csv"
-S5_TAIL_SWEEP_MD = BACKTEST_OUTPUT / "s5_tail_sweep_20260628.md"
 
-# EDGAR point-in-time fundamentals warehouse (off-Drive, on C:). A PERIODIC
-# (monthly-ish) refresh — monitored here as freshness/coverage, not a daily feed.
-EDGAR = Path(r"C:\TradingDesk-Local\canslim\edgar")
-EDGAR_FUNDAMENTALS = EDGAR / "quarterly_fundamentals.parquet"
-EDGAR_STALE_DAYS = 45   # periodic-refresh threshold
-
-# Windows scheduled tasks that drive the desk (name -> friendly label).
-# (Spxw1mCollector retired — the SPXW 1-min one-time backfill is complete 2026-07.)
+# Windows scheduled tasks that actually drive S0 (name -> friendly label).
+# The full whole-desk task inventory (ThetaData/GEX/EDGAR etc.) is archived in
+# dashboard/archive/health_extras.py — this is deliberately the S0-only subset:
+#   TiingoDailyUpdate  — S0's real data inputs (SPY/RSP/sectors/HYG/IEF EOD)
+#   EodReport          — the nightly EOD email, now trimmed to S0-only sections
+#   AccountMonitorDaily — daily drift check + propose-only rebalance for the
+#                         S0-enrolled paper accounts
+#   GatewayWatchdog    — keeps the paper gateway S0's Accounts tab reads through up
 SCHEDULED_TASKS = {
-    "ThetaEodDaily": "EOD options (ThetaData)",
-    "ThetaForwardDaily": "Forward EOD grab",
-    "TiingoDailyUpdate": "Tiingo equity EOD",
-    "GexDailyBuild": "GEX daily build",
-    "EodReport": "EOD status report",
+    "TiingoDailyUpdate": "Tiingo equity EOD (S0 inputs)",
+    "EodReport": "EOD status report (S0-only)",
+    "AccountMonitorDaily": "Account monitor / rebalance check",
+    "GatewayWatchdog": "Gateway watchdog",
 }
 
 BACKTEST_VERSIONS = ("Conservative", "Balanced", "Growth")
@@ -148,13 +148,6 @@ def _fmt_dt(ts: str | None) -> str:
     return str(ts).replace("T", " ")
 
 
-def _fmt_big(x: float, nd: int = 2) -> str:
-    """One shared magnitude formatter: raw dollars/notional -> a compact B/M/K string.
-    Used so GEX numbers read consistently across the snapshot tiles, chart and history.
-    Thin wrapper over the shared formatter — see desk_health.fmt_magnitude."""
-    return desk_health.fmt_magnitude(x, nd=nd)
-
-
 def _status_tier(status: str) -> str:
     """Map any free-text status onto one of: good / warn / bad / unknown."""
     s = (status or "").lower()
@@ -199,8 +192,9 @@ def load_json(path_str: str) -> dict | None:
 
 @st.cache_data(ttl=60)
 def scheduled_task_states() -> dict:
-    """Read Windows Task Scheduler states for the desk's jobs (read-only). Best-effort:
-    returns {label: state} and degrades to {} if PowerShell/schtasks isn't reachable."""
+    """Read Windows Task Scheduler states for S0's own jobs (read-only). Best-effort:
+    returns {label: state} and degrades to {} if PowerShell/schtasks isn't reachable.
+    (The full whole-desk task inventory is archived — see dashboard/archive/health_extras.py.)"""
     import subprocess
     states: dict[str, str] = {}
     try:
@@ -228,83 +222,32 @@ def scheduled_task_states() -> dict:
 
 
 # ================================ 1. HEALTH ===================================
-@st.cache_data(ttl=120)
-def eod_coverage() -> tuple[pd.DataFrame, dict]:
-    """EOD warehouse coverage straight from the derived GEX parquet files (no DB lock
-    contention with the live collector). Returns (per-symbol table, summary dict)."""
-    files = sorted(DERIVED.glob("*_gex_daily.parquet"))
-    rows = []
-    for f in files:
-        sym = f.name.replace("_gex_daily.parquet", "")
-        try:
-            d = pd.read_parquet(f, columns=["date"])
-            rows.append({
-                "symbol": sym,
-                "days": len(d),
-                "first": str(d["date"].min()),
-                "last": str(d["date"].max()),
-            })
-        except Exception:
-            rows.append({"symbol": sym, "days": 0, "first": "—", "last": "—"})
-    df = pd.DataFrame(rows)
-    summary = {
-        "n_symbols": len(df),
-        "total_day_rows": int(df["days"].sum()) if not df.empty else 0,
-        "latest_day": str(df["last"].max()) if not df.empty else "—",
-    }
-    return df, summary
+def _port_open(host: str, port: int, timeout: float = 2.0) -> bool:
+    """Cheap 'is something listening?' TCP probe — milliseconds, no asyncio, no
+    trading session. Same pattern as dailyreport/eod_report.py::_port_open — a
+    live ib_async connect just to print up/down previously crashed a
+    non-interactive scheduled job (silent for 5 nights, 2026-06-27..07-01). A
+    port-open check is a safe proxy for 'up' and safe to call on every page load."""
+    import socket
+    try:
+        with socket.create_connection((host, port), timeout=timeout):
+            return True
+    except OSError:
+        return False
 
 
-@st.cache_data(ttl=120)
-def edgar_coverage() -> dict:
-    """EDGAR point-in-time fundamentals freshness/coverage — presentation shaping
-    on top of the shared desk_health.edgar_coverage() computation (also used by
-    dailyreport/eod_report.py::build_edgar()). Returns a summary dict shaped for
-    the Streamlit tiles; degrades gracefully to an 'info: build landing' state
-    when the table isn't there yet.
-
-    tier: good (fresh) / warn (stale or in-progress) / unknown (not landed yet)."""
-    ec = desk_health.edgar_coverage(EDGAR, EDGAR_FUNDAMENTALS, EDGAR_STALE_DAYS)
-
-    if not ec["dir_present"]:
-        return {"tier": "unknown", "state": "build landing",
-                "companies": None, "size_gb": 0.0, "n_files": 0,
-                "table_present": False, "last_refresh": "—", "age_days": None,
-                "newest_file": "—", "headline": "EDGAR warehouse dir not present yet."}
-
-    companies = ec["n_companies"]
-    table_present = ec["table_present"]
-    refresh_dt = ec["refresh_dt"]
-    age_days = ec["age_days"]
-    newest_name = ec["newest_file"]
-    newest_mtime = ec["newest_mtime"]
-
-    if ec["recent_activity"]:
-        tier, state = "warn", "refresh in progress"
-        headline = (f"Build/refresh in progress — newest file {newest_name} "
-                    "updated in the last 15 min. Table not final.")
-    elif not table_present:
-        tier, state = "unknown", "build landing"
-        headline = "Fundamentals table not written yet."
-    elif ec["state"] == "stale":
-        tier, state = "warn", "stale"
-        headline = (f"Stale — last refresh {age_days}d ago "
-                    f"(> {EDGAR_STALE_DAYS}d periodic threshold). Time to re-pull EDGAR.")
-    else:
-        tier, state = "good", "fresh"
-        headline = (f"Fresh — {companies:,} companies, last refresh {age_days}d ago."
-                    if companies is not None else f"Fresh — last refresh {age_days}d ago.")
-
-    return {
-        "tier": tier, "state": state, "companies": companies,
-        "size_gb": ec["size_bytes"] / 1e9, "n_files": ec["n_files"],
-        "table_present": table_present,
-        "last_refresh": refresh_dt.strftime("%Y-%m-%d %H:%M") if refresh_dt else "—",
-        "age_days": age_days,
-        "newest_file": f"{newest_name} @ {datetime.fromtimestamp(newest_mtime):%Y-%m-%d %H:%M}"
-                       if newest_name else "—",
-        "headline": headline,
-    }
+@st.cache_data(ttl=30)
+def gateway_status() -> dict:
+    """S0's paper gateway (port 4002) up/down + C: free disk space — the two
+    cheapest 'will things break tonight' checks. No live trading session opened."""
+    up = _port_open("127.0.0.1", 4002)
+    try:
+        import shutil as _shutil
+        _t, _u, free = _shutil.disk_usage("C:\\")
+        free_gb = free / 1e9
+    except Exception:
+        free_gb = None
+    return {"gateway_up": up, "free_gb": free_gb}
 
 
 def _parse_ts(s: str | None) -> datetime | None:
@@ -321,29 +264,15 @@ def _parse_ts(s: str | None) -> datetime | None:
 
 @st.cache_data(ttl=60)
 def last_refreshed() -> str:
-    """Newest of every available data timestamp: collector `updated`, the status
-    JSON `ts` values, latest GEX `date`, and the newest backtest report mtime."""
+    """Newest of every available S0-relevant data timestamp: the tiingo/eod_report
+    status JSON `ts` values, and the newest backtest report mtime."""
     cands: list[datetime] = []
-    try:
-        ec = edgar_coverage()
-        d = _parse_ts(ec.get("last_refresh"))
-        if d:
-            cands.append(d)
-    except Exception:
-        pass
-    for name in ("forward", "tiingo", "gex", "eod_report"):
+    for name in ("tiingo", "eod_report"):
         js = load_json(str(STATUS_DIR / f"{name}.json"))
         if js:
             d = _parse_ts(js.get("ts")) or _parse_ts(js.get("date"))
             if d:
                 cands.append(d)
-    try:
-        _, summ = eod_coverage()
-        d = _parse_ts(summ.get("latest_day"))
-        if d:
-            cands.append(d)
-    except Exception:
-        pass
     for v in BACKTEST_VERSIONS:
         f = BACKTEST_OUTPUT / f"backtest_report_{v}.html"
         if f.exists():
@@ -355,13 +284,14 @@ def last_refreshed() -> str:
 
 @st.cache_data(ttl=60)
 def desk_status() -> dict:
-    """Roll the pipeline up into one home-screen summary. Read-only; reuses the
-    same JSONs/parquet the detail sections show."""
-    # Overall pipeline health = worst tier across the status JSONs.
+    """Roll S0's pipeline up into one home-screen summary. Read-only; reuses the
+    same JSONs the detail section shows, plus the gateway/disk probe."""
+    # Overall pipeline health = worst tier across S0's own status JSONs.
     order = {"good": 0, "unknown": 1, "warn": 2, "bad": 3}
     worst, worst_name = "good", "—"
     any_status = False
-    for name in ("forward", "tiingo", "gex", "eod_report"):
+    latest_day = "—"
+    for name in ("tiingo", "eod_report"):
         js = load_json(str(STATUS_DIR / f"{name}.json"))
         if not js:
             continue
@@ -370,19 +300,12 @@ def desk_status() -> dict:
         t = _status_tier(shown)
         if order[t] > order[worst]:
             worst, worst_name = t, name
+        if name == "tiingo" and js.get("date"):
+            latest_day = js["date"]
     if not any_status:
         worst = "unknown"
 
-    try:
-        ec = edgar_coverage()
-    except Exception:
-        ec = {"tier": "unknown", "state": "—", "companies": None, "age_days": None}
-
-    try:
-        _, summ = eod_coverage()
-        latest_day = summ.get("latest_day", "—")
-    except Exception:
-        latest_day = "—"
+    gw = gateway_status()
 
     states = scheduled_task_states()
     not_ready = sum(1 for s in states.values() if str(s).lower() != "ready")
@@ -390,88 +313,51 @@ def desk_status() -> dict:
 
     return {
         "overall_tier": worst, "overall_name": worst_name,
-        "edgar_tier": ec.get("tier", "unknown"), "edgar_state": ec.get("state", "—"),
-        "edgar_companies": ec.get("companies"), "edgar_age_days": ec.get("age_days"),
         "latest_day": latest_day,
+        "gateway_up": gw["gateway_up"], "free_gb": gw["free_gb"],
         "tasks_not_ready": not_ready, "tasks_total": n_tasks,
     }
 
 
 def render_health() -> None:
-    st.subheader("Desk health")
+    st.subheader("S0 health")
+    st.caption("Scoped to S0 (Adaptive All-Weather Core): its data pipeline, its "
+               "own scheduled tasks, and the gateway/disk checks. Whole-desk "
+               "sections (EDGAR, GEX, full task inventory) are archived — see "
+               "dashboard/archive/.")
 
-    # --- At-a-glance desk status (the "is anything broken?" row) ---
+    # --- At-a-glance S0 status (the "is anything broken?" row) ---
     s = desk_status()
     cols = st.columns(4)
     with cols[0]:
         tier = s["overall_tier"]
         label = {"good": "Healthy", "warn": "Warning",
                  "bad": "Problem", "unknown": "Unknown"}[tier]
-        st.metric("Pipeline health", f"{_TIER_DOT[tier]} {label}", border=True)
+        st.metric("S0 pipeline health", f"{_TIER_DOT[tier]} {label}", border=True)
         if tier in ("warn", "bad") and s["overall_name"] != "—":
             st.caption(f"worst: {s['overall_name']}")
     with cols[1]:
-        et = s["edgar_tier"]
-        companies = s.get("edgar_companies")
-        val = f"{companies:,}" if companies is not None else "—"
-        st.metric("EDGAR companies", f"{_TIER_DOT[et]} {val}", border=True)
-        age = s.get("edgar_age_days")
-        st.caption(f"{s['edgar_state']}"
-                   + (f" · {age}d old" if age is not None else ""))
+        st.metric("Latest Tiingo data day", s["latest_day"], border=True)
     with cols[2]:
-        st.metric("Latest warehouse day", s["latest_day"], border=True)
-    with cols[3]:
-        nr = s["tasks_not_ready"]
-        st.metric("Tasks not Ready", f"{nr} / {s['tasks_total']}",
-                  delta=("all Ready" if nr == 0 and s["tasks_total"] else None),
-                  delta_color="off", border=True)
+        up = s["gateway_up"]
+        tier_g = "good" if up else "warn"
+        st.metric("Paper gateway (4002)", f"{_TIER_DOT[tier_g]} {'UP' if up else 'DOWN'}", border=True)
         is_weekend = datetime.now().weekday() >= 5
-        st.caption("Weekend — gateway offline is expected"
-                   if is_weekend else "Weekday — gateway should be up")
+        st.caption("Weekend — offline is expected"
+                   if is_weekend else "Weekday — should be up")
+    with cols[3]:
+        fg = s["free_gb"]
+        val = f"{fg:.0f} GB" if fg is not None else "—"
+        tier_d = "good" if (fg is None or fg > 5) else "warn"
+        st.metric("C: free space", f"{_TIER_DOT[tier_d]} {val}", border=True)
     _badge_legend()
 
     st.divider()
 
-    # --- EDGAR fundamentals freshness / coverage ---
-    # (The SPXW 1-min one-time-grab panel is retired: backfill complete 2026-07.)
-    # EDGAR is a PERIODIC (monthly-ish) refresh — shown as freshness/coverage, not a
-    # nightly download. Handles a partially-built (mid-refresh) warehouse gracefully.
-    ec = edgar_coverage()
-    st.markdown("#### EDGAR fundamentals (point-in-time)")
-    et = ec["tier"]
-    st.markdown(
-        f"{_TIER_DOT[et]} **{_color_text(ec['state'], et)}** — {ec['headline']}",
-        unsafe_allow_html=True)
-    c1, c2, c3, c4 = st.columns(4)
-    comp = ec["companies"]
-    c1.metric("Companies", f"{comp:,}" if comp is not None else "—")
-    c2.metric("Warehouse size", f"{ec['size_gb']:.2f} GB")
-    age = ec["age_days"]
-    c3.metric("Refresh age", f"{age}d" if age is not None else "—")
-    c4.metric("Files", f"{ec['n_files']:,}")
-    st.caption(
-        f"Last refresh {ec['last_refresh']} · "
-        f"table {'present' if ec['table_present'] else 'not built yet'} · "
-        f"newest file: {ec['newest_file']}")
-
-    st.divider()
-
-    # --- EOD warehouse coverage ---
-    st.markdown("#### EOD warehouse coverage (derived GEX tables)")
-    df, summ = eod_coverage()
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Symbols", summ["n_symbols"])
-    c2.metric("Total day-rows", f"{summ['total_day_rows']:,}")
-    c3.metric("Latest day", summ["latest_day"])
-    with st.expander("Per-symbol coverage"):
-        st.dataframe(df, use_container_width=True, hide_index=True)
-
-    st.divider()
-
-    # --- Status JSONs ---
+    # --- Status JSONs (S0-relevant only) ---
     st.markdown("#### Pipeline status")
-    cols = st.columns(4)
-    for col, name in zip(cols, ("forward", "tiingo", "gex", "eod_report")):
+    cols = st.columns(2)
+    for col, name in zip(cols, ("tiingo", "eod_report")):
         js = load_json(str(STATUS_DIR / f"{name}.json"))
         with col:
             if not js:
@@ -492,176 +378,22 @@ def render_health() -> None:
 
     st.divider()
 
-    # --- Windows scheduled tasks ---
-    st.markdown("#### Scheduled tasks (Windows)")
+    # --- S0's own scheduled tasks ---
+    st.markdown("#### S0 scheduled tasks (Windows)")
     states = scheduled_task_states()
     if not states:
         st.caption("Task states unavailable on this host.")
     else:
-        cols = st.columns(3)
+        cols = st.columns(2)
         for i, (label, state) in enumerate(states.items()):
-            with cols[i % 3]:
+            with cols[i % 2]:
                 tier = _status_tier(state)
                 st.markdown(
                     f"{_TIER_DOT[tier]} **{label}** — {_color_text(state, tier)}",
                     unsafe_allow_html=True)
 
 
-# ================================ 2. GAMMA ====================================
-@st.cache_data(ttl=120)
-def gex_latest(symbol: str) -> dict | None:
-    f = DERIVED / f"{symbol}_gex_daily.parquet"
-    if not f.exists():
-        return None
-    try:
-        df = pd.read_parquet(f)
-        last = df.iloc[-1]
-        return {col: last[col] for col in df.columns}
-    except Exception:
-        return None
-
-
-@st.cache_data(ttl=120)
-def gex_history(symbol: str, n: int = 250) -> pd.DataFrame | None:
-    f = DERIVED / f"{symbol}_gex_daily.parquet"
-    if not f.exists():
-        return None
-    try:
-        df = pd.read_parquet(f).tail(n).copy()
-        df["date"] = pd.to_datetime(df["date"].astype(str), format="%Y%m%d")
-        return df
-    except Exception:
-        return None
-
-
-def render_gamma() -> None:
-    st.subheader("Dealer gamma (GEX)")
-
-    snap_syms = ["SPX", "SPXW", "SPY"]
-    cols = st.columns(len(snap_syms))
-    for col, sym in zip(cols, snap_syms):
-        snap = gex_latest(sym)
-        with col:
-            st.markdown(f"### {sym}")
-            if not snap:
-                st.caption("no data")
-                continue
-            state = str(snap.get("gamma_state", "—"))
-            # Shared with dailyreport/eod_report.py — see desk_health.GAMMA_STATE_TIER.
-            # Negative gamma is a market-condition/awareness signal, not a pipeline
-            # failure: maps to "warn" (amber), not "bad" (red).
-            dh_tier = desk_health.GAMMA_STATE_TIER.get(state, "info")
-            g_tier = {"ok": "good", "warn": "warn", "info": "unknown"}.get(dh_tier, "unknown")
-            st.markdown(
-                f"{_TIER_DOT[g_tier]} **{_color_text(state + ' gamma', g_tier)}**",
-                unsafe_allow_html=True)
-            net = snap.get("net_gex", 0) or 0
-            net_tier = "good" if net > 0 else ("bad" if net < 0 else "unknown")
-            st.metric("Spot", f"{snap.get('spot', float('nan')):,.2f}", border=True)
-            st.metric("Net GEX", f"{_fmt_big(net)}",
-                      delta=("positive" if net > 0 else "negative" if net < 0 else None),
-                      delta_color=("normal" if net > 0 else "inverse" if net < 0 else "off"),
-                      border=True)
-            st.metric("Gamma flip", f"{snap.get('gamma_flip', float('nan')):,.2f}", border=True)
-            st.metric("Dist to flip", f"{snap.get('dist_to_flip_pct', float('nan')):.2f}%", border=True)
-            st.metric("Expected move", f"{snap.get('expected_move_pct', float('nan')):.3f}%", border=True)
-            st.caption(f"as of {snap.get('date','—')}")
-
-    st.divider()
-
-    # --- L1: GEX zero-line / flip chart -------------------------------------
-    # The headline viz. Replaces the bare line chart with a proper plotly chart:
-    #   * net GEX drawn as a signed area with a ZERO LINE marked (green above /
-    #     red below) — the "are we long or short gamma" read at a glance;
-    #   * spot vs gamma_flip on a secondary y-axis, so you see how far price is
-    #     from the flip level (positive- vs negative-gamma regime boundary).
-    # Pure frontend on the existing *_gex_daily.parquet (net_gex, spot,
-    # gamma_flip already present) — no new data, no writes.
-    st.markdown("#### GEX zero-line / flip chart")
-    all_syms = sorted(p.name.replace("_gex_daily.parquet", "")
-                      for p in DERIVED.glob("*_gex_daily.parquet"))
-    default_idx = all_syms.index("SPX") if "SPX" in all_syms else 0
-    c1, c2 = st.columns([1, 1])
-    sym = c1.selectbox("Symbol", all_syms, index=default_idx)
-    lookback_label = c2.selectbox("Lookback", ["30", "90", "250", "All"], index=2)
-    n = 100_000 if lookback_label == "All" else int(lookback_label)
-
-    hist = gex_history(sym, n=n)
-    if hist is None or hist.empty:
-        st.caption("no history")
-    else:
-        have_flip = "gamma_flip" in hist.columns and hist["gamma_flip"].notna().any()
-        have_spot = "spot" in hist.columns and hist["spot"].notna().any()
-
-        # --- Panel 1: net GEX with a zero line (sign = gamma regime) ---
-        gb = hist["net_gex"] / 1e9
-        pos = gb.where(gb >= 0)
-        neg = gb.where(gb < 0)
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(
-            x=hist["date"], y=pos, name="net GEX ≥ 0 (long gamma)",
-            fill="tozeroy", mode="lines", line=dict(color=_TIER_COLOR["good"], width=1),
-            connectgaps=False))
-        fig.add_trace(go.Scatter(
-            x=hist["date"], y=neg, name="net GEX < 0 (short gamma)",
-            fill="tozeroy", mode="lines", line=dict(color=_TIER_COLOR["bad"], width=1),
-            connectgaps=False))
-        fig.add_hline(y=0, line_width=1.4, line_color="#c9ccd1")
-        last_g = gb.iloc[-1]
-        fig.update_layout(
-            height=300, margin=dict(l=10, r=10, t=28, b=10),
-            template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            title=dict(text=f"{sym} net GEX ($B) — last {len(hist)} sessions "
-                            f"(latest {_fmt_big(hist['net_gex'].iloc[-1])})", font=dict(size=13)),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-            yaxis=dict(title="net GEX ($B)"))
-        st.plotly_chart(fig, use_container_width=True)
-        regime = ("positive gamma (mean-reverting)" if last_g > 0 else
-                  "negative gamma (trend-amplifying)" if last_g < 0 else "flat")
-        st.caption(f"Latest net GEX {_fmt_big(hist['net_gex'].iloc[-1])} → **{regime}**. "
-                   "Above the zero line = dealers long gamma (dampen moves); "
-                   "below = short gamma (amplify moves).")
-
-        # --- Panel 2: spot vs the gamma-flip level ---
-        if have_spot and have_flip:
-            f2 = go.Figure()
-            f2.add_trace(go.Scatter(
-                x=hist["date"], y=hist["spot"], name="spot",
-                mode="lines", line=dict(color="#5b9dff", width=1.4)))
-            f2.add_trace(go.Scatter(
-                x=hist["date"], y=hist["gamma_flip"], name="gamma flip",
-                mode="lines", line=dict(color="#f5c451", width=1.2, dash="dot")))
-            sp, fl = hist["spot"].iloc[-1], hist["gamma_flip"].iloc[-1]
-            above = sp >= fl
-            f2.update_layout(
-                height=260, margin=dict(l=10, r=10, t=28, b=10),
-                template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                title=dict(text=f"{sym} spot vs gamma-flip level", font=dict(size=13)),
-                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-                yaxis=dict(title="index level"))
-            st.plotly_chart(f2, use_container_width=True)
-            dist = hist["dist_to_flip_pct"].iloc[-1] if "dist_to_flip_pct" in hist.columns else float("nan")
-            st.caption(
-                f"Spot {sp:,.2f} is **{'ABOVE' if above else 'BELOW'}** the flip "
-                f"{fl:,.2f}"
-                + (f" ({dist:+.2f}% away)" if dist == dist else "")
-                + " — spot above flip ≈ positive-gamma regime; below ≈ negative-gamma.")
-        else:
-            st.caption("spot / gamma_flip not available for this symbol — "
-                       "showing net-GEX zero-line only.")
-
-    # --- L2 (gamma-by-strike grid): blocked. The derived *_gex_daily.parquet
-    # tables are daily AGGREGATES (net/call/put GEX + a single focal_strike) —
-    # there is no per-strike GEX profile persisted, so the strike-ladder heat
-    # strip cannot be built from data on disk yet. It needs a small build in
-    # datacollector features to persist the strike-level profile first.
-    st.caption("⚠ Gamma-by-strike grid (roadmap L2) is blocked: the derived tables "
-               "are daily aggregates only — no per-strike GEX profile is persisted yet.")
-
-
-# ============================== 3. BACKTESTS ==================================
+# ============================== 2. BACKTESTS ==================================
 @st.cache_data(ttl=3600, show_spinner="Computing backtest metrics (validated engine)...")
 def backtest_metrics() -> pd.DataFrame:
     """Run the VALIDATED run_backtest once per version (cached 1h) and pull the
@@ -742,7 +474,7 @@ def render_backtests() -> None:
             st.caption(f"{v}: report not found")
 
 
-# ============================== 4. ACCOUNTS ===================================
+# ============================== 3. ACCOUNTS ===================================
 def _connect_readonly_short(timeout: int = 6):
     """Connect read-only with a SHORT timeout. Never launches the gateway (weekend
     safety) so a down gateway fails fast instead of trying to boot it. Returns the IB
@@ -876,222 +608,20 @@ def render_accounts() -> None:
                 pass
 
 
-# ============================ 5. S5 CONVEXITY =================================
-@st.cache_data(ttl=3600, show_spinner="Computing S5 convexity ledger (EOD prototype)...")
-def s5_ledger() -> dict | None:
-    """Recompute the S5 EOD convexity prototype ONCE (cached 1h) and return its
-    per-day ledger/NAV time series + roll-up totals. Read-only research compute —
-    imports the backtester's own s5_convexity_overlay.simulate_s5 unmodified and
-    touches no broker/warehouse/config. The run is <1s; recomputing live avoids
-    persisting a stale curve. Returns None if the module/data isn't importable."""
-    try:
-        s5dir = REPO / "backtester"
-        if str(s5dir) not in sys.path:
-            sys.path.insert(0, str(s5dir))
-        import s5_convexity_overlay as s5
-        with contextlib.redirect_stdout(io.StringIO()):
-            panel = s5.build_panel()
-            res = s5.simulate_s5(panel)
-        out = res["df"].copy()
-        # SPY total-return buy&hold NAV on the same index (the honest benchmark).
-        spy_nav = (1.0 + panel["r_spy"].reindex(out.index).fillna(0.0)).cumprod()
-        return {
-            "df": out,
-            "spy_nav": spy_nav,
-            "reserve_target": res.get("reserve_target"),
-            "total_harvest": res.get("total_harvest"),
-            "total_tail_carry": res.get("total_tail_carry"),
-            "total_upside_spent": res.get("total_upside_spent"),
-            "total_upside_payoff": res.get("total_upside_payoff"),
-            "upside_fund_count": res.get("upside_fund_count"),
-        }
-    except Exception as exc:  # pragma: no cover - defensive display path
-        return {"error": f"{type(exc).__name__}: {exc}"}
-
-
-@st.cache_data(ttl=3600)
-def s5_frontier() -> pd.DataFrame | None:
-    """The pre-computed head-to-head summary (ENDOGENOUS vs FIXED vs S4 vs SPY)
-    from the S5 ledger-experiment CSV. Display-only read."""
-    if not S5_LEDGER_CSV.exists():
-        return None
-    try:
-        return pd.read_csv(S5_LEDGER_CSV)
-    except Exception:
-        return None
-
-
-def _s5_metric_block(r: pd.Series, spy_nav: pd.Series) -> dict:
-    """Headline CAGR/maxDD/Calmar off the S5 fund-return series (self-contained so
-    the panel doesn't depend on the backtester's metrics wiring)."""
-    import numpy as np
-    rr = r.dropna()
-    nav = (1.0 + rr.fillna(0.0)).cumprod()
-    yrs = len(rr) / 252.0
-    cagr = float(nav.iloc[-1] ** (1.0 / yrs) - 1.0) if yrs > 0 and len(nav) else float("nan")
-    dd = float((nav / nav.cummax() - 1.0).min()) if len(nav) else float("nan")
-    calmar = float(cagr / abs(dd)) if dd < 0 else float("nan")
-    vol = float(rr.std(ddof=0) * np.sqrt(252.0)) if len(rr) else float("nan")
-    return {"cagr": cagr, "maxdd": dd, "calmar": calmar, "vol": vol}
-
-
-def render_s5() -> None:
-    st.subheader("S5 — financed-convexity overlay (EOD ledger)")
-    st.caption("Read-only research view. Recomputes the EOD convexity prototype live "
-               "(cached 1h) from the backtester's own simulate_s5 — no broker, no "
-               "writes. Numbers are a STRUCTURAL prototype on assumed harvest income "
-               "and flat-skew BSM pricing (optimistic in absolutes; the honest reads "
-               "are relative). Nothing here is adopted or wired into any strategy.")
-
-    if st.button("↻ Recompute S5 ledger (cached 1h)"):
-        s5_ledger.clear()
-
-    led = s5_ledger()
-    if led is None:
-        st.warning("S5 prototype module not importable on this host.")
-        return
-    if "error" in led:
-        st.error(f"Could not compute S5 ledger: {led['error']}")
-        return
-
-    out = led["df"]
-    spy_nav = led["spy_nav"]
-    m = _s5_metric_block(out["r_fund"], spy_nav)
-
-    # --- Headline metric row ---
-    c = st.columns(5)
-    c[0].metric("CAGR", f"{m['cagr']*100:.2f}%", border=True)
-    c[1].metric("Max drawdown", f"{m['maxdd']*100:.1f}%", border=True)
-    c[2].metric("Calmar", f"{m['calmar']:.2f}", border=True)
-    c[3].metric("Ann vol", f"{m['vol']*100:.1f}%", border=True)
-    c[4].metric("Cum. harvest (assumed)",
-                f"{(led.get('total_harvest') or 0)*100:.0f}%", border=True)
-    st.caption(f"EOD window {out.index.min().date()} → {out.index.max().date()} "
-               f"({len(out):,} trading days). CAGR is optimistic (flat-skew BSM + "
-               "assumed harvest); read it against SPY below, not in isolation.")
-
-    st.divider()
-
-    # --- Equity curve: S5 vs SPY buy&hold (TR) ---
-    st.markdown("#### Equity curve — S5 vs SPY buy & hold (TR)")
-    s5_nav = (1.0 + out["r_fund"].fillna(0.0)).cumprod()
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=out.index, y=s5_nav, name="S5 fund",
-                             mode="lines", line=dict(color=_TIER_COLOR["good"], width=1.4)))
-    fig.add_trace(go.Scatter(x=spy_nav.index, y=spy_nav, name="SPY buy&hold (TR)",
-                             mode="lines", line=dict(color="#5b9dff", width=1.1)))
-    fig.update_layout(
-        height=320, margin=dict(l=10, r=10, t=24, b=10),
-        template="plotly_dark", paper_bgcolor="rgba(0,0,0,0)",
-        plot_bgcolor="rgba(0,0,0,0)",
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-        yaxis=dict(title="growth of $1", type="log"))
-    st.plotly_chart(fig, use_container_width=True)
-    st.caption("Log-scale growth of $1. The S5 story is a smoother path (shallower "
-               "crash drawdowns via the always-on tail), not beating SPY on raw return.")
-
-    st.divider()
-
-    # --- Convexity ledger: core vs tail + the self-funding ledger/reserve ---
-    st.markdown("#### Convexity ledger — core vs tail, and the self-funding buffer")
-    lc, rc = st.columns(2)
-    with lc:
-        # Net book delta = the passive de-risk engine (1.0 = fully invested core,
-        # ~0 = fully hedged at a crash bottom). This is the "convexity" dial.
-        fdel = go.Figure()
-        fdel.add_trace(go.Scatter(x=out.index, y=out["net_delta"], name="net delta",
-                                  mode="lines", line=dict(color="#f5c451", width=1)))
-        fdel.add_hline(y=1.0, line_width=1, line_color="#5b9dff", line_dash="dot")
-        fdel.add_hline(y=0.0, line_width=1, line_color="#c9ccd1")
-        fdel.update_layout(
-            height=240, margin=dict(l=10, r=10, t=26, b=10), template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            title=dict(text="Net book delta (1.0 = full core · ~0 = hedged at bottom)",
-                       font=dict(size=12)),
-            showlegend=False, yaxis=dict(title="net delta"))
-        st.plotly_chart(fdel, use_container_width=True)
-        st.caption("The passive convexity engine: net delta falls toward ~0 as the "
-                   "uncapped tail goes ITM in a crash, then re-rises on recovery — "
-                   "no signal, no timing.")
-    with rc:
-        flg = go.Figure()
-        flg.add_trace(go.Scatter(x=out.index, y=out["ledger"] * 100, name="ledger",
-                                 mode="lines", line=dict(color=_TIER_COLOR["good"], width=1)))
-        flg.add_trace(go.Scatter(x=out.index, y=out["reserve"] * 100, name="reserve",
-                                 mode="lines", line=dict(color="#5b9dff", width=1)))
-        rt = led.get("reserve_target")
-        if rt is not None:
-            flg.add_hline(y=rt * 100, line_width=1, line_color="#c9ccd1",
-                          line_dash="dot")
-        flg.update_layout(
-            height=240, margin=dict(l=10, r=10, t=26, b=10), template="plotly_dark",
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            title=dict(text="Self-funding ledger & reserve (% of NAV)", font=dict(size=12)),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, font=dict(size=10)),
-            yaxis=dict(title="% of NAV"))
-        st.plotly_chart(flg, use_container_width=True)
-        st.caption("Harvested-premium ledger funds the discretionary hedge spend via "
-                   "the priority waterfall; the reserve is the senior buffer (dotted "
-                   "= target).")
-
-    # --- Ledger roll-up totals ---
-    tc = st.columns(4)
-    tc[0].metric("Cum. tail carry paid",
-                 f"{(led.get('total_tail_carry') or 0)*100:.1f}%")
-    tc[1].metric("Upside fundings", f"{led.get('upside_fund_count') or 0}")
-    tc[2].metric("Upside premium spent",
-                 f"{(led.get('total_upside_spent') or 0)*100:.2f}%")
-    tc[3].metric("Upside payoff",
-                 f"{(led.get('total_upside_payoff') or 0)*100:.2f}%")
-
-    st.divider()
-
-    # --- Tail-sizing frontier / head-to-head (pre-computed) ---
-    st.markdown("#### Head-to-head (pre-registered ledger experiment)")
-    fr = s5_frontier()
-    if fr is None or fr.empty:
-        st.caption("Frontier summary CSV not found.")
-    else:
-        disp = fr.copy()
-        for col, pct in (("cagr", True), ("maxdd", True), ("calmar", False),
-                         ("sharpe", False), ("vol", True)):
-            if col in disp.columns:
-                disp[col] = disp[col].map(
-                    (lambda v: f"{v*100:.2f}%") if pct else (lambda v: f"{v:.2f}"))
-        st.dataframe(disp, use_container_width=True, hide_index=True)
-        st.caption("ENDOGENOUS waterfall ledger vs a FIXED flat budget (2%/yr spec "
-                   "seed), S4 vol-control and SPY. Verdict: endogenous wins on "
-                   "twitchy-market bleed; ~tie on the full cycle at a like budget. "
-                   "See s5_ledger_experiment / s5_tail_sweep reports for the full study.")
-
-    # --- Blocked note: the offensive/harvest half ---
-    st.info("⚠ **Offensive / harvest half is blocked-for-real-data.** The harvest "
-            "income above is an ASSUMED knob and the tail is flat-skew-BSM priced "
-            "(optimistic). The active-monetization 0DTE harvest engine needs the "
-            "1-min SPXW feed (now backfilled) wired through before those numbers are "
-            "real P&L. This panel shows the EOD / defensive half only.")
-
-
 # ================================= LAYOUT =====================================
 def main() -> None:
-    st.title("📊 Trading Desk")
+    st.title("📊 Trading Desk — S0")
     st.caption(f"As of {last_refreshed()} (newest available data) · auto-refreshes "
-               "as caches expire (status/JSON 60s, GEX/coverage 120s, "
-               "backtests cached 1h).")
-    st.caption("Read-only dashboard · Phase 1 · paper account only · nothing here "
-               "places, arms, or transmits any order.")
+               "as caches expire (status/JSON 60s, backtests cached 1h).")
+    st.caption("Read-only dashboard · scoped to S0 (Adaptive All-Weather Core) · "
+               "paper account only · nothing here places, arms, or transmits any order.")
 
-    tabs = st.tabs(["🩺 Health", "📈 Gamma (GEX)", "🧪 Backtests",
-                    "🛡 S5 Convexity", "💼 Accounts"])
+    tabs = st.tabs(["🩺 Health", "🧪 Backtests", "💼 Accounts"])
     with tabs[0]:
         render_health()
     with tabs[1]:
-        render_gamma()
-    with tabs[2]:
         render_backtests()
-    with tabs[3]:
-        render_s5()
-    with tabs[4]:
+    with tabs[2]:
         render_accounts()
 
 
