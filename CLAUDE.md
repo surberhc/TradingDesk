@@ -20,6 +20,9 @@ is safe and reversible (paper for now), and a clean compliance trail behind ever
    reachable by accident. The review → arm → transmit gate stays sacred; nothing transmits
    without a deliberate, gated, armed action.
 
+## The counterweight — judge on net merit
+Rule #1 bars curve-fitting the **strategy**; it does not license curve-fitting the **test** to guarantee failure. Every real strategy has weak spots — the call is whether strengths outweigh weaknesses **on balance**, never whether a weakness exists. Don't reflexively hunt for a reason to fail a result, treat a single weak spot as disqualifying, or move the goalposts once something clears the bar; a weakness disqualifies only when it genuinely outweighs the strengths. Reserve the strict robustness gate for its real job — parameters tuned to a period — not for beating down every honest result. Test a strategy in the **role it's actually used** (its real combination/deployment) against a bar that matches how it's meant to work — not a strawman in isolation (a hedge needn't profit every year; a financing overlay needn't win the crash its paired hedge exists to cover). **Lead with the net verdict, then weigh caveats in proportion.** If you're stacking "buts" onto a good result, stop and state the balance.
+
 ## Where things live
 - **Code** is in Google Drive at the `TradingDesk\` root (synced + backed up).
 - **Data, running state, the venv, and secrets** live on local `C:\TradingDesk-Local\`
@@ -62,7 +65,7 @@ is safe and reversible (paper for now), and a clean compliance trail behind ever
 ## Verification bar
 Nothing is called "working" without the relevant check actually run:
 - Affected package's tests green, from that package's folder with the venv python:
-  - backtester:  `cd backtester` → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest -q`   (currently 95 passing)
+  - backtester:  `cd backtester` → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest -q`   (currently 436 passing)
   - paperbot:    `cd paperbot`   → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest -q`
 - Standing causality guard (the closest thing to a parity check):
   `cd backtester` → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest tests/test_no_lookahead.py -v`
