@@ -1,10 +1,25 @@
-# LANE STATUS  (last updated by: Conductor, 2026-07-06 — session close)
+# LANE STATUS  (last updated by: Conductor, 2026-07-06 — evening audit)
 
 > Live dashboard. RAW SESSION HANDOFFS live in `conductor/handoffs/` + dated `docs/SESSION_HANDOFF_*.md`.
 > **PICK UP HERE NEXT SESSION → `docs/SESSION_HANDOFF_2026-07-03.md`** (full 2026-07-03 session-close handoff).
 > **First multi-account PAPER rebalance: DONE 2026-06-29 — all 5 accounts (DU142-146) in-band.** Built + proved live a dynamic laddered order router + self-verifying hands-free gateway arming + `--only-account` scope flag (memory `dynamic-order-router`, `paper-arming-and-fills`). Gateway disarmed + verified-locked.
-> Desk runs on its own: collector + ThetaData **terminal-watchdog (NEW, live)** + dashboard survive session close. **Collector ~59%, ETA 2026-06-30 ~18:19 CT** — gates S5 harvest + S2/S3.
+> Desk runs on its own: **13 TradingDesk scheduled tasks + 2 external InvesTech feeds** survive session close (full inventory in §B). **Current big backfill = `UniverseDownloadEod` (options chains, 90 roots, 2018→2026), LIVE ~9.1% as of 2026-07-06 19:36, 0 errors, ETA ~2026-07-10..07-13.** (Supersedes the old "~59% collector" line — that job is done.)
 > **Regime config still UNTOUCHED.** `sharp_recovery` refinement TESTED 2026-06-29 → SHELVED (clean negative; GFC fails −118bp filter-independently). Re-entry stays MAX_LAG=6. 2008 GFC audit CLOSED.
+
+### 2026-07-06 (evening) — RUNNING-JOB AUDIT: scheduled-task inventory reconciled + anomalies flagged
+- **Real inventory = 13 TradingDesk scheduled tasks + 2 external InvesTech feeds** (STATUS.md previously implied ~8). Full task list now in §B. The tasks MISSING from prior STATUS.md, now added:
+  * **UniverseDownloadEod** — startup + logon + every-15-min supervisor; pulls options chains for **90 ETF/index roots** (2018→2026, snapshot layer, 4 shards) into the warehouse. **LIVE, ~9.1% complete as of 2026-07-06 19:36, 0 errors, ETA ~2026-07-10..07-13.** This is the current big backfill and REPLACES the stale "~59% collector" line.
+  * **CanslimIbkrPriceGapfill** — startup + logon + every-15-min; IBKR survivor daily-price pull (clientId 43, read-only). **Effectively COMPLETE** (6,001 of 6,014 IBKR-pullable survivors on disk; remaining 17 permanently unpullable). Currently **thrashing** (watchdog kill/relaunch loop) — FLAGGED (see anomalies).
+  * **CanslimOverlayWatchdog** — every 20 min; overlay-pipeline watchdog (standing down; pipeline complete 2026-07-02).
+  * **CanslimOverlayPipeline** — one-time task, last ran 2026-07-02, complete.
+  * **HeartbeatStalenessAlarm** — every 15 min; alarms on stale collector heartbeats.
+  * **Spxw1mCollector is intentionally DISABLED** — 1-min SPXW backfill complete, superseded by UniverseDownloadEod.
+- **NEEDS ATTENTION / ANOMALIES (2026-07-06 audit):**
+  1. **CAN SLIM IBKR gapfill thrash loop** — effectively complete, but the watchdog relaunches every ~65s to retry the 17 permanently-unpullable tickers. **FIX SPUN OFF to its own task.**
+  2. **InvesTech Phase1 + Phase2 feeds failing** (exit code 1, 2026-07-05) — likely the H:→C: Drive-remount path break (memory `gdrive-remount-h-to-c`). **FIX SPUN OFF to its own task.**
+  3. **Orphaned idle JVM** (PID present at audit time) from an earlier watchdog relaunch — benign (holds no port), reapable.
+  4. **EodReport's 2026-07-05 run had one failing section** — VERIFY tonight's 21:00 run went green.
+- Docs+audit only; no scheduled task or process was modified.
 
 ### 2026-07-06 — S3 INTRADAY 0DTE IRON-CONDOR = REOPENED (6 arms) → DEFINITIVELY CLOSED (short-vol BETA, not structural alpha)
 - **Andrew reopened S3** arguing the 4-way refutation had killed it on a strawman (hold-to-settle only). Tested **6 new arms, all pre-registered in `docs/PREREG_condor_reopen_2026-07-06.md`**, reports under `backtester/output/`. **VERDICT: the iron-condor STRUCTURE has no alpha.** Managed versions die to the 4-leg exit-crossing toll; the toll-free cash-settle version is net-positive but is **pure short-vol BETA** — a plain ATM short straddle harvests it better (OOS, higher Sharpe) — and is fragile to an unsampled COVID-scale tail. Only genuine virtue = the defined-risk cap (a risk-SHAPE, not an edge).
@@ -16,6 +31,7 @@
   * **Arm 6 `condor_alpha_beta_20260706.md` (the decider)** — regression intercept looked like alpha (t=14.56) BUT a passive delta-neutral ATM short STRADDLE on the SAME days earns $98,175 vs the condor's $37,019 at HIGHER Sharpe (0.98 vs 0.75), gap WIDENS OOS. **BETA, not alpha** — Arm 5's P&L is the vol risk premium any short-premium position harvests; the condor is a capped, lower-Sharpe SUBSET.
 - **Tail limitation flagged:** worst in-sample 2h move only −3.2%; 0DTE dailies start ~2022 so COVID-scale intraday crashes are OUT of sample; ~7.8 capped max-loss days erase the multi-year total — the capped tail is unvalidated against a real crash.
 - **Forward pointer:** harvesting the VRP with a BETTER RISK-SHAPE is a DIFFERENT strategy family — connects to S4 (vol-control fund), S7 (income-condor), and the CSP alpha/beta work. Reusable lesson: the placebo-on-ALPHA (not just P&L) is what caught the beta costume (logged in `strategy-evaluation-playbook`).
+- **IN-FLIGHT (overnight 2026-07-06 → verdict 2026-07-07 late AM): condor BASE-PACKAGE grid** (6-shard, commit `9d1620b`). Methodology SHIFT — from "test an overlay vs a frozen base" to "**search the base package** (entry × delta × wing × management) on TRAIN, validate ONCE on OOS, Deflated-Sharpe-corrected, then judge overlays." The question it answers: **is there a base package that clears honest costs on OOS, or is the 0DTE condor structurally thin everywhere?**
 - **Commits:** pre-reg + 6 arms; final alpha/beta commit `9a77f83`. **Full backtester suite 436 passing.** All PAPER; frozen S0/regime config UNTOUCHED; nothing armed/transmitted; research only (no paperbot version bump). Memory `s2s3-intraday-condor-refuted` updated (definitive-close section).
 
 ### 2026-07-06 — SPX PREMIUM-SELLING RESEARCH ARC = COMPLETE + REFUTED (all 3 lenses) — SESSION CLOSED, FAMILY PARKED
@@ -219,12 +235,20 @@
   with `REGIME_TREND_MARGIN=0.03` (max abs diff 0.0). Paper-use prerequisite cleared.
 
 ## B — Data Warehouse / Collector
+- **SCHEDULED-TASK INVENTORY (reconciled 2026-07-06 evening audit) = 13 TradingDesk tasks + 2 external InvesTech feeds:**
+  * `UniverseDownloadEod` — startup+logon+every-15-min supervisor; options chains, 90 ETF/index roots (2018→2026, snapshot layer, 4 shards). **LIVE ~9.1% @ 2026-07-06 19:36, 0 errors, ETA ~2026-07-10..07-13** — the current big backfill (supersedes the old collector-% snapshots below).
+  * `CanslimIbkrPriceGapfill` — startup+logon+every-15-min; IBKR survivor daily-price pull (clientId 43, read-only). Effectively COMPLETE (6,001/6,014 pullable survivors on disk; 17 permanently unpullable). **THRASHING** (watchdog relaunch loop) — fix spun off.
+  * `CanslimOverlayWatchdog` — every 20 min; overlay-pipeline watchdog (standing down; pipeline complete 2026-07-02).
+  * `CanslimOverlayPipeline` — one-time task, last ran 2026-07-02, complete.
+  * `HeartbeatStalenessAlarm` — every 15 min; alarms on stale collector heartbeats.
+  * `GatewayWatchdog` (every 5 min), `EodReport` (21:00 CT), `AccountMonitorDaily` (16:30 CT), plus the forward/tiingo/gex daily feeds + `ThetaTerminalWatchdog` round out the 13. **`Spxw1mCollector` is intentionally DISABLED** (1-min SPXW backfill complete, superseded by `UniverseDownloadEod`).
+  * External (non-TradingDesk): **InvesTech Phase1 + Phase2** feeds — both FAILING (exit code 1, 2026-07-05), likely the H:→C: Drive-remount path break (memory `gdrive-remount-h-to-c`); fix spun off.
 - **OUTAGE + RECOVERY 2026-06-28 ~14:47:** ThetaData terminal + collector + dashboard all died. Recovered —
   terminal relaunched via `datacollector/start_terminal.py`; collector RESUMED from day ~342 (not from scratch,
   thanks to the progress heartbeat + on-disk dedupe). **ROOT CAUSE:** no watchdog auto-restarts the ThetaData
   TERMINAL (the collector's supervisor restarts the *collector*, but a dead terminal on port 25503 just stalls it).
   **OPEN:** build a port-25503 watchdog scheduled task (recommended, not built).
-- Collector snapshot 2026-06-30 09:41: **~82% (961/1170 days)**, ETA tonight ~23:24 CT — finishing unblocks S5 harvest + S2/S3 + DDOI.
+- ~~Collector snapshot 2026-06-30 09:41: ~82% (961/1170 days)~~ **[STALE — that SPXW backfill COMPLETED; the live backfill is now `UniverseDownloadEod`, ~9.1% @ 2026-07-06, see task inventory above].**
 - RESOLVED 2026-06-27: the DuckDB `options_eod` "non-empty parquets only" fix is ALREADY in committed
   `storage.py` (`_nonempty_parquets()` + `rebuild_catalog()`). Verified against the LIVE ~102k-file
   warehouse — zero-column markers correctly EXCLUDED (kept on disk), 0 corrupt, view builds clean.
