@@ -402,18 +402,6 @@ def build_system():
     return _sec("system", "System / Gateway Health", st, headline, rows)
 
 
-def build_strategy():
-    s = status.read("strategy")
-    if not s:
-        return _sec("strategy", "Strategy EOD Update", "info",
-                    "Not yet active — appears here once strategies are running.", [])
-    fresh = _is_fresh(s.get("date"))
-    st = s.get("status", "fail") if fresh else "stale"
-    m = s.get("metrics", {})
-    rows = [(k, v) for k, v in m.items()] + [("Last update", s.get("ts"))]
-    return _sec("strategy", "Strategy EOD Update", st, s.get("message", ""), rows)
-
-
 # --------------------------------------------------------------------------- #
 # S0 (Adaptive All-Weather Core regime engine) sections — added 2026-07-07.
 # Both read the shared brain's OWN price loader + regime scorer directly
@@ -421,10 +409,6 @@ def build_strategy():
 # frame) rather than running a full run_backtest() — cheap file reads + one
 # vectorized score computation, safe to do inline in the nightly email job.
 # --------------------------------------------------------------------------- #
-S0_EQUITY_TICKERS = ["SPY", "RSP"] + [
-    "XLC", "XLY", "XLP", "XLE", "XLF", "XLV", "XLI", "XLB", "XLRE", "XLK", "XLU"]
-S0_CREDIT_TICKERS = ["HYG", "IEF"]
-S0_TICKERS = S0_EQUITY_TICKERS + S0_CREDIT_TICKERS  # macro (_vix/_hy_oas) tracked separately
 
 
 def build_s0_regime():
@@ -779,7 +763,7 @@ def build_alarm():
 
 
 # Trimmed to S0-only 2026-07-07 (see module docstring). build_forward, build_edgar,
-# build_gex, build_system, build_tiingo, build_strategy, build_alarm are all still
+# build_gex, build_system, build_tiingo, build_alarm are all still
 # defined above/below — just not wired in — so they're one line away from coming back.
 SECTIONS = [build_s0_regime, build_s0_data, build_account]
 
