@@ -1,6 +1,7 @@
 from ib_async import IB, Stock
 import sqlite3, os, shutil, tempfile
 from datetime import datetime
+from connections import clientids
 # State (rrg.db) lives on local C:, not Drive: Drive lacks SQLite locking and can
 # corrupt the DB mid-write. Code lives in TradingDesk\dailyreport.
 STATE_DIR = r'C:\TradingDesk-Local\state\dailyreport'
@@ -29,7 +30,8 @@ def main():
             low REAL, close REAL, volume REAL, pulled_at TEXT,
             PRIMARY KEY(symbol, date, timeframe))''')
         ib = IB()
-        ib.connect('127.0.0.1', 4002, clientId=1, readonly=True)
+        ib.connect('127.0.0.1', 4002,
+                   clientId=clientids.CLIENT_IDS["dailyreport_poller"], readonly=True)
         now = datetime.now().isoformat()
         rows = 0
         try:

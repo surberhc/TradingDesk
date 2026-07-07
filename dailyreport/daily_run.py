@@ -1,13 +1,12 @@
-import subprocess, time, sys, os, shutil, tempfile, atexit, glob, traceback
+import subprocess, sys, os, shutil, tempfile, atexit, glob, traceback
 from datetime import datetime
-from ib_async import IB, Stock
 import rrg_emailer
+from connections import ibkr as _ibkr
 # Code lives in this folder (TradingDesk\dailyreport, in Drive). STATE — rrg.db,
 # outputs, logs — lives on local C: so Drive sync can't corrupt the running DB.
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
 STATE_DIR = r'C:\TradingDesk-Local\state\dailyreport'
 os.makedirs(STATE_DIR, exist_ok=True)
-GATEWAY_BAT = r'C:\IBC\StartGateway.bat'
 POLLER = os.path.join(CODE_DIR, 'rrg_poller.py')
 COMPUTE = os.path.join(CODE_DIR, 'rrg_compute.py')
 CANONICAL_DB = os.path.join(STATE_DIR, 'rrg.db')
@@ -53,43 +52,13 @@ for _old in glob.glob(os.path.join(LOG_DIR, 'rrg_run_*.log')):
 
 print('=' * 60)
 print(f'RRG DAILY RUN START {_run_start:%Y-%m-%d %H:%M:%S}  (log: {LOG_PATH})')
-def gateway_running():
-    ib = IB()
-    try:
-        ib.connect('127.0.0.1', 4002, clientId=9, readonly=True, timeout=8)
-        spy = Stock('SPY', 'SMART', 'USD')
-        ib.qualifyContracts(spy)
-        bars = ib.reqHistoricalData(spy, endDateTime='', durationStr='1 D',
-            barSizeSetting='1 day', whatToShow='TRADES', useRTH=True,
-            formatDate=1, timeout=20)
-        ib.disconnect()
-        return len(bars) > 0
-    except Exception:
-        try: ib.disconnect()
-        except Exception: pass
-        return False
-print('checking if gateway already up...')
-if not gateway_running():
-    print('launching gateway...')
-    # IBC 3.24.0 + Gateway 1045 have a JRE-version-probe bug in StartIBC.bat: its
-    # findstr capture comes back empty and the next line throws "set was unexpected
-    # at this time", aborting BEFORE Java starts. Pre-seeding java_version to a
-    # non-1.8 value makes that probe a harmless no-op so the Gateway launches.
-    # (No IBKR script is edited; matches connections.ibkr._gateway_env.)
-    _gw_env = dict(os.environ)
-    _gw_env['java_version'] = '17'
-    subprocess.Popen(['cmd', '/c', GATEWAY_BAT],
-        creationflags=subprocess.CREATE_NEW_CONSOLE, env=_gw_env)
-    ready = False
-    for i in range(18):
-        time.sleep(10)
-        print(f'  waiting for farms... ({(i+1)*10}s)')
-        if gateway_running():
-            ready = True
-            break
-    if not ready:
-        print('GATEWAY NEVER CAME UP — aborting, no poll run')
-        sys.exit(1)
+print('checking if gateway already up (launching if needed)...')
+# Shared, launch-mutex-protected gateway check/launch (connections.ibkr.ensure_gateway):
+# replaces this file's former local gateway_running()/Popen duplicate so RRG's launch
+# path is coordinated with every other consumer instead of racing its own StartGateway.bat.
+if not _ibkr.ensure_gateway():
+    print('GATEWAY NEVER CAME UP — aborting, no poll run')
+    sys.exit(1)
 print('gateway ready, running poller...')
 poll = subprocess.run([sys.executable, POLLER], capture_output=True, text=True)
 if poll.stdout: print(poll.stdout, end='')
