@@ -3,7 +3,8 @@
 One email at the end of each day summarizing every automated activity on the desk.
 (Originally the RRG regime pipeline — that was a test and is now **retired**; this
 harness was repurposed. The old `daily_run.py` / `rrg_*.py` files remain but are no
-longer scheduled.)
+longer scheduled. Moved to `archive/rrg/` on 2026-07-08 as explicit housekeeping —
+confirmed unscheduled and unreferenced by anything active before the move.)
 
 ## What it does
 
@@ -25,7 +26,7 @@ ThetaData supervisor (always) ─┘     (+ native heartbeats/manifest)
 | `status.py` | Tiny helper: `write(job, status, metrics, message)` / `read(job)`. |
 | `mailer.py` | Generic `send_html(subject, html)`; reuses the RRG Gmail creds. |
 | `tiingo_daily.py` | Daily Tiingo refresh — runs the backtester downloader, writes status. |
-| `daily_run.py`, `rrg_*.py` | RETIRED RRG regime pipeline (kept for reference, unscheduled). |
+| `archive/rrg/daily_run.py`, `archive/rrg/rrg_*.py` | RETIRED RRG regime pipeline (kept for reference, unscheduled). |
 
 Sections live in `eod_report.SECTIONS`. **To add one** (e.g. a strategy update):
 write a `build_*()` returning `_sec(key, title, status, headline, rows)` and append it.
