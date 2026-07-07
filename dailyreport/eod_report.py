@@ -23,7 +23,9 @@ Run manually any time:  <venv python> eod_report.py
 
 from __future__ import annotations
 
+import contextlib
 import datetime as dt
+import io
 import json
 import sys
 import threading
@@ -39,6 +41,12 @@ import status
 _BACKTESTER = Path(__file__).resolve().parent.parent / "backtester"
 if str(_BACKTESTER) not in sys.path:
     sys.path.insert(0, str(_BACKTESTER))
+
+# paperbot's nav_history module (S0 live-vs-model since-inception line in
+# build_account) — same sys.path-add pattern as _BACKTESTER above.
+_PAPERBOT = Path(__file__).resolve().parent.parent / "paperbot"
+if str(_PAPERBOT) not in sys.path:
+    sys.path.insert(0, str(_PAPERBOT))
 
 LOG = Path(r"C:\TradingDesk-Local\state\dailyreport\eod_report.log")
 
@@ -314,6 +322,58 @@ def build_s0_data():
                     f"could not check S0 data freshness: {type(e).__name__}: {e}", [])
 
 
+def _since_inception_line() -> str | None:
+    """One short since-inception performance line: aggregate total-desk paper NAV
+    % change vs a NAV-weighted blend of the 3 backtest curves over the same
+    tracked window. Simplest honest aggregate for a one-line email context (no
+    per-version breakdown here — the dashboard's Performance section has that).
+
+    Returns None if fewer than 2 distinct tracked dates exist yet (expected for
+    the first night this feature ships, 2026-07-07) — the caller omits the line
+    entirely rather than show a broken/empty stat. Never raises into the caller.
+    """
+    try:
+        import nav_history
+        hist = nav_history.load_history()
+        if hist.empty or hist["date"].nunique() < 2:
+            return None
+
+        start_date = hist["date"].min()
+        end_date = hist["date"].max()
+
+        # Paper: total desk NAV (all accounts, all versions) at start vs latest.
+        by_date = hist.groupby("date")["net_liq"].sum().sort_index()
+        paper_start, paper_end = by_date.iloc[0], by_date.iloc[-1]
+        if paper_start <= 0:
+            return None
+        paper_pct = (paper_end / paper_start - 1.0) * 100.0
+
+        # Model: NAV-weighted blend of the 3 backtest curves, weighted by each
+        # version's tracked-window start NAV (so the blend matches how paper
+        # capital is actually split across versions).
+        from src import backtest as bt
+        weighted_num = 0.0
+        weight_total = 0.0
+        for v, v_df in hist.groupby("version"):
+            v_by_date = v_df.groupby("date")["net_liq"].sum().sort_index()
+            w = v_by_date.iloc[0]
+            with contextlib.redirect_stdout(io.StringIO()):
+                res = bt.run_backtest(version=v, end=None)
+            curve = res["nav"].loc[start_date:end_date]
+            if len(curve) < 2 or curve.iloc[0] <= 0:
+                continue
+            model_pct_v = (curve.iloc[-1] / curve.iloc[0] - 1.0)
+            weighted_num += w * model_pct_v
+            weight_total += w
+        if weight_total <= 0:
+            return None
+        model_pct = weighted_num / weight_total * 100.0
+
+        return (f"Since {start_date}: paper {paper_pct:+.1f}% vs model {model_pct:+.1f}%")
+    except Exception:
+        return None
+
+
 def build_account():
     """Account cash-flow monitor — the propose-only, read-only per-account cycle
     (paperbot\\account_monitor_run.py) that runs ~4:30 PM CT. It writes an
@@ -356,10 +416,19 @@ def build_account():
     known_keys = {"rc", "accounts", "n_hold", "n_rebalance", "n_alert"}
     extra = [(k, v) for k, v in m.items() if k not in known_keys]
 
+    # Since-inception performance line (paper NAV vs backtest-expected curve) —
+    # omitted entirely until >=2 tracked days exist (expected for tonight,
+    # 2026-07-07, the day this feature ships).
+    perf_row = []
+    perf_line = _since_inception_line()
+    if perf_line:
+        perf_row = [("Performance", perf_line)]
+
     rows = ([("Run date", s.get("date")),
              ("Return code", rc_label if rc_label is not None else "—")]
             + account_rows
             + extra
+            + perf_row
             + [("Posture", "read-only / propose-only (transmits nothing)"),
                ("Last update", s.get("ts"))])
     headline = s.get("message", "") + ("" if fresh else "  ⚠ status is from a previous day")

@@ -47,6 +47,7 @@ import account_monitor as mon
 import accounts
 import cashflows
 import config
+import nav_history
 import strategy_target
 import version
 from connections import clientids, ibkr
@@ -403,6 +404,15 @@ def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> tuple[i
                   f"SettledCashByDate={snap['settled_raw']!r}->{_fmt(sc)}  "
                   f"fills={len(snap['fills'])}{cross}")
             snapshots.append(snap)
+
+        # NAV history: append today's per-account NetLiq snapshot to the local CSV,
+        # regardless of verdict outcome (HOLD/REBALANCE/ALERT) — this is pure
+        # observability, feeding the dashboard's "S0 Performance vs Model" section
+        # and the EOD email's since-inception line. Never blocks/raises the cycle.
+        try:
+            nav_history.append_snapshot(today, snapshots)
+        except Exception as exc:
+            print(f"    ! nav_history.append_snapshot failed (non-fatal): {exc}")
 
         print("\n[4] Verdicts (pure decide() per account) — PROPOSE-ONLY:")
         rows = run_cycle(snapshots, targets, baselines, earmarks_by_acct, today, persist=True)

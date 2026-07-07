@@ -394,6 +394,21 @@ def render_health() -> None:
 
 
 # ============================== 2. BACKTESTS ==================================
+@st.cache_data(ttl=3600, show_spinner="Running backtest curve for performance comparison...")
+def _backtest_strategy_curve(version_str: str) -> pd.Series:
+    """The validated run_backtest()'s own "strategy" NAV series for one version —
+    reused as-is (no re-derived performance math) to compare against the live
+    paper NAV. Cached 1h, same convention as backtest_metrics() below (re-running
+    the full backtest is comparatively expensive; the NAV history read that pairs
+    with this is NOT cached, since it changes daily and should show promptly)."""
+    from src import backtest as bt
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = bt.run_backtest(version=version_str, end=None)
+    # run_backtest() names its own NAV series "strategy" (res["nav"], also carried
+    # as benchmark_navs["strategy"]) — pull it directly, no re-derived math.
+    return res["nav"]
+
+
 @st.cache_data(ttl=3600, show_spinner="Computing backtest metrics (validated engine)...")
 def backtest_metrics() -> pd.DataFrame:
     """Run the VALIDATED run_backtest once per version (cached 1h) and pull the
@@ -474,6 +489,73 @@ def render_backtests() -> None:
             st.caption(f"{v}: report not found")
 
 
+def render_performance() -> None:
+    """S0 Performance vs Model — live paper NAV (per version, accounts summed by
+    version since that's what's directly comparable to one backtest curve) vs the
+    backtest's own run_backtest() curve for the same version/window, both rebased
+    to 100 at the first tracked date. Purely additive reporting; no broker call —
+    reads the local nav_history.csv that account_monitor_run.py appends to daily.
+
+    The live paper test started 2026-07-07 with no backfill possible before that
+    date, so this gracefully shows a "tracking started" message until >=2 distinct
+    dates of history exist (true today, the day this feature ships)."""
+    st.markdown("#### S0 Performance vs Model")
+    st.caption("Live paper NAV (summed per version) vs the validated backtest's own "
+               "NAV curve for the same version and window, both rebased to 100 at "
+               "the first tracked date. No backfill exists before the live paper "
+               "test started (2026-07-07) — tracking accumulates forward only.")
+
+    import nav_history
+    hist = nav_history.load_history()
+
+    if hist.empty or hist["date"].nunique() < 2:
+        first_date = hist["date"].min() if not hist.empty else None
+        if first_date:
+            st.info(f"Performance tracking started {first_date} — check back after "
+                    "a few sessions accumulate.")
+        else:
+            st.info("Performance tracking has not recorded any sessions yet — "
+                    "check back after the account monitor's next cycle.")
+        return
+
+    start_date = hist["date"].min()
+    end_date = hist["date"].max()
+
+    import plotly.graph_objects as go
+
+    for v in BACKTEST_VERSIONS:
+        v_hist = hist[hist["version"] == v]
+        if v_hist.empty:
+            continue
+        paper_nav = v_hist.groupby("date")["net_liq"].sum().sort_index()
+        if len(paper_nav) < 2 or paper_nav.iloc[0] == 0:
+            continue
+        paper_rebased = paper_nav / paper_nav.iloc[0] * 100.0
+
+        try:
+            bt_curve = _backtest_strategy_curve(v)
+            bt_window = bt_curve.loc[start_date:end_date]
+        except Exception as exc:
+            st.caption(f"{v}: could not load backtest curve ({type(exc).__name__})")
+            continue
+        if bt_window.empty:
+            st.caption(f"{v}: backtest curve has no data in the tracked window yet.")
+            continue
+        bt_rebased = bt_window / bt_window.iloc[0] * 100.0
+
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=paper_rebased.index, y=paper_rebased.values,
+                                  mode="lines", name="Paper (live)"))
+        fig.add_trace(go.Scatter(x=bt_rebased.index, y=bt_rebased.values,
+                                  mode="lines", name="Backtest (model)"))
+        fig.update_layout(
+            title=f"{v} — rebased to 100 at {start_date}",
+            height=280, margin=dict(l=10, r=10, t=40, b=10),
+            legend=dict(orientation="h", yanchor="bottom", y=1.02),
+        )
+        st.plotly_chart(fig, use_container_width=True, key=f"perf_{v}")
+
+
 # ============================== 3. ACCOUNTS ===================================
 def _connect_readonly_short(timeout: int = 6):
     """Connect read-only with a SHORT timeout. Never launches the gateway (weekend
@@ -488,6 +570,11 @@ def render_accounts() -> None:
     st.subheader("Live paper accounts (read-only)")
     st.caption("Display only. No controls. The gateway is offline on weekends — this "
                "panel degrades gracefully and lights up Monday.")
+
+    # Performance tracking reads a local CSV (no broker call), so it renders
+    # regardless of whether the gateway read below succeeds.
+    render_performance()
+    st.divider()
 
     go = st.button("🔌 Read live accounts (read-only)")
     if not go:
