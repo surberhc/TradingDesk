@@ -55,10 +55,42 @@ GRANULARITY = "eod"          # end-of-day only — compact, sufficient for daily
 # IBKR forward collector — nightly EOD capture depth
 # --------------------------------------------------------------------------- #
 # A literal full chain via IBKR streaming is ~9.8 h/night (511k contracts) — not
-# viable nightly. "Wide band" (chosen 2026-06-26) captures all actionable dealer
-# gamma + every strike the condor/MSR strategies use, in ~2 h. Tunable.
-FORWARD_MAX_EXPIRATIONS = 12     # nearest N expirations
-FORWARD_STRIKE_BAND = 50         # ±N strikes around ATM (None = all strikes / full chain)
+# viable nightly. Widened 2026-07-07 after measuring actual downstream footprint:
+# datacollector/features/gex.py (the GEX/dealer-gamma engine behind the validated
+# MSR signal, consumed via run_gex.py -> derived/{SYM}_gex_daily.parquet -> MSR
+# key-levels) does NOT filter by strike or expiration — it uses every contract
+# with open_interest > 0 in whatever chain it's handed, gamma-weighted. Measured
+# against a real SPXW EOD day (2026-07-02, 19,124-row full chain): 95% of |GEX|
+# needs ~40 expirations (of 40 total — gamma has real mass out to ~182-363 DTE
+# monthlies/LEAPS, not just the front week) and +/-131 strikes from ATM; SPY/AAPL
+# similarly needed ~20-24 of their available expirations and +/-14 to +/-90
+# strikes. The prior band=50/exp=12 (~2h/night, ~98k contracts) covered well
+# under half of measured 95%-gamma mass for SPX/SPXW. New split gives SPX/SPXW
+# (the condor+MSR-critical roots) full headroom over the measured footprint;
+# everything else gets a smaller-but-still-~2x-wider band (thin roots are capped
+# by their own available strikes/expirations anyway, so this costs little).
+# Measured against the live 2026-07-02 warehouse day: ~209k contracts total,
+# batches of LINE_LIMIT=90 @ (6s settle + 0.2s cooldown) => ~4.0h/night estimate
+# (up from ~1.9h measured-equivalent under the old band). Well under an overnight
+# window. NOT yet cut over — see conductor/STATUS.md for remaining validation
+# steps (side-by-side greeks vs ThetaData, full overnight timing run) before the
+# scheduled task is re-enabled.
+FORWARD_MAX_EXPIRATIONS = 20     # nearest N expirations (default; SPX/SPXW override below)
+FORWARD_STRIKE_BAND = 75         # +/-N strikes around ATM (default; SPX/SPXW override below)
+
+# SPX/SPXW carry the dealer gamma that actually drives GEX/MSR and the condor
+# research — widened further than the rest of the universe (measured: 95% of
+# |GEX| needs ~40 expirations and +/-131 strikes on SPXW; SPX is comparable).
+FORWARD_DEEP_ROOTS = {"SPX", "SPXW"}
+FORWARD_DEEP_MAX_EXPIRATIONS = 40
+FORWARD_DEEP_STRIKE_BAND = 150
+
+
+def forward_depth(sym: str) -> tuple[int, int]:
+    """(strike_band, max_expirations) for a root — deep for SPX/SPXW, default elsewhere."""
+    if sym in FORWARD_DEEP_ROOTS:
+        return FORWARD_DEEP_STRIKE_BAND, FORWARD_DEEP_MAX_EXPIRATIONS
+    return FORWARD_STRIKE_BAND, FORWARD_MAX_EXPIRATIONS
 
 # Curated universe (~36 roots) — chosen to leave doors open across every strategy
 # theme we've discussed, WITHOUT exploding into the full OPRA single-name universe.

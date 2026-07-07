@@ -239,7 +239,7 @@ def main() -> None:
     elif full:
         band, max_exps = None, None      # literal full chain (~9.8h universe)
     else:
-        band, max_exps = config.FORWARD_STRIKE_BAND, config.FORWARD_MAX_EXPIRATIONS
+        band = max_exps = None           # per-root via config.forward_depth() below
 
     real_errors: list[str] = []
     ib = gw.connect(CLIENT, readonly=True, launch=launch)
@@ -252,7 +252,8 @@ def main() -> None:
     try:
         for sym in roots:
             t0 = datetime.now()
-            status, n = collect_day(ib, sym, daystr, band=band, max_exps=max_exps)
+            b, mx = (band, max_exps) if (test or full) else config.forward_depth(sym)
+            status, n = collect_day(ib, sym, daystr, band=b, max_exps=mx)
             dt = (datetime.now() - t0).total_seconds()
             print(f"  {sym:6} {status:9} rows={n:<7} {dt:5.1f}s"
                   + (f"  errors={len(real_errors)}" if real_errors else ""))

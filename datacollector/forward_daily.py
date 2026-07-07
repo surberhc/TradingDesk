@@ -63,8 +63,9 @@ def main() -> None:
         jobstatus.write("forward", "ok", message="weekend — no trading day", day=daystr)
         return
 
-    band, max_exps = config.FORWARD_STRIKE_BAND, config.FORWARD_MAX_EXPIRATIONS
-    log(f"=== forward run {daystr} start (band=+/-{band} strikes, <={max_exps} expirations) ===")
+    log(f"=== forward run {daystr} start (per-root depth: SPX/SPXW band=+/-"
+        f"{config.FORWARD_DEEP_STRIKE_BAND} exps<={config.FORWARD_DEEP_MAX_EXPIRATIONS}; "
+        f"others band=+/-{config.FORWARD_STRIKE_BAND} exps<={config.FORWARD_MAX_EXPIRATIONS}) ===")
     if not gw.ensure_gateway():
         log("Gateway did not come up within timeout - aborting; retry next scheduled run.")
         jobstatus.write("forward", "fail", message="Gateway did not come up", day=daystr)
@@ -86,6 +87,7 @@ def main() -> None:
                     if not ib.isConnected():
                         ib = _connect(real_errors)
                         log("  (reconnected)")
+                    band, max_exps = config.forward_depth(sym)
                     status, n = fwd.collect_day(ib, sym, daystr, band=band, max_exps=max_exps)
                     if status == "ok":
                         ok += 1
