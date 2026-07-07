@@ -75,6 +75,8 @@ DATA (local warehouse, never on Drive):
     C:/TradingDesk-Local/canslim/prices/<SYMBOL>.parquet              (output, shared w/ Tiingo)
     C:/TradingDesk-Local/canslim/prices/_state/ibkr_resolved.json     (resolved symbols)
     C:/TradingDesk-Local/canslim/prices/_state/ibkr_unresolved.json   (deferred to paid pull)
+    C:/TradingDesk-Local/canslim/prices/_state/ibkr_terminal_skip.json (resolved but permanently
+                                                                        unpullable — IBKR err 162)
     C:/TradingDesk-Local/canslim/prices/_state/ibkr_heartbeat.json    (liveness)
     C:/TradingDesk-Local/canslim/prices/_state/ibkr_pull_log.txt      (append-only log)
 
@@ -132,6 +134,15 @@ RESOLVED_JSON = STATE / "ibkr_resolved.json"
 UNRESOLVED_JSON = STATE / "ibkr_unresolved.json"
 HEARTBEAT_JSON = STATE / "ibkr_heartbeat.json"
 LOG_TXT = STATE / "ibkr_pull_log.txt"
+# TERMINAL-SKIP ledger: symbols that RESOLVE against IBKR but can NEVER return daily bars
+# (IBKR error 162 — "No market data permissions" for PINK/ARCAEDGE names, or "No historical
+# market data" for delisted-but-still-resolvable tickers). Without this ledger they resolve
+# every run, return no bars, never land on disk, and so are counted as "remaining" forever —
+# which starved the completion check and left the watchdog in a permanent kill+relaunch loop.
+# Each empty pull bumps a counter; TERMINAL_SKIP_AFTER consecutive empties promotes the symbol
+# to terminal-skip, and it is then excluded from the resolvable-work set (deferred to the paid
+# source alongside the unresolved names). A genuinely-new survivor is unaffected (starts at 0).
+TERMINAL_JSON = STATE / "ibkr_terminal_skip.json"
 
 # Cross-process SINGLETON lock for the pull-SUPERVISION role (launcher/watchdog). This is
 # ORTHOGONAL to the paperbot Gateway mutex the pull itself takes: the Gateway mutex serialises
@@ -161,6 +172,13 @@ RESOLVE_GAP_SECS = 0.25
 HEARTBEAT_EVERY = 10            # symbols between heartbeat rewrites
 CONNECT_RETRIES = 6             # reconnect attempts on a dropped Gateway
 RECONNECT_BACKOFF = 10          # base backoff seconds between reconnects
+
+# ---- terminal-skip (permanently-unpullable, e.g. IBKR error 162) -------------------------
+# After this many CONSECUTIVE runs where a resolved symbol returns no bars, treat it as
+# permanently unpullable and stop retrying it every run. 2 is enough: error 162 is a hard,
+# deterministic permission/no-history denial, not a transient farm hiccup — but requiring two
+# consecutive misses guards against a single Gateway/farm blip flagging a good symbol.
+TERMINAL_SKIP_AFTER = 2
 
 # ---- watchdog ----------------------------------------------------------------------------
 STALE_HEARTBEAT_SECS = 900      # a heartbeat older than this = hung run -> relaunch
@@ -235,6 +253,54 @@ def _done_symbols(prices_dir: Path = PRICES) -> set[str]:
         except OSError:
             pass
     return out
+
+
+def _terminal_skip() -> set[str]:
+    """Symbols promoted to PERMANENTLY-UNPULLABLE (>= TERMINAL_SKIP_AFTER consecutive empty
+    pulls, e.g. IBKR error 162). These resolve but can never yield bars, so they are NOT
+    counted as outstanding work — they are deferred to the paid source with the unresolved set.
+    The ledger stores {symbol: {"empties": n, "terminal": bool, "why": str, "ts": iso}}."""
+    ledger = _load_json(TERMINAL_JSON, {})
+    return {s for s, v in ledger.items() if isinstance(v, dict) and v.get("terminal")}
+
+
+def _record_empty(symbol: str) -> bool:
+    """Bump the consecutive-empty counter for `symbol`; promote to terminal-skip once it
+    reaches TERMINAL_SKIP_AFTER. Returns True iff the symbol is now terminal (newly or
+    already). Idempotent + crash-safe (atomic JSON write)."""
+    ledger = _load_json(TERMINAL_JSON, {})
+    rec = ledger.get(symbol) if isinstance(ledger.get(symbol), dict) else {}
+    empties = int(rec.get("empties", 0)) + 1
+    terminal = empties >= TERMINAL_SKIP_AFTER
+    ledger[symbol] = {
+        "empties": empties,
+        "terminal": terminal,
+        "why": "resolved but no bars (IBKR err 162: no data-permission / no history)",
+        "ts": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    _save_json(TERMINAL_JSON, ledger)
+    return terminal
+
+
+def _clear_empty(symbol: str) -> None:
+    """A symbol that finally returned bars is no longer a candidate for terminal-skip —
+    drop it from the ledger so its counter cannot linger."""
+    ledger = _load_json(TERMINAL_JSON, {})
+    if symbol in ledger:
+        del ledger[symbol]
+        _save_json(TERMINAL_JSON, ledger)
+
+
+def _remaining_symbols(cands: list[str] | None = None) -> list[str]:
+    """The single source of truth for 'what real work is left': resolved survivors that are
+    neither on disk NOR terminal-skipped. Every completion check (pull/watchdog/launcher/
+    status) uses THIS so they can never disagree."""
+    if cands is None:
+        cands = _candidates()
+    resolved = _load_json(RESOLVED_JSON, {})
+    done = _done_symbols()
+    terminal = _terminal_skip()
+    return [s for s in cands if s in resolved and s not in done and s not in terminal]
 
 
 # ==========================================================================================
@@ -434,11 +500,21 @@ def pull(run_limit: int | None = None) -> None:
                 # resolve first (idempotent; skips already-classified)
                 resolved, unresolved = resolve(ib=ib, symbols=cands)
                 done = _done_symbols()
-                todo = [s for s in cands if s in resolved and s not in done]
+                terminal = _terminal_skip()
+                # real work = resolved AND not-on-disk AND not permanently-unpullable.
+                todo = _remaining_symbols(cands)
                 total_target = len([s for s in cands if s in resolved])
                 _log(f"PULL start: {len(resolved):,} resolved survivors, "
-                     f"{len(done):,} already on disk, {len(todo):,} to pull "
+                     f"{len(done):,} already on disk, {len(terminal):,} terminal-skip "
+                     f"(permanently unpullable), {len(todo):,} to pull "
                      f"(unresolved/deferred={len(unresolved):,})")
+                # Fresh heartbeat BEFORE the first symbol. Critical: the watchdog kills a child
+                # whose heartbeat is older than STALE_HEARTBEAT_SECS. If the previous run left a
+                # stale heartbeat, this stamps it fresh immediately so a short (e.g. all-empty)
+                # run is never killed before it can do — and record — its work. Without this the
+                # watchdog killed each child at the first 60s poll, starving all forward progress.
+                _heartbeat("pull", len(done), total_target, "(run start)",
+                           note=f"{len(todo)} to pull, {len(terminal)} terminal-skip")
                 pacer = Pacer()
                 pulled = 0
                 adj_fallbacks = 0
@@ -451,19 +527,30 @@ def pull(run_limit: int | None = None) -> None:
                     frame, adj_ok = _pull_with_reconnect(ib, sym, meta, pacer)
                     if frame is None or frame.empty:
                         empties += 1
-                        _log(f"  [empty] {sym}: resolved but no bars returned "
-                             f"(recorded, will retry next run)")
+                        now_terminal = _record_empty(sym)
+                        if now_terminal:
+                            _log(f"  [terminal-skip] {sym}: resolved but no bars after "
+                                 f"{TERMINAL_SKIP_AFTER} runs (IBKR err 162: no data-permission"
+                                 f" / no history) — will NOT retry; deferred to paid source")
+                        else:
+                            _log(f"  [empty] {sym}: resolved but no bars returned "
+                                 f"(recorded, one more empty run promotes to terminal-skip)")
                     else:
+                        _clear_empty(sym)
                         _atomic_write_parquet(frame, PRICES / f"{sym}.parquet")
                         pulled += 1
                         if not adj_ok:
                             adj_fallbacks += 1
                             _log(f"  [adj-fallback] {sym}: ADJUSTED_LAST empty, adj_close=raw close")
+                    # Refresh the heartbeat EVERY symbol (cheap, atomic). A resolved-but-empty
+                    # symbol writes no parquet, so a run that is ALL empties (the terminal-skip
+                    # tail) would otherwise let the heartbeat age past STALE_HEARTBEAT_SECS and
+                    # get needlessly killed. A per-symbol beat keeps a slow, honest run alive.
+                    ndone = len(done) + pulled
+                    _heartbeat("pull", ndone, total_target, sym,
+                               note=f"this run +{pulled} pulled, {empties} empty, "
+                                    f"{adj_fallbacks} adj-fallback")
                     if (pulled + empties) % HEARTBEAT_EVERY == 0:
-                        ndone = len(done) + pulled
-                        _heartbeat("pull", ndone, total_target, sym,
-                                   note=f"this run +{pulled} pulled, {empties} empty, "
-                                        f"{adj_fallbacks} adj-fallback")
                         _log(f"  progress: +{pulled} pulled, {empties} empty, "
                              f"{adj_fallbacks} adj-fallback this run; "
                              f"{ndone:,}/{total_target:,} survivors on disk; last={sym}")
@@ -636,6 +723,7 @@ def status() -> None:
     resolved = _load_json(RESOLVED_JSON, {})
     unresolved = _load_json(UNRESOLVED_JSON, {})
     done = _done_symbols()
+    terminal = _terminal_skip()
     ibkr_on_disk = 0
     for p in PRICES.glob("*.parquet"):
         try:
@@ -644,14 +732,16 @@ def status() -> None:
                 ibkr_on_disk += 1
         except Exception:
             pass
-    resolved_remaining = [s for s in cands if s in resolved and s not in done]
+    resolved_remaining = _remaining_symbols(cands)
     print("IBKR SURVIVOR PRICE GAP-FILL — STATUS")
     print(f"  universe candidates      : {len(cands):,}")
     print(f"  resolved (survivors)     : {len(resolved):,}")
     print(f"  unresolved (deferred)    : {len(unresolved):,}")
     print(f"  on disk (any source)     : {len(done):,}")
     print(f"  on disk sourced=ibkr     : {ibkr_on_disk:,}")
+    print(f"  terminal-skip (err 162)  : {len(terminal):,}  (permanently unpullable, deferred)")
     print(f"  resolved & still to pull : {len(resolved_remaining):,}")
+    print(f"  COMPLETE                 : {_is_complete()}")
     if HEARTBEAT_JSON.exists():
         hb = _load_json(HEARTBEAT_JSON, {})
         age = "?"
@@ -707,15 +797,13 @@ def _pid_is_alive(pid) -> bool:
 
 
 def _is_complete() -> bool:
-    """True iff we've done a resolve pass AND nothing resolved-but-unpulled remains — i.e.
-    the survivor set is fully on disk. A leftover scheduled task then does nothing."""
-    cands = _candidates()
+    """True iff we've done a resolve pass AND nothing resolved-but-PULLABLE remains — i.e.
+    every resolved survivor is either on disk OR terminal-skipped (permanently unpullable,
+    deferred to the paid source). A leftover scheduled task then cleanly no-ops."""
     resolved = _load_json(RESOLVED_JSON, {})
     if not resolved:
         return False  # no resolve pass yet -> there is work to do
-    done = _done_symbols()
-    remaining = [s for s in cands if s in resolved and s not in done]
-    return len(remaining) == 0
+    return len(_remaining_symbols()) == 0
 
 
 def launcher() -> None:
@@ -792,14 +880,15 @@ def watchdog() -> None:
     script = str(Path(__file__).resolve())
     _log("WATCHDOG start")
     while True:
-        # complete? (nothing resolved-but-unpulled left)
+        # complete? (nothing resolved-AND-PULLABLE left: on-disk + terminal-skip both count
+        # as "done", so the permanently-unpullable err-162 tail can no longer wedge the loop)
         cands = _candidates()
         resolved = _load_json(RESOLVED_JSON, {})
-        done = _done_symbols()
-        remaining = [s for s in cands if s in resolved and s not in done]
-        # if we've done a resolve pass and there's nothing left, stop
+        remaining = _remaining_symbols(cands)
+        # if we've done a resolve pass and there's nothing pullable left, STAND DOWN
         if resolved and not remaining:
-            _log("WATCHDOG: survivor set complete — exiting.")
+            _log("WATCHDOG: survivor set complete (all resolved survivors on disk or "
+                 "terminal-skipped) — standing down.")
             return
 
         _log(f"WATCHDOG: launching pull ({len(remaining):,} survivors remaining "
