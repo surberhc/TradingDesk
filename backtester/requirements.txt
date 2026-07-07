@@ -13,3 +13,5 @@ jinja2==3.1.4
 python-dotenv==1.0.1
 pyarrow==18.1.0        # Parquet engine for data/ storage
 pytest==8.3.4
+matplotlib==3.11.0     # S2/S3 PV-band PNG render
+scipy==1.18.0
