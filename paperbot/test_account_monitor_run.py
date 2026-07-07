@@ -123,9 +123,10 @@ def test_busy_lock_skips_cycle_without_touching_broker(monkeypatch, tmp_path, ca
 
     monkeypatch.setattr(amr.ibkr, "connect", _boom_connect)
 
-    rc = main_no_exception(monkeypatch)
+    rc, verdict_summary = main_no_exception(monkeypatch)
 
     assert rc == 0                                   # a clean SKIP, not an error
+    assert verdict_summary == {}                      # no cycle ran -> no verdicts
     out = capsys.readouterr().out
     assert "gateway busy" in out                     # logged the busy line
     assert "rebalance_execute" in out                # named the holder purpose
@@ -144,9 +145,10 @@ def test_free_lock_runs_cycle(monkeypatch, tmp_path, capsys):
     fake = _FakeIB()
     monkeypatch.setattr(amr.ibkr, "connect", lambda *a, **k: fake)
 
-    rc = amr.main()
+    rc, verdict_summary = amr.main()
 
     assert rc == 0
+    assert verdict_summary == {}                      # no managed accounts -> no verdicts
     assert fake.used is True                          # it actually connected + read
     assert fake.disconnected is True                  # session closed (disconnect ran)
     # lock released after the session (held through connect->work->disconnect, then freed).
@@ -178,11 +180,71 @@ def test_free_lock_held_through_whole_session(monkeypatch, tmp_path):
 
     monkeypatch.setattr(amr.ibkr, "connect", _connect)
 
-    rc = amr.main()
+    rc, verdict_summary = amr.main()
     assert rc == 0
+    assert verdict_summary == {}                      # no managed accounts -> no verdicts
     assert seen["during_connect"] is True            # held BEFORE/AT connect
     assert seen["during_read"] is True               # still held DURING the read work
     assert not os.path.exists(path)                  # released AFTER disconnect
+
+
+# --- status severity reflects real per-account drift (not just cycle health) ---
+# These prove _run_with_status() reads main()'s verdict_summary, not just rc. Slice: the
+# 2026-07-01 -> 2026-07-07 incident where a week of live ALERT verdicts on every account
+# still wrote status "ok" because the status write only ever looked at rc==0/non-zero.
+def test_alert_verdict_writes_fail_status_with_detail(monkeypatch):
+    summary = {"accounts": {"DU8922142": {"action": "ALERT", "reason": "UNTRACKED_POSITION"}},
+               "n_hold": 0, "n_rebalance": 0, "n_alert": 1}
+    monkeypatch.setattr(amr, "main", lambda: (0, summary))
+    written = {}
+
+    def fake_write(st, metrics=None, message=""):
+        written["status"] = st
+        written["metrics"] = metrics
+        written["message"] = message
+
+    monkeypatch.setattr(amr, "_write_monitor_status", fake_write)
+
+    rc = amr._run_with_status()
+
+    assert rc == 0
+    assert written["status"] == "fail"                # ALERT overrides a clean rc
+    assert written["metrics"]["n_alert"] == 1
+    assert "ALERT" in written["message"]
+    assert "DU8922142" in written["message"]
+
+
+def test_all_hold_verdict_keeps_ok_status(monkeypatch):
+    summary = {"accounts": {"DU8922142": {"action": "HOLD", "reason": "IN_BAND"}},
+               "n_hold": 1, "n_rebalance": 0, "n_alert": 0}
+    monkeypatch.setattr(amr, "main", lambda: (0, summary))
+    written = {}
+    monkeypatch.setattr(amr, "_write_monitor_status",
+                        lambda st, metrics=None, message="": written.update(
+                            status=st, metrics=metrics, message=message))
+
+    rc = amr._run_with_status()
+
+    assert rc == 0
+    assert written["status"] == "ok"
+    assert written["metrics"]["n_hold"] == 1
+
+
+def test_rebalance_only_verdict_keeps_ok_but_carries_summary(monkeypatch):
+    summary = {"accounts": {"DU8922142": {"action": "REBALANCE", "reason": "DRIFT_BAND_BREACH"}},
+               "n_hold": 0, "n_rebalance": 1, "n_alert": 0}
+    monkeypatch.setattr(amr, "main", lambda: (0, summary))
+    written = {}
+    monkeypatch.setattr(amr, "_write_monitor_status",
+                        lambda st, metrics=None, message="": written.update(
+                            status=st, metrics=metrics, message=message))
+
+    rc = amr._run_with_status()
+
+    assert rc == 0
+    assert written["status"] == "ok"                  # REBALANCE alone doesn't fail the day
+    assert written["metrics"]["n_rebalance"] == 1
+    assert "1" in written["message"]
 
 
 # --- helpers -------------------------------------------------------------------

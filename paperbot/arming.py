@@ -26,6 +26,27 @@ THE FIX (defense in depth):
      with a ZERO-TRANSMISSION primitive (a cancel of a non-existent orderId — see
      `probe_api_readonly`). Raise loudly if it didn't take, instead of proceeding.
 
+THE ELEVATION GAP (found 2026-07-07)
+-------------------------------------
+Step 2's kill (`stop_gateway()`, still defined below) runs `Stop-Process` from a
+NON-ELEVATED PowerShell context. The IB Gateway process runs ELEVATED (see
+connections\\connections\\gateway_watchdog.py's docstring — the SAME elevation gap
+caused the 2026-07-05 gateway-pileup incident and was fixed there by giving the
+watchdog's OWN scheduled task RunLevel=Highest). A non-elevated kill against an
+elevated process silently no-ops: no error, but the old Gateway never actually dies,
+so IBC never gets the clean GUI step 2 promises and the toggle never commits.
+Confirmed directly: `arming.py arm` failed twice in a row with "port still looked
+open after stop" then "ARM FAILED: Gateway is STILL Read-Only after restart."
+
+THE FIX'S SECOND LAYER: `restart_gateway()` no longer runs the kill itself. It
+triggers the on-demand, elevated `GatewayArmRestart` scheduled task (RunLevel=Highest,
+registered separately — see `gateway_arm_restart_elevated.py`), which reuses
+gateway_watchdog's proven `_kill_gateway_processes()` kill routine and then relaunches.
+`restart_gateway()` polls that task's JSON completion-state file for a fresh result
+and returns True/False accordingly — same `-> bool` contract as before, so `arm()`/
+`disarm()` did not need to change. `stop_gateway()` is kept in this file (still
+useful/importable, e.g. for tests) but is no longer part of the restart path.
+
 ZERO-TRANSMISSION GUARANTEE
 ---------------------------
 The verification never places an order. It calls `ib.cancelOrder` on a fabricated,
@@ -37,6 +58,8 @@ order ever reaching the market:
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import subprocess
 import threading
@@ -48,6 +71,15 @@ from connections import clientids, ibkr
 
 CONFIG_INI = r"C:\IBC\config.ini"
 _VERIFY_CLIENT_ID = clientids.get("paperbot_arm_verify")  # 39
+
+# Elevated restart task (see gateway_arm_restart_elevated.py + THE ELEVATION GAP
+# above). On-demand only — no schedule; triggered here via `schtasks /run`.
+ARM_RESTART_TASK = "GatewayArmRestart"
+ARM_RESTART_STATE_FILE = os.environ.get(
+    "TRADINGDESK_GATEWAY_ARM_RESTART_STATE",
+    r"C:\TradingDesk-Local\state\paperbot\gateway_arm_restart_state.json",
+)
+ARM_RESTART_POLL_TIMEOUT = 60  # seconds to wait for a fresh state-file result
 
 
 # --------------------------------------------------------------------------- #
@@ -97,7 +129,12 @@ def _port_closed() -> bool:
 def stop_gateway(wait: int = 30) -> bool:
     """Kill ONLY the Gateway process (the one listening on the paper port), not other
     java apps (e.g. the ThetaData collector on its own port). Returns True once the
-    port is closed AND no listener remains — the clean state IBC needs to relaunch."""
+    port is closed AND no listener remains — the clean state IBC needs to relaunch.
+
+    SUPERSEDED as part of restart_gateway()'s path (see "THE ELEVATION GAP" above):
+    this runs Stop-Process from a NON-ELEVATED context and silently no-ops against the
+    elevated Gateway process. Kept here because it's still importable/useful (e.g.
+    tests, or killing a gateway that happens to be running non-elevated)."""
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
          f"$p=(Get-NetTCPConnection -LocalPort {ibkr.PAPER_PORT} -State Listen "
@@ -111,15 +148,55 @@ def stop_gateway(wait: int = 30) -> bool:
     return _port_closed()
 
 
+def _read_arm_restart_state() -> dict | None:
+    """Read the elevated task's JSON completion-state file. None if missing/unreadable."""
+    try:
+        with open(ARM_RESTART_STATE_FILE, "r", encoding="utf-8") as fh:
+            data = json.load(fh)
+        if isinstance(data, dict) and "ts" in data and "ok" in data:
+            return data
+    except (OSError, ValueError):
+        pass
+    return None
+
+
 def restart_gateway() -> bool:
-    """Clean-restart recipe: stop the Gateway, WAIT until the port is fully closed,
-    settle ~4s so no zombie/dialog survives, THEN relaunch (java_version=17 fix in
-    connections.ibkr). A clean GUI is what lets IBC actually commit the ReadOnly
-    toggle. Returns True once the Gateway is serving data again."""
-    if not stop_gateway():
-        print("  WARN: paper port still looked open after stop; proceeding to relaunch anyway.")
-    time.sleep(4)  # let the old session fully die before IBC relaunches
-    return ibkr.ensure_gateway()
+    """Clean-restart recipe — routed through the ELEVATED `GatewayArmRestart`
+    scheduled task (see "THE ELEVATION GAP" above), because a non-elevated kill
+    silently no-ops against the elevated Gateway process.
+
+    Deletes any stale completion-state file, triggers the task via
+    `schtasks /run /tn GatewayArmRestart`, then polls the state file for a FRESH
+    result (timestamped after the trigger). Returns True/False on the task's own
+    `ok` field — same contract as before, so arm()/disarm() need no changes. Returns
+    False (never raises) if the trigger fails or no fresh result shows up in time."""
+    try:
+        os.remove(ARM_RESTART_STATE_FILE)
+    except OSError:
+        pass  # missing/unreadable stale file is fine — just means nothing to clear
+
+    trigger_time = time.time()
+    triggered = subprocess.run(
+        ["schtasks", "/run", "/tn", ARM_RESTART_TASK],
+        check=False, capture_output=True, text=True)
+    if triggered.returncode != 0:
+        print(f"  WARN: failed to trigger '{ARM_RESTART_TASK}' task: "
+              f"{(triggered.stderr or triggered.stdout or '').strip()}")
+        return False
+
+    deadline = trigger_time + ARM_RESTART_POLL_TIMEOUT
+    while time.time() < deadline:
+        state = _read_arm_restart_state()
+        if state is not None and state.get("ts", 0) > trigger_time:
+            ok = bool(state.get("ok"))
+            detail = state.get("detail", "")
+            print(f"  GatewayArmRestart task result: ok={ok} detail={detail!r}")
+            return ok
+        time.sleep(1)
+
+    print(f"  WARN: no fresh '{ARM_RESTART_TASK}' result within "
+          f"{ARM_RESTART_POLL_TIMEOUT}s.")
+    return False
 
 
 # --------------------------------------------------------------------------- #

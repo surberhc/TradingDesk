@@ -67,7 +67,13 @@ except Exception:
 
 
 def _write_monitor_status(st: str, metrics: dict | None = None, message: str = "") -> None:
-    """Write the 'account_monitor' status JSON. Never raises into the caller."""
+    """Write the 'account_monitor' status JSON. Never raises into the caller.
+
+    Severity here reflects REAL per-account drift (ALERT/REBALANCE verdicts from decide()),
+    not just whether the read-only cycle completed cleanly. Before this, a week of live
+    ALERT/UNTRACKED_POSITION verdicts (2026-07-01 -> 2026-07-07, every account) still showed
+    "ok" in the nightly EOD email, because status only tracked rc==0 vs non-zero — the cycle
+    ran fine even though every account needed a human. See _run_with_status()."""
     if _status is None:
         return
     try:
@@ -312,7 +318,7 @@ def run_cycle(snapshots: list, targets: dict, baselines: dict, earmarks_by_acct:
 
 
 # --- the LIVE read-only cycle --------------------------------------------------
-def main() -> int:
+def main() -> tuple[int, dict]:
     print("=" * 104)
     print(f"ACCOUNT-CASHFLOW MONITOR — LIVE READ-ONLY CYCLE (propose-only, transmits "
           f"nothing)   [{version.banner()}]")
@@ -321,6 +327,7 @@ def main() -> int:
           f"clientId={clientids.get('paperbot_monitor')}  readonly=True")
     print("posture: reads accountValues / positions / reqExecutions ONLY. No order, no "
           "modify/cancel, NO whatIfOrder, no FA/gateway config write.")
+    empty_summary: dict = {}
 
     today = date.today()
     baselines = load_baselines()
@@ -351,10 +358,10 @@ def main() -> int:
               f"clientId {holder.get('client_id')} since "
               f"{holder.get('acquired_at') or holder.get('acquired_ts')}; skipping this "
               f"monitor cycle. (Read-only; nothing read or transmitted. Next cycle retries.)")
-        return 0
+        return 0, empty_summary
 
 
-def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> int:
+def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> tuple[int, dict]:
     """The connect -> read -> disconnect body, run only while the gateway lock is HELD.
 
     Factored out of main() so the `with gateway_lock(...)` block wraps the WHOLE session —
@@ -369,7 +376,7 @@ def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> int:
         print(f"    COULD NOT CONNECT: {exc}")
         print("    -> Is IB Gateway up and logged into PAPER, API on port 4002? "
               "Reporting and exiting (Part A core + tests are unaffected).")
-        return 1
+        return 1, {}
 
     try:
         managed = set(ib.managedAccounts())
@@ -380,13 +387,13 @@ def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> int:
               f"(read-only): {', '.join(targets_accounts)}")
         if not targets_accounts:
             print("    none of the enrolled accounts are visible under the master. Done.")
-            return 0
+            return 0, {}
 
         snapshots = []
         for acct in targets_accounts:
             if datetime.now().timestamp() > deadline:
                 print("    ! cycle watchdog tripped — aborting reads, disconnecting.")
-                return 3
+                return 3, {}
             snap = read_account_cycle(ib, acct, today)
             sc = snap["settled_cash"]
             tc = snap["total_cash"]
@@ -398,14 +405,32 @@ def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> int:
             snapshots.append(snap)
 
         print("\n[4] Verdicts (pure decide() per account) — PROPOSE-ONLY:")
-        run_cycle(snapshots, targets, baselines, earmarks_by_acct, today, persist=True)
+        rows = run_cycle(snapshots, targets, baselines, earmarks_by_acct, today, persist=True)
+        verdict_summary = _summarize_verdicts(rows)
 
         print("\nDone. Read-only cycle complete. Nothing was transmitted; no order/whatIf; "
               "gateway left read-only.")
-        return 0
+        return 0, verdict_summary
     finally:
         ib.disconnect()
         print("Read-only session closed.")
+
+
+def _summarize_verdicts(rows: list) -> dict:
+    """Roll up run_cycle()'s (snap, verdict) rows into a compact per-account + aggregate
+    summary the status artifact can carry. PURE — reads only the rows it's given."""
+    accounts = {}
+    n_hold = n_rebalance = n_alert = 0
+    for snap, v in rows:
+        accounts[snap["account"]] = {"action": v.action, "reason": v.reason}
+        if v.action == "HOLD":
+            n_hold += 1
+        elif v.action == "REBALANCE":
+            n_rebalance += 1
+        elif v.action == "ALERT":
+            n_alert += 1
+    return {"accounts": accounts, "n_hold": n_hold, "n_rebalance": n_rebalance,
+            "n_alert": n_alert}
 
 
 def _fmt(x) -> str:
@@ -482,18 +507,42 @@ def simulate() -> int:
 
 
 def _run_with_status() -> int:
-    """Run the daily cycle and write an 'account_monitor' status artifact on BOTH the
-    success and failure paths (rc==0 -> ok, else fail; an exception -> fail). The status
-    write is best-effort and never changes the return code / never raises."""
+    """Run the daily cycle and write an 'account_monitor' status artifact reflecting BOTH
+    cycle health AND real per-account drift (rc==0 + verdicts -> ok/fail by verdict;
+    non-zero rc or an exception -> fail). The status write is best-effort and never changes
+    the return code / never raises.
+
+    Status severity used to track ONLY whether the cycle ran cleanly (rc==0 -> "ok"), never
+    the actual per-account verdicts decide() returned — so a week of live ALERT/
+    UNTRACKED_POSITION verdicts on every account (2026-07-01 -> 2026-07-07) still showed
+    "ok" in the nightly EOD email. Now: any ALERT verdict marks the day "fail" (a human
+    needs to look), a REBALANCE-only day stays "ok" but carries the summary in metrics, and
+    an all-HOLD day is "ok" as before."""
     try:
-        rc = main()
+        rc, verdict_summary = main()
     except Exception as e:
         _write_monitor_status("fail", metrics={"rc": None},
                               message=f"cycle raised {type(e).__name__}: {e}")
         raise
     if rc == 0:
-        _write_monitor_status("ok", metrics={"rc": rc},
-                              message="read-only monitor cycle completed (or cleanly skipped)")
+        n_alert = verdict_summary.get("n_alert", 0)
+        n_rebalance = verdict_summary.get("n_rebalance", 0)
+        if n_alert > 0:
+            alert_accts = [a for a, v in verdict_summary.get("accounts", {}).items()
+                           if v.get("action") == "ALERT"]
+            _write_monitor_status(
+                "fail", metrics={"rc": rc, **verdict_summary},
+                message=(f"ALERT: {n_alert} account(s) drifted from S0 target — "
+                         f"{', '.join(alert_accts)}"))
+        elif n_rebalance > 0:
+            _write_monitor_status(
+                "ok", metrics={"rc": rc, **verdict_summary},
+                message=(f"read-only monitor cycle completed; {n_rebalance} account(s) "
+                         f"propose REBALANCE (no ALERT)"))
+        else:
+            _write_monitor_status(
+                "ok", metrics={"rc": rc, **verdict_summary},
+                message="read-only monitor cycle completed (or cleanly skipped)")
     else:
         _write_monitor_status("fail", metrics={"rc": rc},
                               message=f"monitor cycle returned non-zero rc={rc}")
