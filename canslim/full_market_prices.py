@@ -63,7 +63,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import pandas as pd
-import requests
+
+from connections.tiingo import fetch_ohlcv as _shared_fetch_ohlcv, TiingoRateLimited as _SharedTiingoRateLimited, _api_key as _shared_tiingo_key
 
 # ---- paths -------------------------------------------------------------------------------
 UNIVERSE = Path(r"C:\TradingDesk-Local\canslim\universe")
@@ -81,20 +82,15 @@ START = "2010-01-01"
 END = "2026-12-31"
 
 # ---- Tiingo ------------------------------------------------------------------------------
-TIINGO_BASE = "https://api.tiingo.com/tiingo/daily"
 # Free-tier-friendly defaults; a single run stops well before the daily cap so it always
 # resumes cleanly the next day rather than dying on a 429.
 DEFAULT_RUN_LIMIT = 400          # new symbols per run (well under the ~1000/day request cap)
 REQ_PAUSE_SECS = 1.2            # gentle spacing (~50/min ceiling on the free hourly window)
-MAX_RETRIES = 3
 HEARTBEAT_EVERY = 20            # symbols between heartbeat/progress lines
 
 
 def _tiingo_key() -> str:
-    key = os.environ.get("TIINGO_API_KEY")
-    if not key:
-        raise RuntimeError("TIINGO_API_KEY env var not set (Windows user env var, off Drive).")
-    return key
+    return _shared_tiingo_key()
 
 
 def _atomic_write_parquet(df: pd.DataFrame, dest: Path) -> None:
@@ -170,52 +166,27 @@ class RateLimited(Exception):
 
 def _tiingo_frame(symbol: str, key: str) -> pd.DataFrame | None:
     """
-    Pull one symbol's daily OHLCV from Tiingo. Returns a normalized frame or None if the
-    symbol legitimately has no data (delisted-before-window / not covered). Raises
-    RateLimited on a 429 / cap so the caller stops cleanly.
+    Pull one symbol's daily OHLCV from Tiingo (via the shared connections.tiingo client).
+    Returns a normalized frame or None if the symbol legitimately has no data
+    (delisted-before-window / not covered). Raises RateLimited on a 429 / cap so the caller
+    stops cleanly.
     """
-    url = f"{TIINGO_BASE}/{symbol}/prices"
-    params = {"startDate": START, "endDate": END, "format": "json", "token": key}
-    last_exc: Exception | None = None
-    for attempt in range(MAX_RETRIES):
-        try:
-            r = requests.get(url, params=params, timeout=45)
-        except requests.RequestException as e:
-            last_exc = e
-            time.sleep(2 * (attempt + 1))
-            continue
-        if r.status_code == 429:
-            raise RateLimited(f"429 on {symbol}")
-        if r.status_code == 404:
-            return None            # symbol not in Tiingo — an honest miss
-        if r.status_code >= 500:
-            last_exc = RuntimeError(f"{r.status_code} on {symbol}")
-            time.sleep(2 * (attempt + 1))
-            continue
-        if not r.ok:
-            # 400-class (e.g. bad symbol) — a miss, not a retry
-            txt = r.text.lower()
-            if "not found" in txt or "no data" in txt or "supported" in txt:
-                return None
-            if "limit" in txt or "exceeded" in txt:
-                raise RateLimited(f"cap text on {symbol}: {r.text[:80]}")
-            return None
-        rows = r.json()
-        if not rows:
-            return None            # covered but empty in-window — honest miss
-        d = pd.DataFrame(rows)
-        d["date"] = pd.to_datetime(d["date"]).dt.tz_localize(None)
-        out = pd.DataFrame({
-            "date": d["date"],
-            "open": d.get("open"), "high": d.get("high"),
-            "low": d.get("low"), "close": d.get("close"),
-            "volume": d.get("volume"),
-            # adjusted close = split+dividend adjusted (what RS/base detection needs)
-            "adj_close": d.get("adjClose"),
-        })
-        out["source"] = "tiingo"
-        return out.sort_values("date").reset_index(drop=True)
-    raise RuntimeError(f"tiingo failed for {symbol}: {last_exc}")
+    try:
+        d = _shared_fetch_ohlcv(symbol, START, END)
+    except _SharedTiingoRateLimited as e:
+        raise RateLimited(str(e))
+    if d is None or d.empty:
+        return None                # covered but empty in-window, or an honest miss
+    out = pd.DataFrame({
+        "date": d["date"],
+        "open": d.get("open"), "high": d.get("high"),
+        "low": d.get("low"), "close": d.get("close"),
+        "volume": d.get("volume"),
+        # adjusted close = split+dividend adjusted (what RS/base detection needs)
+        "adj_close": d.get("adjClose"),
+    })
+    out["source"] = "tiingo"
+    return out.sort_values("date").reset_index(drop=True)
 
 
 # ==========================================================================================

@@ -29,6 +29,7 @@ import pandas as pd
 import requests
 from dotenv import load_dotenv
 
+from connections import fred as shared_fred
 from strategies import config
 
 # Resolve paths relative to the project root (this file lives in src/).
@@ -221,27 +222,19 @@ def _fetch_hy_oas(start: str) -> tuple[pd.DataFrame | None, str]:
     credit signal falls back to the labeled HYG/IEF proxy (the key-free FRED graph
     CSV only serves ~3 recent years, which would corrupt older backtests).
     """
-    key = os.environ.get("FRED_API_KEY", "").strip()
-    if not key:
-        return None, "no_fred_key"
-    url = "https://api.stlouisfed.org/fred/series/observations"
-    params = {
-        "series_id": "BAMLH0A0HYM2", "api_key": key, "file_type": "json",
-        "observation_start": start,
-    }
     try:
-        resp = requests.get(url, params=params, timeout=_HTTP_TIMEOUT_SECONDS)
-        resp.raise_for_status()
-        obs = resp.json().get("observations", [])
+        series = shared_fred.fetch_series("BAMLH0A0HYM2", start=start)
+    except RuntimeError:
+        return None, "no_fred_key"
     except Exception:
         return None, "fred_fetch_failed"
-    rows = [(o["date"], o["value"]) for o in obs if o.get("value") not in (".", "", None)]
-    if not rows:
+    if series.empty:
         return None, "fred_empty"
-    out = pd.DataFrame(rows, columns=["date", "hy_oas"])
-    out["date"] = pd.to_datetime(out["date"]).dt.normalize()
+    out = series.to_frame(name="hy_oas")
+    out.index = pd.to_datetime(out.index).normalize()
+    out.index.name = "date"
     out["hy_oas"] = pd.to_numeric(out["hy_oas"], errors="coerce")
-    out = out.dropna().set_index("date").sort_index()
+    out = out.dropna().sort_index()
     return (out, "fred_BAMLH0A0HYM2") if not out.empty else (None, "fred_empty")
 
 
