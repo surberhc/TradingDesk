@@ -245,7 +245,7 @@ def main() -> None:
     ib = gw.connect(CLIENT, readonly=True, launch=launch)
     ib.errorEvent += lambda rid, code, msg, c: (
         real_errors.append(f"[{code}] {msg}") if code not in OK_STATUS else None)
-    ib.reqMarketDataType(1)              # ask for live (paper account has live entitlement)
+    ib.reqMarketDataType(3)              # ask for delayed — EOD snapshot doesn't need live entitlement
     print(f"connected={ib.isConnected()} clientId={gw.clientids.get(CLIENT)} "
           f"{'TEST slice' if test else 'FULL chain'} | day={daystr} | roots={roots}")
 

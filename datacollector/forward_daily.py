@@ -51,7 +51,7 @@ def _connect(real_errors: list[str]):
     ib = gw.connect(fwd.CLIENT, readonly=True)
     ib.errorEvent += lambda rid, code, msg, c: (
         real_errors.append(f"[{code}] {msg}") if code not in fwd.OK_STATUS else None)
-    ib.reqMarketDataType(1)              # live (paper account has live entitlement)
+    ib.reqMarketDataType(3)              # delayed — EOD snapshot doesn't need live entitlement
     return ib
 
 
