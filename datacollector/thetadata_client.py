@@ -62,13 +62,28 @@ def list_expirations(symbol: str) -> list[str]:
     return sorted({str(x) for x in df["expiration"].dropna().unique()})
 
 
-def connected() -> bool:
-    """Is the local Terminal up and serving?"""
-    try:
-        requests.get(f"{config.THETA_BASE_URL}/system/mdds/status", timeout=5)
-        return True
-    except requests.RequestException:
-        return False
+def connected(retries: int = 1, backoff_s: float = 5.0) -> bool:
+    """Is the local Terminal up and serving?
+
+    Default behavior (retries=1) is UNCHANGED from before: a single 5s-timeout GET,
+    no sleep, return False immediately on failure. Every existing caller relies on
+    this being a cheap one-shot check.
+
+    Callers that expect the Terminal may momentarily be busy (e.g. eod_daily.py,
+    which can race a long-running concurrent backfill on the same Terminal) can opt
+    in to a small BOUNDED retry by passing retries > 1: on failure, sleep
+    `backoff_s` seconds and try again, up to `retries` total attempts, returning
+    True on the first success. This is NOT a background/continuous poll — it only
+    runs inline, once, at the single call site that asks for it.
+    """
+    for attempt in range(retries):
+        try:
+            requests.get(f"{config.THETA_BASE_URL}/system/mdds/status", timeout=5)
+            return True
+        except requests.RequestException:
+            if attempt < retries - 1:
+                time.sleep(backoff_s)
+    return False
 
 
 def eod_greeks(symbol: str, start: str, end: str,

@@ -213,8 +213,9 @@ def main() -> None:
         f"{'WEEKEND — today skipped, self-heal only' if weekend else 'weekday'}) ===")
 
     # ---- Terminal up-check ---------------------------------------------- #
-    if not td.connected():
-        log(f"Theta Terminal not reachable at {config.THETA_BASE_URL} — aborting; "
+    if not td.connected(retries=3, backoff_s=5.0):
+        log(f"Theta Terminal not reachable at {config.THETA_BASE_URL} "
+            "(checked 3x with backoff — likely busy, not down) — aborting; "
             "retry next scheduled run.")
         jobstatus.write("forward", "fail", day=daystr,
                         metrics={"roots": len(roots), "ok": 0, "skip": 0,
