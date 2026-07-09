@@ -15,10 +15,26 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.14.0"
+VERSION = "0.15.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.15.0", "2026-07-09", "DU8922144 and DU8922146 removed from ENROLLMENT "
+                             "(Andrew's explicit decision, freeing them up for testing "
+                             "other strategies later, e.g. S4/S8). Balanced and Growth "
+                             "tiers go from 2-account FA blocks to single-account "
+                             "enrollments; rebalance_engine.route_blocks() derives "
+                             "routing from live account count per tier, so both tiers "
+                             "now route DIRECT automatically (same mechanism that "
+                             "already made Conservative/DU8922142 DIRECT) -- no routing "
+                             "logic changed, just the ENROLLMENT map. Existing S0 "
+                             "positions in the two freed accounts are to be liquidated "
+                             "to cash separately, via a deliberate armed PAPER session "
+                             "-- NOT part of this change. conductor/ACCOUNT_ALLOCATION.md "
+                             "is now the authoritative account->strategy map (update it "
+                             "alongside any future ENROLLMENT edit). Order-affecting: "
+                             "changes which accounts S0 rebalances and how the two "
+                             "affected tiers route."),
     ("0.14.0", "2026-07-09", "Automated nightly-monitor + morning-execute PILOT for "
                              "S0 (Andrew-approved, deliberate exception to the normally "
                              "sacred manual review->arm->transmit gate, discussed and "

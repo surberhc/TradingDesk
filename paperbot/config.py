@@ -81,14 +81,16 @@ STRATEGY_VERSION = "Balanced"   # matches strategies.config.ACTIVE_VERSION
 #
 # EDIT per real client. Until a sub-account is actually funded + visible under the
 # master (run accounts.py to check), enrolling it is a no-op the engine will skip.
+# DU8922144 (Balanced) and DU8922146 (Growth) were pulled 2026-07-09 (Andrew's
+# decision) to free them up for testing other strategies later; their S0 positions are
+# being liquidated separately. `conductor/ACCOUNT_ALLOCATION.md` is now the
+# authoritative account -> strategy map — update it alongside any ENROLLMENT edit.
 VALID_VERSIONS = ("Conservative", "Balanced", "Growth")
 ENROLLMENT = {
     # account number  : strategy version  (set to each client's risk profile)
     "DU8922142": "Conservative",
     "DU8922143": "Balanced",
-    "DU8922144": "Balanced",
     "DU8922145": "Growth",
-    "DU8922146": "Growth",
 }
 REBALANCE_MASTER = False   # the DF...141 master is the advisor account; not traded.
 

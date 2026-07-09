@@ -1,5 +1,11 @@
 # MONDAY RUNBOOK — First live PAPER rebalance (5 client sub-accounts)
 
+> **HISTORICAL as of 2026-07-09.** The account table below reflects the original
+> 5-account enrollment. DU8922144 and DU8922146 are no longer enrolled in S0 (pulled
+> to free them for future strategy testing) — see `conductor/ACCOUNT_ALLOCATION.md`
+> for the current, authoritative account -> strategy map before relying on anything
+> here.
+
 PAPER ONLY. Port 4002, paper master DF8922141, paper subs DU8922142–146. Nothing in this
 runbook touches real money. Read it top to bottom once before you start.
 
