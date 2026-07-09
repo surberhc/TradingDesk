@@ -171,7 +171,7 @@ DEADLINE_JOBS: list[dict] = [
      "market_dependent": True},
     {"name": "tiingo", "label": "Tiingo daily data refresh",
      "status_file": _STATUS_DIR / "tiingo.json",
-     "deadline_hhmm": (17, 15), "task_name": "TiingoDailyUpdate",
+     "deadline_hhmm": (21, 0), "task_name": "TiingoDailyUpdate",
      "market_dependent": True},
     {"name": "gex", "label": "GEX dealer-gamma build",
      "status_file": _STATUS_DIR / "gex.json",
@@ -179,7 +179,7 @@ DEADLINE_JOBS: list[dict] = [
      "market_dependent": True},
     {"name": "account_monitor", "label": "account-cashflow monitor",
      "status_file": _STATUS_DIR / "account_monitor.json",
-     "deadline_hhmm": (17, 15), "task_name": "AccountMonitorDaily",
+     "deadline_hhmm": (21, 30), "task_name": "AccountMonitorDaily",
      "market_dependent": True},
 ]
 
