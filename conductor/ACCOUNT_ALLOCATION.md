@@ -30,15 +30,16 @@ file should never be allowed to go stale — treat a mismatch as a bug to fix im
    are sold to cash via a deliberate, armed PAPER session (review -> arm -> transmit).
    This is a separate next step, not part of the config/docs change that created this
    file.
-2. **IBKR FA group membership (GUI-only) not yet updated.** IBKR's live FA groups
-   `tier_balanced` and `tier_growth` still list DU8922144 and DU8922146 as members on
-   the actual gateway side. There is no API to edit FA group membership (see memory:
-   IBKR model portfolio API limit) — it's a GUI-only, serialized admin step. Until that
-   GUI edit happens, `rebalance_execute.py`'s fail-closed live-membership check will
-   raise "FAILING CLOSED" the next time a Balanced or Growth rebalance is attempted,
-   because the code-side ENROLLMENT (2 accounts) will no longer match the live FA
-   group's membership (still 4 accounts total across the two groups). Fix the GUI-side
-   group membership before the next Balanced/Growth rebalance run.
+2. **IBKR FA group membership — DONE (confirmed 2026-07-09):** DU8922144 and
+   DU8922146 have been removed from the `tier_balanced`/`tier_growth` FA groups on the
+   IBKR GUI side. Code-side ENROLLMENT and live FA group membership should now agree.
+3. **TODO — liquidation trade sizing.** When the deliberate armed paper session to
+   liquidate DU8922144/DU8922146's residual S0 positions is run (see item 1 above),
+   size that session's trades off each account's *current actual holdings*, not off
+   any stale target/model allocation — since they're now standalone accounts outside
+   any FA group, there's no group-derived target to reconcile against, just "sell
+   what's there to cash." Not urgent; flagged for whenever that liquidation session
+   happens.
 
 ## History
 
@@ -51,3 +52,7 @@ file should never be allowed to go stale — treat a mismatch as a bug to fix im
   `paperbot/config.py` ENROLLMENT, `paperbot/version.py` (VERSION bump + CHANGELOG),
   `paperbot/MONDAY_RUNBOOK.md` (flagged as historical). See CLAUDE.md for the
   paper-only / commit-discipline rules governing this change.
+- **2026-07-09 (later)** — DU8922144/DU8922146 confirmed removed from the
+  `tier_balanced`/`tier_growth` FA groups in the IBKR GUI (Andrew completed this
+  manually). Liquidation of their residual S0 positions still pending; when done,
+  size off current actual holdings per-account, not a stale target.
