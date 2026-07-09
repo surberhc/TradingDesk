@@ -28,15 +28,28 @@ WAREHOUSE = Path(r"C:\TradingDesk-Local\warehouse\raw\options_1m\SPXW")
 # ---------------------------------------------------------------------------
 # Template configuration
 #
-# Entry-time grids below are given in ET (the warehouse's native timezone,
-# confirmed against combo_ledger.csv real fill timestamps — see progress doc
-# item "timezone reconciliation"). STRATEGY_MECHANICS.md documents these grids
-# in CT (TAT-tradelog's timezone); ET = CT + 1 hour, so e.g. CT 08:45/09:15/09:45
-# -> ET 09:45/10:15/10:45. The grids below were derived directly from
-# combo_ledger.csv's real ET fill-time clusters (cross-checked against the CT
-# grid in STRATEGY_MECHANICS.md section 1 and found consistent after the +1h
-# shift), which is the more reliable source since it's in the same timezone as
-# the market data this simulator uses.
+# STAGE B FINAL (2026-07-09) — entry-time grids are REAL, computed schedules
+# derived directly from combo_ledger.csv (all 2,592 combos, filtered to
+# single-long-leg combos, n=2,276) joined against TAT-tradelog's true Template
+# labels (reusing template_join.py's join_full_range() function). A real strike-
+# parsing regex bug was found+fixed along the way: `long_strikes` column values
+# look like "[np.int64(6975)]" and need `re.search(r'\((\d+)\)', s).group(1)`,
+# NOT a bare \d+ search (which matches the "64" inside "int64" first). Result:
+# 1,350 of 2,276 rows got a real Template label (1,071 MATCHED + 279
+# AMBIGUOUS_MULTI_CANDIDATE, both usable).
+#
+# Grids below are 5-min-bucketed real observed entry times, ET (the warehouse's
+# native timezone, matches the raw quote data's own timestamp convention -- do
+# NOT convert to CT). Threshold = buckets with >=5% of that template's
+# observations. Seven templates (80-$4 x2, 80-$3 x2, 50-$2 x2, 80-$2) have
+# REAL-DERIVED schedules (n=20 to n=491, trustworthy). Four templates
+# (Puts/Calls-50-$3, Puts/Calls-50-$4) have only 1-3 real observations each --
+# too thin to derive a schedule from -- and FALL BACK to the documented
+# schedule in STRATEGY_MECHANICS.md / docs/S8_SPEC.md section 2.1 (the "50-$4
+# afternoon grid ~12:15-13:45 CT" pattern), converted CT -> ET by adding 1 hour.
+# This real-derived vs. documented-fallback distinction is flagged per-template
+# below and matters for interpreting calibration results -- see
+# SIMULATOR_STAGE_B_PROGRESS.md.
 # ---------------------------------------------------------------------------
 
 
@@ -55,9 +68,8 @@ TEMPLATES: dict[str, Template] = {
     "Puts-80-$4": Template(
         name="British IC - Puts - 80 - $4",
         side="PUT",
-        # ET grid, derived from combo_ledger real-fill clusters for this template's
-        # price band (see progress doc): 09:33, 09:43-09:51, 10:07-10:19, periodically 10:15/10:45->ET 11:15/11:45
-        entry_times_et=("09:33", "09:43", "09:51", "10:07", "10:15", "10:19", "10:45"),
+        # REAL-DERIVED, n=491. >=5% buckets from real combo_ledger/TAT join.
+        entry_times_et=("09:30", "09:40", "09:50", "10:05", "10:15", "13:00"),
         target_delta=0.2318,  # delta_median, template_delta_stats.csv
         target_width=80.0,    # width_median
         stop_multiple=3.3,
@@ -66,7 +78,8 @@ TEMPLATES: dict[str, Template] = {
     "Calls-80-$4": Template(
         name="British IC - Calls - 80 - $4",
         side="CALL",
-        entry_times_et=("09:33", "09:43", "09:51", "10:07", "10:15", "10:19", "10:45"),
+        # REAL-DERIVED, n=363. >=5% buckets from real combo_ledger/TAT join.
+        entry_times_et=("09:30", "09:40", "09:50", "10:05", "10:15"),
         target_delta=0.2489,
         target_width=75.0,
         stop_multiple=3.3,
@@ -75,9 +88,11 @@ TEMPLATES: dict[str, Template] = {
     "Puts-50-$4": Template(
         name="British IC - Puts - 50 - $4",
         side="PUT",
-        # afternoon grid, ET: CT 12:15/12:45/13:00/13:30 -> ET 13:15/13:45/14:00/14:30;
-        # cross-checked against combo_ledger $4-band clusters at 13:03/13:19/13:34/13:58 ET
-        entry_times_et=("13:03", "13:19", "13:34", "13:58"),
+        # THIN/DOCUMENTED-FALLBACK: n=1 real observation (10:50 ET) -- too few to
+        # trust. Falls back to STRATEGY_MECHANICS.md/S8_SPEC.md section 2.1's
+        # documented "50-$4 afternoon grid ~12:15-13:45 CT" -> ET (+1h):
+        # 12:15/12:45/13:00/13:30 CT -> 13:15/13:45/14:00/14:30 ET.
+        entry_times_et=("13:15", "13:45", "14:00", "14:30"),
         target_delta=0.2692,
         target_width=50.0,
         stop_multiple=3.2,
@@ -86,7 +101,9 @@ TEMPLATES: dict[str, Template] = {
     "Calls-50-$4": Template(
         name="British IC - Calls - 50 - $4",
         side="CALL",
-        entry_times_et=("13:03", "13:19", "13:34", "13:58"),
+        # THIN/DOCUMENTED-FALLBACK: n=1 real observation (11:05 ET) -- too few to
+        # trust. Same documented-CT->ET fallback grid as Puts-50-$4.
+        entry_times_et=("13:15", "13:45", "14:00", "14:30"),
         target_delta=0.2766,
         target_width=50.0,
         stop_multiple=3.2,
@@ -95,7 +112,8 @@ TEMPLATES: dict[str, Template] = {
     "Puts-80-$3": Template(
         name="British IC - Puts - 80 - $3",
         side="PUT",
-        entry_times_et=("13:03", "13:19", "13:34", "13:58"),
+        # REAL-DERIVED, n=96. >=5% buckets from real combo_ledger/TAT join.
+        entry_times_et=("13:00", "13:15", "13:30", "13:55"),
         target_delta=0.2632,
         target_width=80.0,
         stop_multiple=2.4,
@@ -104,7 +122,8 @@ TEMPLATES: dict[str, Template] = {
     "Calls-80-$3": Template(
         name="British IC - Calls - 80 - $3",
         side="CALL",
-        entry_times_et=("13:03", "13:19", "13:34", "13:58"),
+        # REAL-DERIVED, n=44. >=5% buckets from real combo_ledger/TAT join.
+        entry_times_et=("10:15", "13:00", "13:15", "13:30", "14:30"),
         target_delta=0.2843,
         target_width=70.0,
         stop_multiple=2.4,
@@ -113,7 +132,8 @@ TEMPLATES: dict[str, Template] = {
     "Puts-50-$2": Template(
         name="British IC - Puts - 50 - $2",
         side="PUT",
-        entry_times_et=("10:00", "11:00", "12:00", "13:00", "14:00", "15:15"),  # no dominant slot per STRATEGY_MECHANICS.md
+        # REAL-DERIVED, n=179. >=5% buckets from real combo_ledger/TAT join.
+        entry_times_et=("13:00", "13:15", "13:30", "13:55", "14:05", "14:25", "14:30"),
         target_delta=0.2156,
         target_width=45.0,
         stop_multiple=2.0,
@@ -122,7 +142,8 @@ TEMPLATES: dict[str, Template] = {
     "Calls-50-$2": Template(
         name="British IC - Calls - 50 - $2",
         side="CALL",
-        entry_times_et=("10:00", "11:00", "12:00", "13:00", "14:00", "15:15"),
+        # REAL-DERIVED, n=151. >=5% buckets from real combo_ledger/TAT join.
+        entry_times_et=("13:00", "13:15", "13:30", "13:55", "14:05", "14:10", "14:30"),
         target_delta=0.2363,
         target_width=45.0,
         stop_multiple=2.0,
@@ -131,7 +152,10 @@ TEMPLATES: dict[str, Template] = {
     "Puts-80-$2": Template(
         name="British IC - Puts - 80 - $2",
         side="PUT",
-        entry_times_et=("11:00", "12:00", "13:00", "14:00", "15:15"),  # spread 10:00-14:15, no dominant slot
+        # REAL-DERIVED, n=20, no dominant slot (matches STRATEGY_MECHANICS.md's
+        # existing characterization) -- all buckets clearing >=5% listed.
+        entry_times_et=("11:05", "12:05", "12:30", "12:55", "13:00", "13:15", "13:25",
+                         "13:30", "13:40", "14:00", "14:15", "14:20", "14:25", "14:35", "14:40"),
         target_delta=0.2444,
         target_width=80.0,
         stop_multiple=2.0,
@@ -140,20 +164,25 @@ TEMPLATES: dict[str, Template] = {
     "Puts-50-$3": Template(
         name="British IC - Puts - 50 - $3",
         side="PUT",
-        entry_times_et=("13:03", "13:19", "13:34", "13:58"),
+        # THIN/DOCUMENTED-FALLBACK: n=3 real observations (11:05, 11:10, 12:10 ET,
+        # not statistically reliable). Same documented-CT->ET fallback grid as
+        # Puts/Calls-50-$4.
+        entry_times_et=("13:15", "13:45", "14:00", "14:30"),
         target_delta=0.2846,
         target_width=50.0,
         stop_multiple=2.4,
         target_credit=3.0,
     ),
-    "Calls-80-$4b": Template(  # placeholder alias kept out of default set; not used
-        name="British IC - Calls - 80 - $4",
+    "Calls-50-$3": Template(
+        name="British IC - Calls - 50 - $3",
         side="CALL",
-        entry_times_et=("09:33", "09:43", "09:51", "10:07", "10:15", "10:19", "10:45"),
-        target_delta=0.2489,
-        target_width=75.0,
-        stop_multiple=3.3,
-        target_credit=4.0,
+        # THIN/DOCUMENTED-FALLBACK: n=1 real observation (11:05 ET) -- too few to
+        # trust. Same documented-CT->ET fallback grid as Puts-50-$4.
+        entry_times_et=("13:15", "13:45", "14:00", "14:30"),
+        target_delta=0.2923,  # delta_median, template_delta_stats.csv
+        target_width=50.0,
+        stop_multiple=2.4,
+        target_credit=3.0,
     ),
 }
 
