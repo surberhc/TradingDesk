@@ -155,3 +155,43 @@ def test_stress_uses_real_vix_when_provided():
     stress = regime.market_health_score(df, vix=rising_vix).dropna(subset=["stress_vol_calm"])
     assert calm["stress_vol_calm"].iloc[-1] == pytest.approx(1.0)    # below its trend
     assert stress["stress_vol_calm"].iloc[-1] == pytest.approx(0.0)  # above its trend
+
+
+# ---------------------------------------------------------------------------
+# 2026-07-09 NaN-as-bearish regression: a missing today's print must read as
+# unknown (NaN), never as a false "broke trend" / "not calm" bearish 0.0. Bare
+# pandas `>` reads NaN>NaN as False, not NaN — this was the root-cause bug.
+# ---------------------------------------------------------------------------
+def test_missing_last_price_reads_as_unknown_not_bearish():
+    df = _frame(_rising(), 600)
+    df.loc[df.index[-1], "SPY"] = np.nan  # today's SPY print hasn't landed yet
+    out = regime.market_health_score(df)
+    last = out.iloc[-1]
+    # Sub-signals that previously bare-`>`-compared against a NaN price/MA/return
+    # must be NaN (unknown), not 0.0 (a false bearish read).
+    assert pd.isna(last["trend_above_10m"])
+    assert pd.isna(last["trend_ret_6m_pos"])
+    assert pd.isna(last["trend_slope_pos"])  # _rolling_slope_positive cast, same bug class
+    # The rolled-up trend component (100% dependent on SPY) must also be NaN, not
+    # a deflated score from silently treating the missing print as bearish.
+    assert pd.isna(last["trend"])
+    # NOTE: the overall `score` is NOT asserted NaN here on purpose. score =
+    # mean(trend, breadth, stress) with skipna=True (by design — see
+    # _breadth_component's own inception-aware skipna averaging), and in this
+    # synthetic frame breadth_pct/stress are independent of SPY's last-day value,
+    # so they legitimately stay defined. That's a pre-existing, deliberate
+    # partial-information averaging choice, not part of this NaN-as-bearish bug.
+
+
+def test_missing_last_price_makes_rsp_leads_unknown():
+    # breadth_rsp_leads = membership(RSP/SPY, ...) needs SPY specifically — a
+    # missing SPY print must NaN this sub-signal out, not silently read as
+    # "RSP not leading" (bearish-for-breadth false read). breadth_pct (sector-vs-
+    # own-MA) is independent of SPY and legitimately stays defined.
+    df = _frame(_rising(), 600)
+    df.loc[df.index[-1], "SPY"] = np.nan
+    sector_cols = [s for s in config.SECTORS if s in df.columns]
+    b = regime._breadth_component(df["RSP"], df["SPY"], df[sector_cols])
+    last = b.iloc[-1]
+    assert pd.isna(last["breadth_rsp_leads"])
+    assert not pd.isna(last["breadth_pct"])  # unaffected by SPY, stays defined

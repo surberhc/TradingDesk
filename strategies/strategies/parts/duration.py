@@ -50,8 +50,19 @@ def _ret(series: pd.Series, months: int) -> pd.Series:
 
 
 def _above_ma(series: pd.Series, window: int) -> pd.Series:
-    """True where price sits above its own trailing moving average."""
-    return series > series.rolling(window).mean()
+    """NaN-aware: True/False where price is defined vs its trailing MA, NaN where
+    either is undefined (pre-inception or a missing today's print) — never a false
+    "not above" the way a bare `>` would read NaN>NaN. 2026-07-09 NaN-as-bearish
+    fix. Every call site below `.fillna(False)`s this explicitly (matching
+    gates.is_above's existing conservative collapse-to-not-in-trend convention for
+    permission/ban rules) so the conservative default is a visible, deliberate
+    choice at the point of use, not a silent side effect of the operator."""
+    ma = series.rolling(window).mean()
+    valid = series.notna() & ma.notna()
+    # boolean (nullable) dtype, not object: avoids a pandas FutureWarning on the
+    # .fillna(False) call sites below and is the more correct dtype for a
+    # True/False/<NA> signal anyway.
+    return (series > ma).where(valid).astype("boolean")
 
 
 def _drawdown_from_high(series: pd.Series, window: int) -> pd.Series:
@@ -118,7 +129,10 @@ def duration_signals(
     s = pd.DataFrame(index=px.index)
 
     # --- Long-Treasury PERMISSION rules (need >= MIN of 5) ---
-    s["perm_tlt_trend"] = gates.is_above(tlt, buffer=dmargin) | _above_ma(tlt, ma10m)
+    # .fillna(False): a NaN _above_ma reads as "not above" for this permission
+    # rule (conservative-collapse, matching gates.is_above's own convention) —
+    # deliberate, not the silent bare-`>` bug. 2026-07-09 NaN-as-bearish fix.
+    s["perm_tlt_trend"] = gates.is_above(tlt, buffer=dmargin) | _above_ma(tlt, ma10m).fillna(False)
     s["perm_tlt_pos_3m"] = _ret(tlt, r3) > 0
     s["perm_tlt_beats_tbill_3m"] = _ret(tlt, r3) > _ret(bil, r3)
     s["perm_yield_flat_or_falling"] = yld_flat_or_falling
@@ -165,7 +179,10 @@ def duration_signals(
 
     # --- Long-Treasury BAN rules (any one bans) ---
     ban = pd.DataFrame(index=px.index)
-    ban["broken_trend"] = (~gates.is_above(tlt, buffer=dmargin)) & (~_above_ma(tlt, ma10m))
+    # .fillna(False) -> ~False -> True: a NaN _above_ma reads as "not above" here
+    # too, so its negation reads as satisfying the ban leg — same conservative-
+    # collapse convention as perm_tlt_trend above. 2026-07-09 NaN-as-bearish fix.
+    ban["broken_trend"] = (~gates.is_above(tlt, buffer=dmargin)) & (~_above_ma(tlt, ma10m).fillna(False))
     ban["yield_up_rising"] = yld_above_avg_and_rising
     ban["tbill_beats_long"] = (_ret(bil, tbill_lb[0]) > _ret(tlt, tbill_lb[0])) | (
         _ret(bil, tbill_lb[1]) > _ret(tlt, tbill_lb[1])

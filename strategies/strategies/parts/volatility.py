@@ -25,7 +25,13 @@ from strategies import config
 
 def realized_vol(spy: pd.Series, lookback: int = config.VOL_LOOKBACK_DAYS) -> pd.Series:
     """Trailing annualized realized volatility of daily returns (causal)."""
-    return spy.pct_change().rolling(lookback).std() * np.sqrt(252)
+    # fill_method=None: don't let pandas silently forward-fill a missing today's
+    # price before computing the return — the old pad default turned a missing
+    # print into a fake 0% return day, understating realized vol on a data-gap
+    # night (which then reads as falsely calm downstream in volatility_multiplier,
+    # nudging toward MORE equity exposure than warranted). 2026-07-09 NaN-as-
+    # bearish fix (same pattern as regime.py; here it's NaN-as-falsely-calm).
+    return spy.pct_change(fill_method=None).rolling(lookback).std() * np.sqrt(252)
 
 
 def _target_band(version: str) -> tuple[float, float]:

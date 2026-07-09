@@ -58,13 +58,21 @@ def _rolling_slope_positive(price: pd.Series, window: int) -> pd.Series:
         x -= x.mean()  # center x so the intercept term drops out
         denom = float((x * x).sum())
         slopes[window - 1:] = (wins * x).sum(axis=1) / denom
-    return pd.Series(slopes, index=price.index) > 0
+    s = pd.Series(slopes, index=price.index)
+    # NaN-safe: a NaN slope (pre-inception or a NaN price inside the window) must
+    # read as unknown, not a false "not positive" — bare `>` reads NaN>0 as False,
+    # not NaN. 2026-07-09 NaN-as-bearish fix (this cast previously undid the
+    # NaN-safety the docstring above promises).
+    return (s > 0).where(s.notna())
 
 
 def _ratio_above_trend(numer: pd.Series, denom: pd.Series, window: int) -> pd.Series:
     """True where a price ratio sits above its own trailing moving average."""
     ratio = numer / denom
-    return ratio > ratio.rolling(window).mean()
+    # NaN-safe: a NaN ratio (missing today's print) must read as unknown, not a
+    # false "not above trend" — bare `>` reads NaN>NaN as False, not NaN.
+    # 2026-07-09 NaN-as-bearish fix.
+    return (ratio > ratio.rolling(window).mean()).where(ratio.notna())
 
 
 # ---------------------------------------------------------------------------
@@ -73,13 +81,21 @@ def _ratio_above_trend(numer: pd.Series, denom: pd.Series, window: int) -> pd.Se
 def _trend_component(spy: pd.Series) -> pd.DataFrame:
     """Component 1 — broad equity trend on SPY. Returns sub-signals + [0,1] score."""
     ma_10m = spy.rolling(config.MA_MONTHS * TRADING_DAYS_PER_MONTH).mean()
-    ret_6m = spy.pct_change(config.TREND_RETURN_MONTHS * TRADING_DAYS_PER_MONTH)
+    # fill_method=None: don't let pandas silently forward-fill a missing today's
+    # price before computing the return (2026-07-09 NaN-as-bearish fix — the old
+    # pad default turned a missing print into a flat 0% return, which then read
+    # as bearish below).
+    ret_6m = spy.pct_change(config.TREND_RETURN_MONTHS * TRADING_DAYS_PER_MONTH,
+                             fill_method=None)
 
     sub = pd.DataFrame(
         {
             "trend_above_200d": gates.membership(spy, buffer=config.trend_margin("regime")),
-            "trend_above_10m": (spy > ma_10m).astype(float),
-            "trend_ret_6m_pos": (ret_6m > 0).astype(float),
+            # NaN-safe: a NaN spy/ma_10m/ret_6m (today's print hasn't landed) must
+            # read as unknown, not a false "not in trend" — bare `>` reads NaN>NaN
+            # as False, not NaN. 2026-07-09 NaN-as-bearish fix.
+            "trend_above_10m": (spy > ma_10m).astype(float).where(spy.notna() & ma_10m.notna()),
+            "trend_ret_6m_pos": (ret_6m > 0).astype(float).where(ret_6m.notna()),
             "trend_slope_pos": _rolling_slope_positive(
                 spy, config.SLOPE_LOOKBACK_DAYS
             ).astype(float),
@@ -129,8 +145,13 @@ def _stress_component(
         v = vix.reindex(idx).ffill()
         vol_calm = (v <= v.rolling(config.stress_ma_days()).mean()).astype(float)
     else:
-        realized = spy.pct_change().rolling(config.VOL_LOOKBACK_DAYS).std() * np.sqrt(252)
-        vol_calm = (realized <= realized.rolling(config.stress_ma_days()).mean()).astype(float)
+        # fill_method=None + explicit NaN mask: same 2026-07-09 NaN-as-bearish fix
+        # as the trend component — don't let a missing today's price read as calm/
+        # not-calm by accident.
+        realized = (spy.pct_change(fill_method=None).rolling(config.VOL_LOOKBACK_DAYS).std()
+                    * np.sqrt(252))
+        vol_calm = ((realized <= realized.rolling(config.stress_ma_days()).mean())
+                    .astype(float).where(realized.notna()))
     cols = {"stress_vol_calm": vol_calm}
 
     # --- Credit sub-signal ---

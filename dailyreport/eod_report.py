@@ -87,6 +87,11 @@ DOT = {"ok": "#22c55e", "info": "#3b82f6", "stale": "#9ca3af",
        "partial": "#fbbf24", "warn": "#f59e0b", "fail": "#ef4444"}
 SEVERITY = ["ok", "info", "stale", "partial", "warn", "fail"]
 
+# Severity rank used specifically to make s0_regime inherit s0_data's status when
+# s0_data is worse (2026-07-09 fix) — a subset/superset of SEVERITY restricted to
+# the statuses build_s0_data/build_s0_regime actually emit: ok < stale < warn < fail.
+_DATA_STATUS_RANK = {"ok": 0, "stale": 1, "warn": 2, "fail": 3}
+
 
 def _log(msg: str) -> None:
     line = f"{dt.datetime.now():%Y-%m-%d %H:%M:%S}  {msg}"
@@ -120,7 +125,7 @@ def _sec(key, title, st, headline, rows):
 # --------------------------------------------------------------------------- #
 
 
-def build_s0_regime():
+def build_s0_regime(data_status: str | None = None):
     """S0 (Adaptive All-Weather Core) — today's Market Health Score + regime.
 
     Computes the score the SAME way the shared strategy brain does (see
@@ -135,7 +140,16 @@ def build_s0_regime():
     confirmed regime (and therefore the traded band) actually changing.
 
     Never raises: any failure (missing data, import issue) degrades to a
-    'fail' section rather than taking the whole report down."""
+    'fail' section rather than taking the whole report down.
+
+    data_status: build_s0_data's already-computed status string, passed in so
+    s0_regime can never report a HEALTHIER verdict than s0_data for the same
+    night (2026-07-09 fix — they previously disagreed: s0_data warned on stale
+    tickers while s0_regime independently said ok). If data_status outranks
+    this section's own computed status (severity ok < stale < warn < fail),
+    this section's status is downgraded to match and the headline is prefixed
+    so the reason stays visible. None (the default) skips this — used only for
+    back-compat / standalone calls where s0_data hasn't run."""
     title = "S0 Regime (Adaptive All-Weather Core)"
     try:
         from src import data_loader
@@ -154,8 +168,16 @@ def build_s0_regime():
             prices, hyg=hyg, credit_denom=credit_denom, vix=vix, hy_oas=hy_oas)
         confirmed = s_regime.apply_hysteresis(score_df["score"])
 
-        last = score_df.iloc[-1]
-        as_of = score_df.index[-1]
+        # "Data as-of" must be the OLDEST last-real-value date across S0's required
+        # price inputs, not score_df.index[-1] (the union of every ticker's dates,
+        # which can read "fresh" even when a required ticker's row that day is NaN
+        # — 2026-07-09 fix, paired with the NaN-as-bearish fix in regime.py).
+        _required_cols = [c for c in (["SPY", "RSP"] + list(s_config.SECTORS)) if c in prices.columns]
+        _real_dates = [prices[c].last_valid_index() for c in _required_cols]
+        _real_dates += [hyg.last_valid_index(), credit_denom.last_valid_index()]
+        _real_dates = [d for d in _real_dates if d is not None]
+        as_of = min(_real_dates) if _real_dates else score_df.index[-1]
+        last = score_df.loc[as_of]
         raw_regime = last["regime"]
         confirmed_regime = confirmed.iloc[-1]
         fresh = _is_fresh(as_of.strftime("%Y%m%d"))
@@ -190,6 +212,14 @@ def build_s0_regime():
                             f"but the CONFIRMED/traded regime is still "
                             f"{confirmed_regime} (equity band {band_lo:.0%}-{band_hi:.0%}) "
                             f"— hysteresis hasn't confirmed the move yet")
+
+        # Inherit s0_data's status if it's worse (2026-07-09 fix): s0_regime must
+        # never look healthier than s0_data for the same report. Downgrade, don't
+        # silently swallow — prepend a visible note to the headline.
+        if (data_status is not None
+                and _DATA_STATUS_RANK.get(data_status, 0) > _DATA_STATUS_RANK.get(st, 0)):
+            headline = f"[data {data_status}] " + headline
+            st = data_status
 
         status.write("s0_regime", st, metrics={
             "score": float(last["score"]), "raw_regime": raw_regime,
@@ -435,6 +465,10 @@ def build_account():
     return _sec("account", title, st, headline, rows)
 
 
+# NOTE: build_s0_data must run BEFORE build_s0_regime so s0_regime can inherit
+# s0_data's status when it's worse (2026-07-09 fix, see build_s0_regime's
+# data_status param) — main() special-cases this ordering; SECTIONS here is kept
+# only for any other caller that iterates it uniformly (e.g. archive tooling).
 SECTIONS = [build_s0_regime, build_s0_data, build_account]
 
 
@@ -573,7 +607,18 @@ def main() -> bool:
     _log(f"=== EOD report {TODAY_STR} start ===")
     sent = False
     try:
-        sections = [_run_section(build) for build in SECTIONS]
+        # build_s0_data runs BEFORE build_s0_regime (order-affecting, 2026-07-09
+        # fix) so s0_regime can inherit s0_data's status when it's worse — see
+        # build_s0_regime's data_status param. Display order stays s0_regime,
+        # s0_data, account (unchanged) since _status_banner and the rendered
+        # email both expect that order.
+        s0_data_sec = _run_section(build_s0_data)
+        _build_s0_regime_with_data_status = lambda: build_s0_regime(
+            data_status=s0_data_sec.get("status"))
+        _build_s0_regime_with_data_status.__name__ = "build_s0_regime"
+        s0_regime_sec = _run_section(_build_s0_regime_with_data_status)
+        account_sec = _run_section(build_account)
+        sections = [s0_regime_sec, s0_data_sec, account_sec]
         overall = _overall(sections)
         html = render_html(sections, overall)
         subject = f"Trading Desk EOD — {TODAY.strftime('%b %d')} — {overall.upper()}"
