@@ -68,8 +68,13 @@ TEMPLATES: dict[str, Template] = {
     "Puts-80-$4": Template(
         name="British IC - Puts - 80 - $4",
         side="PUT",
-        # REAL-DERIVED, n=491. >=5% buckets from real combo_ledger/TAT join.
-        entry_times_et=("09:30", "09:40", "09:50", "10:05", "10:15", "13:00"),
+        # STAGE-B REAL-DERIVED, n=439 strict-MATCHED (combo_ledger x TAT-tradelog,
+        # TAT coverage through 2026-03-19). Buckets kept iff >=3% of entries AND
+        # >=3 distinct days; 8/41 buckets kept, 82.2% coverage. Includes the real
+        # afternoon 13:05/13:20 cluster (6.6%/29d, 3.4%/15d) that the old
+        # morning-only grid missed -- resolves Stage-A's "trades found at 14:33 ET
+        # with no comparable grid slot" caveat. See SIMULATOR_STAGE_B_PROGRESS.md.
+        entry_times_et=("09:35", "09:45", "09:50", "10:05", "10:15", "10:20", "13:05", "13:20"),
         target_delta=0.2318,  # delta_median, template_delta_stats.csv
         target_width=80.0,    # width_median
         stop_multiple=3.3,
@@ -78,8 +83,10 @@ TEMPLATES: dict[str, Template] = {
     "Calls-80-$4": Template(
         name="British IC - Calls - 80 - $4",
         side="CALL",
-        # REAL-DERIVED, n=363. >=5% buckets from real combo_ledger/TAT join.
-        entry_times_et=("09:30", "09:40", "09:50", "10:05", "10:15"),
+        # STAGE-B REAL-DERIVED, n=332 strict-MATCHED. Same threshold rule as
+        # Puts-80-$4 (>=3% of entries AND >=3 distinct days); 84.3% coverage.
+        # Also picks up the real 13:05/13:20 afternoon cluster.
+        entry_times_et=("09:35", "09:45", "09:50", "10:05", "10:15", "10:20", "13:05", "13:20"),
         target_delta=0.2489,
         target_width=75.0,
         stop_multiple=3.3,
@@ -88,9 +95,10 @@ TEMPLATES: dict[str, Template] = {
     "Puts-50-$4": Template(
         name="British IC - Puts - 50 - $4",
         side="PUT",
-        # THIN/DOCUMENTED-FALLBACK: n=1 real observation (10:50 ET) -- too few to
-        # trust. Falls back to STRATEGY_MECHANICS.md/S8_SPEC.md section 2.1's
-        # documented "50-$4 afternoon grid ~12:15-13:45 CT" -> ET (+1h):
+        # STAGE-B CONFIRMED THIN/FALLBACK: n=1 strict-MATCHED (2025-07-28 only)
+        # -- below the n>=10 derivation floor, LOW-CONFIDENCE. Falls back to
+        # STRATEGY_MECHANICS.md/S8_SPEC.md section 2.1's documented "50-$4
+        # afternoon grid ~12:15-13:45 CT" -> ET (+1h):
         # 12:15/12:45/13:00/13:30 CT -> 13:15/13:45/14:00/14:30 ET.
         entry_times_et=("13:15", "13:45", "14:00", "14:30"),
         target_delta=0.2692,
@@ -101,8 +109,9 @@ TEMPLATES: dict[str, Template] = {
     "Calls-50-$4": Template(
         name="British IC - Calls - 50 - $4",
         side="CALL",
-        # THIN/DOCUMENTED-FALLBACK: n=1 real observation (11:05 ET) -- too few to
-        # trust. Same documented-CT->ET fallback grid as Puts-50-$4.
+        # STAGE-B CONFIRMED THIN/FALLBACK: n=1 strict-MATCHED (2025-07-28 only)
+        # -- below the n>=10 derivation floor, LOW-CONFIDENCE. Same
+        # documented-CT->ET fallback grid as Puts-50-$4.
         entry_times_et=("13:15", "13:45", "14:00", "14:30"),
         target_delta=0.2766,
         target_width=50.0,
@@ -112,8 +121,9 @@ TEMPLATES: dict[str, Template] = {
     "Puts-80-$3": Template(
         name="British IC - Puts - 80 - $3",
         side="PUT",
-        # REAL-DERIVED, n=96. >=5% buckets from real combo_ledger/TAT join.
-        entry_times_et=("13:00", "13:15", "13:30", "13:55"),
+        # STAGE-B REAL-DERIVED, n=83 strict-MATCHED. 7/? buckets kept
+        # (>=3% AND >=3 distinct days), 77.1% coverage.
+        entry_times_et=("11:35", "12:30", "13:05", "13:20", "13:35", "14:00", "14:35"),
         target_delta=0.2632,
         target_width=80.0,
         stop_multiple=2.4,
@@ -122,8 +132,11 @@ TEMPLATES: dict[str, Template] = {
     "Calls-80-$3": Template(
         name="British IC - Calls - 80 - $3",
         side="CALL",
-        # REAL-DERIVED, n=44. >=5% buckets from real combo_ledger/TAT join.
-        entry_times_et=("10:15", "13:00", "13:15", "13:30", "14:30"),
+        # STAGE-B REAL-DERIVED, n=53 strict-MATCHED. 5 buckets kept
+        # (13:05 33.96%/18d, 13:20 18.87%/10d, 13:35 9.43%/5d, 14:00 5.66%/3d,
+        # 14:35 7.55%/4d), 75.5% coverage. 14:15 (3.77%/2d) narrowly fails the
+        # 3-distinct-day floor and is correctly excluded.
+        entry_times_et=("13:05", "13:20", "13:35", "14:00", "14:35"),
         target_delta=0.2843,
         target_width=70.0,
         stop_multiple=2.4,
@@ -132,8 +145,8 @@ TEMPLATES: dict[str, Template] = {
     "Puts-50-$2": Template(
         name="British IC - Puts - 50 - $2",
         side="PUT",
-        # REAL-DERIVED, n=179. >=5% buckets from real combo_ledger/TAT join.
-        entry_times_et=("13:00", "13:15", "13:30", "13:55", "14:05", "14:25", "14:30"),
+        # STAGE-B REAL-DERIVED, n=163 strict-MATCHED. 73.6% coverage.
+        entry_times_et=("13:05", "13:20", "13:35", "14:00", "14:10", "14:15", "14:25", "14:35"),
         target_delta=0.2156,
         target_width=45.0,
         stop_multiple=2.0,
@@ -142,8 +155,8 @@ TEMPLATES: dict[str, Template] = {
     "Calls-50-$2": Template(
         name="British IC - Calls - 50 - $2",
         side="CALL",
-        # REAL-DERIVED, n=151. >=5% buckets from real combo_ledger/TAT join.
-        entry_times_et=("13:00", "13:15", "13:30", "13:55", "14:05", "14:10", "14:30"),
+        # STAGE-B REAL-DERIVED, n=131 strict-MATCHED. 76.3% coverage.
+        entry_times_et=("12:25", "13:05", "13:20", "13:35", "14:00", "14:10", "14:15", "14:25", "14:35", "15:05"),
         target_delta=0.2363,
         target_width=45.0,
         stop_multiple=2.0,
@@ -152,8 +165,11 @@ TEMPLATES: dict[str, Template] = {
     "Puts-80-$2": Template(
         name="British IC - Puts - 80 - $2",
         side="PUT",
-        # REAL-DERIVED, n=20, no dominant slot (matches STRATEGY_MECHANICS.md's
-        # existing characterization) -- all buckets clearing >=5% listed.
+        # STAGE-B: n=17 strict-MATCHED, THIN. Nominal best bucket (12:30,
+        # 17.65%, 3 distinct days) clears both floors but only 17.6% total
+        # coverage, below the 40% trust floor -> LOW-CONFIDENCE fallback,
+        # kept at the Stage-A/STRATEGY_MECHANICS.md grid (matches its existing
+        # "scattered 10:00-14:15, no dominant slot" characterization).
         entry_times_et=("11:05", "12:05", "12:30", "12:55", "13:00", "13:15", "13:25",
                          "13:30", "13:40", "14:00", "14:15", "14:20", "14:25", "14:35", "14:40"),
         target_delta=0.2444,
@@ -164,9 +180,9 @@ TEMPLATES: dict[str, Template] = {
     "Puts-50-$3": Template(
         name="British IC - Puts - 50 - $3",
         side="PUT",
-        # THIN/DOCUMENTED-FALLBACK: n=3 real observations (11:05, 11:10, 12:10 ET,
-        # not statistically reliable). Same documented-CT->ET fallback grid as
-        # Puts/Calls-50-$4.
+        # STAGE-B CONFIRMED THIN/FALLBACK: n=2 strict-MATCHED (2025-07-22,
+        # 2025-08-25) -- below the n>=10 derivation floor, LOW-CONFIDENCE. Same
+        # documented-CT->ET fallback grid as Puts/Calls-50-$4.
         entry_times_et=("13:15", "13:45", "14:00", "14:30"),
         target_delta=0.2846,
         target_width=50.0,
@@ -176,8 +192,9 @@ TEMPLATES: dict[str, Template] = {
     "Calls-50-$3": Template(
         name="British IC - Calls - 50 - $3",
         side="CALL",
-        # THIN/DOCUMENTED-FALLBACK: n=1 real observation (11:05 ET) -- too few to
-        # trust. Same documented-CT->ET fallback grid as Puts-50-$4.
+        # STAGE-B CONFIRMED THIN/FALLBACK: n=0 strict-MATCHED rows at all in the
+        # Stage-B rejoin -- no real data to derive from, LOW-CONFIDENCE. Same
+        # documented-CT->ET fallback grid as Puts-50-$4.
         entry_times_et=("13:15", "13:45", "14:00", "14:30"),
         target_delta=0.2923,  # delta_median, template_delta_stats.csv
         target_width=50.0,
