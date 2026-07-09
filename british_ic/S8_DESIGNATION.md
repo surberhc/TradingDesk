@@ -2,6 +2,10 @@
 
 Status: **research/paper-analysis finding only — not live, not yet running anywhere.**
 
+**Superseded as the canonical spec by `docs/S8_SPEC.md` (2026-07-09) — S8 is now developed/evaluated as
+its own standalone strategy, not scored against this account's actual trade log going forward. This
+file remains as the original research derivation.**
+
 ## What S8 is
 
 S8 = the actual, externally-traded British IC strategy (SPX 0DTE credit spreads,
