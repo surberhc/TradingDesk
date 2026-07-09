@@ -1,10 +1,13 @@
 # S8 — SPX 0DTE Credit Spread Pair, Scheduled Entries + Stop-Triggered Long-Leg Close
 
 **STATUS: STANDALONE STRATEGY DESIGNATED (2026-07-09). Research/paper only — no live capital, no
-paperbot wiring yet.** This document is the canonical spec. S8 is now developed and evaluated as its
-own strategy going forward, not as a delta against the externally-traded "British IC" account it was
-originally derived from. That original account remains the *origin* of the ruleset (see §6) but is no
-longer the strategy's benchmark or scoreboard.
+paperbot wiring yet.** This document is the canonical spec — S8's rules, performance, and limitations
+are now defined and evaluated on their own terms, not perpetually re-derived as "the B2 correction vs.
+what actually happened" in the account it came from. That does NOT mean the live account stops being
+useful: it remains an active, ongoing out-of-sample data source (see §6) — S8 will continue to be
+tested against its real forward fills as they accrue, and Andrew is separately working on an additional
+historical export to extend the analysis window further back (see §7 item 3). Standalone means S8 has
+its own identity and spec; it does not mean the live comparison is retired.
 
 **Type:** Strategy specification, entries + exits fully mechanical. PAPER / research only — nothing is
 armed or transmitted; the frozen S0/regime config is untouched; no backtester/paperbot code exists for
@@ -165,24 +168,33 @@ S8's ruleset was reverse-engineered from an external, live-traded account ("Brit
 U***9156, run via TAT/NinjaTrader) whose own trade log understated its true P&L (it marked the long leg
 worthless the instant the short stopped, when a human actually held it longer). The reconstruction
 against that account's real fills (`british_ic/RECONSTRUCTION_NOTES.md`) is where the entry mechanics
-(§2) and the candidate exit rule (§3) were both discovered and validated. That reconstruction, and the
-account it came from, are now historical inputs — S8 is no longer scored against "what actually
-happened" in that account going forward. Full derivation detail remains in `british_ic/` for anyone who
-wants to audit the methodology; it is not required reading to work on S8 itself.
+(§2) and the candidate exit rule (§3) were both discovered and validated.
+
+That account remains a live, ongoing source of real out-of-sample evidence — it keeps trading, and
+every new day of its fills is a genuine forward test of whether S8's rules continue to hold up, not a
+one-time backward-looking comparison that's now closed. The distinction that changed 2026-07-09 is
+identity, not data access: S8 is no longer *defined* as "a delta against this account's actual P&L," it
+is defined by its own rules (§2, §3) — but those rules should keep being checked against this account's
+real forward fills as they accrue, exactly the way any strategy gets walk-forward re-validated (§7 item
+5). Full derivation detail remains in `british_ic/` for anyone who wants to audit the methodology; it is
+not required reading to work on S8 itself.
 
 ---
 
 ## 7. Forward work (what "developing S8 as its own strategy" means next)
 
-Not started, no owner assigned yet:
+Not started unless noted:
 1. **Wire S8's full ruleset (§2 + §3) as a real strategy module**, runnable through the backtester's own
    `run_backtest()` path the way S0/S4/S5 are, so it can be evaluated with this project's standard
    walk-forward / out-of-sample tooling instead of a one-off reconstruction script.
 2. **Fill-cost realism pass** on both legs (§5.2) before any paper deployment is considered.
-3. **Extend history** back to 2024-09-16 (TAT log coverage) once/if an additional Flex Query export is
-   available, to add regime variety beyond the single 2025-10-10 crash event.
+3. **Extend history** back to 2024-09-16 (TAT log coverage) — **actively IN PROGRESS, owned by Andrew**:
+   he is pursuing an additional Flex Query export to add regime variety beyond the single 2025-10-10
+   crash event. Re-run the §2/§3/§4 numbers once that data lands.
 4. **Independent entry-side validation** — test whether the scheduled-entry/credit-target structure
    itself (not just the B2 exit correction) clears an honest out-of-sample bar, the same rigor already
    applied to the exit rule.
-5. **Walk-forward re-check cadence** once any paper/live version exists — do not bless S8 once and leave
-   it unmonitored; re-check per-leg and per-day performance on a rolling basis as new data accrues.
+5. **Walk-forward re-check cadence — starts now, not just "once paper/live exists."** The British IC
+   account keeps generating real forward fills today; treat each new batch as an out-of-sample check on
+   S8's rules (§2, §3) as it comes in, rather than waiting for a paper/live S8 implementation to exist
+   before re-validating. Do not bless S8 once and leave it unmonitored.
