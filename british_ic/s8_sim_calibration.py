@@ -79,7 +79,8 @@ def main():
                   f"{elapsed:.0f}s elapsed, ~{eta:.0f}s remaining")
 
     df = pd.DataFrame(all_rows)
-    out_path = Path(__file__).parent / "s8_sim_calibration_2025_2026.csv"
+    out_name = sys.argv[1] if len(sys.argv) > 1 else "s8_sim_calibration_2025_2026.csv"
+    out_path = Path(__file__).parent / out_name
     df.to_csv(out_path, index=False)
     print(f"\nWrote {out_path} ({len(df)} rows)")
 

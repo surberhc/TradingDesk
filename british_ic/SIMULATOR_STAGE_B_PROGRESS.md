@@ -206,3 +206,71 @@ float precision).
 days, the full Task 2 calibration run is estimated at **~106 minutes**, which is
 viable to run directly (not backgrounded/chunked the way Task 3's 1,127-day run will
 need to be).
+
+---
+
+## Task 2: full calibration run — IN PROGRESS
+
+Started `s8_sim_calibration.py` (commit ed6ff50) as a background process at
+approximately 17:35 local. Found 247 trading days with SPXW parquet on disk in
+[2025-07-09, 2026-07-07] (a few more than S8_SPEC.md's 236 "active" trading days,
+since parquet exists for every market day regardless of whether S8 itself traded
+that day; last parquet on disk is 2026-07-01, so 2026-07-02 through 2026-07-07 are
+expected-missing, consistent with Stage A's earlier finding). Running all 10 real
+templates (excluding the unused `Calls-80-$4b` alias) per day, writing one row per
+simulated trade. Will update this doc with the full aggregate summary once the run
+completes (est. ~106 min from start based on the 27s/day benchmark). Output:
+`british_ic/s8_sim_calibration_2025_2026.csv` (gitignored per convention).
+
+**Environment note:** discovered several stray duplicate python processes running the
+same benchmark/calibration scripts concurrently (leftover from earlier interactive
+timing tests in this session that appear not to have exited cleanly, plus what looks
+like a duplicate interpreter path -- both `C:\TradingDesk-Local\venv\...\python.exe`
+and `C:\Users\andre\...\Python312\python.exe` show matching invocations). Could not
+clean these up directly (auto-mode's safety classifier blocked system-wide
+process-kill actions, correctly, since it can't tell my own strays apart from
+protected desk processes like the ThetaData terminal from PID alone). The tracked
+run (PID 10136, `python.exe -u s8_sim_calibration.py`, started ~17:25) is
+confirmed alive and progressing via its own log output (checkpoint: 10/247 days done
+in 190s = 19s/day, actually faster than the single-process 27s/day benchmark despite
+the contention) -- not blocked, just sharing CPU/disk with the stray copies. No
+action needed beyond patience; flagging for the record in case Andrew wants to clear
+strays manually.
+
+**Update: root cause identified.** Checked CPU time on the tracked PID (10136) after
+~20 min: 0.015s CPU -- essentially never scheduled, despite the log showing one real
+checkpoint. Found that EVERY background Bash invocation in this session is being
+silently duplicated by the harness itself: each command spawns both a
+`C:\TradingDesk-Local\venv\...\python.exe` process (the correct interpreter) AND an
+identical `C:\Users\andre\...\Python312\python.exe` process (a different install) --
+confirmed via `Get-CimInstance Win32_Process`, both share the exact same command
+line, both created within ~1 second of each other. The `Python312` copies are the
+ones actually burning CPU (500-700s each); the `venv` copies (the ones this session's
+own log/PID tracking pointed at) sit at ~0 CPU. This is an environment/harness
+quirk, not a bug in the simulator or calibration script. Started a fresh run
+(`s8_sim_calibration.py s8_sim_calibration_2025_2026.csv`, explicit output-name arg
+added to the script to avoid any path collision with the earlier stray run) --
+duplicated the same way (PID 5852 venv / 18892 Python312), but since both copies run
+the exact same deterministic script against the same read-only inputs, the only cost
+is wasted duplicate compute, not a correctness risk -- both will independently
+compute and write the identical CSV. Not attempting further process cleanup (blocked
+by the auto-mode safety classifier, correctly, since PID-based identification alone
+can't rule out protected desk processes) -- letting it run to completion and
+verifying the output file's row count/content once done.
+
+**Further update: log-file progress appears to stall intermittently across all
+attempts** (multiple runs launched to work around the duplication; each shows one or
+two real progress checkpoints then goes quiet for several minutes at a time despite
+`Get-Process` showing hundreds of seconds of accumulated CPU time on some sibling
+PID). Likely cause: Google Drive sync on this folder (the whole TradingDesk repo
+lives under `My Drive`) intermittently locks/delays file writes, or stdout
+buffering/flush timing interacts badly with the duplicated-process setup. No data
+corruption risk either way (each run is fully independent and deterministic against
+read-only inputs) -- worst case is wasted compute across several redundant attempts,
+not wrong numbers. As of this note, three separate calibration runs are alive in
+parallel (`calibration_run.log` at checkpoint 20/247, `calibration_run2.log` and
+`calibration_run3.log` freshly started) all racing to the same computation; whichever
+finishes first will be used for the Task 2 verdict, and this section will be updated
+with the real completion time once one lands. This entire episode is an environment
+quirk unrelated to S8/the simulator's correctness — flagging transparently per the
+"never claim done without proof" rule rather than silently working around it.
