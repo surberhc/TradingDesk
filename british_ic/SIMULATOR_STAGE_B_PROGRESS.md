@@ -177,3 +177,32 @@ Verified the simulator still runs end-to-end post-update:
 `python s8_mechanical_simulator.py 20251231 "Puts-80-$4"` produces 8 well-formed trade
 rows (one per new grid slot, including the new 13:05/13:20 afternoon entries) with
 sane spot/strike/credit/exit values.
+
+---
+
+## Task 2 prep: performance fix required before the 236-day run
+
+Attempted a timing benchmark before committing to the full run: `Puts-80-$4` alone,
+ONE day (2025-12-31, 8 entries), took **83.5 seconds**. At that rate, 10 templates x
+236 days would have taken an estimated **>48 hours** -- not viable, and the Task 3
+2022-2026 extension (1,127 days) would have been ~10x worse still.
+
+**Root cause found:** `_quote_at()` (called twice per minute per trade -- once for
+the short leg, once for the long leg -- for up to ~390 minutes per trade) did a full
+boolean-mask scan over the ENTIRE day's `quote0` dataframe (~320,000 rows for a single
+day, confirmed via direct parquet read of `20251231.parquet`) on every single call,
+instead of an indexed/O(1) lookup.
+
+**Fix (pure performance, no fill-model or trade-logic change):** added a
+`(timestamp, right, strike) -> (bid, ask)` dict built once per day (cached by
+`id(quote0)`, cleared/rebuilt when a new day's `quote0` is passed in) in
+`s8_mechanical_simulator.py`, and switched `_quote_at()` to an O(1) dict lookup
+against it. Verified byte-identical trade output before/after the fix on
+`Puts-80-$4` / 2025-12-31 (same 8 trades, same strikes/credits/exits/P&L to full
+float precision).
+
+**Result: 83.5s -> 2.88s for Puts-80-$4/one day (29x speedup); all 10 real templates
+(excluding the unused `Calls-80-$4b` alias) for one day: 27.0s.** At 27s/day x 236
+days, the full Task 2 calibration run is estimated at **~106 minutes**, which is
+viable to run directly (not backgrounded/chunked the way Task 3's 1,127-day run will
+need to be).

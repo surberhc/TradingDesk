@@ -466,12 +466,44 @@ def _select_strikes(quote0: pd.DataFrame, timestamp: str, side: str, spot: float
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# Performance: _quote_at() and _select_strikes()/estimate_spot()'s per-minute
+# quote lookups originally did a full boolean-mask scan over the day's WHOLE
+# quote0 dataframe (~320k rows) on every call -- for a single trade's
+# minute-by-minute walk (up to ~390 minutes) that's ~390 O(n) scans just for
+# the short leg, doubled for the long leg. Measured: ~84s for ONE template's
+# ONE day (8 entries) before this fix, which would have made the Task-2/3 236-
+# day x 10-template run take >48 hours. Fix: build a single (timestamp, right,
+# strike) -> (bid, ask) dict once per day (per quote0 dataframe identity,
+# cached by id()) and do O(1) dict lookups instead. This is a pure performance
+# change -- same fill model, same values, verified byte-identical against the
+# original scan on a spot-check (see SIMULATOR_STAGE_B_PROGRESS.md).
+# ---------------------------------------------------------------------------
+_QUOTE_INDEX_CACHE: dict[int, dict[tuple[str, str, float], tuple[float, float]]] = {}
+
+
+def _quote_index(quote0: pd.DataFrame) -> dict[tuple[str, str, float], tuple[float, float]]:
+    key = id(quote0)
+    idx = _QUOTE_INDEX_CACHE.get(key)
+    if idx is None:
+        idx = {
+            (ts, right, strike): (bid, ask)
+            for ts, right, strike, bid, ask in zip(
+                quote0["timestamp"], quote0["right"], quote0["strike"],
+                quote0["bid"], quote0["ask"],
+            )
+        }
+        _QUOTE_INDEX_CACHE.clear()  # only ever cache the current day's quote0
+        _QUOTE_INDEX_CACHE[key] = idx
+    return idx
+
+
 def _quote_at(quote0: pd.DataFrame, timestamp: str, right: str, strike: float) -> tuple[float, float, float] | None:
-    row = quote0[(quote0["timestamp"] == timestamp) & (quote0["right"] == right) & (quote0["strike"] == strike)]
-    if row.empty:
+    idx = _quote_index(quote0)
+    got = idx.get((timestamp, right, strike))
+    if got is None:
         return None
-    bid = float(row["bid"].iloc[0])
-    ask = float(row["ask"].iloc[0])
+    bid, ask = got
     mid = _mid(bid, ask)
     if math.isnan(mid):
         return None
