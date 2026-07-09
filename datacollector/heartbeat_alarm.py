@@ -60,7 +60,9 @@ import argparse
 import datetime as dt
 import json
 import os
+import subprocess
 import sys
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import config
@@ -88,6 +90,59 @@ def _is_trading_day(d: "dt.date") -> bool:
         except Exception:  # noqa: BLE001 — un-tabled year etc. -> weekday fallback
             pass
     return d.weekday() < 5
+
+
+# --------------------------------------------------------------------------- #
+# Live Task Scheduler deadline lookup (2026-07-09 fix)
+# --------------------------------------------------------------------------- #
+# WHY: DEADLINE_JOBS used to hardcode a deadline_hhmm that was a hand-maintained
+# SECOND COPY of "when does this task actually run" (the real source of truth is
+# the Windows Scheduled Task's own trigger times). When TiingoDailyUpdate and
+# AccountMonitorDaily got their trigger times changed, nobody updated this file's
+# copy, and the alarm fired false pages against a schedule that no longer existed.
+# Fix: derive the deadline LIVE from the task's own trigger(s) via `schtasks /query
+# /xml`, and keep the old hardcoded value only as a defensive fallback (task
+# deleted/renamed, schtasks unavailable, no time-based trigger, etc).
+_task_deadline_cache: dict[str, tuple[int, int] | None] = {}
+
+
+def _latest_task_trigger_hhmm(task_name: str) -> tuple[int, int] | None:
+    """Query Windows Task Scheduler for task_name's trigger(s) and return the LATEST
+    (H, M) local time among them, or None on ANY failure (task missing, schtasks
+    unavailable/slow, malformed XML, no time-based trigger). NEVER raises. Cached
+    per task_name for the life of this process (single-run script)."""
+    if task_name in _task_deadline_cache:
+        return _task_deadline_cache[task_name]
+
+    result: tuple[int, int] | None = None
+    try:
+        proc = subprocess.run(
+            ["schtasks", "/query", "/tn", task_name, "/xml"],
+            capture_output=True, text=True, timeout=15, check=False,
+        )
+        if proc.returncode == 0 and proc.stdout:
+            root = ET.fromstring(proc.stdout)
+            latest: dt.time | None = None
+            for el in root.iter():
+                if el.tag.endswith("StartBoundary") and el.text:
+                    # Format: 2026-07-09T20:45:00-05:00 (offset optional/variable).
+                    # Strptime can't handle a colon-containing UTC offset uniformly
+                    # across Python versions, so just parse the local H:M ourselves.
+                    try:
+                        time_part = el.text.split("T", 1)[1]
+                        hh, mm = time_part.split(":")[:2]
+                        t = dt.time(int(hh), int(mm))
+                    except (IndexError, ValueError):
+                        continue
+                    if latest is None or t > latest:
+                        latest = t
+            if latest is not None:
+                result = (latest.hour, latest.minute)
+    except Exception:  # noqa: BLE001 — live schedule lookup is best-effort only
+        result = None
+
+    _task_deadline_cache[task_name] = result
+    return result
 
 # --------------------------------------------------------------------------- #
 # Paths / tunables
@@ -152,34 +207,50 @@ JOBS: list[dict] = [
 # scheduled tasks needed.
 #
 # Each entry:
-#   name          : status-file stem + state-file key + log id
-#   label         : human name used in the alert
-#   status_file   : Path to the status JSON (status.py output)
-#   deadline_hhmm : (H, M) local (CT) time by which the job must have run
-#   task_name     : the Windows scheduled task that owns the job (named in the alert)
+#   name                  : status-file stem + state-file key + log id
+#   label                 : human name used in the alert
+#   status_file           : Path to the status JSON (status.py output)
+#   deadline_hhmm_fallback: (H, M) local (CT) time by which the job must have run —
+#                           used ONLY if the live Task Scheduler query fails (task
+#                           renamed/deleted, schtasks unavailable, no time trigger).
+#                           This is NOT the source of truth; it is a defensive copy
+#                           that can drift, which is exactly what happened 2026-07-09
+#                           (Tiingo/AccountMonitor trigger times changed here without
+#                           updating the copy -> false pages). The live query in
+#                           handle_deadline() is now the primary source.
+#   deadline_buffer_min   : minutes of slack added on top of the task's LATEST live
+#                           trigger time to get the actual deadline (grace period for
+#                           the job to finish running once triggered).
+#   task_name             : the Windows scheduled task that owns the job (named in
+#                           the alert AND queried live for its trigger times)
 # --------------------------------------------------------------------------- #
 _STATUS_DIR = Path(r"C:\TradingDesk-Local\state\dailyreport\status")
 
 DEADLINE_JOBS: list[dict] = [
     {"name": "eod_report", "label": "nightly EOD email",
      "status_file": _STATUS_DIR / "eod_report.json",
-     "deadline_hhmm": (21, 15), "task_name": "EodReport",
+     "deadline_hhmm_fallback": (21, 15), "deadline_buffer_min": 15,
+     "task_name": "EodReport",
      "market_dependent": False},
     {"name": "forward", "label": "IBKR forward options collector",
      "status_file": _STATUS_DIR / "forward.json",
-     "deadline_hhmm": (19, 0), "task_name": "ThetaEodDaily",
+     "deadline_hhmm_fallback": (19, 0), "deadline_buffer_min": 15,
+     "task_name": "ThetaEodDaily",
      "market_dependent": True},
     {"name": "tiingo", "label": "Tiingo daily data refresh",
      "status_file": _STATUS_DIR / "tiingo.json",
-     "deadline_hhmm": (21, 0), "task_name": "TiingoDailyUpdate",
+     "deadline_hhmm_fallback": (21, 0), "deadline_buffer_min": 15,
+     "task_name": "TiingoDailyUpdate",
      "market_dependent": True},
     {"name": "gex", "label": "GEX dealer-gamma build",
      "status_file": _STATUS_DIR / "gex.json",
-     "deadline_hhmm": (20, 0), "task_name": "GexDailyBuild",
+     "deadline_hhmm_fallback": (20, 0), "deadline_buffer_min": 15,
+     "task_name": "GexDailyBuild",
      "market_dependent": True},
     {"name": "account_monitor", "label": "account-cashflow monitor",
      "status_file": _STATUS_DIR / "account_monitor.json",
-     "deadline_hhmm": (21, 30), "task_name": "AccountMonitorDaily",
+     "deadline_hhmm_fallback": (21, 30), "deadline_buffer_min": 15,
+     "task_name": "AccountMonitorDaily",
      "market_dependent": True},
 ]
 
@@ -192,8 +263,20 @@ def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
     name = job["name"]
     label = job["label"]
     status_file = Path(job["status_file"])
-    dh, dm = job["deadline_hhmm"]
     task_name = job["task_name"]
+    buffer_min = job.get("deadline_buffer_min", 15)
+
+    live = _latest_task_trigger_hhmm(task_name)
+    if live is not None:
+        dh, dm = live
+        dm += buffer_min
+        dh += dm // 60
+        dm %= 60
+        dh %= 24
+    else:
+        dh, dm = job["deadline_hhmm_fallback"]
+        log(f"{name}: live Task Scheduler lookup failed for '{task_name}' — "
+            f"using fallback deadline {dh:02d}:{dm:02d} (informational only)")
 
     js = state.setdefault(name, {})
     now_dt = dt.datetime.fromtimestamp(now)

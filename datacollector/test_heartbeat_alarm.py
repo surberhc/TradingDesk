@@ -176,3 +176,155 @@ def test_progress_pct_reads_spxw_days(tmp_path):
     p.write_text(json.dumps({"days_done": 1052, "days_total": 1173, "pct": 89.7}))
     s = hba._progress_pct(p)
     assert "1052" in s and "1173" in s and "days" in s
+
+
+# --------------------------------------------------------------------------- #
+# 2026-07-09 fix: live Task Scheduler deadline lookup (stop hand-maintaining a
+# second copy of the schedule that silently drifted and caused false pages).
+# --------------------------------------------------------------------------- #
+_FAKE_TASK_XML = """<?xml version="1.0" encoding="UTF-16"?>
+<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
+  <Triggers>
+    <TimeTrigger>
+      <StartBoundary>2026-07-09T19:00:00-05:00</StartBoundary>
+    </TimeTrigger>
+    <TimeTrigger>
+      <StartBoundary>2026-07-09T20:45:00-05:00</StartBoundary>
+    </TimeTrigger>
+  </Triggers>
+</Task>
+"""
+
+
+class _FakeCompletedProcess:
+    def __init__(self, stdout, returncode=0):
+        self.stdout = stdout
+        self.returncode = returncode
+
+
+def test_latest_task_trigger_hhmm_picks_later_of_two_triggers(monkeypatch):
+    """Tiingo-shaped case: two TimeTriggers (19:00 and 20:45) -> must return the
+    LATER one (20:45), not the first in document order."""
+    hba._task_deadline_cache.clear()
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompletedProcess(_FAKE_TASK_XML)
+
+    monkeypatch.setattr(hba.subprocess, "run", fake_run)
+    result = hba._latest_task_trigger_hhmm("TiingoDailyUpdate")
+    assert result == (20, 45)
+
+
+def test_latest_task_trigger_hhmm_is_cached_per_process(monkeypatch):
+    """Second call for the same task name must NOT re-invoke subprocess (module-level
+    cache for the life of the process)."""
+    hba._task_deadline_cache.clear()
+    calls = {"n": 0}
+
+    def fake_run(*args, **kwargs):
+        calls["n"] += 1
+        return _FakeCompletedProcess(_FAKE_TASK_XML)
+
+    monkeypatch.setattr(hba.subprocess, "run", fake_run)
+    first = hba._latest_task_trigger_hhmm("TiingoDailyUpdate")
+    second = hba._latest_task_trigger_hhmm("TiingoDailyUpdate")
+    assert first == second == (20, 45)
+    assert calls["n"] == 1
+
+
+def test_latest_task_trigger_hhmm_none_when_subprocess_raises(monkeypatch):
+    """schtasks unavailable / times out -> must return None, never raise."""
+    hba._task_deadline_cache.clear()
+
+    def fake_run(*args, **kwargs):
+        raise FileNotFoundError("schtasks not found")
+
+    monkeypatch.setattr(hba.subprocess, "run", fake_run)
+    assert hba._latest_task_trigger_hhmm("NoSuchTask") is None
+
+
+def test_latest_task_trigger_hhmm_none_on_malformed_xml(monkeypatch):
+    """Corrupt/truncated XML from schtasks must return None, never raise."""
+    hba._task_deadline_cache.clear()
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompletedProcess("<Task><Triggers><Broken")
+
+    monkeypatch.setattr(hba.subprocess, "run", fake_run)
+    assert hba._latest_task_trigger_hhmm("BrokenTask") is None
+
+
+def test_latest_task_trigger_hhmm_none_when_no_start_boundary(monkeypatch):
+    """A task with only a boot/logon trigger (no StartBoundary at all) must return
+    None gracefully rather than crash or invent a time."""
+    hba._task_deadline_cache.clear()
+    xml_no_time_trigger = (
+        '<?xml version="1.0" encoding="UTF-16"?>'
+        '<Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">'
+        '<Triggers><LogonTrigger><Enabled>true</Enabled></LogonTrigger></Triggers>'
+        '</Task>'
+    )
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompletedProcess(xml_no_time_trigger)
+
+    monkeypatch.setattr(hba.subprocess, "run", fake_run)
+    assert hba._latest_task_trigger_hhmm("LogonOnlyTask") is None
+
+
+def test_latest_task_trigger_hhmm_none_when_returncode_nonzero(monkeypatch):
+    """Task not found -> schtasks exits non-zero; must return None, not raise."""
+    hba._task_deadline_cache.clear()
+
+    def fake_run(*args, **kwargs):
+        return _FakeCompletedProcess("", returncode=1)
+
+    monkeypatch.setattr(hba.subprocess, "run", fake_run)
+    assert hba._latest_task_trigger_hhmm("DeletedTask") is None
+
+
+def _deadline_job(tmp_path, **overrides):
+    job = {
+        "name": "tiingo",
+        "label": "Tiingo daily data refresh",
+        "status_file": tmp_path / "tiingo.json",
+        "deadline_hhmm_fallback": (21, 0),
+        "deadline_buffer_min": 15,
+        "task_name": "TiingoDailyUpdate",
+        "market_dependent": False,  # avoid the market-calendar dependency in this test
+    }
+    job.update(overrides)
+    return job
+
+
+def test_handle_deadline_uses_live_trigger_plus_buffer(tmp_path, monkeypatch):
+    """When the live query succeeds (20:45 latest trigger), the effective deadline
+    must be 20:45 + 15min buffer = 21:00 -> a run at 20:50 is still pre-deadline."""
+    hba._task_deadline_cache.clear()
+    monkeypatch.setattr(hba, "_latest_task_trigger_hhmm", lambda task_name: (20, 45))
+    job = _deadline_job(tmp_path)
+    state: dict = {}
+    now_dt = dt.datetime.now().replace(hour=20, minute=50, second=0, microsecond=0)
+    line = hba.handle_deadline(job, state, now_dt.timestamp(), dry_run=True)
+    assert "pre-deadline" in line
+    assert "21:00" in line
+
+
+def test_handle_deadline_falls_back_and_logs_when_live_query_fails(tmp_path, monkeypatch, capsys):
+    """If the live Task Scheduler lookup returns None (task renamed/deleted/schtasks
+    unavailable), handle_deadline must fall back to deadline_hhmm_fallback, log one
+    informational line about the fallback, and must NOT itself alarm/email for that
+    reason alone."""
+    hba._task_deadline_cache.clear()
+    monkeypatch.setattr(hba, "_latest_task_trigger_hhmm", lambda task_name: None)
+    job = _deadline_job(tmp_path)
+    state: dict = {}
+    # Before the fallback deadline (21:00) -> should just report pre-deadline, no email.
+    now_dt = dt.datetime.now().replace(hour=20, minute=0, second=0, microsecond=0)
+    line = hba.handle_deadline(job, state, now_dt.timestamp(), dry_run=True)
+    assert "pre-deadline" in line
+    assert "21:00" in line  # fallback value, unchanged by any buffer
+
+    out = capsys.readouterr().out
+    assert "fallback" in out.lower()
+    assert "TiingoDailyUpdate" in out
