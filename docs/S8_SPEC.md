@@ -31,6 +31,17 @@ execution-level fills for the entry side and real intraday price paths for the e
   long leg gives up 100% of its upside past the moment the short stops. S8 is a variance-reduction
   design, not a free lunch — it converts an occasional lottery-ticket payoff into a modest, high-hit-
   rate risk reducer.
+- **Alpha-vs-beta decomposition (2026-07-09): the edge survives a linear beta test that killed every
+  other SPX premium-selling strategy tested in this project (CSP, managed condor, short strangle — all
+  turned out to be equity beta in disguise once decomposed).** Regressing S8's daily P&L against SPY's
+  daily return gives beta -0.63, R² = 0.016 (SPY explains ~1.6% of S8's variance) and annualized alpha
+  +130.6% (95% CI [+33.5%, +241.8%], excludes zero) — the structural opposite of CSP's beta 0.55/R²=0.31
+  collapse. Holds excluding the two tail days. **This is real, good news, and a genuine point of
+  difference from the refuted family — but it is not a fully closed case** (see the new §5 item 5 and
+  §8 for the caveats that temper it, most importantly: the out-of-sample second half's alpha is not
+  independently significant, and the short-vol/tail-risk channel — the more relevant risk for this kind
+  of strategy — remains an open question this test cannot answer). Full detail:
+  `british_ic/ALPHA_VS_BETA_DECOMPOSITION.md`.
 
 **Known limitations, unresolved, do not treat as closed:** ~1 year of data with exactly one true
 crash-magnitude event (2025-10-10); exit fills modeled at 1-minute OHLC close rather than a real bid/ask
@@ -46,9 +57,12 @@ already-refuted SPX premium-selling family (condor/CSP/strangle, see `spx-premiu
 those were tested as *managed, discretionless-entry* structures and found to be equity beta, not alpha.
 S8 differs on both axes that mattered there — **entries are scheduled/template-driven** (not a single
 static rule swept for a parameter fit) and **the long leg carries a real, mechanically-triggered exit**,
-not a static hold-to-expiry or profit-take rule. Whether S8 clears the same alpha-vs-beta bar the prior
-family failed is an open question for forward evaluation (§7), not yet answered — this spec formalizes
-the ruleset so that question can be asked cleanly.
+not a static hold-to-expiry or profit-take rule. Whether S8 clears the same alpha-vs-beta bar the prior family failed was tested 2026-07-09 (see §8) —
+**it does, on a linear-beta basis** (near-zero beta, positive alpha with a bootstrap CI excluding zero),
+which is a genuine point of difference from CSP/condor/strangle. That result is real but not fully
+closed: the out-of-sample half isn't independently significant on its own, and the more relevant
+short-vol/tail-risk question for a 0DTE options book is still open (see §8). This spec formalizes the
+ruleset so that and future questions can keep being asked cleanly.
 
 ---
 
@@ -159,6 +173,15 @@ is not two-lucky-days-dependent.
    split, single-day-removed check) — §2's entry mechanics were derived to describe what the strategy
    *does*, not yet re-validated as a source of edge on its own out-of-sample terms. That is exactly the
    forward work in §7.
+5. **Alpha-vs-beta: cleared on a linear basis, not on the more relevant short-vol basis.** The 2026-07-09
+   decomposition (§8) found near-zero linear beta to SPY and a statistically positive alpha — genuinely
+   different from the refuted CSP/condor/strangle family. But (a) the out-of-sample second half of the
+   window is not independently significant (alpha t-stat 1.10 vs. 2.35 in the first half), and (b) the
+   short-vol/short-gamma signature check — whether S8's P&L is concentrated on calm days the way a
+   short-volatility book's would be, the more economically relevant risk channel for a 0DTE
+   credit-spread strategy than linear equity beta — came back inconclusive at this sample size, not a
+   clean pass. Treat "alpha survives" as real but provisional, not fully proven across a second,
+   differently-shaped stress regime.
 
 ---
 
@@ -198,3 +221,43 @@ Not started unless noted:
    account keeps generating real forward fills today; treat each new batch as an out-of-sample check on
    S8's rules (§2, §3) as it comes in, rather than waiting for a paper/live S8 implementation to exist
    before re-validating. Do not bless S8 once and leave it unmonitored.
+
+---
+
+## 8. Alpha-vs-beta decomposition (2026-07-09)
+
+Ran the same delta-matched regression methodology already established and validated in this project's
+CSP/short-strangle refutations (`docs/PREREG_CSP_alpha_vs_beta_2026-07-06.md`, `backtester/csp_alpha_beta.py`)
+against S8's real fill-level daily P&L, to test whether the +108.8% headline is genuine edge or disguised
+market beta — the same test that killed every other SPX premium-selling strategy in this project's
+research line.
+
+**Result: alpha survives.** Regressing S8's daily P&L against SPY's daily return over the full 236-day
+window: **beta -0.626, R² = 0.016** (SPY's daily move explains ~1.6% of S8's day-to-day variance — the
+structural opposite of CSP's beta 0.55/R²=0.31, which showed CSP was substantially levered SPX in
+disguise). **Annualized alpha +130.6%, 95% bootstrap CI [+33.5%, +241.8%]** (excludes zero). Excluding
+the two largest single-day contributors (2025-10-10 crash, 2026-05-18): alpha stays positive at +89.9%,
+beta stays near zero at -0.617 — not an artifact of two outsized days.
+
+**What tempers this, stated plainly, not minimized:**
+1. **Sample size.** 236 trading days vs. CSP's ~1,750-2,900-day window — the bootstrap CI is
+   correspondingly wide, and this is a much weaker statistical base than the multi-year CSP study.
+2. **The out-of-sample half is not independently significant.** Splitting the window in half: first-half
+   alpha t-stat 2.35, second-half (more recent) t-stat only 1.10 — the full-window result clears a
+   95%-confidence bar, but the more recent half alone would not, on its own, be called statistically
+   significant.
+3. **The short-vol/tail-risk channel — the more economically relevant risk for a 0DTE credit-spread
+   book than linear equity beta — remains genuinely open.** A quartile check on whether S8's P&L
+   concentrates on calm (low-|SPY-move|) days, the signature you'd expect from a structurally
+   short-volatility strategy, came back inconclusive at n=236 (roughly 59 days per quartile) — not a
+   clean pass, not a clean fail, underpowered to say either way.
+4. **Still only one real crash event (2025-10-10) in the data.** A linear beta/alpha decomposition
+   cannot distinguish "genuinely beta-free edge" from "has not yet been tested by a second,
+   differently-shaped crash."
+
+**Bottom line:** this is real, materially good news — S8 clears a specific, meaningful bar that CSP,
+the managed condor, and the short strangle all failed, and it is a genuine structural difference, not a
+marginal call (beta -0.63 vs. CSP's 0.55 is not a close comparison). But it is not yet a fully
+multi-regime-validated result. The honest label is **"consistent with genuine alpha beyond linear beta;
+not yet proven across a second, differently-shaped stress regime or independently on out-of-sample data
+alone."** Full methodology, regression tables, and the quartile-check detail: `british_ic/ALPHA_VS_BETA_DECOMPOSITION.md`.
