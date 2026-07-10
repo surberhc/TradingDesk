@@ -9,7 +9,6 @@
 > - (#11) HY-OAS-only spike history (shorter ~3yr FRED window) — Flagged but not run -- do if Andrew wants the credit-spread side of the VIX/HY-OAS data-lag analysis too.
 >
 > **S0 automation pilot**
-> - (#2) Confirm first real nightly-monitor / morning-execute pilot cycles fired — nightly-monitor (~21:15 CT) and morning-execute (~08:50 CT) pilot cycles expected 2026-07-09/10; logs/emails not yet reviewed as of 2026-07-09.
 > - (#3) Review PILOT_MODE 'WOULD HAVE TRANSMITTED' logs, decide whether to flip live — After a few real pilot cycles, Andrew reviews the logs and decides whether to flip PILOT_MODE=False. No transmit capability exists until then.
 >
 > **S4**
@@ -30,12 +29,16 @@
 > **data pipeline**
 > - (#9) ThetaData port 25503 vs 25510 client consolidation — Parked; revisit only if/when the InvesTech project resumes.
 > - (#10) Schedule + validate forward-collector depth widening (commit 6c57ecf) — Built but unscheduled; needs a greeks side-by-side + overnight timing run before cutover.
+> - (#22) Backfill missing 2026-07-09 ThetaData options-chain snapshot (SPX/SPXW/NDX + 47 other roots) — ThetaEodDaily's 5:30pm run on 2026-07-09 aborted instantly ('Theta Terminal not reachable') because the terminal was down at collection time; the watchdog didn't recover it until ~20:53, hours after the collection window closed. forward.json still shows date=20260709, status=fail, 0 roots collected. The next scheduled run (07-10 17:30) only pulls 07-10, not 07-09 -- this is a permanent gap unless manually backfilled (there's precedent: backfill_20260626.py / repull_20260626_*.py exist for an earlier gap). Root cause is now fixed (see theta-terminal-watchdog-hardening memory / commit 51c4aa6) so this shouldn't recur, but the one missing day itself is still unfilled.
 >
 > **strategies**
 > - (#6) Decide on strategies/parts/defensive.py fillna(0.0)-as-worst-percentile pattern — A missing daily factor (e.g. return_3m) is scored via pct.fillna(0.0) as the WORST cross-sectional percentile rather than NaN/unknown -- design tradeoff, not a one-line NaN-safety fix like the 6 sites already patched. Andrew's call.
 >
 > **unclassified**
 > - (#17) Review investech/ (untracked directory, unreviewed) — Carried forward from closed item #4 (which also covered british_ic/longleg_slippage_isolation.py, now resolved/committed). The investech/ directory itself was never touched this session -- still untracked, unreviewed, deliberately left uncommitted.
+
+### 2026-07-10 (eod-alarm-investigation) — S0 automation pilot: confirmed the 2026-07-09 nightly-monitor cycle never fired (closes #2)
+While investigating the 07-09 EOD alarm-flood complaint, confirmed item #2's open question directly from logs/Task Scheduler: the nightly-monitor pilot cycle did NOT fire on 07-09. Root cause: the scheduled task carrying it (registered under the name AccountMonitorDaily, repointed to run_nightly_monitor.bat during the same-day pilot build) is DISABLED -- the deliberate gateway-down state from earlier that day (see gateway-pileup-ensure-gateway-bug memory) was re-confirmed by Andrew and never lifted for this task specifically. Consequence: morning_execute.log this morning correctly found nothing staged ('No staged trade file for 2026-07-10') -- expected behavior given nothing ran the night before, not a bug. This closes the 'not yet reviewed' state of #2 with a definitive (negative) answer; the underlying tradeoff -- keep the gateway down vs. re-enable to actually collect pilot data -- remains Andrew's call and isn't re-opened here.
 
 ### 2026-07-10 (theta-watchdog-hardening) — ThetaTerminalWatchdog confirmed live on the new 1-min schedule
 Closes item #21. Andrew ran register_theta_terminal_watchdog.ps1 (C:\TradingDesk-Local\warehouse\); first attempt errored (Register-ScheduledTask: AmbiguousParameterSet -- the script mixed -InputObject with -User/-Password/-RunLevel, an invalid combo) and had already unregistered the old task, briefly leaving ZERO watchdog coverage. Fixed by switching Register-ScheduledTask to the flat parameter set (-Action/-Trigger/-Settings/-Description alongside -User/-Password/-RunLevel, no -InputObject). A terminal-paste mishap then briefly re-displayed the pre-fix error with no real second run; resolved by re-running the bare command in a fresh window. Confirmed independently (not just trusting the script's own OK print): Get-ScheduledTask shows AtStartup + a 1-min TimeTrigger (next run 1 min out), Principal Password/Limited preserved, ExecutionTimeLimit PT3M, LastTaskResult 0. theta_watchdog.log/heartbeat/state files show a REAL live invocation at 10:06:23 logging 'healthy' and writing a clean state file. The 2026-07-09 forward-collector data-loss incident's root cause (watchdog-itself-can-silently-die) is now closed end to end: code + tests (commit 51c4aa6) + live schedule.
