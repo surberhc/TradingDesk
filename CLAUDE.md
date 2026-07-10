@@ -56,9 +56,13 @@ Rule #1 bars curve-fitting the **strategy**; it does not license curve-fitting t
   memory. Separate what's known from assumed from still-to-verify. Never fabricate a
   confirming check. If tests fail, say so with the output; if a step was skipped, say that.
 - **Memorialize.** Keep a live running tally of open items and next-actions through the
-  session; write updates to the right place (`conductor\STATUS.md`, dated handoffs, memory)
-  automatically as threads close or the session winds down. The force-word **`wrap`**
-  triggers a full sweep on demand.
+  session; log progress via `conductor\cli.py log` / `open` / `close` (SQLite-backed,
+  see `conductor\db.py`) as threads close, then run `conductor\cli.py render` before
+  ending a session or committing — this regenerates `conductor\STATUS.md` and
+  `conductor\status_export.md` from the DB, don't hand-edit `STATUS.md` directly.
+  Also write dated handoffs / memory where appropriate. See `docs\CONCURRENT_SESSIONS.md`
+  for the worktree workflow when running genuinely parallel sessions. The force-word
+  **`wrap`** triggers a full sweep on demand.
 - **No ceremony.** No startup audit, no rule recital, no charter prompt, no shutdown
   routine. This contract governs silently. Andrew can override in the moment.
 
