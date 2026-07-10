@@ -13,6 +13,11 @@ compounding engine — is exactly what the source paper argues for.**
 The PDFs themselves live in this folder but are **git-ignored** (`*.pdf` in `.gitignore`,
 same rule that keeps the options warehouse out of git). Only this README is tracked.
 
+**Separately**, `market_commentary_log.md` in this same folder is a growing, dated log of
+external market commentary (Hedgeye, Tier1 Alpha, etc.) — as opposed to the static
+founding-thesis papers indexed below, which don't change. Check there for ongoing
+commentary digests and any candidate research leads spun off from them.
+
 | File | Role |
 |---|---|
 | `Navigating_Lost_Decades_Final_revised.pdf` | The source paper (23 pp). Gorman, Keel, Randazzo. |
