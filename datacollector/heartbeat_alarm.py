@@ -173,27 +173,17 @@ JOBS: list[dict] = [
     # Get-ScheduledTask) and its heartbeat is intentionally cold forever now, so
     # monitoring it here produced a recurring false "heartbeat cold" page. See
     # conductor/STATUS.md and memory `options-warehouse` for the backfill-complete record.
-    {
-        # Expanded-universe options bulk pull (universe_download.py --launcher). The
-        # supervisor rewrites this heartbeat every ~30s while alive and stamps a
-        # 'COMPLETE' line when the whole scope is on disk (suppresses the alarm on a
-        # legit finish). Progress JSON carries done_units/total_units (its 'complete'
-        # flag also suppresses via _progress_complete once done==total).
-        #
-        # THRESHOLD 60 min (vs 15 for the 1-min collector): this pull DELIBERATELY backs
-        # off during the nightly ThetaData-terminal contention window (ThetaEodDaily 17:30
-        # +1h, CanslimOverlayPipeline 18:00 up to 8h) — a shard can be paused/slow for a
-        # stretch while still alive. A supervisor that is merely backing off still rewrites
-        # this heartbeat every ~30s, so 60 min COLD means the supervisor PROCESS is gone
-        # (crashed/killed and the scheduled task didn't revive it), not just throttled.
-        # This is the #1 protection against the 15.5h-silent-death recurrence.
-        "name": "universe_dl",
-        "label": "expanded-universe options downloader",
-        "heartbeat": config.DATA_ROOT / "universe_dl_state" / "universe_dl_heartbeat.txt",
-        "progress": config.DATA_ROOT / "universe_dl_state" / "universe_dl_progress.json",
-        "threshold_s": 60 * 60,
-        "task_name": "UniverseDownloadEod",
-    },
+    # universe_dl (expanded-universe options bulk pull / UniverseDownloadEod task)
+    # STOPPED 2026-07-10: Andrew halted the pull -- its only live justification (unblocking
+    # the diversified single-name tastytrade strangle-basket test) was contingent on the
+    # SPX short-strangle pre-registered test passing, and it was REFUTED (collapsed to
+    # equity beta, see PREREG_short_strangle_alpha_2026-07-06.md + conductor/STATUS.md).
+    # A deep-dive also disproved the initial assumption that this pull was CAN SLIM-related
+    # (zero code/data link found; disjoint universes -- see conductor log). The
+    # UniverseDownloadEod scheduled task is being disabled so monitoring its heartbeat here
+    # would produce a false "heartbeat cold" page for a deliberately-stopped job, same
+    # reason spxw_1m was removed above. Data already on disk (raw/options, raw/options_snap)
+    # is left untouched.
 ]
 
 
