@@ -22,18 +22,25 @@
 > - (#23) S8: decide fate of uncommitted mechanical-simulator diagnostic files + whether to fold regime-bucketing result into S8_SPEC.md — See log entry #7 (2026-07-10) for full narrative. Two small decisions pending: (1) british_ic/s8_mechanical_simulator.py + SIMULATOR_STAGE_B_PROGRESS.md have an uncommitted probability-fix diff from the prior session, now moot given the abort decision -- plus 3 new untracked one-off diagnostic scripts (s8_replication_test.py, s8_short_leg_only_diag.py, s8_real_slippage_check.py) that document how the root cause was isolated. Commit for the compliance record vs discard -- Andrew's call, nothing destructive taken unilaterally. (2) The regime-bucketed real-fills result (S8 profitable in 4/5 regime buckets, 90% of days; soft spot in Caution regime, -$9,450/24d) is a genuine new finding -- decide whether it's worth folding into docs/S8_SPEC.md as a lighter-weight substitute for some of item #16's 'more crash-event data' prerequisite (it is NOT a full substitute -- still only 1yr of data, still one true crash day; it only shows the edge isn't fragile to the regime mix that occurred within that year).
 >
 > **data pipeline**
-> - (#9) ThetaData port 25503 vs 25510 client consolidation — Parked; revisit only if/when the InvesTech project resumes.
 > - (#10) Schedule + validate forward-collector depth widening (commit 6c57ecf) — Built but unscheduled; needs a greeks side-by-side + overnight timing run before cutover.
 > - (#22) Backfill missing 2026-07-09 ThetaData options-chain snapshot (SPX/SPXW/NDX + 47 other roots) — ThetaEodDaily's 5:30pm run on 2026-07-09 aborted instantly ('Theta Terminal not reachable') because the terminal was down at collection time; the watchdog didn't recover it until ~20:53, hours after the collection window closed. forward.json still shows date=20260709, status=fail, 0 roots collected. The next scheduled run (07-10 17:30) only pulls 07-10, not 07-09 -- this is a permanent gap unless manually backfilled (there's precedent: backfill_20260626.py / repull_20260626_*.py exist for an earlier gap). Root cause is now fixed (see theta-terminal-watchdog-hardening memory / commit 51c4aa6) so this shouldn't recur, but the one missing day itself is still unfilled.
 >
 > **strategies**
 > - (#6) Decide on strategies/parts/defensive.py fillna(0.0)-as-worst-percentile pattern — A missing daily factor (e.g. return_3m) is scored via pct.fillna(0.0) as the WORST cross-sectional percentile rather than NaN/unknown -- design tradeoff, not a one-line NaN-safety fix like the 6 sites already patched. Andrew's call.
 >
-> **unclassified**
-> - (#17) Review investech/ (untracked directory, unreviewed) — Carried forward from closed item #4 (which also covered british_ic/longleg_slippage_isolation.py, now resolved/committed). The investech/ directory itself was never touched this session -- still untracked, unreviewed, deliberately left uncommitted.
->
 > **PENDING DECISIONS:**
 > - (#6) [premium-selling] Universe download stopped (26.31%% done, data preserved). Per PREREG_short_strangle_alpha_2026-07-06.md's own pre-committed logic, the SPX strangle refutation = comprehensive refutation of mechanical premium-selling (condor+CSP+strangle) -- treat it as closed? OR run a cheap EOD-only sanity check (10-15 liquid high-IV-rank names, no new pull, hours not weeks) on the diversified single-name strangle-basket idea before fully closing the book? | options: Treat as comprehensively closed (per PREREG's own logic) | Run the cheap EOD-only basket sanity check first | Resume the full snapshot pull at narrower scope (not recommended -- desk's rec was the cheap test)
+
+### 2026-07-10 (main) — InvesTech project SHELVED by Andrew -- documented, not being pursued further
+Andrew's call: abandon InvesTech entirely, document what was done, put it on the shelf. Reason stated plainly: 'We don't need it.'
+
+Context: this followed a real timing test for InvesTech Phase 2's remaining backfill work (item #9's scope). The ThetaData v2->v3 port (commit 3441701) surfaced real numbers -- 50-ticker sample measured at 3.12 sec/ticker, extrapolating to ~52 min for an S&P-500-scope 2yr pull or ~45 hours for the full unfiltered ThetaData universe (~26,225 tickers) -- plus a newly-discovered v3 365-day-per-request cap bug in the project's own default lookback config. Faced with those numbers and the still-inconclusive prior calibration state, Andrew decided the project isn't worth continuing rather than sizing/running the pull.
+
+Actions taken:
+- Closed #9 (ThetaData port 25503 vs 25510 client consolidation) -- moot now, both because InvesTech is shelved and because the v3 port itself already resolved the port/API-version mismatch for the one file that used the old v2/25510 client.
+- Closed #17 (review investech/, untracked directory) -- reviewed as part of this session's work (explained the project's purpose/history to Andrew in detail); directory remains untracked overall (only thetadata.py + config.py got committed as part of the v3 port, commit 3441701), left as-is per Andrew's 'shelve it' instruction rather than force-committing or deleting the rest.
+- investech/PROJECT_STATUS.md updated (separately) to record the full history and mark status SHELVED 2026-07-10, not just ON HOLD -- kept for reference, not to be resumed without explicit new direction.
+- Open question not yet resolved: whether to also disable the two live Windows scheduled tasks (InvesTech Phase1 Feed 22:30, InvesTech Phase2 Breadth 23:00) that are still actively running daily, or leave them accumulating data passively. Asked Andrew directly, not assumed.
 
 ### 2026-07-10 (main) — Clarified InvesTech project + forward-collector depth widening; deferred #22 backfill
 Answered Andrew's questions on 3 open items:
