@@ -44,8 +44,8 @@ execution-level fills for the entry side and real intraday price paths for the e
   `british_ic/ALPHA_VS_BETA_DECOMPOSITION.md`.
 
 **Known limitations, unresolved, do not treat as closed:** ~1 year of data with exactly one true
-crash-magnitude event (2025-10-10); exit fills modeled at 1-minute OHLC close rather than a real bid/ask
-fill (see §5); no live implementation exists anywhere.
+crash-magnitude event (2025-10-10); no live implementation exists anywhere. (Long-leg exit fill realism
+was measured directly against real bid/ask quotes and found small — see §5 item 2, updated 2026-07-10.)
 
 ---
 
@@ -164,10 +164,13 @@ is not two-lucky-days-dependent.
 
 1. **Thin regime coverage.** ~1 year of data, exactly one true crash-magnitude event (2025-10-10). A
    single tail event cannot validate a tail-dependent design's true expectancy.
-2. **Exit fill realism not yet modeled.** Exits in this backtest are marked at 1-minute OHLC close, not a
-   real bid/ask fill. A dedicated measurement isolating long-leg-specific exit slippage (as opposed to
-   the blended short-stop + long-close ~13x-half-spread / ~$700k aggregate figure previously measured)
-   is tracked separately — see `british_ic/LONGLEG_SLIPPAGE_ISOLATION.md` when available.
+2. **Long-leg exit fill realism — RESOLVED 2026-07-10.** `british_ic/LONGLEG_SLIPPAGE_ISOLATION.md`
+   measured long-leg-specific exit slippage against real 1-min SPXW bid/ask quotes (589 legs, 36.4%
+   coverage — the rest settle at expiration with no live quote to compare against): median $0.05/contract
+   (2.0x half-spread), a rounding error relative to per-combo P&L. Short-leg stop-out slippage is real and
+   much larger (median $0.93/contract, 13.6x half-spread) but is inherited base-strategy risk shared with
+   vanilla British IC, not new risk from S8's automated long-leg-close mechanism. Both figures are
+   measured against real fills/quotes, not a synthetic OHLC-close proxy.
 3. **No live/paper implementation exists.** This is a backtested ruleset, not a running system anywhere.
 4. **Entry-side edge itself is not yet independently stress-tested** the way the exit rule was (train/test
    split, single-day-removed check) — §2's entry mechanics were derived to describe what the strategy
@@ -210,7 +213,9 @@ Not started unless noted:
 1. **Wire S8's full ruleset (§2 + §3) as a real strategy module**, runnable through the backtester's own
    `run_backtest()` path the way S0/S4/S5 are, so it can be evaluated with this project's standard
    walk-forward / out-of-sample tooling instead of a one-off reconstruction script.
-2. **Fill-cost realism pass** on both legs (§5.2) before any paper deployment is considered.
+2. **Fill-cost realism pass — long leg RESOLVED (§5.2), short leg still open.** Long-leg exit slippage
+   measured small and real (see §5 item 2). Short-leg stop-out slippage is measured too (§5 item 2) but
+   still large/real — whether S8's edge nets out positive against it is not yet a dedicated pass.
 3. **Extend history** back to 2024-09-16 (TAT log coverage) — **actively IN PROGRESS, owned by Andrew**:
    he is pursuing an additional Flex Query export to add regime variety beyond the single 2025-10-10
    crash event. Re-run the §2/§3/§4 numbers once that data lands.
