@@ -34,7 +34,15 @@
 >
 > **unclassified**
 > - (#4) Review british_ic/longleg_slippage_isolation.py and investech/ (untracked) — Both sit untracked in the working tree, unreviewed, deliberately left uncommitted.
-> - (#5) Clean up stray git worktree .claude/worktrees/awesome-pare-467379/ — Old pre-archive copy of dailyreport/; flagged multiple sessions; awaiting Andrew's explicit cleanup call.
+
+### 2026-07-09 (main) — Consolidated progress-tracking into conductor/ SQLite system
+- Diagnosed 8+ overlapping tracking surfaces (STATUS.md prose log, DECISIONS.md, stale handoffs, per-strategy folders, memory, git commits, version.py) and the deeper problem: single shared branch + hand-edited STATUS.md with no isolation across concurrent Claude sessions (evidenced by an orphaned unmerged worktree branch).
+- Built conductor/db.py (WAL-mode SQLite at C:\TradingDesk-Local\conductor\conductor.db, 3 tables: log_entries/items/decisions), conductor/cli.py (log/open/close/block/decide/answer/status/render), conductor/render.py (regenerates STATUS.md + status_export.md from DB state).
+- Migrated existing open items (16) and answered decisions (5) from STATUS.md/DECISIONS.md into the DB via migrate_seed.py. STATUS.md is now a generated view, not hand-edited.
+- Documented worktree-per-parallel-session workflow in docs/CONCURRENT_SESSIONS.md; updated CLAUDE.md's Memorialize bullet to point at the CLI instead of hand-editing STATUS.md.
+- Cleaned up dead duplicates: deleted conductor/handoffs/ (10 files), docs/SESSION_HANDOFF_*.md (5 files), docs/RESUME_HERE_2026-06-26.md; removed the orphaned worktree/branch claude/awesome-pare-467379 from git (no unmerged commits).
+**Verification:** DB tables + WAL mode confirmed; CLI round-trip (log/open/close/decide/answer/status) confirmed writes take effect; STATUS.md render reviewed and matches expected shape; status_export.md confirmed identical via diff.
+**Open/carried forward:** physical folders .claude/worktrees/awesome-pare-467379 and .git/worktrees/awesome-pare-467379 are inert (git no longer tracks them) but couldn't be filesystem-deleted due to a Drive sync file lock — delete by hand after a Drive sync pause or reboot.
 
 ### 2026-07-09 (migration) — STATUS.md / DECISIONS.md migration to SQLite
 One-time migration from the prose STATUS.md + DECISIONS.md to the SQLite-backed conductor (conductor/db.py, cli.py, render.py). Seeded 16 open items (from the PICK UP HERE banner + carried-forward bullets) and 5 answered decisions (from DECISIONS.md's ANSWERED section). The full prior STATUS.md is preserved at conductor/STATUS_prior_to_migration_2026-07-09.md. DECISIONS.md itself is left in place, not deleted, per the task's scope limit.
