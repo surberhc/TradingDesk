@@ -214,49 +214,89 @@ def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn):
 # --------------------------------------------------------------------------- #
 # REAL kill wrapper (mocked in tests). Stdlib + PowerShell only, NO new pip deps.
 # --------------------------------------------------------------------------- #
-# We kill:
+# We kill, for THIS Gateway instance only:
 #   * java processes whose command line matches "IbcGateway" (the IB Gateway JVM
 #     launched by IBController), AND
-#   * cmd processes whose command line matches "StartGateway" (the launcher shell).
+#   * cmd processes whose command line matches "StartGateway" (the launcher shell),
+# ...AND (instance scoping, added when a second independent Gateway instance was
+# introduced on the same box on a different port/install dir):
+#   * the process is the one actually LISTENING on `port` (PRIMARY discriminator —
+#     same Get-NetTCPConnection idiom already used below for the ThetaData
+#     carve-out), OR
+#   * its CommandLine contains `dir_substring` (SECONDARY discriminator — catches a
+#     not-yet-port-bound process during a wedge/launch race window, before it's
+#     listening).
 # We SPARE:
 #   * the ThetaData terminal (the java that owns local port 25503), and
 #   * ALL python (never kill ourselves or any sibling desk process).
 # Because the task runs ELEVATED it can read command lines and kill elevated java.
 # Implemented via a single PowerShell Get-CimInstance Win32_Process filter piped to
 # Stop-Process (mirrors the approach that worked during the incident cleanup).
-_KILL_PS = r"""
+#
+# Defaults (port=ibkr.PAPER_PORT, dir_substring=C:\IBC) reproduce the ORIGINAL,
+# pre-multi-instance behavior for the paper Gateway: every call site today
+# (gateway_watchdog.main() and paperbot/gateway_arm_restart_elevated.py) invokes
+# this with NO arguments and must keep doing so unchanged.
+_KILL_PS_TEMPLATE = r"""
 $ErrorActionPreference = 'SilentlyContinue'
+$dirSubstring = '{dir_substring}'
 # PID that owns local port 25503 = the ThetaData terminal -> SPARE it.
 $thetaPid = (Get-NetTCPConnection -LocalPort 25503 -State Listen).OwningProcess |
             Select-Object -Unique
-$procs = Get-CimInstance Win32_Process | Where-Object {
+# PID that owns local port {port} = THIS Gateway instance -> primary discriminator
+# (mirrors the ThetaData carve-out idiom above).
+$gwPid = (Get-NetTCPConnection -LocalPort {port} -State Listen).OwningProcess |
+         Select-Object -Unique
+$procs = Get-CimInstance Win32_Process | Where-Object {{
     $n  = $_.Name
     $cl = $_.CommandLine
     (
         ($n -eq 'java.exe' -and $cl -match 'IbcGateway') -or
         ($n -eq 'cmd.exe'  -and $cl -match 'StartGateway')
     ) -and
+    (
+        ($_.ProcessId -in $gwPid) -or
+        ($cl -match [regex]::Escape($dirSubstring))
+    ) -and
     ($_.ProcessId -notin $thetaPid) -and
     ($n -ne 'python.exe') -and ($n -ne 'pythonw.exe')
-}
+}}
 $killed = @()
-foreach ($p in $procs) {
+foreach ($p in $procs) {{
     Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-    if ($?) { $killed += $p.ProcessId }
-}
+    if ($?) {{ $killed += $p.ProcessId }}
+}}
 # Emit the killed PIDs as JSON on the last line for the caller to parse.
 $killed | ConvertTo-Json -Compress
 """
 
 
-def _kill_gateway_processes() -> list[int]:
-    """Kill all IB Gateway processes (sparing ThetaData terminal + all python).
+def _ps_single_quote(s: str) -> str:
+    """Escape a string for embedding in a PowerShell single-quoted literal."""
+    return s.replace("'", "''")
+
+
+def _kill_gateway_processes(port: int = ibkr.PAPER_PORT,
+                            dir_substring: str = r"C:\IBC") -> list[int]:
+    """Kill THIS Gateway instance's processes only — sparing the ThetaData
+    terminal, all python, and any OTHER Gateway instance running on a different
+    port/install dir (see the module comment above for the discriminator logic).
+
+    port          : the port THIS instance's Gateway listens on (primary match).
+    dir_substring : a substring of THIS instance's install dir, matched against
+                    CommandLine (secondary match, for the pre-listen race window).
+    Defaults (ibkr.PAPER_PORT / C:\\IBC) reproduce the original unscoped behavior
+    for the paper Gateway — every call site today invokes this with NO arguments.
 
     Returns the list of killed PIDs. Never raises — on any failure returns []."""
+    ps = _KILL_PS_TEMPLATE.format(
+        port=int(port),
+        dir_substring=_ps_single_quote(dir_substring),
+    )
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive",
-             "-ExecutionPolicy", "Bypass", "-Command", _KILL_PS],
+             "-ExecutionPolicy", "Bypass", "-Command", ps],
             capture_output=True, text=True, timeout=60,
         )
     except Exception as e:  # noqa: BLE001 — the kill must never crash the watchdog

@@ -236,3 +236,71 @@ def test_already_alerted_stays_rate_limited_no_restart():
     assert action == "rate_limited"
     assert new["alerted"] is True
     assert kill.calls == 0 and launch.calls == 0
+
+
+# ---------------------------------------------------------------------------
+# 10. _kill_gateway_processes() PowerShell generation — port/dir_substring
+#     instance-scoping added for the second (market-data-only) Gateway instance.
+#     No real PowerShell/gateway involved: subprocess.run is monkeypatched to
+#     capture the generated script instead of executing it.
+# ---------------------------------------------------------------------------
+class _FakeCompletedProcess:
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+        self.stderr = ""
+
+
+def _capture_ps(monkeypatch, **kwargs):
+    """Call _kill_gateway_processes(**kwargs) with subprocess.run stubbed out;
+    return the generated PowerShell script (the -Command argument)."""
+    captured = {}
+
+    def fake_run(cmd, **_kw):
+        captured["cmd"] = cmd
+        return _FakeCompletedProcess(stdout="[]")
+
+    monkeypatch.setattr(gw.subprocess, "run", fake_run)
+    result = gw._kill_gateway_processes(**kwargs)
+    assert result == []          # "[]" JSON -> no PIDs, from our fake stdout
+    return captured["cmd"][-1]   # the -Command script is the last argv element
+
+
+def test_kill_gateway_processes_default_reproduces_original_paper_filter(monkeypatch):
+    """Golden-reference check: a ZERO-ARGUMENT call must still generate a filter
+    that matches the paper Gateway's java.exe/IbcGateway + cmd.exe/StartGateway
+    processes and still spares ThetaData (port 25503) + all python — exactly what
+    the pre-change, unscoped _KILL_PS matched — now additionally scoped to the
+    paper port/dir (which is a no-op against today's real single-instance box)."""
+    ps = _capture_ps(monkeypatch)
+
+    # Original match conditions, unchanged.
+    assert "$n -eq 'java.exe' -and $cl -match 'IbcGateway'" in ps
+    assert "$n -eq 'cmd.exe'  -and $cl -match 'StartGateway'" in ps
+    # Original spares, unchanged.
+    assert "-LocalPort 25503" in ps
+    assert "$n -ne 'python.exe'" in ps
+    assert "$n -ne 'pythonw.exe'" in ps
+
+    # NEW scoping defaults to the paper instance: port 4002 / C:\IBC.
+    assert f"-LocalPort {gw.ibkr.PAPER_PORT}" in ps
+    assert gw.ibkr.PAPER_PORT == 4002
+    assert r"$dirSubstring = 'C:\IBC'" in ps
+
+
+def test_kill_gateway_processes_second_instance_scoped_and_distinct(monkeypatch):
+    """A second, independently-configured Gateway (different port + install dir)
+    generates a filter scoped to ITS OWN port/dir — never the paper defaults —
+    proving the two instances' kill filters can never overlap."""
+    ps = _capture_ps(monkeypatch, port=4001, dir_substring=r"C:\IBC-Live")
+
+    assert "-LocalPort 4001" in ps
+    assert r"$dirSubstring = 'C:\IBC-Live'" in ps
+    # Must NOT reference the paper instance's port/dir at all.
+    assert "-LocalPort 4002" not in ps
+    assert r"$dirSubstring = 'C:\IBC'" not in ps   # not the bare paper dir string
+
+    # Original generic pattern + ThetaData/python spares still present regardless
+    # of instance scoping.
+    assert "IbcGateway" in ps and "StartGateway" in ps
+    assert "-LocalPort 25503" in ps
+    assert "$n -ne 'python.exe'" in ps

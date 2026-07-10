@@ -5,12 +5,14 @@ Every component that connects to the Gateway takes its clientId from here, so tw
 things can never silently grab the same id and collide. To add a consumer, give it
 the next free id below and import it (don't hard-code a number elsewhere).
 
-PAPER ONLY: port 4002. The real-money port (4001) is intentionally absent — this
-project does not connect to a real-money account.
+PAPER ONLY: port 4002. Port 4001 (live) is used only by a separate, deliberately
+access-restricted read-only market-data login (visibility into exactly one personal
+account, no execution capability); paperbot execution remains exclusively on port 4002.
 """
 from __future__ import annotations
 
 PAPER_PORT = 4002
+LIVE_DATA_PORT = 4001
 
 CLIENT_IDS = {
     "dailyreport_poller": 1,        # dailyreport: pull SPY+sector bars (rrg_poller)
@@ -38,6 +40,7 @@ CLIENT_IDS = {
     "paperbot_s4_exec": 45,         # paperbot S4 EXECUTOR (RESERVED, not yet built): the future transmit-capable S4 single-account executor (connects readonly=False, pinned to the S4 DU sub, places the vol-control orders armed). Own id reserved now so it never collides with anything when it is built
     "paperbot_nightly_monitor": 46,  # paperbot: nightly bounded-retry monitor+stage runner (nightly_monitor_run.py) — connects READ-ONLY (~9:15 PM CT, after EodReport), runs the same drift/cashflow check as account_monitor_run.py, computes S0's current target, and on a rebalance/signal day builds+guard-checks the trade list and STAGES it to C:\TradingDesk-Local\pending_trades for the morning executor to pick up. Transmits nothing; own id so it never collides with the read-only monitor (40) or any rebalance path
     "paperbot_morning_execute": 47,  # paperbot: morning execution runner (morning_execute_run.py, ~8:50 AM CT) — no-ops with ZERO gateway touch on a day with no staged file; otherwise bounded-retry connects and either (PILOT_MODE=True, default) logs/emails "WOULD HAVE TRANSMITTED" without transmitting, or (PILOT_MODE=False, future) arms + executes the staged, guard-approved trade list via the existing laddered router. Own id so it never collides with the manual rebalance_execute path (38) or anything else
+    "live_data_forward": 48,        # datacollector: read-only nightly forward-fill against the separate, restricted live-side Gateway (port 4001, distinct instance from paper 4002); never transmits; never touched by paperbot
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.
