@@ -9,10 +9,21 @@ transmit real S8 orders:
   * the due-check (due_templates) correctly matches/misses within the tolerance window,
     and a template whose ENTRY_GRID_CT is None NEVER fires, at any time of day.
   * s8_config.ACCOUNT == "TBD" -> loud refusal, ZERO gateway contact (bounded_connect
-    never even called).
+    never even called) — a belt-and-suspenders check, exercised here via monkeypatch
+    since the real ACCOUNT is now decided ("DU8922146", see s8_config.py and
+    conductor/ACCOUNT_ALLOCATION.md's 2026-07-13 entries).
   * a full simulated due-cycle (fake IB, fake chain snapshot, real account string)
     completes PILOT_MODE-only end to end and NEVER calls order_router.place() (nor
     anything resembling it) at any point.
+
+CONNECTION TARGET (updated 2026-07-13 — see s8_runner.py's own module docstring,
+"CONNECTION TARGET" section): the runner's live cycle connects exclusively through
+`connections.ibkr_live_data` (the separate, read-only-only live-side Gateway, port
+4001), never `connections.ibkr` (paper, port 4002), and never wraps its work in
+`gateway_lock` (that mutex protects the shared paper Gateway, which this file no longer
+touches at all). Tests below mock `runner.bounded_connect` directly (the same seam the
+old paper-Gateway tests used) rather than reaching into `connections.ibkr_live_data`
+itself — bounded_connect is the one function that would call it.
 
 Run:
   cd paperbot
@@ -20,7 +31,6 @@ Run:
 """
 from __future__ import annotations
 
-import os
 from datetime import time as dt_time
 
 import pandas as pd
@@ -90,14 +100,22 @@ def test_due_templates_matched_slot_always_belongs_to_that_templates_grid():
 
 
 # --- ACCOUNT == "TBD": loud refusal, zero gateway contact ---------------------------
+# NOTE: s8_config.ACCOUNT is now decided ("DU8922146", 2026-07-13 — see s8_config.py and
+# conductor/ACCOUNT_ALLOCATION.md), so these tests monkeypatch it back to the "TBD"
+# placeholder to exercise the belt-and-suspenders refusal path that remains in
+# s8_runner.py's main() for exactly this (now hypothetical) case. This check no longer
+# gates a paper-account CONNECTION either way (the live-data connection has no
+# sub-account concept at all) -- see s8_runner.py's module docstring, "ACCOUNT == TBD
+# REFUSAL" section.
 def test_account_tbd_refuses_without_connecting(monkeypatch):
-    assert s8_config.ACCOUNT == "TBD"   # the real, current placeholder (not yet decided)
+    monkeypatch.setattr(s8_config, "ACCOUNT", "TBD")
+    monkeypatch.setattr(runner.s8_config, "ACCOUNT", "TBD")
 
     def _boom(*a, **k):
         raise AssertionError("must not attempt a connection while ACCOUNT is 'TBD'")
 
     monkeypatch.setattr(runner, "bounded_connect", _boom)
-    monkeypatch.setattr(runner.ibkr, "connect", _boom)
+    monkeypatch.setattr(runner.ibkr_live_data, "connect", _boom)
 
     rc = runner.main()
 
@@ -107,12 +125,15 @@ def test_account_tbd_refuses_without_connecting(monkeypatch):
 def test_account_tbd_checked_before_due_check(monkeypatch):
     # Even if something WOULD be due right now, the ACCOUNT=="TBD" gate must still
     # refuse first -- it's a build-time gap, not a scheduling question.
+    monkeypatch.setattr(s8_config, "ACCOUNT", "TBD")
+    monkeypatch.setattr(runner.s8_config, "ACCOUNT", "TBD")
     monkeypatch.setattr(runner, "due_templates", lambda now: [("Puts-80-$4", "08:45")])
 
     def _boom(*a, **k):
         raise AssertionError("must not connect while ACCOUNT is 'TBD', due or not")
 
     monkeypatch.setattr(runner, "bounded_connect", _boom)
+    monkeypatch.setattr(runner.ibkr_live_data, "connect", _boom)
 
     rc = runner.main()
 
@@ -135,7 +156,10 @@ class _FakeIB:
         self.disconnected = False
         self.client = _FakeClient()
 
-    def accountSummary(self, account):
+    def accountSummary(self):
+        # Matches the live-data connection's real shape: exactly one personal account is
+        # visible, so accountSummary() takes no account argument (see s8_runner.py's
+        # _do_work -- "NOT passed to accountSummary() below").
         return self._summary
 
     def disconnect(self):
@@ -160,27 +184,11 @@ def _synthetic_chain_snapshot() -> pd.DataFrame:
     return df
 
 
-def _install_free_lock(monkeypatch, tmp_path):
-    import gateway_lock as gl
-    path = os.path.join(str(tmp_path), "gateway.lock")
-    real = gl.gateway_lock
-
-    def patched(purpose, client_id, on_busy="refuse", wait_secs=None, **kw):
-        kw.setdefault("lock_path", path)
-        kw.setdefault("poll_interval", 0.001)
-        kw.setdefault("sleep_fn", lambda s: None)
-        if wait_secs is None:
-            wait_secs = 0.02
-        return real(purpose, client_id, on_busy=on_busy, wait_secs=wait_secs, **kw)
-
-    monkeypatch.setattr(runner, "gateway_lock", patched)
-
-
 def _boom_place(*a, **k):
     raise AssertionError("order_router.place must NEVER be called while PILOT_MODE=True")
 
 
-def test_full_due_cycle_never_calls_order_router_place(monkeypatch, tmp_path):
+def test_full_due_cycle_never_calls_order_router_place(monkeypatch):
     # A real-looking (not "TBD") account, so the cycle proceeds past the safety gate.
     monkeypatch.setattr(s8_config, "ACCOUNT", "DU8922144")
     monkeypatch.setattr(runner.s8_config, "ACCOUNT", "DU8922144")
@@ -191,12 +199,12 @@ def test_full_due_cycle_never_calls_order_router_place(monkeypatch, tmp_path):
     fake_summary = {"AccountType": "MARGIN", "BuyingPower": 10_000_000.0,
                     "ExcessLiquidity": 5_000_000.0}
     fake_ib = _FakeIB(fake_summary)
+    # bounded_connect is the one seam that would otherwise call
+    # connections.ibkr_live_data.connect(...) against the real live-data Gateway.
     monkeypatch.setattr(runner, "bounded_connect", lambda *a, **k: fake_ib)
 
     monkeypatch.setattr(runner.s8_chain, "snapshot_0dte_chain",
                         lambda ib, *a, **k: _synthetic_chain_snapshot())
-
-    _install_free_lock(monkeypatch, tmp_path)
 
     # The hard guarantee: neither order_router.place nor place_laddered is ever called.
     monkeypatch.setattr(runner.order_router, "place", _boom_place)
@@ -227,7 +235,7 @@ def test_full_due_cycle_never_calls_order_router_place(monkeypatch, tmp_path):
     assert any("WOULD HAVE TRANSMITTED" in "\n".join(lines) for _, lines in alerts)
 
 
-def test_full_due_cycle_builds_a_stop_parent_and_b2_child(monkeypatch, tmp_path):
+def test_full_due_cycle_builds_a_stop_parent_and_b2_child(monkeypatch):
     """Deeper check on the same cycle: the order group actually has the parentId link
     (child.parentId == parent.orderId) and the child sits on a DIFFERENT contract than
     the parent, per the settled cross-contract design."""
@@ -240,7 +248,6 @@ def test_full_due_cycle_builds_a_stop_parent_and_b2_child(monkeypatch, tmp_path)
     monkeypatch.setattr(runner, "bounded_connect", lambda *a, **k: fake_ib)
     monkeypatch.setattr(runner.s8_chain, "snapshot_0dte_chain",
                         lambda ib, *a, **k: _synthetic_chain_snapshot())
-    _install_free_lock(monkeypatch, tmp_path)
     monkeypatch.setattr(runner.order_router, "place", _boom_place)
     monkeypatch.setattr(runner.ledger, "record_run", lambda record: "fake.jsonl")
     monkeypatch.setattr(runner, "_alert_email", lambda *a, **k: None)

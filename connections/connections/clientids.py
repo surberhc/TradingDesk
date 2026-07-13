@@ -8,6 +8,13 @@ the next free id below and import it (don't hard-code a number elsewhere).
 PAPER ONLY: port 4002. Port 4001 (live) is used only by a separate, deliberately
 access-restricted read-only market-data login (visibility into exactly one personal
 account, no execution capability); paperbot execution remains exclusively on port 4002.
+
+NOTE (2026-07-13): a paperbot consumer may now READ from port 4001 too -- s8_runner.py's
+live-cycle connection ("paperbot_s8_livedata", 51) queries the live-data Gateway for its
+account-summary margin gate and chain snapshot, never the paper Gateway. This does not
+change the rule above: order TRANSMISSION (place/placeOrder) remains exclusively a port
+4002 (paper) capability everywhere in this codebase; connections.ibkr_live_data has no
+order-placement method at all, by construction.
 """
 from __future__ import annotations
 
@@ -42,7 +49,8 @@ CLIENT_IDS = {
     "paperbot_morning_execute": 47,  # paperbot: morning execution runner (morning_execute_run.py, ~8:50 AM CT) — no-ops with ZERO gateway touch on a day with no staged file; otherwise bounded-retry connects and either (PILOT_MODE=True, default) logs/emails "WOULD HAVE TRANSMITTED" without transmitting, or (PILOT_MODE=False, future) arms + executes the staged, guard-approved trade list via the existing laddered router. Own id so it never collides with the manual rebalance_execute path (38) or anything else
     "live_data_forward": 48,        # datacollector: read-only nightly forward-fill against the separate, restricted live-side Gateway (port 4001, distinct instance from paper 4002); never transmits; never touched by paperbot
     "paperbot_s8": 49,               # paperbot S8 (British IC + B2 long-leg auto-close): scheduled entry-point runner (s8_runner.py) -- zero-gateway-contact due-check fast path; when a template's entry grid slot is due, connects READ-ONLY, snapshots the live 0DTE SPXW chain, picks the spread, runs the S8 margin preflight, builds the entry+stop-parent+B2-child order group, and (PILOT_MODE=True, hardcoded) logs/emails "WOULD HAVE TRANSMITTED" without transmitting. Own id so it never collides with the S4 runner (44) or anything else
-    "paperbot_s8_exec": 50,          # paperbot S8 EXECUTOR (RESERVED, not yet built): the future transmit-capable S8 executor (connects readonly=False, pinned to the S8 DU sub once s8_config.ACCOUNT is decided, transmits the entry/stop/B2 order group armed). Own id reserved now so it never collides with anything when it is built, mirroring the S4 44/45 pattern
+    "paperbot_s8_exec": 50,          # paperbot S8 EXECUTOR (RESERVED, not yet built): the future transmit-capable S8 executor (connects readonly=False, pinned to the S8 DU sub once s8_config.ACCOUNT is decided, transmits the entry/stop/B2 order group armed). Own id reserved now so it never collides with anything when it is built, mirroring the S4 44/45 pattern. NOTE (2026-07-13): s8_runner.py's live-cycle connection no longer uses "paperbot_s8" (49) at all -- see "paperbot_s8_livedata" (51) below -- but 49/50 stay registered/reserved for a future real-transmission path against the paper account
+    "paperbot_s8_livedata": 51,      # paperbot S8 (British IC + B2): s8_runner.py's ACTUAL live-cycle connection, decided 2026-07-13 -- connects READ-ONLY (structurally, no override possible) to the separate live-side data Gateway (connections.ibkr_live_data, port 4001, NOT the paper Gateway on port 4002) for both the account-summary margin-preflight read and the 0DTE SPXW chain snapshot. Distinct from live_data_forward (48, datacollector's own live-data consumer) so the two never collide on the same live-data Gateway connection. PILOT_MODE (paperbot/s8_runner.py) remains the primary non-transmission control; this connection's hardcoded read-only-ness is a second, independent backstop
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.

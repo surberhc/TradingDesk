@@ -4,6 +4,21 @@ see the approved build plan). PURE over an account-summary mapping — never con
 never transmits, never touches a broker; the caller (a later stage, s8_runner.py) reads
 `ib.accountSummary()` and feeds it in AT DEPLOY time only.
 
+WHOSE accountSummary THIS ACTUALLY IS (updated 2026-07-13 — connection pivot)
+------------------------------------------------------------------------------
+As of the 2026-07-13 decision to route s8_runner.py's live cycle exclusively through
+`connections.ibkr_live_data` (the separate, read-only-only live-side Gateway, port
+4001) rather than the paper Gateway, the `summary` this function receives in practice is
+the real personal LIVE account's own `accountSummary()` — not a paper DU sub-account's
+(the live-data connection only ever sees exactly one personal account; there is no
+sub-account concept to select on that connection at all). This function itself needed no
+logic change for that: it was already generic over any accountSummary shape (dict or
+ib_async row list, see `_summary_map`) and doesn't care whose account produced the tags.
+This note exists purely so a reader doesn't assume `summary` still comes from
+`paperbot/s8_config.py`'s `ACCOUNT` ("DU8922146") — it does not; that constant is now
+informational/reserved for a future paper- or live-transmission path, not a filter
+applied anywhere in this module or in the accountSummary() call that feeds it.
+
 WHY A SIBLING (not an edit to s4_risk.py)
 ------------------------------------------
 s4_risk.py::margin_preflight() is built around a LONG-ONLY equity notional: NAV * exposure.

@@ -11,8 +11,14 @@ level. That is backstop #1. Backstop #2 lives in this file: `connect()` has no
 exposes, wraps, or re-exports any order-placement/transaction method. Execution
 never happens through this module, by construction, twice over.
 
-This module is NEVER imported by paperbot/. It exists purely for read-only
-market-data gathering off the live side. Nothing in this file transmits an order.
+This module guarantees read-only market-data access off the live side, structurally and
+always — not by convention of who imports it. It was built in the neutral `connections/`
+package specifically so either a future paper-side or live-side consumer could use it.
+As of 2026-07-13, `paperbot/s8_runner.py` IS one such consumer (its account-summary
+margin read and its 0DTE chain snapshot both go through this module's `connect()`) —
+that is legitimate, intended use of a module whose safety property never depended on
+who calls it, only on what it can do once called: nothing in this file transmits an
+order, ever, regardless of caller.
 
 Gateway launch mirrors ibkr.py's proven IBController pattern, pointed at a not-yet-
 built install (`C:\\IBC-Live\\StartGatewayLive.bat`) that the user will set up

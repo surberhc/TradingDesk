@@ -4,14 +4,20 @@ long-leg auto-close). Stage 4 of the 5-stage S8 build (see docs/S8_SPEC.md and t
 approved build plan at the top-level plans folder, calm-riding-hammock.md item 2).
 
 >>> UNTESTED LIVE AS OF THIS BUILD <<<
-The shared paper Gateway is currently deliberately disabled (advisor data-entitlement
-contention, unrelated to this work) and touching it requires Andrew's explicit go-ahead,
-which has not been given as of this build. This file is therefore a careful, code-level
-ADAPTATION of `datacollector/ibkr_forward.py`'s proven, nightly-production `_underlying()`
-/ `build_chain()` / `snapshot_chain()` — reviewed for correctness by inspection (contract
+As of the 2026-07-13 pivot, `s8_runner.py` calls this module's functions against a
+connection to the separate LIVE-DATA Gateway (`connections/ibkr_live_data.py`, port
+4001) — NOT the paper Gateway. That Gateway is currently blocked on IBKR's own account
+approval (conductor item #24/#25, expected "tomorrow" as of this note) and has not yet
+had its first live login, so this module remains untested live for that reason — a
+different, unrelated blocker than the paper Gateway's earlier advisor-data-entitlement
+shutdown (which S8 no longer cares about at all: this module takes `ib: IB` as a
+parameter, per its original design, and is agnostic to which Gateway that connection
+came from). This file is therefore a careful, code-level ADAPTATION of
+`datacollector/ibkr_forward.py`'s proven, nightly-production `_underlying()` /
+`build_chain()` / `snapshot_chain()` — reviewed for correctness by inspection (contract
 construction pattern, batching pattern, tick reads all mirrored from that proven code
 where they generalize) — NOT reinvented from scratch. Its first real verification is a
-live paper dry run once Andrew brings the Gateway back up (this is the approved plan's
+live dry run once Andrew brings the live-data Gateway up (this is the approved plan's
 own stated Verification step for `s8_runner.py`, not a gap being introduced here).
 
 WHAT'S REUSED VS. ADAPTED (stated plainly, per the build instructions):
