@@ -833,17 +833,37 @@ def _s8_last_fired(records: list[dict], template: str) -> str:
     return latest
 
 
+def _s8_first_slot_minutes(grid: list[str] | None) -> int | None:
+    """Minutes-since-midnight of a template's own FIRST (earliest) scheduled entry —
+    the template's fixed, day-independent sort key. Deliberately NOT
+    _s8_next_slot_today()'s "next slot from right now" value: that changes as the day
+    progresses and would reorder the whole table hour by hour, which defeats its use
+    as a stable reference schedule. None (no ENTRY_GRID_CT data) sorts last."""
+    if not grid:
+        return None
+    h, m = (int(x) for x in grid[0].split(":"))
+    return h * 60 + m
+
+
 def render_s8_schedule() -> None:
     st.markdown("#### Today's schedule — all 11 templates")
     st.caption("Times are CT (US/Central), matching s8_config.ENTRY_GRID_CT's own "
-               "convention. Templates flagged NO SCHEDULE DATA are real gaps in the "
-               "real-fills MATCHED sample (too few observations to name a grid, per "
-               "s8_config.py's own comment) — never silently shown as an empty "
-               "schedule.")
+               "convention. Sorted by each template's own first scheduled entry time "
+               "(fixed all day — not reordered by the clock); the 5 templates flagged "
+               "NO SCHEDULE DATA are real gaps in the real-fills MATCHED sample (too "
+               "few observations to name a grid, per s8_config.py's own comment) and "
+               "are grouped at the bottom rather than interspersed.")
     now_ct = datetime.now(tz=CT_ZONE).time()
     records = _s8_read_today_records()
+    templates_sorted = sorted(
+        s8_config.TEMPLATES.items(),
+        key=lambda kv: (
+            (1, 0, kv[0]) if _s8_first_slot_minutes(s8_config.ENTRY_GRID_CT.get(kv[0])) is None
+            else (0, _s8_first_slot_minutes(s8_config.ENTRY_GRID_CT.get(kv[0])), kv[0])
+        ),
+    )
     rows = []
-    for name, cfg in s8_config.TEMPLATES.items():
+    for name, cfg in templates_sorted:
         grid = s8_config.ENTRY_GRID_CT.get(name)
         last_fired = _s8_last_fired(records, name)
         if grid is None:
@@ -861,7 +881,24 @@ def render_s8_schedule() -> None:
             "target credit": f"${cfg['target_credit']:.0f}",
             "next entry (CT)": next_slot, "last fired": last_fired, "status": status,
         })
-    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    # st.dataframe (kept for styling consistency with every other table in this file —
+    # see the Accounts/cycle-log/history tables above, none of which use st.table) but
+    # with EXPLICIT per-column width config: this is an 11-row static schedule strip
+    # where a squeezed/auto-fit column is exactly the reported bug (time values
+    # rendering invisible), so every column — the two time columns especially — gets a
+    # forced minimum width rather than trusting auto-fit.
+    st.dataframe(
+        pd.DataFrame(rows), use_container_width=True, hide_index=True,
+        column_config={
+            "template": st.column_config.TextColumn("template", width="medium"),
+            "side": st.column_config.TextColumn("side", width="small"),
+            "width label": st.column_config.TextColumn("width label", width="small"),
+            "target credit": st.column_config.TextColumn("target credit", width="small"),
+            "next entry (CT)": st.column_config.TextColumn("next entry (CT)", width="medium"),
+            "last fired": st.column_config.TextColumn("last fired", width="medium"),
+            "status": st.column_config.TextColumn("status", width="medium"),
+        },
+    )
     _badge_legend()
 
 
