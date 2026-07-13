@@ -19,12 +19,17 @@ plainly in a comment rather than silently resolved either direction.
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Account — NOT YET DECIDED
+# Account — DECIDED 2026-07-13
 # ---------------------------------------------------------------------------
-# Not yet decided — candidates DU8922144/DU8922146 (freed from S0 2026-07-09), also
-# being eyed for S4 (conductor item #7) — needs Andrew's account-allocation decision
-# before any real pilot run.
-ACCOUNT = "TBD"
+# Andrew decided 2026-07-13: S8 gets DU8922146 (not DU8922144, which remains the sole
+# freed candidate for S4 per conductor item #7). See conductor/ACCOUNT_ALLOCATION.md
+# for the authoritative account map and history.
+#
+# PREREQUISITE STILL OPEN: DU8922146 still holds residual S0 positions that have not
+# yet been liquidated to cash (see conductor/ACCOUNT_ALLOCATION.md Open Items #1). This
+# config change alone does not make the account clean for use — a deliberate, armed
+# PAPER liquidation session must run first, before any real S8 pilot activity here.
+ACCOUNT = "DU8922146"
 
 
 # ---------------------------------------------------------------------------

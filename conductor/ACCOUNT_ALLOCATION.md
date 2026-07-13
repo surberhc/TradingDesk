@@ -19,9 +19,9 @@ file should never be allowed to go stale — treat a mismatch as a bug to fix im
 |---|---|---|---|
 | DU8922142 | S0 (Conservative tier) | ACTIVE | solo account, DIRECT order routing |
 | DU8922143 | S0 (Balanced tier) | ACTIVE | now solo in tier (DU8922144 removed 2026-07-09); routing is derived automatically at runtime by `rebalance_engine.route_blocks()` from the live account count per tier — a tier with exactly 1 enrolled account routes DIRECT, >=2 routes as an FA block. With DU8922144 gone, DU8922143 now routes DIRECT (same mechanism that already makes Conservative/DU8922142 DIRECT), no code change required for this beyond the ENROLLMENT edit. IBKR's live `tier_balanced` FA group still lists DU8922144 as a member on the gateway side (GUI-only, no API) — must be edited there too, see Open Items. |
-| DU8922144 | UNASSIGNED (freed from S0) | AVAILABLE FOR REASSIGNMENT | pulled from S0's Balanced tier 2026-07-09 to free up for testing another strategy; existing S0 positions being liquidated to cash (not yet done — see Open Items) |
+| DU8922144 | UNASSIGNED (freed from S0) | AVAILABLE FOR REASSIGNMENT | pulled from S0's Balanced tier 2026-07-09 to free up for testing another strategy; existing S0 positions being liquidated to cash (not yet done — see Open Items). **2026-07-13:** now the SOLE remaining freed/unassigned account (DU8922146 assigned to S8, see below) — the natural remaining candidate for S4 (conductor item #7 previously floated DU8922144/146 as S4 candidates; narrowed to DU8922144 only as of this date). |
 | DU8922145 | S0 (Growth tier) | ACTIVE | now solo in tier (DU8922146 removed 2026-07-09); same DIRECT-routing note as DU8922143 above, but for `tier_growth`. |
-| DU8922146 | UNASSIGNED (freed from S0) | AVAILABLE FOR REASSIGNMENT | pulled from S0's Growth tier 2026-07-09 to free up for testing another strategy; existing S0 positions being liquidated to cash (not yet done — see Open Items) |
+| DU8922146 | S8 (British IC + B2) | ASSIGNED (S8) — not yet clean for use, see Open Items | pulled from S0's Growth tier 2026-07-09 to free up for testing another strategy. **2026-07-13:** Andrew decided S8 gets this account (over DU8922144) — see `docs/S8_SPEC.md` and `paperbot/s8_config.py` (`ACCOUNT = "DU8922146"`). Still holds residual S0 positions not yet liquidated to cash (see Open Items #1) — must be cleaned via a deliberate, armed PAPER liquidation session before any real S8 pilot activity begins here. |
 
 ## Open items (as of 2026-07-09)
 
@@ -56,3 +56,11 @@ file should never be allowed to go stale — treat a mismatch as a bug to fix im
   `tier_balanced`/`tier_growth` FA groups in the IBKR GUI (Andrew completed this
   manually). Liquidation of their residual S0 positions still pending; when done,
   size off current actual holdings per-account, not a stale target.
+- **2026-07-13** — Andrew decided S8 (British IC + B2, see `docs/S8_SPEC.md`) is
+  assigned to DU8922146, not DU8922144 (no further reasoning given — decision as made).
+  `paperbot/s8_config.py`'s `ACCOUNT` constant updated from `"TBD"` to `"DU8922146"` in
+  the same change-set. This leaves DU8922144 as the sole remaining freed/unassigned
+  account, narrowing conductor item #7's S4 account question to DU8922144 only. Open
+  Items #1's liquidation caveat is unchanged by this decision: DU8922146 still holds
+  residual S0 positions that must be liquidated to cash via a deliberate, armed PAPER
+  session before any real S8 pilot activity can safely begin there.
