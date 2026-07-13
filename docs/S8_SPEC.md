@@ -185,6 +185,16 @@ is not two-lucky-days-dependent.
    credit-spread strategy than linear equity beta — came back inconclusive at this sample size, not a
    clean pass. Treat "alpha survives" as real but provisional, not fully proven across a second,
    differently-shaped stress regime.
+6. **Regime-bucketed real-fills result — rebuilt as a verified script 2026-07-13 (was previously only
+   narrated in the conductor log, never committed; that gap is now closed).** Bucketing the 236 real
+   trading days by S0's existing, frozen regime engine (no new thresholds) gives profit in 4 of 5
+   regime buckets, covering all 236 days: RiskOn (101d, +$69,077), RiskOnNarrowing (89d, +$64,893),
+   CapitalPreservation (10d, +$8,357), and Defensive (12d, +$6,104) all positive; Caution is the one net
+   loser (24d, -$9,450). The extreme-regime buckets (Defensive, CapitalPreservation, Caution) are thin —
+   10 to 24 days each — so this is evidence the edge isn't fragile to the regime mix that actually
+   occurred within the one known year, **not** proof S8 survives a genuine multi-year bear market or a
+   2008-style event. See `british_ic/s8_regime_bucketing.py` (script, with its own sanity gate against
+   the §4 headline) and `british_ic/S8_REGIME_BUCKETING.md` (result).
 
 ---
 
