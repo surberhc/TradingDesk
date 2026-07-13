@@ -59,6 +59,31 @@ REFERENCE_BALANCE = 127_710.0  # documented constant, alpha_vs_beta_decompositio
 RESULTS_CSV = OUT_DIR / "bic_2026_execution_profile_entries.csv"
 REPORT_MD = OUT_DIR / "BIC_2026_EXECUTION_PROFILE.md"
 
+# --- Timezone fix (2026-07-13) -------------------------------------------------
+# combo_ledger.csv's real IBKR timestamps (short_open_dt / short_close_dt, and by
+# extension fully_unmatched_short_lifecycles.csv's first_open_dt) are in US/Eastern
+# time, NOT Central, even though this repo's convention is to report clock times in
+# CT (see STRATEGY_MECHANICS.md, S8_SPEC.md). Confirmed this session:
+#   - Real entries span 09:07-15:51 raw wall-clock -- fits ET's 09:30-16:00 cash
+#     session (with normal pre/post padding), not CT's 08:30-15:00.
+#   - Settlement/expiry closes cluster at a uniform 16:20:00 raw -- only makes sense
+#     as "20 min after the 4:00 PM ET cash close"; in CT terms that would be 1h20m
+#     after close, which doesn't fit standard EOD settlement-processing timing.
+#   - Cross-checked against template_join.py's join logic, which ties real IBKR fill
+#     times directly to the raw NinjaTrader/TAT log's OpenTime with ZERO timezone
+#     offset applied between them -- i.e. both sources share the same (Eastern)
+#     timezone convention.
+# A prior version of this script (committed 011d59a) read these raw ET timestamps
+# as-is and labeled every clock-time figure "CT" with no conversion -- every
+# reported time was off by exactly 1 hour. Fixed here: entry_dt is converted
+# ET -> CT (-1 hour) once, at construction, in build_entries() below, so every
+# downstream time-of-day figure (bucket table, first-entry-of-day modal time,
+# representative example) is genuinely CT. NOTE: the TAT-join tie-break in
+# run_tat_join() (short_open_time vs TAT's OpenTime) intentionally does NOT apply
+# this offset -- both sides of that comparison are raw ET-native (confirmed above),
+# so it's a same-convention relative time-diff, not a reported clock time.
+ET_TO_CT = pd.Timedelta(hours=-1)
+
 
 # ---------------------------------------------------------------------------
 # Parsing helpers
@@ -165,7 +190,8 @@ def build_entries(cl2026, fu2026):
     )
     cl2026["qty"] = cl2026["short_open_qty"].abs()
     cl2026["credit"] = cl2026["short_open_price"]
-    cl2026["entry_dt"] = pd.to_datetime(cl2026["short_open_dt"])
+    # short_open_dt is raw US/Eastern; convert to CT (-1h) -- see ET_TO_CT note above.
+    cl2026["entry_dt"] = pd.to_datetime(cl2026["short_open_dt"]) + ET_TO_CT
     cl2026["source"] = "combo_ledger"
 
     entries_cl = cl2026[[
@@ -175,7 +201,8 @@ def build_entries(cl2026, fu2026):
     ]].copy()
 
     fu2026 = fu2026.copy()
-    fu2026["entry_dt"] = pd.to_datetime(fu2026["first_open_dt"])
+    # first_open_dt is raw US/Eastern; convert to CT (-1h) -- see ET_TO_CT note above.
+    fu2026["entry_dt"] = pd.to_datetime(fu2026["first_open_dt"]) + ET_TO_CT
     fu2026["qty"] = fu2026["total_open_qty"].abs()
     fu2026["credit"] = fu2026["first_open_price"]
     fu2026["ComboType"] = np.where(fu2026["Put/Call"] == "P", "PutSpread", "CallSpread")
@@ -415,6 +442,37 @@ def bucket_15min(dt):
     return dt.replace(minute=minute, second=0, microsecond=0).strftime("%H:%M")
 
 
+def characterize_900_premise(modal_time_str):
+    """Characterize how close the modal first-entry clock time is to a literal "9:00 AM"
+    premise. Only meaningful now that modal_time_str is genuinely CT (see ET_TO_CT note
+    at the top of this file) -- data-driven, not a hardcoded verdict, so the wording
+    tracks whatever the corrected numbers actually show."""
+    h, m = map(int, modal_time_str.split(":"))
+    delta_min = (h * 60 + m) - (9 * 60)  # + = after 9:00, - = before 9:00, 0 = exact
+    if delta_min == 0:
+        return "consistent with a literal \"9:00 AM\" premise", "exactly at 09:00"
+    direction = "before" if delta_min < 0 else "after"
+    adelta = abs(delta_min)
+    phrase = f"{adelta} minute{'s' if adelta != 1 else ''} {direction} 09:00"
+    if adelta <= 20:
+        verdict = "close enough to be broadly consistent with a literal \"9:00 AM\" premise"
+    elif adelta <= 45:
+        verdict = "in the same neighborhood as, but not a literal match for, a \"9:00 AM\" premise"
+    else:
+        verdict = "clearly NOT what a literal \"9:00 AM\" premise would predict"
+    return verdict, phrase
+
+
+def shift_ct_to_raw_str(ct_time_str):
+    """Narrative-only helper: given a corrected CT 'HH:MM' string, back out what the
+    PRIOR (buggy) committed report would have shown -- the raw ET clock reading,
+    mislabeled CT (i.e. +1 hour). Used only to describe the delta in the report text,
+    not for any computation."""
+    h, m = map(int, ct_time_str.split(":"))
+    total = (h * 60 + m + 60) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
 def main():
     cl2026, fu2026, avb, bv, tat = load_data()
     ok = check_no_double_count(cl2026, fu2026)
@@ -440,7 +498,7 @@ def main():
 
     entries["time_bucket"] = entries["entry_dt"].apply(bucket_15min)
     bucket_counts = entries["time_bucket"].value_counts().sort_index()
-    print("\n  Entry time-of-day distribution (15-min buckets, real IBKR fill timestamps, all 2026):")
+    print("\n  Entry time-of-day distribution (15-min buckets, real IBKR fill timestamps converted ET->CT, all 2026):")
     for b, c in bucket_counts.items():
         print(f"    {b}: {c} ({100*c/len(entries):.1f}%)")
 
@@ -533,9 +591,9 @@ def main():
           f"modal clock time = {modal_time} ({modal_n}/{len(first_per_day)} = "
           f"{100*modal_n/len(first_per_day):.1f}% of days)")
     n_before_915 = (first_per_day["entry_dt"].dt.strftime("%H:%M") < "09:15").sum()
-    print(f"  Only {n_before_915}/{len(first_per_day)} days have their first entry before 09:15 -- "
-          f"a literal '9:00 AM first trade' is NOT what 2026 data shows; the real first-of-day "
-          f"clock slot is ~{modal_time}.")
+    verdict_900, phrase_900 = characterize_900_premise(modal_time)
+    print(f"  {n_before_915}/{len(first_per_day)} days have their first entry before 09:15 CT -- "
+          f"the real first-of-day clock slot is ~{modal_time} CT ({phrase_900}): {verdict_900}.")
 
     # ---- representative first-of-day entry example (near the modal clock time + median size) ----
     print("\n" + "=" * 78)
@@ -548,7 +606,7 @@ def main():
     best_row = cand.sort_values("dist_to_median").iloc[0]
     ex = sized[(sized.TradeDate == best_row.TradeDate) & (sized.short_conid == best_row.short_conid)].iloc[0]
     print(f"  TradeDate: {int(ex.TradeDate)}")
-    print(f"  Entry time (real IBKR fill): {ex.entry_dt}")
+    print(f"  Entry time (real IBKR fill, ET->CT converted): {ex.entry_dt}")
     print(f"  ComboType: {ex.ComboType}, short_strike: {ex.short_strike}")
     print(f"  Contracts (real IBKR qty): {int(ex.qty)}")
     print(f"  Wing width: {ex.width_pts:.0f} pts")
@@ -593,13 +651,21 @@ def write_report(entries, sized, daily_balance, per_day, bucket_counts, matched,
       "(STRATEGY_MECHANICS.md, template_delta_stats.csv) covered the FULL "
       "2024-09-16..2026-07-07 window, never 2026 alone, and never computed trade-frequency-per-day "
       "or account-value/margin sizing at all -- this is new.\n")
+    a("**Timezone note:** all clock-time figures below are CT. combo_ledger.csv's raw IBKR "
+      "timestamps are US/Eastern (confirmed 2026-07-13: raw range 09:07-15:51 fits ET's cash "
+      "session, not CT's; settlement/expiry closes cluster at a uniform 16:20:00 raw, which only "
+      "fits as 20 min after the 4:00 PM ET close; cross-checked against template_join.py's "
+      "zero-offset join to the raw TAT/NinjaTrader log) -- converted here via a -1 hour ET->CT "
+      "shift before any time-of-day analysis. An earlier version of this report (committed "
+      "011d59a) used the raw ET timestamps unconverted while labeling them CT; every clock-time "
+      "figure in that version was off by exactly 1 hour. This version supersedes it.\n")
 
     a("## 1. Trade frequency\n")
     a(f"- Entries/day: **mean {per_day.mean():.2f}, median {per_day.median():.0f}, "
       f"min {per_day.min()}, max {per_day.max()}** (n={per_day.shape[0]} trading days)")
     a(f"- Percentiles: p10={per_day.quantile(.10):.0f}, p25={per_day.quantile(.25):.0f}, "
       f"p75={per_day.quantile(.75):.0f}, p90={per_day.quantile(.90):.0f}\n")
-    a("| Time bucket (15-min) | Count | % of all entries |")
+    a("| Time bucket (15-min, CT) | Count | % of all entries |")
     a("|---|---|---|")
     for b, c in bucket_counts.items():
         a(f"| {b} | {c} | {100*c/len(entries):.1f}% |")
@@ -615,13 +681,14 @@ def write_report(entries, sized, daily_balance, per_day, bucket_counts, matched,
 
     a("### First entry of the day -- checking the literal \"9:00 AM\" premise\n")
     a(f"- Modal first-entry clock time across all {n_trading_days_total} 2026 trading days: "
-      f"**{modal_time}** ({modal_n}/{n_trading_days_total} = {100*modal_n/n_trading_days_total:.1f}% of days)")
-    a(f"- Only {n_before_915}/{n_trading_days_total} days have their first entry before 09:15.")
-    a(f"- **A literal \"first trade fires at 9:00 AM\" is not what 2026 shows** -- the day's first "
-      f"entry consistently fires at ~{modal_time}, not 09:00. (The 09:30/09:45/10:00/10:15 and "
-      f"13:00-14:00 clusters in the table above are the real 2026 clock grid; this differs from the "
-      f"full 18-month window's grid documented in STRATEGY_MECHANICS.md, which is expected -- that "
-      f"document explicitly wasn't re-verified for 2026 alone until now.)\n")
+      f"**{modal_time} CT** ({modal_n}/{n_trading_days_total} = {100*modal_n/n_trading_days_total:.1f}% of days)")
+    a(f"- {n_before_915}/{n_trading_days_total} days have their first entry before 09:15 CT.")
+    verdict_900, phrase_900 = characterize_900_premise(modal_time)
+    a(f"- **Corrected verdict (post ET->CT fix): {verdict_900}** -- the day's first entry clusters "
+      f"at ~{modal_time} CT, {phrase_900}. (Prior committed version of this report, before the "
+      f"timezone fix, reported the raw ET clock reading of {shift_ct_to_raw_str(modal_time)} "
+      f"mislabeled as CT and concluded a literal \"9:00 AM\" premise did not hold; with the fix "
+      f"applied, that conclusion {'no longer holds -- the real CT clock slot is close to the literal 9:00 AM premise' if verdict_900.startswith('close') else 'still does not hold, though the gap to 9:00 AM is now smaller than previously reported'}.)\n")
 
     a("## 2. Position sizing per entry\n")
     a(f"- Entries with known width+credit (combo_ledger subset): {len(sized)}/{len(entries)} "

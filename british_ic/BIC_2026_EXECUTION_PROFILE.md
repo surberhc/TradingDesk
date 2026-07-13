@@ -4,48 +4,50 @@ Scope: 2026-01-01 through 2026-07-07 (last date with real fills in this dataset)
 
 Built fresh by `bic_2026_execution_profile.py`. Prior work in this folder (STRATEGY_MECHANICS.md, template_delta_stats.csv) covered the FULL 2024-09-16..2026-07-07 window, never 2026 alone, and never computed trade-frequency-per-day or account-value/margin sizing at all -- this is new.
 
+**Timezone note:** all clock-time figures below are CT. combo_ledger.csv's raw IBKR timestamps are US/Eastern (confirmed 2026-07-13: raw range 09:07-15:51 fits ET's cash session, not CT's; settlement/expiry closes cluster at a uniform 16:20:00 raw, which only fits as 20 min after the 4:00 PM ET close; cross-checked against template_join.py's zero-offset join to the raw TAT/NinjaTrader log) -- converted here via a -1 hour ET->CT shift before any time-of-day analysis. An earlier version of this report (committed 011d59a) used the raw ET timestamps unconverted while labeling them CT; every clock-time figure in that version was off by exactly 1 hour. This version supersedes it.
+
 ## 1. Trade frequency
 
 - Entries/day: **mean 15.12, median 16, min 2, max 26** (n=121 trading days)
 - Percentiles: p10=9, p25=12, p75=18, p90=21
 
-| Time bucket (15-min) | Count | % of all entries |
+| Time bucket (15-min, CT) | Count | % of all entries |
 |---|---|---|
-| 09:00 | 2 | 0.1% |
-| 09:30 | 198 | 10.8% |
-| 09:45 | 164 | 9.0% |
-| 10:00 | 160 | 8.7% |
-| 10:15 | 154 | 8.4% |
-| 10:30 | 8 | 0.4% |
-| 10:45 | 23 | 1.3% |
-| 11:00 | 19 | 1.0% |
-| 11:15 | 42 | 2.3% |
-| 11:30 | 24 | 1.3% |
-| 11:45 | 25 | 1.4% |
-| 12:00 | 22 | 1.2% |
-| 12:15 | 30 | 1.6% |
-| 12:30 | 27 | 1.5% |
-| 12:45 | 7 | 0.4% |
-| 13:00 | 199 | 10.9% |
-| 13:15 | 143 | 7.8% |
-| 13:30 | 129 | 7.0% |
-| 13:45 | 125 | 6.8% |
-| 14:00 | 135 | 7.4% |
-| 14:15 | 74 | 4.0% |
-| 14:30 | 73 | 4.0% |
-| 14:45 | 25 | 1.4% |
-| 15:00 | 18 | 1.0% |
-| 15:15 | 1 | 0.1% |
-| 15:30 | 2 | 0.1% |
-| 15:45 | 1 | 0.1% |
+| 08:00 | 2 | 0.1% |
+| 08:30 | 198 | 10.8% |
+| 08:45 | 164 | 9.0% |
+| 09:00 | 160 | 8.7% |
+| 09:15 | 154 | 8.4% |
+| 09:30 | 8 | 0.4% |
+| 09:45 | 23 | 1.3% |
+| 10:00 | 19 | 1.0% |
+| 10:15 | 42 | 2.3% |
+| 10:30 | 24 | 1.3% |
+| 10:45 | 25 | 1.4% |
+| 11:00 | 22 | 1.2% |
+| 11:15 | 30 | 1.6% |
+| 11:30 | 27 | 1.5% |
+| 11:45 | 7 | 0.4% |
+| 12:00 | 199 | 10.9% |
+| 12:15 | 143 | 7.8% |
+| 12:30 | 129 | 7.0% |
+| 12:45 | 125 | 6.8% |
+| 13:00 | 135 | 7.4% |
+| 13:15 | 74 | 4.0% |
+| 13:30 | 73 | 4.0% |
+| 13:45 | 25 | 1.4% |
+| 14:00 | 18 | 1.0% |
+| 14:15 | 1 | 0.1% |
+| 14:30 | 2 | 0.1% |
+| 14:45 | 1 | 0.1% |
 
 Secondary figure (not primary, timestamp-incomplete): total real short open-BATCH events (scale-ins counted separately) = 2609 vs 1830 lifecycles. combo_ledger.csv only retains a captured timestamp for batches that found a paired long; ~779 additional scale-in batches exist but aren't individually timestamped in this ledger, so the entries-per-day figures above are at the lifecycle level (one real, fully-captured timestamp each), a conservative/complete count of distinct positions opened, not of every individual scale-in fill.
 
 ### First entry of the day -- checking the literal "9:00 AM" premise
 
-- Modal first-entry clock time across all 121 2026 trading days: **09:43** (84/121 = 69.4% of days)
-- Only 1/121 days have their first entry before 09:15.
-- **A literal "first trade fires at 9:00 AM" is not what 2026 shows** -- the day's first entry consistently fires at ~09:43, not 09:00. (The 09:30/09:45/10:00/10:15 and 13:00-14:00 clusters in the table above are the real 2026 clock grid; this differs from the full 18-month window's grid documented in STRATEGY_MECHANICS.md, which is expected -- that document explicitly wasn't re-verified for 2026 alone until now.)
+- Modal first-entry clock time across all 121 2026 trading days: **08:43 CT** (84/121 = 69.4% of days)
+- 106/121 days have their first entry before 09:15 CT.
+- **Corrected verdict (post ET->CT fix): close enough to be broadly consistent with a literal "9:00 AM" premise** -- the day's first entry clusters at ~08:43 CT, 17 minutes before 09:00. (Prior committed version of this report, before the timezone fix, reported the raw ET clock reading of 09:43 mislabeled as CT and concluded a literal "9:00 AM" premise did not hold; with the fix applied, that conclusion no longer holds -- the real CT clock slot is close to the literal 9:00 AM premise.)
 
 ## 2. Position sizing per entry
 
@@ -53,9 +55,9 @@ Secondary figure (not primary, timestamp-incomplete): total real short open-BATC
 - Notional max-loss ($, = width_pts x 100 x qty - credit x 100 x qty): mean **$22,513**, median **$15,864**, range $7,198-$154,090
 - % of account value (account value = PRIOR trading day's close, not same-day EOD, to avoid look-ahead into that day's own P&L): mean **10.588%**, median **7.423%**, p90 18.806%, max 70.376%
 
-### Representative first-of-day entry example (modal clock time 09:43)
+### Representative first-of-day entry example (modal clock time 08:43)
 
-- Date: 20260108, real fill time: 2026-01-08 09:43:27
+- Date: 20260108, real fill time: 2026-01-08 08:43:27
 - CallSpread, short strike 6925, width 75 pts
 - Contracts: 2 (real IBKR-confirmed)
 - Credit received: $4.72/spread
