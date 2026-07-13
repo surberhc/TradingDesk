@@ -13,7 +13,7 @@ A single Streamlit app, phone- and desktop-friendly, that *shows* the state of S
 by reusing the existing Python directly. It NEVER places, arms, or transmits an
 order, never writes to the warehouse/config, never calls replaceFA.
 
-Three sections (tabs):
+Four sections (tabs):
   1. Health      — S0's own data pipeline (Tiingo EOD feed status), the S0-only
                    nightly EOD email's own status, the account-monitor/rebalance
                    task, gateway up/down (cheap TCP probe, no live ib_async
@@ -26,6 +26,13 @@ Three sections (tabs):
                    gateway degrades to "Gateway offline" instead of hanging. Drift
                    vs target + the rebalance PLAN preview (build-only). NO controls
                    anywhere.
+  4. S8          — intraday PILOT_MODE monitor for S8 (British IC + B2 long-leg
+                   auto-close): today's 11-template entry schedule, s8_runner.py's
+                   own ledger'd cycle log, a DISPLAY-ONLY live re-mark of today's
+                   still-open hypothetical picks against current quotes, the live
+                   account's own margin snapshot, and live-data Gateway (port 4001)
+                   connection health. See render_s8() below for the read-only/
+                   never-feeds-back guarantees specific to this tab.
 
 Launch (see run_dashboard.bat): binds 0.0.0.0 so a phone on the LAN can reach it.
 
@@ -34,6 +41,13 @@ Read-only guarantees in this file:
     plus ib.managedAccounts / accountSummary / positions / reconcile (all reads) and
     rebalance_run.build_preview (a PURE build-only planner — no order objects, no send).
   * No order_router.place/arm, no ib.placeOrder, no replaceFA, no file writes.
+  * The S8 tab's live-data reads go through connections.ibkr_live_data.connect() —
+    hardcoded read-only with no override parameter anywhere in that module — called
+    with launch=False (this dashboard never boots the Gateway) and a short timeout;
+    every connection opened here is disconnected before the fragment returns. It only
+    ever calls ib.accountSummary(), ib.qualifyContracts(), ib.reqMktData()/
+    cancelMktData(), and ib.reqTickers() (all reads) — no order object is ever built or
+    placed from this tab.
 """
 from __future__ import annotations
 
@@ -42,8 +56,11 @@ import json
 import os
 import sys
 import contextlib
+import time as _time
 from datetime import datetime
+from datetime import time as dt_time
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import streamlit as st
@@ -64,6 +81,17 @@ if str(_conn) not in sys.path:
 # still the shared computation module for the archived Gamma/EDGAR panels —
 # see dashboard/archive/ — but app.py itself no longer needs it directly.)
 import status as dr_status
+
+# S8 tab: pure/data modules only at module scope (no IBKR import triggers a connection
+# at import time — s8_config is data-only, s8_strategy/s8_chain's own IBKR imports are
+# just class references (IB/Index/Option), never a connect() call, and ledger.py only
+# defines a path constant). connections.ibkr_live_data itself (the thing that actually
+# opens a socket) stays a LAZY import inside _s8_connect_readonly_short(), same
+# convention render_accounts() already uses for `from connections import ibkr`.
+import ledger
+import s8_chain
+import s8_config
+import s8_strategy
 
 # --- Local data locations (off-Drive, on C:) -----------------------------------
 # (WAREHOUSE/derived-GEX-parquet paths are no longer needed here — that's the
@@ -695,6 +723,549 @@ def render_accounts() -> None:
                 pass
 
 
+# ================================== 4. S8 =====================================
+# S8 (British IC + B2 long-leg auto-close): SPX/SPXW 0DTE scheduled credit-spread pair
+# strategy, still in PILOT_MODE (paperbot/s8_runner.py hardcodes PILOT_MODE=True and
+# never calls order_router.place()/ib.placeOrder() — see that module's own docstring).
+# This tab is a pure MONITOR: it reads s8_runner.py's ledger records (paperbot/
+# ledger.py -> C:\TradingDesk-Local\state\paperbot\runs.jsonl, filtered on
+# mode == "s8_runner_pilot" — the only tag ledger.record_run() actually carries; there
+# is no separate strategy/runner field, confirmed by reading both ledger.py and every
+# record_run() call site in s8_runner.py) and, for TODAY's still-open logged picks
+# only, layers on a live re-mark against CURRENT IBKR quotes PURELY FOR DISPLAY.
+#
+# As of today (2026-07-13) the live-data Gateway has never completed a login (blocked
+# on IBKR account approval, conductor item #25) — every live-data read below WILL
+# degrade to "offline" and every ledger read WILL come back empty. That is the
+# expected, correctly-handled state for this tab's first deployment, not a bug.
+CT_ZONE = ZoneInfo("America/Chicago")     # matches s8_config.ENTRY_GRID_CT's own convention
+_ET_ZONE = ZoneInfo("America/New_York")   # SPX/SPXW PM settlement is stated in ET
+_S8_SETTLEMENT_ET = dt_time(16, 0)        # 16:00 ET, same instant s5_harvest_engine.py uses
+
+# Pilot default: mirrors s8_runner.py's own QTY_PER_ENTRY (=1) for the dollar math
+# below. Duplicated as a small local constant rather than importing s8_runner.py itself
+# into the dashboard process — s8_runner.py is a scheduled-task ENTRY POINT (it reads
+# sys.argv-free module-level state and wires mailer/order_router/ledger at import time);
+# a monitor page has no business executing that script's import side effects merely to
+# read one integer. If S8's real position size ever becomes a genuine per-trade
+# variable (not a pilot constant), this line must be revisited alongside that change.
+S8_QTY_PER_ENTRY = 1
+S8_CONTRACT_MULTIPLIER = 100.0  # standard SPX/SPXW index-option multiplier
+
+
+@st.cache_data(ttl=20)
+def _s8_read_today_records() -> list[dict]:
+    """Today's S8 ledger records, read-only. ledger.py is append-only and this function
+    never writes to it. Cached 20s (short — this feeds the fast-refresh fragment)."""
+    path = ledger.RUNS_JSONL
+    if not os.path.exists(path):
+        return []
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    out: list[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("mode") != "s8_runner_pilot":
+                    continue
+                if not str(rec.get("ts", "")).startswith(today_str):
+                    continue
+                out.append(rec)
+    except OSError:
+        return []
+    return out
+
+
+@st.cache_data(ttl=300)
+def _s8_read_all_records(max_rows: int = 2000) -> list[dict]:
+    """Every S8 ledger record ever written, oldest-first, capped to the most recent
+    max_rows so a long-lived ledger can't blow up dashboard memory. Cached 5 minutes —
+    history changes far less often than the live cycle log; read-only, never writes."""
+    path = ledger.RUNS_JSONL
+    if not os.path.exists(path):
+        return []
+    out: list[dict] = []
+    try:
+        with open(path, "r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if rec.get("mode") == "s8_runner_pilot":
+                    out.append(rec)
+    except OSError:
+        return []
+    return out[-max_rows:]
+
+
+# --- 4.1 Today's schedule strip ------------------------------------------------
+def _s8_next_slot_today(grid: list[str] | None, now_ct: dt_time) -> str:
+    if not grid:
+        return "—"
+    now_min = now_ct.hour * 60 + now_ct.minute
+    for slot in grid:
+        h, m = (int(x) for x in slot.split(":"))
+        if h * 60 + m >= now_min:
+            return slot
+    return "done for today"
+
+
+def _s8_last_fired(records: list[dict], template: str) -> str:
+    """Latest cycle ts where `template` appeared in that cycle's due_templates — the
+    only per-template timestamp granularity ledger.py actually stores (there is no
+    separate per-template log line, only a per-cycle record with a due_templates list
+    and a results list); records are read in file order so the last match is the most
+    recent."""
+    latest = "—"
+    for rec in records:
+        if template in (rec.get("due_templates") or []):
+            latest = rec.get("ts", latest)
+    return latest
+
+
+def render_s8_schedule() -> None:
+    st.markdown("#### Today's schedule — all 11 templates")
+    st.caption("Times are CT (US/Central), matching s8_config.ENTRY_GRID_CT's own "
+               "convention. Templates flagged NO SCHEDULE DATA are real gaps in the "
+               "real-fills MATCHED sample (too few observations to name a grid, per "
+               "s8_config.py's own comment) — never silently shown as an empty "
+               "schedule.")
+    now_ct = datetime.now(tz=CT_ZONE).time()
+    records = _s8_read_today_records()
+    rows = []
+    for name, cfg in s8_config.TEMPLATES.items():
+        grid = s8_config.ENTRY_GRID_CT.get(name)
+        last_fired = _s8_last_fired(records, name)
+        if grid is None:
+            next_slot, status = "n/a", "⚪ NO SCHEDULE DATA"
+        else:
+            next_slot = _s8_next_slot_today(grid, now_ct)
+            if last_fired != "—":
+                status = "🟢 fired today"
+            elif next_slot == "done for today":
+                status = "⚪ done for today (never fired)"
+            else:
+                status = "🟡 pending"
+        rows.append({
+            "template": name, "side": cfg["side"], "width label": cfg["width_label"],
+            "target credit": f"${cfg['target_credit']:.0f}",
+            "next entry (CT)": next_slot, "last fired": last_fired, "status": status,
+        })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    _badge_legend()
+
+
+# --- 4.2 Live cycle log ---------------------------------------------------------
+def _render_s8_cycle_log() -> None:
+    st.markdown("#### Live cycle log (today)")
+    records = _s8_read_today_records()
+    if not records:
+        st.info("No S8 runner cycles logged yet today — expected until the live-data "
+                 "Gateway's first successful login (conductor item #25) and the "
+                 "scheduled task begin firing.")
+        return
+    lo, hi = s8_strategy._REAL_DELTA_BAND
+    rows = []
+    for rec in records:
+        ts = rec.get("ts", "—")
+        if rec.get("error"):
+            rows.append({
+                "cycle ts": ts, "template": ", ".join(rec.get("due_templates") or []),
+                "chain snapshot": "FAIL", "short/long": "—", "width": "—", "credit": "—",
+                "delta flag": "", "margin gate": "—", "would transmit": rec["error"],
+            })
+            continue
+        for item in rec.get("results", []):
+            pick = item.get("pick")
+            delta_flag = ""
+            if pick and pick.get("short_delta") is not None:
+                d = pick["short_delta"]
+                if not (lo <= d <= hi):
+                    delta_flag = f"FLAG ({d:.3f} outside [{lo:.2f},{hi:.2f}])"
+            preflight = item.get("preflight")
+            margin_gate = ("OK" if preflight and preflight.get("ok")
+                           else ("REFUSED: " + "; ".join(preflight.get("reasons", []))
+                                 if preflight else "—"))
+            rows.append({
+                "cycle ts": ts, "template": item.get("template"),
+                "chain snapshot": "ok",
+                "short/long": (f"{pick['short_strike']:g}/{pick['long_strike']:g}"
+                              if pick else "—"),
+                "width": f"{pick['width']:.0f}" if pick else "—",
+                "credit": f"{pick['realized_credit']:.2f}" if pick else "—",
+                "delta flag": delta_flag,
+                "margin gate": margin_gate,
+                "would transmit": (item.get("would_transmit") or item.get("reason")
+                                  or item.get("error") or "—"),
+            })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+
+# --- 4.3 Estimated P&L on hypothetical picks (LIVE re-mark; DISPLAY ONLY) -------
+def _s8_settlement_intrinsic(spot_settle: float, side: str, short_strike: float,
+                             width: float) -> float:
+    """Adapted from backtester/s5_harvest_engine.py::_settlement_intrinsic for S8's
+    single-sided vertical (puts OR calls, never a condor's both sides at once) with its
+    own PER-PICK width (S8's width varies pick to pick — NOT s5's fixed 5.0-point wing).
+    Cash-settled European intrinsic, clipped to the defined-risk wing width."""
+    if side == "PUT":
+        return min(max(short_strike - spot_settle, 0.0), width)
+    return min(max(spot_settle - short_strike, 0.0), width)   # CALL
+
+
+def _s8_pick_id(pick_row: dict) -> str:
+    return (f"{pick_row['cycle_ts']}|{pick_row['template']}|"
+            f"{pick_row['short_strike']}|{pick_row['long_strike']}")
+
+
+def _s8_reprice_pick(pick_row: dict, cfg: dict, short_q, long_q,
+                     spot_settle: float | None, phase: str) -> dict:
+    """PURE DISPLAY MATH for one hypothetical S8 pick.
+
+    *** THIS FUNCTION CANNOT AFFECT ANY REAL DECISION. *** Its only caller is
+    _render_s8_pnl() below, its only output is a dict rendered on this page, it never
+    writes to ledger.py, and s8_runner.py / s8_strategy.py have no import of
+    dashboard/app.py anywhere — there is no code path by which this math could reach
+    the real PILOT_MODE decision loop. This whole function could be deleted with zero
+    effect on the actual strategy.
+
+    Stop check: reuses s8_strategy.stop_price(entry_credit, stop_multiple) (the frozen
+    formula) and compares it to the SHORT leg's own current cost-to-close (its live
+    ask) — the same honest-fill convention (sell short at bid, buy back at ask) already
+    established in s8_strategy.py/s8_runner.py. Once stopped, the P&L is FROZEN at
+    exactly (entry_credit - stop_price) — the constant-dollar stop's own definition —
+    rather than kept re-marking a hypothetically-closed position.
+
+    Open mark: a FULL SPREAD mark (both legs), not just the short leg — current cost to
+    close the spread = short_ask_now - long_bid_now (buy back short at its ask, sell
+    long at its bid); P&L = entry realized_credit - that cost. This is algebraically
+    the same honest-fill convention applied to both legs
+    ((short_bid_entry - short_ask_now) + (long_bid_now - long_ask_entry)
+      == realized_credit - (short_ask_now - long_bid_now))
+    without needing the individual per-leg entry prices ledger.py doesn't separately
+    store (only the net realized_credit is logged).
+
+    Settlement mark: past today's 16:00 ET settlement instant, marks to intrinsic at
+    spot via _s8_settlement_intrinsic() above (adapted from
+    backtester/s5_harvest_engine.py's proven _settlement_intrinsic), then freezes.
+    """
+    side = "PUT" if cfg["side"] == "Puts" else "CALL"
+    stop_px = s8_strategy.stop_price(pick_row["realized_credit"], cfg["stop_multiple"])
+    qty = S8_QTY_PER_ENTRY
+
+    if phase == "past_settlement" and spot_settle is not None:
+        debit = _s8_settlement_intrinsic(spot_settle, side, pick_row["short_strike"],
+                                         pick_row["width"])
+        pnl_pts = pick_row["realized_credit"] - debit
+        return {"status": "settled", "pnl_points": pnl_pts,
+                "pnl_dollars": pnl_pts * S8_CONTRACT_MULTIPLIER * qty,
+                "note": f"marked to intrinsic @ spot {spot_settle:.2f}", "frozen": True}
+
+    short_bid, short_ask = short_q if short_q else (None, None)
+    if short_ask is not None and short_ask >= stop_px:
+        pnl_pts = pick_row["realized_credit"] - stop_px
+        return {"status": "stopped", "pnl_points": pnl_pts,
+                "pnl_dollars": pnl_pts * S8_CONTRACT_MULTIPLIER * qty,
+                "note": f"short ask {short_ask:.2f} >= stop {stop_px:.2f} (frozen)",
+                "frozen": True}
+
+    long_bid, long_ask = long_q if long_q else (None, None)
+    if short_ask is not None and long_bid is not None:
+        cost_to_close = short_ask - long_bid
+        pnl_pts = pick_row["realized_credit"] - cost_to_close
+        return {"status": "open", "pnl_points": pnl_pts,
+                "pnl_dollars": pnl_pts * S8_CONTRACT_MULTIPLIER * qty,
+                "note": f"live mark: short ask {short_ask:.2f}, long bid {long_bid:.2f}",
+                "frozen": False}
+
+    return {"status": "quote unavailable", "pnl_points": None, "pnl_dollars": None,
+            "note": "no live two-sided quote for this strike this cycle", "frozen": False}
+
+
+def _s8_targeted_quotes(ib, expiration: str, needs: list[tuple[str, float]]) -> dict:
+    """Lighter targeted quote pull for exactly the strikes today's live P&L re-mark
+    needs (2 legs per still-open pick), reusing s8_chain.py's own contract-construction
+    pattern (SPX/SPXW 0DTE Option, SMART exchange, tradingClass SPXW) rather than
+    inventing a new one. Deliberately NOT s8_chain.snapshot_0dte_chain()'s full
+    near-money sweep (up to ~250 contracts, ~18s, meant for a pre-entry decision) — a
+    30s auto-refresh fragment re-pricing a handful of open picks only needs the exact
+    strikes involved. Settle window shortened to 3s (vs snapshot_0dte_chain's 6s)
+    since this pulls a handful of lines, not up to 3 full LINE_LIMIT batches — a
+    judgment call for this lighter, narrower ask, not a re-tuning of the proven
+    snapshot's own pacing constants."""
+    from ib_async import Option
+    contracts = [
+        Option("SPX", expiration, strike, right, "SMART",
+              tradingClass=s8_chain._SPXW_TRADING_CLASS, currency="USD")
+        for right, strike in needs
+    ]
+    contracts = [c for c in (ib.qualifyContracts(*contracts) or []) if c and c.conId]
+    if not contracts:
+        return {}
+    tickers = [ib.reqMktData(c, "", False, False) for c in contracts]
+    ib.sleep(3)
+    out = {}
+    for c, t in zip(contracts, tickers):
+        out[(c.right, float(c.strike))] = (s8_chain._num(t.bid), s8_chain._num(t.ask))
+    for c in contracts:
+        ib.cancelMktData(c)
+    return out
+
+
+def _render_s8_pnl(ib) -> None:
+    st.markdown("#### Estimated P&L on today's hypothetical picks (live re-mark)")
+    st.caption("DISPLAY ONLY — re-marks today's still-open LOGGED picks against "
+               "current quotes. This math lives entirely in dashboard/app.py and is "
+               "never written to the ledger and never fed back into s8_runner.py's "
+               "real PILOT_MODE decision loop — see _s8_reprice_pick()'s docstring for "
+               "exactly why that coupling is structurally impossible here.")
+
+    records = _s8_read_today_records()
+    picks = [
+        {"cycle_ts": rec.get("ts"), "template": item["template"], **item["pick"]}
+        for rec in records
+        for item in rec.get("results", [])
+        if item.get("pick") and item.get("would_transmit")
+    ]
+    if not picks:
+        st.info("No approved (would-have-transmitted) picks logged today yet.")
+        return
+
+    frozen: dict = st.session_state.setdefault("s8_frozen_pnl", {})
+    now_et = datetime.now(tz=_ET_ZONE)
+    phase = "past_settlement" if now_et.time() >= _S8_SETTLEMENT_ET else "intraday"
+
+    to_query = [p for p in picks if _s8_pick_id(p) not in frozen]
+    quotes: dict = {}
+    spot_settle = None
+    if ib is not None and to_query:
+        try:
+            expiration = to_query[0]["cycle_ts"][:10].replace("-", "")
+            needs = set()
+            for p in to_query:
+                side = "PUT" if s8_config.TEMPLATES[p["template"]]["side"] == "Puts" else "CALL"
+                needs.add((side, p["short_strike"]))
+                needs.add((side, p["long_strike"]))
+            quotes = _s8_targeted_quotes(ib, expiration, sorted(needs))
+            if phase == "past_settlement":
+                try:
+                    _, spot_settle = s8_chain.get_underlying(ib)
+                except Exception:
+                    spot_settle = None
+        except Exception as exc:
+            st.caption(f"Live quote pull failed this cycle: {type(exc).__name__}: {exc}")
+
+    rows = []
+    total_dollars = 0.0
+    any_unknown = False
+    for p in picks:
+        pid = _s8_pick_id(p)
+        cfg = s8_config.TEMPLATES[p["template"]]
+        if pid in frozen:
+            result = frozen[pid]
+        else:
+            side = "PUT" if cfg["side"] == "Puts" else "CALL"
+            short_q = quotes.get((side, p["short_strike"]))
+            long_q = quotes.get((side, p["long_strike"]))
+            result = _s8_reprice_pick(p, cfg, short_q, long_q, spot_settle, phase)
+            if result.get("frozen"):
+                frozen[pid] = result
+        if result["pnl_dollars"] is None:
+            any_unknown = True
+        else:
+            total_dollars += result["pnl_dollars"]
+        rows.append({
+            "template": p["template"], "entered": p["cycle_ts"],
+            "short/long": f"{p['short_strike']:g}/{p['long_strike']:g}",
+            "entry credit": f"{p['realized_credit']:.2f}",
+            "status": result["status"],
+            "est P&L $": (f"{result['pnl_dollars']:,.0f}"
+                         if result["pnl_dollars"] is not None else "—"),
+            "note": result["note"],
+        })
+
+    label = "Total estimated hypothetical P&L (today)"
+    if any_unknown:
+        label += " (partial — some picks unpriced this cycle)"
+    st.metric(label, f"${total_dollars:,.0f}")
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+    if ib is None:
+        st.caption("Live-data Gateway unreachable this cycle — showing logged entry "
+                   "data only; live re-mark resumes once the Gateway is reachable.")
+
+
+# --- 4.4 Account / margin snapshot ----------------------------------------------
+def _s8_account_summary(ib) -> dict:
+    """AccountType/BuyingPower/ExcessLiquidity from the live-data connection's own
+    accountSummary() — the exact same read s8_risk.py's margin_preflight() consumes.
+    Per s8_risk.py's 2026-07-13 note, this IS the real personal live account's own
+    numbers (the live-data Gateway has no sub-account concept), not any paper DU sub."""
+    rows = ib.accountSummary()
+    m = {r.tag: r.value for r in rows}
+    return {"AccountType": m.get("AccountType"), "BuyingPower": m.get("BuyingPower"),
+            "ExcessLiquidity": m.get("ExcessLiquidity")}
+
+
+def _render_s8_account(ib) -> None:
+    st.markdown("#### Account / margin snapshot")
+    st.caption("The real LIVE account's own numbers (live-data Gateway, port 4001 — "
+               "exactly one personal account, no paper sub-account concept; S8 no "
+               "longer touches the paper account at all, per the 2026-07-13 pivot). "
+               "Informational only.")
+    if ib is None:
+        st.info("Live-data Gateway unreachable this cycle.")
+        return
+    try:
+        summary = _s8_account_summary(ib)
+    except Exception as exc:
+        st.error(f"accountSummary() read failed: {type(exc).__name__}: {exc}")
+        return
+    cols = st.columns(3)
+    cols[0].metric("AccountType", summary.get("AccountType") or "—")
+    bp, el = summary.get("BuyingPower"), summary.get("ExcessLiquidity")
+    cols[1].metric("BuyingPower", f"{float(bp):,.0f}" if bp not in (None, "") else "—")
+    cols[2].metric("ExcessLiquidity", f"{float(el):,.0f}" if el not in (None, "") else "—")
+
+
+# --- 4.5 Connection health -------------------------------------------------------
+def _render_s8_connection_health(ib, connect_error: Exception | None) -> None:
+    st.markdown("#### Connection health")
+    up = _port_open("127.0.0.1", 4001)   # same cheap TCP-probe pattern as the Health
+                                          # tab's paper-gateway (4002) check above
+    tier = "good" if up else "bad"
+    st.markdown(f"{_TIER_DOT[tier]} Live-data Gateway (port 4001) — "
+               f"{'UP' if up else 'DOWN'}")
+    if ib is not None:
+        st.session_state["s8_last_live_probe"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    st.caption("Last successful dashboard live probe (this session): "
+              f"{st.session_state.get('s8_last_live_probe', '—')}")
+
+    last_snapshot_ts = "—"
+    for rec in reversed(_s8_read_all_records(max_rows=500)):
+        if not rec.get("error"):
+            last_snapshot_ts = rec.get("ts", "—")
+            break
+    st.caption(f"Last successful runner chain snapshot (from ledger): {last_snapshot_ts}")
+    if connect_error is not None and ib is None:
+        st.caption(f"(dashboard connect attempt this cycle failed: "
+                  f"{type(connect_error).__name__}: {connect_error})")
+
+
+# --- 4.6 History view ------------------------------------------------------------
+def render_s8_history() -> None:
+    st.markdown("#### History (all logged S8 cycles)")
+    records = _s8_read_all_records()
+    if not records:
+        st.info("No S8 ledger history yet.")
+        return
+    dates = sorted({r.get("ts", "")[:10] for r in records if r.get("ts")}, reverse=True)
+    chosen = st.selectbox("Date", ["(all)"] + dates, key="s8_hist_date")
+    filtered = (records if chosen == "(all)"
+               else [r for r in records if r.get("ts", "").startswith(chosen)])
+    rows = []
+    for rec in filtered:
+        ts = rec.get("ts", "—")
+        if rec.get("error"):
+            rows.append({"cycle ts": ts, "template": ", ".join(rec.get("due_templates") or []),
+                        "pick": "—", "outcome": rec["error"]})
+            continue
+        for item in rec.get("results", []):
+            pick = item.get("pick")
+            rows.append({
+                "cycle ts": ts, "template": item.get("template"),
+                "pick": (f"{pick['short_strike']:g}/{pick['long_strike']:g} @ "
+                        f"{pick['realized_credit']:.2f}") if pick else "—",
+                "outcome": (item.get("would_transmit") or item.get("reason")
+                           or item.get("error") or "—"),
+            })
+    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
+                height=400)
+
+
+# --- Connection helper + the auto-refreshing fragment ---------------------------
+def _s8_connect_readonly_short(timeout: int = 5):
+    """Connect to the LIVE-DATA Gateway (port 4001), structurally read-only (no
+    override parameter exists in connections.ibkr_live_data — see that module's own
+    docstring), SHORT timeout, launch=False (an auto-refreshing 30s dashboard fragment
+    must never be the thing that boots a Gateway). Mirrors render_accounts()'s own
+    _connect_readonly_short pattern for the paper side."""
+    from connections import ibkr_live_data
+    return ibkr_live_data.connect("dashboard_s8", launch=False, timeout=timeout)
+
+
+@st.fragment(run_every="30s")
+def render_s8_live() -> None:
+    """The fast-changing S8 sections (cycle log, live P&L re-mark, account snapshot,
+    connection health) — wrapped in its own fragment so ONLY this part of the page
+    reruns every 30s, not the whole app (and not the Health/Backtests/Accounts tabs).
+
+    30s CHOSEN BECAUSE: (a) a live-data IBKR round trip here (qualify + reqMktData +
+    a 3s settle) takes several real seconds, so 30s leaves comfortable headroom
+    between round trips rather than queuing up overlapping connections; (b) it's the
+    same order of magnitude as this desk's other live-polling cadences (e.g.
+    GatewayWatchdog, ~1min) — fast enough to feel "live" for someone actively watching
+    an intraday monitor, without hammering a connection s8_runner.py's own scheduled
+    cycles are also using. A tighter interval (e.g. 5-10s) would risk stacking
+    overlapping IBKR round trips if one settle window ever runs long; a much looser one
+    (e.g. 2min) would feel stale for a same-day P&L watch. 30s is the sensible middle,
+    not a tuned/curve-fit value (nothing here is a strategy parameter).
+
+    ONE shared connection attempt per refresh cycle feeds all four subsections below
+    (cycle log needs none; P&L, account, and connection-health all reuse the same `ib`)
+    rather than reconnecting per-section — halves the round trips of a naive per-
+    section connect.
+    """
+    st.caption("Auto-refreshes every 30s while this tab is open (see render_s8_live's "
+               "docstring for why 30s). Schedule strip and History are cached longer — "
+               "they change far less during the day.")
+
+    ib = None
+    connect_error: Exception | None = None
+    try:
+        ib = _s8_connect_readonly_short()
+    except Exception as exc:
+        connect_error = exc
+
+    try:
+        _render_s8_cycle_log()
+        st.divider()
+        _render_s8_pnl(ib)
+        st.divider()
+        _render_s8_account(ib)
+        st.divider()
+        _render_s8_connection_health(ib, connect_error)
+    finally:
+        if ib is not None:
+            try:
+                ib.disconnect()
+            except Exception:
+                pass
+
+
+def render_s8() -> None:
+    st.subheader("S8 — British IC + B2 (SPX/SPXW 0DTE)")
+    st.caption("PILOT_MODE monitor. paperbot/s8_runner.py hardcodes PILOT_MODE=True "
+               "and never transmits an order — this tab is a read-only window onto "
+               "its ledger plus a live quote re-mark for display only. This tab never "
+               "places, arms, or transmits anything, and never writes to the ledger.")
+
+    render_s8_schedule()
+    st.divider()
+    render_s8_live()
+    st.divider()
+    render_s8_history()
+
+
 # ================================= LAYOUT =====================================
 def main() -> None:
     st.title("📊 Trading Desk — S0")
@@ -703,13 +1274,15 @@ def main() -> None:
     st.caption("Read-only dashboard · scoped to S0 (Adaptive All-Weather Core) · "
                "paper account only · nothing here places, arms, or transmits any order.")
 
-    tabs = st.tabs(["🩺 Health", "🧪 Backtests", "💼 Accounts"])
+    tabs = st.tabs(["🩺 Health", "🧪 Backtests", "💼 Accounts", "📈 S8"])
     with tabs[0]:
         render_health()
     with tabs[1]:
         render_backtests()
     with tabs[2]:
         render_accounts()
+    with tabs[3]:
+        render_s8()
 
 
 if __name__ == "__main__":
