@@ -1,7 +1,10 @@
 # S8 — SPX 0DTE Credit Spread Pair, Scheduled Entries + Stop-Triggered Long-Leg Close
 
-**STATUS: STANDALONE STRATEGY DESIGNATED (2026-07-09). Research/paper only — no live capital, no
-paperbot wiring yet.** This document is the canonical spec — S8's rules, performance, and limitations
+**STATUS: STANDALONE STRATEGY DESIGNATED (2026-07-09). A zero-transmit live pilot now exists
+(`livebot/`) — it reads the LIVE-TRADING Gateway (port 4003, `connections.ibkr_live_trade`) for
+real-time data but transmits nothing: PILOT_MODE=True is hardcoded and `ACCOUNT="TBD"` keeps it
+fail-closed until Andrew provides live test accounts, so no capital is at risk. Gateway lane map:
+`connections/GATEWAYS.md`.** This document is the canonical spec — S8's rules, performance, and limitations
 are now defined and evaluated on their own terms, not perpetually re-derived as "the B2 correction vs.
 what actually happened" in the account it came from. That does NOT mean the live account stops being
 useful: it remains an active, ongoing out-of-sample data source (see §6) — S8 will continue to be
@@ -9,9 +12,11 @@ tested against its real forward fills as they accrue, and Andrew is separately w
 historical export to extend the analysis window further back (see §7 item 3). Standalone means S8 has
 its own identity and spec; it does not mean the live comparison is retired.
 
-**Type:** Strategy specification, entries + exits fully mechanical. PAPER / research only — nothing is
-armed or transmitted; the frozen S0/regime config is untouched; no backtester/paperbot code exists for
-S8 yet (see §7).
+**Type:** Strategy specification, entries + exits fully mechanical. Zero-transmit — nothing is armed
+or transmitted (PILOT_MODE=True hardcoded in `livebot/s8_runner.py`, backstopped by
+`ibkr_live_trade.connect(readonly=True)` default); the frozen S0/regime config is untouched. A
+live-pilot execution package now exists (`livebot/`), deployment-gated on `ACCOUNT="TBD"`; no
+backtester `run_backtest()` module for S8 exists yet (see §7).
 
 ---
 
@@ -44,7 +49,7 @@ execution-level fills for the entry side and real intraday price paths for the e
   `british_ic/ALPHA_VS_BETA_DECOMPOSITION.md`.
 
 **Known limitations, unresolved, do not treat as closed:** ~1 year of data with exactly one true
-crash-magnitude event (2025-10-10); no live implementation exists anywhere. (Long-leg exit fill realism
+crash-magnitude event (2025-10-10); execution exists only as a zero-transmit live pilot (`livebot/`), never run against capital. (Long-leg exit fill realism
 was measured directly against real bid/ask quotes and found small — see §5 item 2, updated 2026-07-10.)
 
 ---
@@ -171,7 +176,10 @@ is not two-lucky-days-dependent.
    much larger (median $0.93/contract, 13.6x half-spread) but is inherited base-strategy risk shared with
    vanilla British IC, not new risk from S8's automated long-leg-close mechanism. Both figures are
    measured against real fills/quotes, not a synthetic OHLC-close proxy.
-3. **No live/paper implementation exists.** This is a backtested ruleset, not a running system anywhere.
+3. **Execution exists only as a zero-transmit live pilot, never run against capital.** The `livebot/`
+   package reads the LIVE-TRADING Gateway (port 4003, `connections.ibkr_live_trade`) but transmits
+   nothing — PILOT_MODE=True hardcoded, `ACCOUNT="TBD"` fail-closed. No order has ever been placed; the
+   ruleset has never traded as a running system. See `connections/GATEWAYS.md`.
 4. **Entry-side edge itself is not yet independently stress-tested** the way the exit rule was (train/test
    split, single-day-removed check) — §2's entry mechanics were derived to describe what the strategy
    *does*, not yet re-validated as a source of edge on its own out-of-sample terms. That is exactly the
