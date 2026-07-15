@@ -18,12 +18,12 @@ transmit real S8 orders:
     anything resembling it) at any point.
 
 CONNECTION TARGET (see s8_runner.py's own module docstring, "CONNECTION TARGET"
-section): the runner's live cycle connects exclusively through `connections.ibkr_live`
-(the live-TRADING Gateway, port 4003, read-only by default), never `connections.ibkr`
+section): the runner's live cycle connects exclusively through `connections.ibkr_live_trade`
+(the live-TRADING Gateway, port 4003, read-only by default), never `connections.ibkr_paper`
 (paper, port 4002) or the earlier port-4001 live-DATA login, and never wraps its work in
 `gateway_lock` (that mutex protects the shared paper Gateway, which this file does not
 touch at all). Tests below mock `runner.bounded_connect` directly (the seam that would
-call `connections.ibkr_live`) rather than reaching into that module itself.
+call `connections.ibkr_live_trade`) rather than reaching into that module itself.
 
 Run:
   cd livebot
@@ -113,7 +113,7 @@ def test_account_tbd_refuses_without_connecting(monkeypatch):
         raise AssertionError("must not attempt a connection while ACCOUNT is 'TBD'")
 
     monkeypatch.setattr(runner, "bounded_connect", _boom)
-    monkeypatch.setattr(runner.ibkr_live, "connect", _boom)
+    monkeypatch.setattr(runner.ibkr_live_trade, "connect", _boom)
 
     rc = runner.main()
 
@@ -131,7 +131,7 @@ def test_account_tbd_checked_before_due_check(monkeypatch):
         raise AssertionError("must not connect while ACCOUNT is 'TBD', due or not")
 
     monkeypatch.setattr(runner, "bounded_connect", _boom)
-    monkeypatch.setattr(runner.ibkr_live, "connect", _boom)
+    monkeypatch.setattr(runner.ibkr_live_trade, "connect", _boom)
 
     rc = runner.main()
 
@@ -198,7 +198,7 @@ def test_full_due_cycle_never_calls_order_router_place(monkeypatch):
                     "ExcessLiquidity": 5_000_000.0}
     fake_ib = _FakeIB(fake_summary)
     # bounded_connect is the one seam that would otherwise call
-    # connections.ibkr_live.connect(...) against the real live-trading Gateway.
+    # connections.ibkr_live_trade.connect(...) against the real live-trading Gateway.
     monkeypatch.setattr(runner, "bounded_connect", lambda *a, **k: fake_ib)
 
     monkeypatch.setattr(runner.s8_chain, "snapshot_0dte_chain",

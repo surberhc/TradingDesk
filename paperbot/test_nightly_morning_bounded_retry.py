@@ -3,7 +3,7 @@ test_nightly_morning_bounded_retry.py — offline tests for the bounded-retry co
 policy shared (in spirit) by nightly_monitor_run.py and morning_execute_run.py, plus
 morning_execute_run's zero-touch no-op when nothing is staged.
 
-NO broker, NO gateway, NO real network/sleep: ibkr.connect and time.sleep are
+NO broker, NO gateway, NO real network/sleep: ibkr_paper.connect and time.sleep are
 monkeypatched so a "gateway never comes up" scenario runs in milliseconds, not ~10
 minutes, and never shells out to the real IBC launcher.
 
@@ -29,7 +29,7 @@ def test_bounded_connect_gives_up_after_cap(monkeypatch):
         calls["n"] += 1
         raise RuntimeError("gateway did not come up")
 
-    monkeypatch.setattr(nmr.ibkr, "connect", always_fails)
+    monkeypatch.setattr(nmr.ibkr_paper, "connect", always_fails)
     monkeypatch.setattr(nmr.time, "sleep", lambda s: None)   # no real backoff wait
 
     result = nmr.bounded_connect("paperbot_nightly_monitor")
@@ -47,7 +47,7 @@ def test_bounded_connect_succeeds_on_a_later_attempt(monkeypatch):
             raise RuntimeError("not up yet")
         return sentinel
 
-    monkeypatch.setattr(nmr.ibkr, "connect", fails_then_succeeds)
+    monkeypatch.setattr(nmr.ibkr_paper, "connect", fails_then_succeeds)
     monkeypatch.setattr(nmr.time, "sleep", lambda s: None)
 
     result = nmr.bounded_connect("paperbot_nightly_monitor")
@@ -137,7 +137,7 @@ def test_morning_execute_bounded_connect_gives_up_after_cap(monkeypatch):
         calls["n"] += 1
         raise RuntimeError("gateway did not come up")
 
-    monkeypatch.setattr(mer.ibkr, "connect", always_fails)
+    monkeypatch.setattr(mer.ibkr_paper, "connect", always_fails)
     monkeypatch.setattr(mer.time, "sleep", lambda s: None)
 
     result = mer.bounded_connect("paperbot_morning_execute")

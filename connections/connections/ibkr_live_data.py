@@ -2,7 +2,7 @@
 ibkr_live_data.py — the one way to start and connect to the LIVE-side, READ-ONLY-ONLY
 market-data Gateway.
 
-This is a SEPARATE Gateway instance from the paper Gateway in ibkr.py: a distinct
+This is a SEPARATE Gateway instance from the paper Gateway in ibkr_paper.py: a distinct
 install directory, a distinct port (4001, LIVE_DATA_PORT), and a distinct,
 deliberately access-restricted live login that IBKR itself grants visibility into
 exactly ONE personal account with NO execution capability at the account-permission
@@ -20,12 +20,12 @@ that is legitimate, intended use of a module whose safety property never depende
 who calls it, only on what it can do once called: nothing in this file transmits an
 order, ever, regardless of caller.
 
-Gateway launch mirrors ibkr.py's proven IBController pattern, pointed at a not-yet-
-built install (`C:\\IBC-Live\\StartGatewayLive.bat`) that the user will set up
+Gateway launch mirrors ibkr_paper.py's proven IBController pattern, pointed at a not-yet-
+built install (`C:\\IBC-Live-Data\\StartGatewayLiveData.bat`) that the user will set up
 separately.
 
-`ensure_gateway()` carries the same NARROW launch mutex as ibkr.py: an atomic
-lockfile that lets at most ONE StartGatewayLive.bat launch be in flight across all
+`ensure_gateway()` carries the same NARROW launch mutex as ibkr_paper.py: an atomic
+lockfile that lets at most ONE StartGatewayLiveData.bat launch be in flight across all
 our processes, with a relaunch cooldown. It uses its OWN lockfile, distinct from
 the paper module's, so the two Gateways' launch coordination never overlaps.
 """
@@ -40,11 +40,11 @@ import time
 from ib_async import IB, Stock
 
 from connections import clientids
-from connections.ibkr import _gateway_env  # shared JRE-probe workaround only; no paper/live logic
+from connections.ibkr_paper import _gateway_env  # shared JRE-probe workaround only; no paper/live logic
 
 HOST = "127.0.0.1"
 LIVE_DATA_PORT = clientids.LIVE_DATA_PORT       # 4001
-GATEWAY_BAT = r"C:\IBC-Live\StartGatewayLive.bat"  # IBController auto-login (live, read-only account) — not yet installed
+GATEWAY_BAT = r"C:\IBC-Live-Data\StartGatewayLiveData.bat"  # IBController auto-login (live, read-only account) — not yet installed
 
 # Launch mutex state. LOCAL C: only — Drive sync corrupts O_EXCL atomicity, and
 # the file must be readable by non-elevated processes. Overridable via env so
@@ -84,7 +84,7 @@ def gateway_running(client_id: int = clientids.CLIENT_IDS["live_data_forward"],
 def _pid_alive(pid: int) -> bool:
     """True if a process with this PID is currently running (Windows + POSIX).
 
-    Mirrors ibkr.py's _pid_alive: tasklist is the dependency-free liveness test on
+    Mirrors ibkr_paper.py's _pid_alive: tasklist is the dependency-free liveness test on
     Windows, and an undeterminable result is treated as ALIVE — here that makes us
     a waiter rather than risk a dup launch.
     """
@@ -156,7 +156,7 @@ def ensure_gateway(wait_secs: int = 180) -> bool:
     Returns True once it's serving data, False if it never came up within wait_secs.
 
     NARROW launch mutex (see module docstring): coordinates via an atomic local
-    lockfile so at most ONE StartGatewayLive.bat launch is ever in flight across
+    lockfile so at most ONE StartGatewayLiveData.bat launch is ever in flight across
     all our processes, and no relaunch happens within RELAUNCH_COOLDOWN_SECS of the
     previous attempt. Own lockfile, entirely separate from the paper module's.
 
@@ -170,7 +170,7 @@ def ensure_gateway(wait_secs: int = 180) -> bool:
         return True
 
     # Below here the gateway is down. Coordinate a launch via the lockfile.
-    # Same pattern as ibkr.py / datacollector/spxw_1m_supervisor.py's acquire_lock:
+    # Same pattern as ibkr_paper.py / datacollector/spxw_1m_supervisor.py's acquire_lock:
     # O_CREAT|O_EXCL create -> launcher; existing+live+recent -> waiter;
     # existing+dead/stale -> reclaim (unlink + retry) -> launcher.
     try:

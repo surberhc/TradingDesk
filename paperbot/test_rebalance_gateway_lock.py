@@ -11,7 +11,7 @@ Proves OFFLINE (NO broker, NO real gateway, NO network, NO transmit):
   * when the lock is FREE, both proceed PAST the guard (they reach the connect step). A
     sentinel raised at connect proves the guard was passed without a real gateway.
 
-The broker is fully mocked/injected: ibkr.connect (run) and the IB() class (execute) are
+The broker is fully mocked/injected: ibkr_paper.connect (run) and the IB() class (execute) are
 monkeypatched; a held lock is simulated by writing a live lock record to a TEMP lock path
 (never the real STATE_DIR / Drive). Time/sleep are injected so the bounded refuse-wait never
 sleeps for real.
@@ -103,7 +103,7 @@ def test_run_refuses_when_lock_held(monkeypatch, tmp_path, capsys):
     # If main() tries to connect while the lock is held, blow up: refuse must abort first.
     def _boom_connect(*a, **k):
         raise AssertionError("rebalance_run must NOT connect while the gateway lock is held!")
-    monkeypatch.setattr(rr.ibkr, "connect", _boom_connect)
+    monkeypatch.setattr(rr.ibkr_paper, "connect", _boom_connect)
 
     rc = rr.main()
     assert rc == 2                                    # refused
@@ -125,7 +125,7 @@ def test_run_passes_guard_when_lock_free(monkeypatch, tmp_path):
     def _connect(*a, **k):
         held_at_connect["v"] = os.path.exists(path)   # lock must be held when we reach connect
         raise RuntimeError("stub: no real gateway")   # main() turns this into a clean return 1
-    monkeypatch.setattr(rr.ibkr, "connect", _connect)
+    monkeypatch.setattr(rr.ibkr_paper, "connect", _connect)
 
     rc = rr.main()
     assert held_at_connect["v"] is True               # got PAST the guard, lock held at connect

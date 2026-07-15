@@ -1,7 +1,7 @@
 import subprocess, sys, os, shutil, tempfile, atexit, glob, traceback
 from datetime import datetime
 import rrg_emailer
-from connections import ibkr as _ibkr
+from connections import ibkr_paper as _ibkr
 # Code lives in this folder (TradingDesk\dailyreport, in Drive). STATE — rrg.db,
 # outputs, logs — lives on local C: so Drive sync can't corrupt the running DB.
 CODE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -53,9 +53,9 @@ for _old in glob.glob(os.path.join(LOG_DIR, 'rrg_run_*.log')):
 print('=' * 60)
 print(f'RRG DAILY RUN START {_run_start:%Y-%m-%d %H:%M:%S}  (log: {LOG_PATH})')
 print('checking if gateway already up (launching if needed)...')
-# Shared, launch-mutex-protected gateway check/launch (connections.ibkr.ensure_gateway):
+# Shared, launch-mutex-protected gateway check/launch (connections.ibkr_paper.ensure_gateway):
 # replaces this file's former local gateway_running()/Popen duplicate so RRG's launch
-# path is coordinated with every other consumer instead of racing its own StartGateway.bat.
+# path is coordinated with every other consumer instead of racing its own StartGatewayPaper.bat.
 if not _ibkr.ensure_gateway():
     print('GATEWAY NEVER CAME UP — aborting, no poll run')
     sys.exit(1)

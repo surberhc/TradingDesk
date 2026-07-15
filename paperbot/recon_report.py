@@ -31,7 +31,7 @@ import investable as _investable
 import reconcile
 import strategy_target
 import version
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 from gateway_lock import GatewayBusySkip, gateway_lock
 
 
@@ -142,7 +142,7 @@ def main() -> int:
         with gateway_lock(purpose="recon",
                           client_id=clientids.get("paperbot_recon"), on_busy="skip"):
             try:
-                ib = ibkr.connect("paperbot_recon", readonly=True, launch=True)
+                ib = ibkr_paper.connect("paperbot_recon", readonly=True, launch=True)
             except Exception as exc:
                 print(f"\nCOULD NOT CONNECT: {exc}")
                 return 1

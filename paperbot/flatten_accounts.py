@@ -20,7 +20,7 @@ from ib_async import IB, Stock, LimitOrder   # noqa: E402
 
 import ledger          # noqa: E402
 import live_quotes     # noqa: E402
-from connections import clientids, ibkr      # noqa: E402
+from connections import clientids, ibkr_paper      # noqa: E402
 
 DU_ACCOUNTS = ["DU8922142", "DU8922143", "DU8922144", "DU8922145", "DU8922146"]
 PIN = "DU8922142"   # pin connect to a DU account (avoids the FA-master hang)
@@ -29,7 +29,7 @@ PIN = "DU8922142"   # pin connect to a DU account (avoids the FA-master hang)
 def main() -> int:
     print("FLATTEN ALL DU ACCOUNTS -> zero (paper only)", flush=True)
     ib = IB()
-    ib.connect(ibkr.HOST, ibkr.PAPER_PORT, clientId=clientids.get("paperbot_flatten"),
+    ib.connect(ibkr_paper.HOST, ibkr_paper.PAPER_PORT, clientId=clientids.get("paperbot_flatten"),
                readonly=False, timeout=15, account=PIN)
     try:
         ib.reqPositions()

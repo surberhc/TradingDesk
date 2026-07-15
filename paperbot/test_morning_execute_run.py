@@ -5,7 +5,7 @@ NO broker, NO real gateway, NO network, NO real sleeps. Proves the guardrails th
 matter most for an unattended script that could (once PILOT_MODE is flipped) transmit
 PAPER orders:
   * PILOT_MODE defaults True.
-  * no staged file for today -> ZERO gateway touch (ibkr.connect never called), rc==0.
+  * no staged file for today -> ZERO gateway touch (ibkr_paper.connect never called), rc==0.
   * a staged file + PILOT_MODE=True -> re-validates the guard, connects, but NEVER calls
     any order-building/placing code; emails "WOULD HAVE TRANSMITTED" and archives the
     staged file.
@@ -119,7 +119,7 @@ def test_no_staged_file_makes_zero_gateway_contact(monkeypatch, tmp_path):
     def _boom(*a, **k):
         raise AssertionError("must not connect when nothing is staged")
 
-    monkeypatch.setattr(mer.ibkr, "connect", _boom)
+    monkeypatch.setattr(mer.ibkr_paper, "connect", _boom)
     monkeypatch.setattr(mer, "bounded_connect", _boom)
 
     rc = mer.main()
@@ -248,7 +248,7 @@ def test_bounded_connect_gives_up_after_max_attempts(monkeypatch):
         calls["n"] += 1
         raise ConnectionError("no gateway")
 
-    monkeypatch.setattr(mer.ibkr, "connect", _boom)
+    monkeypatch.setattr(mer.ibkr_paper, "connect", _boom)
     monkeypatch.setattr(mer.time, "sleep", lambda s: None)
 
     result = mer.bounded_connect("paperbot_morning_execute")

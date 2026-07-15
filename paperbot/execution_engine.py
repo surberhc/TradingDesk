@@ -35,7 +35,7 @@ import live_quotes
 import order_router
 import risk_manager
 import strategy_target
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 
 
 @dataclass
@@ -171,10 +171,10 @@ def main() -> int:
         print(f"      {sym:6s} {wt * 100:6.2f}%   last={float(target.prices.get(sym, float('nan'))):>10,.2f}")
 
     # [2] Connect to the PAPER account (read-only) and confirm it.
-    print(f"\n[2] Connecting to PAPER gateway {ibkr.HOST}:{ibkr.PAPER_PORT} "
+    print(f"\n[2] Connecting to PAPER gateway {ibkr_paper.HOST}:{ibkr_paper.PAPER_PORT} "
           f"(clientId={clientids.get('paperbot')}, readonly=True)...")
     try:
-        ib = ibkr.connect("paperbot", readonly=True, launch=True)
+        ib = ibkr_paper.connect("paperbot", readonly=True, launch=True)
     except Exception as exc:
         print(f"    COULD NOT CONNECT: {exc}")
         return 1

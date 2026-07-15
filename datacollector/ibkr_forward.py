@@ -40,7 +40,7 @@ import config
 import storage
 
 # The shared connection layer owns the clientId registry + the Gateway-launch fix.
-from connections import ibkr as gw
+from connections import ibkr_paper as gw
 
 CLIENT = "datacollector_forward"          # clientId 25 (see connections.clientids)
 

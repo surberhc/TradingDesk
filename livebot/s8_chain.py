@@ -5,7 +5,7 @@ approved build plan at the top-level plans folder, calm-riding-hammock.md item 2
 
 >>> UNTESTED LIVE AS OF THIS BUILD <<<
 `s8_runner.py` calls this module's functions against a connection to the live-TRADING
-Gateway (`connections/ibkr_live.py`, port 4003) — a real, funded, transmit-capable
+Gateway (`connections/ibkr_live_trade.py`, port 4003) — a real, funded, transmit-capable
 account (NOT the paper Gateway at 4002, and NOT the earlier port-4001 live-DATA login).
 This module itself is agnostic to which Gateway that connection came from: it takes
 `ib: IB` as a parameter, per its original design, and never connects on its own, so it
@@ -121,7 +121,7 @@ This module NEVER connects, disconnects, or owns the IBKR connection lifecycle -
 an already-connected `IB()` instance passed in by the caller, exactly mirroring
 `order_router.py`'s `place(ib, ...)` / `what_if(ib, ...)` convention (see the approved
 plan: "connection lifecycle owned by the caller, a later stage, s8_runner.py"). This file
-does not import `connections.ibkr`, does not call `connect()`/`disconnect()`, and takes no
+does not import `connections.ibkr_paper`, does not call `connect()`/`disconnect()`, and takes no
 clientId of its own.
 """
 from __future__ import annotations

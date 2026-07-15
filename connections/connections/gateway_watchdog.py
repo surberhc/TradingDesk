@@ -5,7 +5,7 @@ it can never become a hot loop.
 
 PAPER ONLY. This never touches order transmission; it only restarts the login/data
 gateway process. `ensure_gateway()` (which this calls to relaunch) uses the proven
-paper StartGateway.bat auto-login and the narrow launch-mutex.
+paper StartGatewayPaper.bat auto-login and the narrow launch-mutex.
 
 WHY THIS EXISTS (2026-07-05)
   A wedged IBKR login (one-login-per-username -> "existing session detected"
@@ -23,8 +23,8 @@ DESIGN
     once-per-invocation is reboot/crash-resilient (no long-lived loop to die).
   * The DECISION LOGIC is a pure, injectable function — run_once(...) — with a fake
     clock and mocked health/kill/launch so the whole policy is unit-tested offline.
-    main() is a thin wire-up: real time.time(), ibkr.gateway_running(), the real
-    kill wrapper, ibkr.ensure_gateway, load/save state, print.
+    main() is a thin wire-up: real time.time(), ibkr_paper.gateway_running(), the real
+    kill wrapper, ibkr_paper.ensure_gateway, load/save state, print.
   * State is LOCAL C: only (never Drive — Drive sync corrupts atomicity and the file
     must be readable/writable by the elevated task). Path overridable via env var
     so tests point it at a tmp dir.
@@ -40,7 +40,7 @@ import subprocess
 import time
 from zoneinfo import ZoneInfo
 
-from connections import ibkr
+from connections import ibkr_paper
 
 # --------------------------------------------------------------------------- #
 # TUNABLE POLICY — Andrew's chosen defaults. These are the whole policy surface.
@@ -115,7 +115,7 @@ def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn):
     kill_fn  : zero-arg callable that kills all IB gateway processes (returns killed
                PIDs; the return value is logged but not otherwise used).
     launch_fn: zero-arg callable -> bool. Brings up exactly ONE fresh gateway
-               (ibkr.ensure_gateway). True == it came up.
+               (ibkr_paper.ensure_gateway). True == it came up.
     log_fn   : one-arg callable(str) for a human log line.
     """
     # Normalize incoming state so a partial/garbage file can't crash policy.
@@ -233,7 +233,7 @@ def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn):
 # Implemented via a single PowerShell Get-CimInstance Win32_Process filter piped to
 # Stop-Process (mirrors the approach that worked during the incident cleanup).
 #
-# Defaults (port=ibkr.PAPER_PORT, dir_substring=C:\IBC) reproduce the ORIGINAL,
+# Defaults (port=ibkr_paper.PAPER_PORT, dir_substring=C:\IBC) reproduce the ORIGINAL,
 # pre-multi-instance behavior for the paper Gateway: every call site today
 # (gateway_watchdog.main() and paperbot/gateway_arm_restart_elevated.py) invokes
 # this with NO arguments and must keep doing so unchanged.
@@ -276,7 +276,7 @@ def _ps_single_quote(s: str) -> str:
     return s.replace("'", "''")
 
 
-def _kill_gateway_processes(port: int = ibkr.PAPER_PORT,
+def _kill_gateway_processes(port: int = ibkr_paper.PAPER_PORT,
                             dir_substring: str = r"C:\IBC") -> list[int]:
     """Kill THIS Gateway instance's processes only — sparing the ThetaData
     terminal, all python, and any OTHER Gateway instance running on a different
@@ -285,7 +285,7 @@ def _kill_gateway_processes(port: int = ibkr.PAPER_PORT,
     port          : the port THIS instance's Gateway listens on (primary match).
     dir_substring : a substring of THIS instance's install dir, matched against
                     CommandLine (secondary match, for the pre-listen race window).
-    Defaults (ibkr.PAPER_PORT / C:\\IBC) reproduce the original unscoped behavior
+    Defaults (ibkr_paper.PAPER_PORT / C:\\IBC) reproduce the original unscoped behavior
     for the paper Gateway — every call site today invokes this with NO arguments.
 
     Returns the list of killed PIDs. Never raises — on any failure returns []."""
@@ -386,10 +386,10 @@ def main() -> int:
 
         new_state, action = run_once(
             now=now,
-            healthy=ibkr.gateway_running,
+            healthy=ibkr_paper.gateway_running,
             state=state,
             kill_fn=_kill_gateway_processes,
-            launch_fn=ibkr.ensure_gateway,
+            launch_fn=ibkr_paper.ensure_gateway,
             log_fn=_log,
         )
 

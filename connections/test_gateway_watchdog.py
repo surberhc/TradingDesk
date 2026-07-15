@@ -282,8 +282,8 @@ def test_kill_gateway_processes_default_reproduces_original_paper_filter(monkeyp
     assert "$n -ne 'pythonw.exe'" in ps
 
     # NEW scoping defaults to the paper instance: port 4002 / C:\IBC.
-    assert f"-LocalPort {gw.ibkr.PAPER_PORT}" in ps
-    assert gw.ibkr.PAPER_PORT == 4002
+    assert f"-LocalPort {gw.ibkr_paper.PAPER_PORT}" in ps
+    assert gw.ibkr_paper.PAPER_PORT == 4002
     assert r"$dirSubstring = 'C:\IBC'" in ps
 
 

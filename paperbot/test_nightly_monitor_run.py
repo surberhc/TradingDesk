@@ -3,7 +3,7 @@ test_nightly_monitor_run.py — offline unit tests for the NIGHTLY bounded-retry
 monitor + stage runner.
 
 NO broker, NO real gateway, NO network, NO real price-history reads, NO real sleeps:
-ibkr.connect, gateway_lock, rebalance_guard.compute_regime_now, and time.sleep are all
+ibkr_paper.connect, gateway_lock, rebalance_guard.compute_regime_now, and time.sleep are all
 monkeypatched. Proves:
   * bounded_connect gives up after CONNECT_MAX_ATTEMPTS and never sleeps for real
     past that (a fake sleep is injected via monkeypatch on the module's `time`).
@@ -119,7 +119,7 @@ def test_bounded_connect_gives_up_after_max_attempts(monkeypatch):
         calls["n"] += 1
         raise ConnectionError("no gateway")
 
-    monkeypatch.setattr(nmr.ibkr, "connect", _boom)
+    monkeypatch.setattr(nmr.ibkr_paper, "connect", _boom)
     monkeypatch.setattr(nmr.time, "sleep", lambda s: None)  # no real backoff wait
 
     result = nmr.bounded_connect("paperbot_nightly_monitor")
@@ -130,7 +130,7 @@ def test_bounded_connect_gives_up_after_max_attempts(monkeypatch):
 
 def test_bounded_connect_returns_ib_on_first_success(monkeypatch):
     fake = _FakeIB()
-    monkeypatch.setattr(nmr.ibkr, "connect", lambda *a, **k: fake)
+    monkeypatch.setattr(nmr.ibkr_paper, "connect", lambda *a, **k: fake)
     result = nmr.bounded_connect("paperbot_nightly_monitor")
     assert result is fake
 

@@ -12,7 +12,7 @@ CORE PRINCIPLE — PROPOSE, NEVER DISPOSE
 This module is a hard, test-enforced boundary (test_account_monitor.py asserts it). It
 imports NOTHING that can transmit, arm, or build an order:
   * NO order_router (build / build_fa_block / transmit / arming)
-  * NO connections.ibkr / gateway / broker session
+  * NO connections.ibkr_paper / gateway / broker session
   * NO Task Scheduler, NO state files
 It mirrors reconcile/rebalance_engine's read-only posture: it stops at producing a
 reviewable verdict. If composing a verdict ever required something that can transmit, that

@@ -72,7 +72,7 @@ import live_quotes       # noqa: E402
 import order_router      # noqa: E402
 import risk_manager      # noqa: E402
 import version           # noqa: E402
-from connections import clientids, ibkr   # noqa: E402
+from connections import clientids, ibkr_paper   # noqa: E402
 from gateway_lock import GatewayBusyRefuse, gateway_lock   # noqa: E402
 from rebalance_engine import build_plan   # noqa: E402
 # Reuse, don't duplicate: the review runner already has the preview, the fail-closed
@@ -318,7 +318,7 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
     print(f"\n[2] Connecting NON-readonly pinned to {PIN_ACCOUNT} "
           f"(clientId={clientids.get('paperbot_rebalance_exec')})...")
     ib = IB()
-    ib.connect(ibkr.HOST, ibkr.PAPER_PORT,
+    ib.connect(ibkr_paper.HOST, ibkr_paper.PAPER_PORT,
                clientId=clientids.get("paperbot_rebalance_exec"),
                readonly=False, timeout=15, account=PIN_ACCOUNT)
     placed_fills: list[dict] = []

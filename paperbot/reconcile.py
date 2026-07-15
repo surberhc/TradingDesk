@@ -22,7 +22,7 @@ from dataclasses import dataclass
 import config
 import investable as _investable
 import strategy_target
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 
 
 @dataclass
@@ -100,7 +100,7 @@ def main() -> int:
 
     target = strategy_target.current_target()
     try:
-        ib = ibkr.connect("paperbot", readonly=True, launch=True)
+        ib = ibkr_paper.connect("paperbot", readonly=True, launch=True)
     except Exception as exc:
         print(f"COULD NOT CONNECT: {exc}")
         return 1

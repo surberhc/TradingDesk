@@ -38,7 +38,7 @@ import s4_risk
 import s4_sizing
 import s4_strategy_target
 import version
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 from gateway_lock import GatewayBusyRefuse, gateway_lock
 
 
@@ -166,10 +166,10 @@ def main(account: str | None = None, *, profile: str | None = None,
 def _run_gateway_session(account: str, target, leverage_cap: float, armed: bool) -> int:
     """connect -> read -> preflight -> size -> guard -> build -> place(armed=False), run only
     while the gateway lock is HELD."""
-    print(f"\n[2] Connecting to PAPER gateway {ibkr.HOST}:{ibkr.PAPER_PORT} "
+    print(f"\n[2] Connecting to PAPER gateway {ibkr_paper.HOST}:{ibkr_paper.PAPER_PORT} "
           f"(clientId={clientids.get('paperbot_s4')}, readonly=True)...")
     try:
-        ib = ibkr.connect("paperbot_s4", readonly=True, launch=True)
+        ib = ibkr_paper.connect("paperbot_s4", readonly=True, launch=True)
     except Exception as exc:
         print(f"    COULD NOT CONNECT: {exc}")
         return 1

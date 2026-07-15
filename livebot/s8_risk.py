@@ -6,7 +6,7 @@ never transmits, never touches a broker; the caller (a later stage, s8_runner.py
 
 WHOSE accountSummary THIS ACTUALLY IS
 --------------------------------------
-s8_runner.py routes its live cycle exclusively through `connections.ibkr_live` (the
+s8_runner.py routes its live cycle exclusively through `connections.ibkr_live_trade` (the
 live-TRADING Gateway, port 4003 — a funded, transmit-capable test account, connected
 read-only during the pilot), not the paper Gateway. So the `summary` this function
 receives in practice is the live-trading account's own `accountSummary()` — not a paper

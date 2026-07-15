@@ -43,7 +43,7 @@ import os
 import sys
 import time
 
-from connections import ibkr
+from connections import ibkr_paper
 from connections.gateway_watchdog import _kill_gateway_processes
 
 STATE_FILE = os.environ.get(
@@ -79,7 +79,7 @@ def run() -> bool:
 
     deadline = time.time() + KILL_WAIT_SECS
     while time.time() < deadline:
-        if not ibkr.gateway_running():
+        if not ibkr_paper.gateway_running():
             break
         time.sleep(1)
     else:
@@ -89,7 +89,7 @@ def run() -> bool:
     time.sleep(SETTLE_SECS)  # let the old session fully die before IBC relaunches
 
     print("gateway_arm_restart_elevated: relaunching via ensure_gateway()...")
-    came_up = bool(ibkr.ensure_gateway())
+    came_up = bool(ibkr_paper.ensure_gateway())
     print(f"gateway_arm_restart_elevated: ensure_gateway() -> {came_up}")
     return came_up
 

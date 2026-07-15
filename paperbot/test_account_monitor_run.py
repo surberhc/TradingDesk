@@ -10,7 +10,7 @@ Proves OFFLINE (NO broker, NO real gateway, NO network):
   * FREE  -> when the lock is free, main() proceeds exactly as before: it connects (mocked),
             runs the read-only cycle over the mocked accounts, and returns 0.
 
-The broker is fully mocked/injected — ibkr.connect is monkeypatched to a fake IB; a held
+The broker is fully mocked/injected — ibkr_paper.connect is monkeypatched to a fake IB; a held
 lock is simulated by writing a live lock record to a TEMP lock path (never the real
 STATE_DIR / Drive). Time/sleep are injected so the brief monitor wait never sleeps for real.
 
@@ -121,7 +121,7 @@ def test_busy_lock_skips_cycle_without_touching_broker(monkeypatch, tmp_path, ca
     def _boom_connect(*a, **k):
         raise AssertionError("monitor must NOT connect while the gateway lock is held!")
 
-    monkeypatch.setattr(amr.ibkr, "connect", _boom_connect)
+    monkeypatch.setattr(amr.ibkr_paper, "connect", _boom_connect)
 
     rc, verdict_summary = main_no_exception(monkeypatch)
 
@@ -143,7 +143,7 @@ def test_free_lock_runs_cycle(monkeypatch, tmp_path, capsys):
     assert not os.path.exists(path)                  # lock is free
 
     fake = _FakeIB()
-    monkeypatch.setattr(amr.ibkr, "connect", lambda *a, **k: fake)
+    monkeypatch.setattr(amr.ibkr_paper, "connect", lambda *a, **k: fake)
 
     rc, verdict_summary = amr.main()
 
@@ -178,7 +178,7 @@ def test_free_lock_held_through_whole_session(monkeypatch, tmp_path):
         seen["during_connect"] = os.path.exists(path)   # lock must already be held at connect
         return fake
 
-    monkeypatch.setattr(amr.ibkr, "connect", _connect)
+    monkeypatch.setattr(amr.ibkr_paper, "connect", _connect)
 
     rc, verdict_summary = amr.main()
     assert rc == 0

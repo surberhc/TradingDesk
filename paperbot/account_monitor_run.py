@@ -50,7 +50,7 @@ import config
 import nav_history
 import strategy_target
 import version
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 from gateway_lock import GatewayBusySkip, gateway_lock
 
 # --- daily status artifact (read by the EOD digest + heartbeat_alarm) ----------
@@ -324,7 +324,7 @@ def main() -> tuple[int, dict]:
     print(f"ACCOUNT-CASHFLOW MONITOR — LIVE READ-ONLY CYCLE (propose-only, transmits "
           f"nothing)   [{version.banner()}]")
     print("=" * 104)
-    print(f"connect: PAPER gateway {ibkr.HOST}:{ibkr.PAPER_PORT}  "
+    print(f"connect: PAPER gateway {ibkr_paper.HOST}:{ibkr_paper.PAPER_PORT}  "
           f"clientId={clientids.get('paperbot_monitor')}  readonly=True")
     print("posture: reads accountValues / positions / reqExecutions ONLY. No order, no "
           "modify/cancel, NO whatIfOrder, no FA/gateway config write.")
@@ -372,7 +372,7 @@ def _run_gateway_session(today, targets, baselines, earmarks_by_acct) -> tuple[i
     deadline = datetime.now().timestamp() + CYCLE_WATCHDOG_SECONDS
     print(f"\n[2] Connecting read-only (timeout=15s, cycle watchdog={CYCLE_WATCHDOG_SECONDS}s)...")
     try:
-        ib = ibkr.connect("paperbot_monitor", readonly=True, launch=True, timeout=15)
+        ib = ibkr_paper.connect("paperbot_monitor", readonly=True, launch=True, timeout=15)
     except Exception as exc:
         print(f"    COULD NOT CONNECT: {exc}")
         print("    -> Is IB Gateway up and logged into PAPER, API on port 4002? "

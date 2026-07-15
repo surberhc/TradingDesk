@@ -14,11 +14,11 @@ approved plan) — this file is built and independently testable first.
 
 CONNECTION TARGET — THE LIVE-TRADING GATEWAY, NEVER THE PAPER GATEWAY
 ------------------------------------------------------------------------------------------
-This file connects EXCLUSIVELY to the live-TRADING Gateway (`connections.ibkr_live`,
+This file connects EXCLUSIVELY to the live-TRADING Gateway (`connections.ibkr_live_trade`,
 port 4003) for BOTH steps of its monitoring/decision cycle — the account-summary read
 for the margin gate AND the option-chain snapshot for strike selection. That is a real,
 FUNDED, transmit-CAPABLE account limited to two individual test accounts — NOT the paper
-Gateway (`connections.ibkr`, port 4002) and NOT the earlier port-4001 live-DATA login
+Gateway (`connections.ibkr_paper`, port 4002) and NOT the earlier port-4001 live-DATA login
 (`connections.ibkr_live_data`), neither of which this file imports or calls anywhere.
 The live-trading account serves real-time market data directly, so no delayed-data
 fallback (`reqMarketDataType`) is needed for the quotes S8 reads.
@@ -34,7 +34,7 @@ declared walls sit on top of that absence:
      code in this file, PILOT_MODE is belt-and-suspenders over that absence — but it is
      still the wall of record, not the read-only default.
   2. SECONDARY fail-safe: the connection is read-only by default
-     (`ibkr_live.connect(readonly=True)` — this file never passes `readonly=False`).
+     (`ibkr_live_trade.connect(readonly=True)` — this file never passes `readonly=False`).
      Because the account IS transmit-capable at the broker level, read-only is a real,
      honored session flag here (unlike the port-4001 live-data login, whose read-only-ness
      was structural). It is a fail-safe default, not a substitute for PILOT_MODE.
@@ -164,7 +164,7 @@ import s8_config  # noqa: E402
 import s8_risk  # noqa: E402
 import s8_strategy  # noqa: E402
 import version  # noqa: E402
-from connections import ibkr_live  # noqa: E402
+from connections import ibkr_live_trade  # noqa: E402
 from order_router import _base_fields, _check_limit_price  # noqa: E402
 
 # NOTE on gateway_lock: every OTHER paperbot script that imports gateway_lock does so
@@ -174,7 +174,7 @@ from order_router import _base_fields, _check_limit_price  # noqa: E402
 # TARGET" above): it never touches the paper Gateway at all, so wrapping its live-trading
 # work in that mutex would protect a resource this script doesn't use, while providing
 # zero real protection on the resource it does use (the live-TRADING Gateway,
-# connections.ibkr_live, port 4003, whose own launch coordination lives in that module's
+# connections.ibkr_live_trade, port 4003, whose own launch coordination lives in that module's
 # ensure_gateway() launch mutex). Deliberately not imported/used here -- not an oversight.
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -333,13 +333,13 @@ def _alert_email(subject: str, lines: list[str]) -> None:
 
 def bounded_connect(consumer: str):
     """Identical bounded-retry policy to morning_execute_run.bounded_connect, repointed
-    at the live-TRADING Gateway (connections.ibkr_live, port 4003) instead of the paper
+    at the live-TRADING Gateway (connections.ibkr_live_trade, port 4003) instead of the paper
     Gateway -- see the module docstring's "CONNECTION TARGET" section. Duplicated (not
     imported) on purpose — same rationale stated there: each scheduled script must be
     independently robust and self-contained, and the policy is tiny/stable enough that a
     shared import would be over-engineering for these call sites.
 
-    Connects read-only by DEFAULT: `ibkr_live.connect()` exposes a real `readonly`
+    Connects read-only by DEFAULT: `ibkr_live_trade.connect()` exposes a real `readonly`
     parameter (this account is transmit-capable at the broker level), but it defaults to
     True and this function never passes readonly=False. The pilot only ever reads, so a
     read-only session is a fail-safe that costs it nothing -- PILOT_MODE, not this
@@ -349,7 +349,7 @@ def bounded_connect(consumer: str):
         print(f"    connect attempt {attempt}/{CONNECT_MAX_ATTEMPTS} "
               f"(consumer={consumer}, live-trading Gateway, read-only by default)...")
         try:
-            ib = ibkr_live.connect(consumer, launch=True,
+            ib = ibkr_live_trade.connect(consumer, launch=True,
                                    timeout=CONNECT_ATTEMPT_TIMEOUT_SECS)
             print(f"    connected on attempt {attempt}.")
             return ib
@@ -397,7 +397,7 @@ def main() -> int:
           + ", ".join(f"{n}@{s}" for n, s in due))
 
     # PILOT_MODE never needs write access to the account; bounded_connect uses
-    # ibkr_live.connect()'s read-only default (see bounded_connect's docstring / module
+    # ibkr_live_trade.connect()'s read-only default (see bounded_connect's docstring / module
     # docstring's "CONNECTION TARGET" section) -- readonly=False is never passed here.
     ib = bounded_connect("s8_live_pilot")
     if ib is None:

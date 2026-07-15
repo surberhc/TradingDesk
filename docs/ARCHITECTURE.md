@@ -24,7 +24,7 @@ This is the git repository. Everything here is version-tracked and backed up by 
 | `strategies\` | The shared strategy **"brain"** (a Python package named `strategies`). Both the backtester and the paperbot import it, so **what we test is what we trade** — they can't drift apart. |
 | `backtester\` | The research / backtest engine. Imports `strategies`. Has its own test suite (89 tests). |
 | `paperbot\` | The **PAPER** execution engine (paper accounts only — never real money). Imports `strategies` and `connections`. |
-| `connections\` | Shared broker/data access layer (package `connections`): `ibkr.py` (broker gateway), `tiingo.py` (price data), `clientids.py` (connection ID registry). |
+| `connections\` | Shared broker/data access layer (package `connections`): `ibkr_paper.py` / `ibkr_live_data.py` / `ibkr_live_trade.py` (the three Gateway lanes — see `connections/GATEWAYS.md`), `tiingo.py` (price data), `clientids.py` (connection ID registry). |
 | `datacollector\` | The options-data collector — pulls from ThetaData and writes into the local warehouse. |
 | `dailyreport\` | The end-of-day status email harness (sends the EOD digest). |
 | `msr\` | Newsletter-PDF → features pipeline. **Note:** it contains a sub-folder confusingly named `Backtester Handoff` — that is **DATA**, not a session handoff. Don't look there for handoffs. |

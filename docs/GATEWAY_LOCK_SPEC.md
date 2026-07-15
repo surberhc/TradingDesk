@@ -117,9 +117,9 @@ into the held fd — identical ordering to the supervisor, just a richer payload
 
 ## 3. API (RECOMMENDED) — a context manager that wraps the single connect chokepoint
 
-There is exactly **one place every component connects**: `connections\connections\ibkr.py::
+There is exactly **one place every component connects**: `connections\connections\ibkr_paper.py::
 connect()` (and the one bespoke `IB().connect()` in `rebalance_execute.execute_armed`, which
-must be wrapped at its call site since it bypasses `ibkr.connect`). The lock is a context
+must be wrapped at its call site since it bypasses `ibkr_paper.connect`). The lock is a context
 manager the caller wraps its connect+work in:
 
 ```python
@@ -129,7 +129,7 @@ from connections.gateway_lock import gateway_lock, GatewayBusy
 try:
     with gateway_lock(purpose="monitor", client_id=clientids.get("paperbot_monitor"),
                       wait_secs=MONITOR_WAIT_SECS):          # ≈10 s
-        ib = ibkr.connect("paperbot_monitor", readonly=True, launch=True, timeout=15)
+        ib = ibkr_paper.connect("paperbot_monitor", readonly=True, launch=True, timeout=15)
         try:
             ...read-only cycle...
         finally:
@@ -144,7 +144,7 @@ except GatewayBusy as busy:
 try:
     with gateway_lock(purpose="rebalance_execute", client_id=clientids.get("paperbot_rebalance_exec"),
                       wait_secs=REBALANCE_WAIT_SECS, armed=armed):   # ≈30 s
-        ib = IB(); ib.connect(ibkr.HOST, ibkr.PAPER_PORT, clientId=..., readonly=False, ...)
+        ib = IB(); ib.connect(ibkr_paper.HOST, ibkr_paper.PAPER_PORT, clientId=..., readonly=False, ...)
         try:
             ...build / write FA config / place blocks...
         finally:

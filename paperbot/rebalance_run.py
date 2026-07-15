@@ -44,7 +44,7 @@ import live_quotes
 import order_router
 import strategy_target
 import version
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 from gateway_lock import GatewayBusyRefuse, gateway_lock
 from rebalance_engine import build_plan
 
@@ -280,11 +280,11 @@ def _run_gateway_session(armed: bool, targets: dict) -> int:
     # [2] Connect read-only, PINNED to a DU sub-account so the master account stream
     # (DF...141) never hangs the session. We pick the lowest-numbered enrolled DU account.
     pin_account = sorted(config.ENROLLMENT)[0]
-    print(f"\n[2] Connecting to PAPER gateway {ibkr.HOST}:{ibkr.PAPER_PORT} "
+    print(f"\n[2] Connecting to PAPER gateway {ibkr_paper.HOST}:{ibkr_paper.PAPER_PORT} "
           f"(clientId={clientids.get('paperbot_rebalance')}, readonly=True, "
           f"pinned to {pin_account})...")
     try:
-        ib = ibkr.connect("paperbot_rebalance", readonly=True, launch=True)
+        ib = ibkr_paper.connect("paperbot_rebalance", readonly=True, launch=True)
     except Exception as exc:
         print(f"    COULD NOT CONNECT: {exc}")
         return 1

@@ -21,7 +21,7 @@ from __future__ import annotations
 # ---------------------------------------------------------------------------
 # Account — INTENTIONALLY "TBD" (fail-closed)
 # ---------------------------------------------------------------------------
-# S8's live pilot targets the new live-TRADING Gateway (connections.ibkr_live, port
+# S8's live pilot targets the new live-TRADING Gateway (connections.ibkr_live_trade, port
 # 4003), whose login covers two individual live-trading TEST accounts. S8 will use ONE
 # of those two test accounts — but Andrew has not yet provided the specific account
 # number, so this stays the "TBD" placeholder on purpose (fail-closed).

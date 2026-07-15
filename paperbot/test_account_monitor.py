@@ -375,9 +375,9 @@ _FORBIDDEN_MODULES = {
     "order_router",          # build / build_fa_block / transmit_guard live here
     "execution_engine",      # the arming + transmit driver
     "live_quotes",           # live broker quotes -> a broker session
-    "ibkr",                  # connections.ibkr — the gateway/broker connection
+    "ibkr_paper",            # connections.ibkr_paper — the gateway/broker connection
     "ib_async", "ib_insync",
-    # Slice 6a: the monitor must NOT import accounts (it reaches connections.ibkr / a live
+    # Slice 6a: the monitor must NOT import accounts (it reaches connections.ibkr_paper / a live
     # reqExecutions read). The deposit core takes ALREADY-DECODED settled-cash floats +
     # Execution objects as inputs; the live shell (6b) owns the broker read and the
     # accounts.parse_settled_cash_by_date decode.

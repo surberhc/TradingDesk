@@ -28,7 +28,7 @@ from ib_async import IB
 import config
 import live_quotes
 import order_router
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 
 # The existing group from fa_probe.py (a leftover test artifact). We only READ/what-if
 # against it to prove the mechanism; we do not modify it.
@@ -70,7 +70,7 @@ def main() -> int:
     ib = IB()
     try:
         # Non-read-only (what-if needs it) but we ONLY what-if; nothing is transmitted.
-        ib.connect(ibkr.HOST, ibkr.PAPER_PORT, clientId=clientids.get("paperbot_fa"),
+        ib.connect(ibkr_paper.HOST, ibkr_paper.PAPER_PORT, clientId=clientids.get("paperbot_fa"),
                    readonly=False, timeout=15, account=SUBSCRIBE_ACCOUNT)
         accounts = ib.managedAccounts()
         print(f"\n  managed accounts: {accounts}")

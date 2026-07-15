@@ -3,7 +3,7 @@ forward_daily_live.py — ONE daily EOD pass of the IBKR forward option collecto
 against the SECOND, restricted, read-only-only LIVE-DATA Gateway instance.
 
 Mirrors forward_daily.py exactly, repointed at connections.ibkr_live_data (port
-4001) instead of connections.ibkr (paper, port 4002). This is NOT paper and NOT
+4001) instead of connections.ibkr_paper (paper, port 4002). This is NOT paper and NOT
 live trading — it is a read-only market-data-only Gateway, backed by a personal
 live IBKR login that IBKR itself restricts to visibility into exactly one account
 with no execution capability at the account-permission level, and whose connect()

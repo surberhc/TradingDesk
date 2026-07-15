@@ -16,7 +16,7 @@ from __future__ import annotations
 
 # --- Connection ----------------------------------------------------------------
 # The host, paper port (4002), and clientId (30) all come from the shared
-# connections package — `from connections import ibkr, clientids`. They are NOT
+# connections package — `from connections import ibkr_paper, clientids`. They are NOT
 # duplicated here, so there is one source of truth and nothing collides.
 
 # The paper account we intend to use ends in these digits. The engine REFUSES to

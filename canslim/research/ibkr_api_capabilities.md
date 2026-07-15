@@ -8,10 +8,10 @@ US common stocks (lesser-known small/mid caps). Slow-moving strategy → nightly
 
 ## 0. Our existing stack (read-only review)
 
-- `connections/connections/ibkr.py` — single entry point to the **PAPER** Gateway. Uses the
+- `connections/connections/ibkr_paper.py` — single entry point to the **PAPER** Gateway. Uses the
   `ib_async` library (`from ib_async import IB, Stock`). Host `127.0.0.1`, port **4002** (paper).
   Default connection is **read-only** (`readonly=True`) — cannot transmit orders. Gateway is
-  auto-launched via `C:\IBC\StartGateway.bat` with a `java_version=17` env workaround.
+  auto-launched via `C:\IBC-Paper\StartGatewayPaper.bat` with a `java_version=17` env workaround.
   `gateway_running()` already proves a data round-trip with `reqHistoricalData` on SPY.
 - `connections/connections/clientids.py` — authoritative clientId registry. Highest ID in use
   is **40** (`paperbot_monitor`). A screener would take **id 41+**. `PAPER_PORT = 4002`;

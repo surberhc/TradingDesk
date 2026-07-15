@@ -1,15 +1,15 @@
 """
-ibkr.py — the one way to start and connect to the IBKR PAPER Gateway.
+ibkr_paper.py — the one way to start and connect to the IBKR PAPER Gateway.
 
 PAPER ONLY: paper login, paper port 4002. There is no real-money path here. A
 read-only connection (the default) is physically incapable of transmitting an order;
 the paperbot keeps it read-only until a human deliberately arms order transmission.
 
 Gateway launch reuses the proven IBController script the dailyreport already uses
-(`C:\\IBC\\StartGateway.bat`), which auto-logs into the paper account.
+(`C:\\IBC-Paper\\StartGatewayPaper.bat`), which auto-logs into the paper account.
 
 `ensure_gateway()` carries a NARROW launch mutex: an atomic lockfile that lets at
-most ONE StartGateway.bat launch be in flight across all our processes, with a
+most ONE StartGatewayPaper.bat launch be in flight across all our processes, with a
 relaunch cooldown. This is the fix for the incident where a wedged login made
 canslim/ibkr_price_gapfill's per-symbol reconnect loop stack ~91 dead gateways in
 3.5h. It is NOT the full monitor/rebalance operate-mutex described in
@@ -29,15 +29,15 @@ from connections import clientids
 
 HOST = "127.0.0.1"
 PAPER_PORT = clientids.PAPER_PORT          # 4002
-GATEWAY_BAT = r"C:\IBC\StartGateway.bat"   # IBController auto-login (paper)
+GATEWAY_BAT = r"C:\IBC-Paper\StartGatewayPaper.bat"   # IBController auto-login (paper)
 
 # Launch mutex state. LOCAL C: only — Drive sync corrupts O_EXCL atomicity, and
 # the file must be readable by non-elevated processes (the incident's cleanup
 # needed elevation precisely because we couldn't inspect elevated java procs).
 # Overridable via env so tests can point it at a tmp dir.
 GATEWAY_LAUNCH_LOCK = os.environ.get(
-    "TRADINGDESK_GATEWAY_LAUNCH_LOCK",
-    r"C:\TradingDesk-Local\state\paperbot\gateway_launch.lock",
+    "TRADINGDESK_PAPER_GATEWAY_LAUNCH_LOCK",
+    r"C:\TradingDesk-Local\state\paper\gateway_launch.lock",
 )
 RELAUNCH_COOLDOWN_SECS = 180   # no relaunch within this long of the last attempt
 
@@ -156,7 +156,7 @@ def ensure_gateway(wait_secs: int = 180) -> bool:
     True once it's serving data, False if it never came up within wait_secs.
 
     NARROW launch mutex (see module docstring): coordinates via an atomic local
-    lockfile so at most ONE StartGateway.bat launch is ever in flight across all
+    lockfile so at most ONE StartGatewayPaper.bat launch is ever in flight across all
     our processes, and no relaunch happens within RELAUNCH_COOLDOWN_SECS of the
     previous attempt. This exists because a wedged login (one-login-per-username)
     otherwise lets a per-symbol reconnect loop stack dead gateways and pin the box.

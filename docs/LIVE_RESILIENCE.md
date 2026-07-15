@@ -17,7 +17,7 @@ not in our process.
 - **No stop / trailing stop / OCA / bracket / conditional rests anywhere.** Between rebalances, positions
   sit naked of server-held protection.
 - No reconnect / watchdog / dead-man / `reqGlobalCancel` / protect-on-startup logic in the connection
-  layer (`connections/ibkr.py` is a plain one-shot connect/disconnect).
+  layer (`connections/ibkr_paper.py` is a plain one-shot connect/disconnect).
 - The S5 server-side conditional/OCA machinery (`order_router.py` `build_price_condition` /
   `build_time_condition` / `build_conditional_order` / `apply_oca_group`) is **inert scaffolding** — only
   unit tests call it; nothing wired into the live flow; `transmit` always False. It proves the library can

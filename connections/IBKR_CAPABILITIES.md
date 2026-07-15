@@ -2,7 +2,7 @@
 
 > **FIRST STOP before sourcing any market / fundamental / scanner / news data externally.
 > IBKR is already paid for, the API is live, and it drops straight into our paper-Gateway
-> stack (`connections/ibkr.py`, read-only, a registered clientId). Check what IBKR provides
+> stack (`connections/ibkr_paper.py`, read-only, a registered clientId). Check what IBKR provides
 > HERE before reaching for an outside vendor. See memory rule `ibkr-first-data-sourcing`.**
 
 `Last verified: 2026-07-01` (human research — see `Sources` at the bottom of the research spike)

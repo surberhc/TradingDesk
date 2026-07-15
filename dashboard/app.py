@@ -37,11 +37,11 @@ Four sections (tabs):
 Launch (see run_dashboard.bat): binds 0.0.0.0 so a phone on the LAN can reach it.
 
 Read-only guarantees in this file:
-  * The only broker call path is ibkr.connect(readonly=True) with a short timeout,
+  * The only broker call path is ibkr_paper.connect(readonly=True) with a short timeout,
     plus ib.managedAccounts / accountSummary / positions / reconcile (all reads) and
     rebalance_run.build_preview (a PURE build-only planner — no order objects, no send).
   * No order_router.place/arm, no ib.placeOrder, no replaceFA, no file writes.
-  * The S8 tab's live reads go through connections.ibkr_live.connect(readonly=True) —
+  * The S8 tab's live reads go through connections.ibkr_live_trade.connect(readonly=True) —
     the live-TRADING Gateway (port 4003), connected read-only/display-only — called
     with launch=False (this dashboard never boots the Gateway) and a short timeout;
     every connection opened here is disconnected before the fragment returns. It only
@@ -85,9 +85,9 @@ import status as dr_status
 # S8 tab: pure/data modules only at module scope (no IBKR import triggers a connection
 # at import time — s8_config is data-only, s8_strategy/s8_chain's own IBKR imports are
 # just class references (IB/Index/Option), never a connect() call, and ledger.py only
-# defines a path constant). connections.ibkr_live itself (the thing that actually
+# defines a path constant). connections.ibkr_live_trade itself (the thing that actually
 # opens a socket) stays a LAZY import inside _s8_connect_readonly_short(), same
-# convention render_accounts() already uses for `from connections import ibkr`.
+# convention render_accounts() already uses for `from connections import ibkr_paper`.
 import ledger
 import s8_chain
 import s8_config
@@ -589,9 +589,9 @@ def _connect_readonly_short(timeout: int = 6):
     """Connect read-only with a SHORT timeout. Never launches the gateway (weekend
     safety) so a down gateway fails fast instead of trying to boot it. Returns the IB
     handle or raises."""
-    from connections import ibkr
+    from connections import ibkr_paper
     # readonly=True -> the session physically cannot transmit. launch=False -> no boot.
-    return ibkr.connect("paperbot_accounts", readonly=True, launch=False, timeout=timeout)
+    return ibkr_paper.connect("paperbot_accounts", readonly=True, launch=False, timeout=timeout)
 
 
 def render_accounts() -> None:
@@ -1236,8 +1236,8 @@ def _s8_connect_readonly_short(timeout: int = 5):
     a monitor tab only ever reads. SHORT timeout, launch=False (an auto-refreshing 30s
     dashboard fragment must never be the thing that boots a Gateway). Mirrors
     render_accounts()'s own _connect_readonly_short pattern for the paper side."""
-    from connections import ibkr_live
-    return ibkr_live.connect("dashboard_s8", launch=False, readonly=True, timeout=timeout)
+    from connections import ibkr_live_trade
+    return ibkr_live_trade.connect("dashboard_s8", launch=False, readonly=True, timeout=timeout)
 
 
 @st.fragment(run_every="30s")

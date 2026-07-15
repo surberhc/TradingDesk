@@ -21,7 +21,7 @@ THE FIX (defense in depth):
   1. Still drive the toggle through config.ini (the correct, IBC-supported mechanism).
   2. HARDEN the restart so IBC always gets a clean GUI: fully kill the old Gateway,
      wait until the process is gone AND port 4002 is closed, settle, THEN relaunch
-     (with java_version=17, see connections.ibkr). No zombie => no stranded dialog.
+     (with java_version=17, see connections.ibkr_paper). No zombie => no stranded dialog.
   3. VERIFY the toggle actually took effect by probing the live API's read-only state
      with a ZERO-TRANSMISSION primitive (a cancel of a non-existent orderId — see
      `probe_api_readonly`). Raise loudly if it didn't take, instead of proceeding.
@@ -67,7 +67,7 @@ import time
 
 from ib_async import IB
 
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 
 CONFIG_INI = r"C:\IBC\config.ini"
 _VERIFY_CLIENT_ID = clientids.get("paperbot_arm_verify")  # 39
@@ -120,7 +120,7 @@ def _port_closed() -> bool:
     """True when nothing is listening on the paper port."""
     out = subprocess.run(
         ["powershell", "-NoProfile", "-Command",
-         f"if (Get-NetTCPConnection -LocalPort {ibkr.PAPER_PORT} -State Listen "
+         f"if (Get-NetTCPConnection -LocalPort {ibkr_paper.PAPER_PORT} -State Listen "
          f"-ErrorAction SilentlyContinue) {{ 'OPEN' }} else {{ 'CLOSED' }}"],
         check=False, capture_output=True, text=True)
     return "CLOSED" in (out.stdout or "")
@@ -137,12 +137,12 @@ def stop_gateway(wait: int = 30) -> bool:
     tests, or killing a gateway that happens to be running non-elevated)."""
     subprocess.run(
         ["powershell", "-NoProfile", "-Command",
-         f"$p=(Get-NetTCPConnection -LocalPort {ibkr.PAPER_PORT} -State Listen "
+         f"$p=(Get-NetTCPConnection -LocalPort {ibkr_paper.PAPER_PORT} -State Listen "
          f"-ErrorAction SilentlyContinue).OwningProcess; if ($p) "
          f"{{ Stop-Process -Id $p -Force -ErrorAction SilentlyContinue }}"],
         check=False, capture_output=True)
     for _ in range(wait):
-        if _port_closed() and not ibkr.gateway_running():
+        if _port_closed() and not ibkr_paper.gateway_running():
             return True
         time.sleep(1)
     return _port_closed()
@@ -232,7 +232,7 @@ def probe_api_readonly(timeout: int = 15) -> bool:
     try:
         # readonly=False so the *connection* is write-capable; the gateway-level
         # Read-Only API checkbox is the thing we're actually measuring.
-        ib.connect(ibkr.HOST, ibkr.PAPER_PORT, clientId=_VERIFY_CLIENT_ID,
+        ib.connect(ibkr_paper.HOST, ibkr_paper.PAPER_PORT, clientId=_VERIFY_CLIENT_ID,
                    readonly=False, timeout=timeout)
         ib.errorEvent += on_error
         # Fresh in-range orderId the server will treat as an unknown live order.

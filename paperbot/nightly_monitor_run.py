@@ -27,7 +27,7 @@ email makes the miss visible.
 
 CLEAN SHUTDOWN, ALWAYS: the whole connect -> work -> disconnect body runs inside
 try/finally so the IB connection (and, if THIS run's connect call caused the Gateway
-process itself to launch via ibkr.ensure_gateway, nothing here re-kills a process that
+process itself to launch via ibkr_paper.ensure_gateway, nothing here re-kills a process that
 may be legitimately needed for tomorrow — the Gateway process is intentionally LEFT
 RUNNING; only the API connection this process opened is guaranteed closed) never leaks.
 There is no scenario (error, timeout, KeyboardInterrupt) where this exits without
@@ -96,7 +96,7 @@ import live_quotes
 import rebalance_guard
 import strategy_target
 import version
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 from gateway_lock import GatewayBusySkip, gateway_lock
 from rebalance_engine import build_plan
 
@@ -111,7 +111,7 @@ except Exception:
 
 # --- bounded retry (never bleed into the morning) -------------------------------
 CONNECT_MAX_ATTEMPTS = 3
-CONNECT_ATTEMPT_TIMEOUT_SECS = 120     # ibkr.connect's own timeout is short; this bounds
+CONNECT_ATTEMPT_TIMEOUT_SECS = 120     # ibkr_paper.connect's own timeout is short; this bounds
                                        # the ensure_gateway launch-and-wait inside it too
 CONNECT_RETRY_BACKOFF_SECS = 90        # ~3 attempts * (up to ~120s each + 90s backoff)
                                        # worst case is comfortably under 10 minutes total
@@ -149,7 +149,7 @@ def bounded_connect(consumer: str, readonly: bool = True):
         print(f"    connect attempt {attempt}/{CONNECT_MAX_ATTEMPTS} "
               f"(consumer={consumer}, readonly={readonly})...")
         try:
-            ib = ibkr.connect(consumer, readonly=readonly, launch=True,
+            ib = ibkr_paper.connect(consumer, readonly=readonly, launch=True,
                               timeout=CONNECT_ATTEMPT_TIMEOUT_SECS)
             print(f"    connected on attempt {attempt}.")
             return ib

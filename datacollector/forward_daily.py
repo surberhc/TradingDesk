@@ -9,7 +9,7 @@ loops because that grab is a one-time finite backfill; forward collection is an
 open-ended daily cadence, so "daily trigger + one-shot" is the right shape.
 
 Resilience: weekday guard, launches the Gateway if it's down (the java_version fix
-lives in connections.ibkr), per-root error isolation (one bad root never aborts the
+lives in connections.ibkr_paper), per-root error isolation (one bad root never aborts the
 run), resumable (skips any root already on disk for today). Logs to
 warehouse\forward.log and updates warehouse\forward_heartbeat.txt so a glance
 confirms it ran and how far it got.
@@ -26,7 +26,7 @@ from datetime import date
 
 import config
 import ibkr_forward as fwd
-from connections import ibkr as gw
+from connections import ibkr_paper as gw
 
 # status.py lives in the sibling dailyreport project (the EOD reporter reads it).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "dailyreport"))

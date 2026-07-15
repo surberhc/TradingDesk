@@ -44,7 +44,7 @@ Every box must be **GO** before §4's arm step. Any single NO-GO ⇒ stop.
 | 1 | **Strategy validated (anti-curve-fit)** — selection + options cleared OOS + per-episode/per-regime; Andrew's explicit blessing on file | review `canslim/research/*` verdicts; memory `canslim-aps-strategy-eval`, `strategy-evaluation-playbook` | **NO-GO** (selection promising-not-proven; options still open) |
 | 2 | **Protective stop rests SERVER-SIDE** — the `initial_stop` (−7%) must survive a client/gateway disconnect | the kill-the-gateway probe, §2 (run WITH Andrew) | **NOT YET DONE** — mandatory before any arm (memory `live-trading-order-resilience`) |
 | 3 | **clientId reserved** — a dedicated, collision-proof id for the CAN SLIM executor | `connections/clientids.py` — next free id after `42`; add `"canslim_paper_exec": 43` (own id, never collides with paperbot on 30 / rebalance-exec on 38 / arm-verify on 39) | **NOT YET RESERVED** (must be added before wiring) |
-| 4 | **Paper gateway healthy** | `python paperbot/arming.py verify` (reports READ-ONLY/WRITE-ENABLED + `config.ini` value, transmits nothing); or `connections.ibkr.gateway_running()` | check at run time |
+| 4 | **Paper gateway healthy** | `python paperbot/arming.py verify` (reports READ-ONLY/WRITE-ENABLED + `config.ini` value, transmits nothing); or `connections.ibkr_paper.gateway_running()` | check at run time |
 | 5 | **Gateway currently LOCKED (read-only)** — the safe resting state | `arming.py verify` shows `READ-ONLY (locked)`; `paperbot/config.py` committed `READONLY=True`, `DRY_RUN=True` | should be GO (committed defaults are safe) |
 | 6 | **Single-process gateway mutex available** — no other desk process (monitor/rebalance/collector) will operate the gateway during the run | `paperbot/gateway_lock.py` — acquire with `on_busy="refuse"` (names the holder) | procedural |
 | 7 | **Kill switch + risk guards present** | `paperbot/risk_manager.py` (`max_daily_loss_pct_nav` = −2%, per-position cap, cash reserve) — evaluate per account BEFORE any transmit | exists; wire into the CAN SLIM path (§3) |
@@ -82,7 +82,7 @@ Procedure (documented; do not execute here):
 5. **KILL THE GATEWAY** out from under it — the actual resilience test. Use the proven kill
    primitive `paperbot/arming.stop_gateway()` (kills only the process listening on port
    4002; leaves the ThetaData collector alone) and confirm the port is closed.
-6. **Relaunch the gateway** (`connections.ibkr.ensure_gateway()` or `arming.restart_gateway()`)
+6. **Relaunch the gateway** (`connections.ibkr_paper.ensure_gateway()` or `arming.restart_gateway()`)
    and **reconnect read-only.**
 7. **CONFIRM THE STOP IS STILL THERE** — the resting protective order re-appears in the open
    orders with the same `orderRef`. **PASS** = the stop survived the kill. **FAIL** = the

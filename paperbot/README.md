@@ -24,7 +24,7 @@ engine runs the EXACT code the backtester validated.
 
 ### 2026-06-26 (cont.) — Gateway launch fixed, first contact, dry-run ExecutionEngine
 - ✅ **Paper Gateway now auto-launches.** Fixed an IBC 3.24.0 / Gateway-1045 JRE-probe bug by
-  pre-seeding `java_version=17` in the launch env (baked into `connections/ibkr.py`; same one-line
+  pre-seeding `java_version=17` in the launch env (baked into `connections/ibkr_paper.py`; same one-line
   fix applied to `dailyreport/daily_run.py`). Port 4002 comes up in ~15s. No IBKR script was edited.
 - ✅ **First contact (read-only):** connected to **DF8922141** — an **FA paper *master***, which is
   our MAIN account — NetLiq $31,808.96, flat. Corrected the account model: 141 is a `DF` master, and

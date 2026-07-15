@@ -58,7 +58,7 @@ import rebalance_execute  # noqa: E402
 import rebalance_guard  # noqa: E402
 import rebalance_run  # noqa: E402
 import version  # noqa: E402
-from connections import clientids, ibkr  # noqa: E402
+from connections import clientids, ibkr_paper  # noqa: E402
 from gateway_lock import GatewayBusyRefuse, gateway_lock  # noqa: E402
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
@@ -129,7 +129,7 @@ def bounded_connect(consumer: str, readonly: bool = True):
         print(f"    connect attempt {attempt}/{CONNECT_MAX_ATTEMPTS} "
               f"(consumer={consumer}, readonly={readonly})...")
         try:
-            ib = ibkr.connect(consumer, readonly=readonly, launch=True,
+            ib = ibkr_paper.connect(consumer, readonly=readonly, launch=True,
                               timeout=CONNECT_ATTEMPT_TIMEOUT_SECS)
             print(f"    connected on attempt {attempt}.")
             return ib

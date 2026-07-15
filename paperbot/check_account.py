@@ -2,7 +2,7 @@
 check_account.py — first contact with the IBKR PAPER account. READ-ONLY.
 
 What it does, and ONLY this:
-  1. Connects to the PAPER gateway (port 4002) via connections.ibkr on a READ-ONLY
+  1. Connects to the PAPER gateway (port 4002) via connections.ibkr_paper on a READ-ONLY
      session — read-only physically cannot transmit an order. Launches the Gateway
      (IBController auto-login) if it isn't already up.
   2. Confirms the account ending in '141' (config.ACCOUNT_SUFFIX). If it can't find
@@ -22,7 +22,7 @@ from __future__ import annotations
 import sys
 
 import config
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 
 
 def _tag(summary, account: str, tag: str) -> str:
@@ -36,18 +36,18 @@ def _tag(summary, account: str, tag: str) -> str:
 def main() -> int:
     print("=" * 70)
     print("PAPER ACCOUNT CHECK - read-only, no orders")
-    print(f"Connecting to PAPER gateway {ibkr.HOST}:{ibkr.PAPER_PORT} "
+    print(f"Connecting to PAPER gateway {ibkr_paper.HOST}:{ibkr_paper.PAPER_PORT} "
           f"(clientId={clientids.get('paperbot')}, readonly=True)")
     print("=" * 70)
 
     try:
         # launch=True -> start the Gateway (IBC auto-login) if it isn't up yet.
-        ib = ibkr.connect("paperbot", readonly=True, launch=True)
+        ib = ibkr_paper.connect("paperbot", readonly=True, launch=True)
     except Exception as exc:
         print("\nCOULD NOT CONNECT.")
         print(f"  reason: {exc}")
         print("\n  -> Is IB Gateway able to start, logged into the PAPER account?")
-        print(f"  -> Is the API enabled with socket port {ibkr.PAPER_PORT}?")
+        print(f"  -> Is the API enabled with socket port {ibkr_paper.PAPER_PORT}?")
         return 1
 
     try:

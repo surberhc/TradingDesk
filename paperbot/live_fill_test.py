@@ -27,7 +27,7 @@ import config
 import ledger
 import live_quotes
 import order_router
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 
 # The single tiny test order: cheap + liquid -> minimal notional, fast fill.
 TEST_SYMBOL = "PDBC"
@@ -82,7 +82,7 @@ def main() -> int:
         # Connect NON-readonly, subscribing to THIS DU account's updates. Passing the
         # account avoids ib_async hanging on the FA master's account-update stream.
         ib = IB()
-        ib.connect(ibkr.HOST, ibkr.PAPER_PORT, clientId=clientids.get("paperbot"),
+        ib.connect(ibkr_paper.HOST, ibkr_paper.PAPER_PORT, clientId=clientids.get("paperbot"),
                    readonly=False, timeout=15, account=account)
         accounts = ib.managedAccounts()
         if account not in accounts:

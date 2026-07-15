@@ -20,7 +20,7 @@ from __future__ import annotations
 import sys
 
 import config
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 from gateway_lock import GatewayBusySkip, gateway_lock
 
 # TWS API FA data types. 1=GROUPS, 2=PROFILES (de-supported on 983+), 3=ALIASES.
@@ -36,7 +36,7 @@ def main() -> int:
         with gateway_lock(purpose="fa_probe",
                           client_id=clientids.get("paperbot_fa"), on_busy="skip"):
             try:
-                ib = ibkr.connect("paperbot_fa", readonly=True, launch=True)
+                ib = ibkr_paper.connect("paperbot_fa", readonly=True, launch=True)
             except Exception as exc:
                 print(f"\nCOULD NOT CONNECT: {exc}")
                 return 1

@@ -30,7 +30,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 
 import config
-from connections import clientids, ibkr
+from connections import clientids, ibkr_paper
 from gateway_lock import GatewayBusySkip, gateway_lock
 
 
@@ -153,7 +153,7 @@ def reconcile_enrollment(infos: list[AccountInfo]) -> list[str]:
 def main() -> int:
     print("=" * 86)
     print("FA MULTI-ACCOUNT DISCOVERY - read-only, no orders")
-    print(f"Connecting to PAPER gateway {ibkr.HOST}:{ibkr.PAPER_PORT} "
+    print(f"Connecting to PAPER gateway {ibkr_paper.HOST}:{ibkr_paper.PAPER_PORT} "
           f"(clientId={clientids.get('paperbot_accounts')}, readonly=True)")
     print("=" * 86)
 
@@ -163,11 +163,11 @@ def main() -> int:
             try:
                 # Own clientId (paperbot_accounts) so discovery can run even while the
                 # execution engine (clientId 30) is connected.
-                ib = ibkr.connect("paperbot_accounts", readonly=True, launch=True)
+                ib = ibkr_paper.connect("paperbot_accounts", readonly=True, launch=True)
             except Exception as exc:
                 print("\nCOULD NOT CONNECT.")
                 print(f"  reason: {exc}")
-                print(f"  -> Is IB Gateway up and logged into PAPER, API on port {ibkr.PAPER_PORT}?")
+                print(f"  -> Is IB Gateway up and logged into PAPER, API on port {ibkr_paper.PAPER_PORT}?")
                 return 1
 
             try:

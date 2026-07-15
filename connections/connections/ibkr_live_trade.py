@@ -1,9 +1,9 @@
 """
-ibkr_live.py — the one way to start and connect to the LIVE-TRADING Gateway: a
+ibkr_live_trade.py — the one way to start and connect to the LIVE-TRADING Gateway: a
 separate, FUNDED, transmit-CAPABLE account used for Strategy 8's zero-transmit
 live pilot.
 
-This is a SEPARATE Gateway instance from BOTH the paper Gateway in ibkr.py (port
+This is a SEPARATE Gateway instance from BOTH the paper Gateway in ibkr_paper.py (port
 4002) AND the read-only live-data Gateway in ibkr_live_data.py (port 4001): a
 distinct install directory, a distinct port (4003, LIVE_TRADE_PORT), and a
 distinct live-trading login that — unlike the deliberately access-restricted
@@ -28,11 +28,11 @@ The two walls that keep the S8 pilot at zero transmissions are:
 This module's read-only default is a safety default, NOT the primary wall — do
 not treat it as a substitute for PILOT_MODE.
 
-Gateway launch mirrors ibkr.py's proven IBController pattern, pointed at a not-yet-
+Gateway launch mirrors ibkr_paper.py's proven IBController pattern, pointed at a not-yet-
 built install (`C:\\IBC-Live-Trade\\StartGatewayLiveTrade.bat`) that the user will
 set up separately.
 
-`ensure_gateway()` carries the same NARROW launch mutex as ibkr.py / ibkr_live_data.py:
+`ensure_gateway()` carries the same NARROW launch mutex as ibkr_paper.py / ibkr_live_data.py:
 an atomic lockfile that lets at most ONE StartGatewayLiveTrade.bat launch be in
 flight across all our processes, with a relaunch cooldown. It uses its OWN lockfile,
 distinct from BOTH the paper module's and the live-data module's, so the three
@@ -49,7 +49,7 @@ import time
 from ib_async import IB, Stock
 
 from connections import clientids
-from connections.ibkr import _gateway_env  # shared JRE-probe workaround only; no paper/live logic
+from connections.ibkr_paper import _gateway_env  # shared JRE-probe workaround only; no paper/live logic
 
 HOST = "127.0.0.1"
 LIVE_TRADE_PORT = clientids.LIVE_TRADE_PORT       # 4003
@@ -95,7 +95,7 @@ def gateway_running(client_id: int = clientids.CLIENT_IDS["s8_live_pilot"],
 def _pid_alive(pid: int) -> bool:
     """True if a process with this PID is currently running (Windows + POSIX).
 
-    Mirrors ibkr.py's _pid_alive: tasklist is the dependency-free liveness test on
+    Mirrors ibkr_paper.py's _pid_alive: tasklist is the dependency-free liveness test on
     Windows, and an undeterminable result is treated as ALIVE — here that makes us
     a waiter rather than risk a dup launch.
     """
@@ -182,7 +182,7 @@ def ensure_gateway(wait_secs: int = 180) -> bool:
         return True
 
     # Below here the gateway is down. Coordinate a launch via the lockfile.
-    # Same pattern as ibkr.py / datacollector/spxw_1m_supervisor.py's acquire_lock:
+    # Same pattern as ibkr_paper.py / datacollector/spxw_1m_supervisor.py's acquire_lock:
     # O_CREAT|O_EXCL create -> launcher; existing+live+recent -> waiter;
     # existing+dead/stale -> reclaim (unlink + retry) -> launcher.
     try:

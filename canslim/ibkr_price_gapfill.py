@@ -120,7 +120,7 @@ for _p in (str(_REPO / "connections"), str(_REPO / "paperbot")):
         sys.path.insert(0, _p)
 
 from connections import clientids                      # noqa: E402
-from connections import ibkr as gw                     # noqa: E402
+from connections import ibkr_paper as gw               # noqa: E402
 
 CLIENT = "canslim_price_gapfill"                        # clientId 43 (see connections.clientids)
 
