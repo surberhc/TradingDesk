@@ -15,11 +15,19 @@ account-summary margin gate and chain snapshot, never the paper Gateway. This do
 change the rule above: order TRANSMISSION (place/placeOrder) remains exclusively a port
 4002 (paper) capability everywhere in this codebase; connections.ibkr_live_data has no
 order-placement method at all, by construction.
+
+NOTE (2026-07-15): port 4003 (LIVE_TRADE_PORT) now also exists -- a SEPARATE live-TRADING
+Gateway instance for S8's zero-transmit live pilot (connections.ibkr_live). Unlike the
+port 4001 live-data login, this account is transmit-CAPABLE at the account-permission
+level. Nothing transmits on it during the pilot: the primary wall is hardcoded
+PILOT_MODE=True in livebot/s8_runner.py, backstopped by ibkr_live.connect()'s
+readonly=True default. Ports 4001 (live read-only data) and 4002 (paper) are unchanged.
 """
 from __future__ import annotations
 
 PAPER_PORT = 4002
 LIVE_DATA_PORT = 4001
+LIVE_TRADE_PORT = 4003
 
 CLIENT_IDS = {
     "dailyreport_poller": 1,        # dailyreport: pull SPY+sector bars (rrg_poller)
@@ -53,6 +61,7 @@ CLIENT_IDS = {
     "paperbot_s8_livedata": 51,      # paperbot S8 (British IC + B2): s8_runner.py's ACTUAL live-cycle connection, decided 2026-07-13 -- connects READ-ONLY (structurally, no override possible) to the separate live-side data Gateway (connections.ibkr_live_data, port 4001, NOT the paper Gateway on port 4002) for both the account-summary margin-preflight read and the 0DTE SPXW chain snapshot. Distinct from live_data_forward (48, datacollector's own live-data consumer) so the two never collide on the same live-data Gateway connection. PILOT_MODE (paperbot/s8_runner.py) remains the primary non-transmission control; this connection's hardcoded read-only-ness is a second, independent backstop
     "dashboard_s8": 52,              # dashboard/app.py's S8 monitor tab -- READ-ONLY (structurally, no override exists on this module), launch=False (never boots the Gateway from a passive auto-refreshing web page), short timeout. Targeted per-pick quote pulls (2 legs at a time) + accountSummary() read, purely for DISPLAY re-marking of today's logged picks -- never builds or transmits an order. Own id so it never collides with s8_runner.py's own live-cycle connection (51) if both are polling the live-data Gateway at the same moment
     "live_data_order_verify": 53,    # connections: read-only-gateway ORDER-REJECTION verification probe (check_live_data_order_reject.py) -- connects readonly=False directly (bypassing ibkr_live_data.connect()'s hardcoded readonly), with Andrew's explicit informed authorization, specifically to test whether IBKR itself rejects order transmission at the ACCOUNT-permission level on this live-data-only account. Zero-transmission: only ever calls raw client.cancelOrder() on a fabricated, never-placed orderId (mirrors paperbot/arming.py's probe_api_readonly pattern) -- no order is ever sent. Own id so it never collides with any read-only live-data consumer (48/51/52)
+    "s8_live_pilot": 54,             # livebot/s8_runner.py's live-cycle connection to the NEW live-TRADING Gateway (connections.ibkr_live, port 4003, transmit-capable account) -- connects readonly=True during the PILOT (reads accountSummary + 0DTE SPXW chain only, never transmits; PILOT_MODE in s8_runner is the primary wall). Distinct id from the retired live-DATA path paperbot_s8_livedata (51, port 4001) and from the reserved future executor paperbot_s8_exec (50)
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.
