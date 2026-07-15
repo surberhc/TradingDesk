@@ -19,17 +19,17 @@ plainly in a comment rather than silently resolved either direction.
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Account — DECIDED 2026-07-13
+# Account — INTENTIONALLY "TBD" (fail-closed)
 # ---------------------------------------------------------------------------
-# Andrew decided 2026-07-13: S8 gets DU8922146 (not DU8922144, which remains the sole
-# freed candidate for S4 per conductor item #7). See conductor/ACCOUNT_ALLOCATION.md
-# for the authoritative account map and history.
+# S8's live pilot targets the new live-TRADING Gateway (connections.ibkr_live, port
+# 4003), whose login covers two individual live-trading TEST accounts. S8 will use ONE
+# of those two test accounts — but Andrew has not yet provided the specific account
+# number, so this stays the "TBD" placeholder on purpose (fail-closed).
 #
-# PREREQUISITE STILL OPEN: DU8922146 still holds residual S0 positions that have not
-# yet been liquidated to cash (see conductor/ACCOUNT_ALLOCATION.md Open Items #1). This
-# config change alone does not make the account clean for use — a deliberate, armed
-# PAPER liquidation session must run first, before any real S8 pilot activity here.
-ACCOUNT = "DU8922146"
+# While ACCOUNT == "TBD", livebot/s8_runner.py REFUSES to run (returns 2) before making
+# any Gateway contact — see its main() TBD guard and module docstring. Set this to the
+# real test-account number only when Andrew provides it; do NOT invent one.
+ACCOUNT = "TBD"
 
 
 # ---------------------------------------------------------------------------

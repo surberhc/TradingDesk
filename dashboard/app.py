@@ -30,7 +30,7 @@ Four sections (tabs):
                    auto-close): today's 11-template entry schedule, s8_runner.py's
                    own ledger'd cycle log, a DISPLAY-ONLY live re-mark of today's
                    still-open hypothetical picks against current quotes, the live
-                   account's own margin snapshot, and live-data Gateway (port 4001)
+                   account's own margin snapshot, and live-TRADING Gateway (port 4003)
                    connection health. See render_s8() below for the read-only/
                    never-feeds-back guarantees specific to this tab.
 
@@ -41,8 +41,8 @@ Read-only guarantees in this file:
     plus ib.managedAccounts / accountSummary / positions / reconcile (all reads) and
     rebalance_run.build_preview (a PURE build-only planner — no order objects, no send).
   * No order_router.place/arm, no ib.placeOrder, no replaceFA, no file writes.
-  * The S8 tab's live-data reads go through connections.ibkr_live_data.connect() —
-    hardcoded read-only with no override parameter anywhere in that module — called
+  * The S8 tab's live reads go through connections.ibkr_live.connect(readonly=True) —
+    the live-TRADING Gateway (port 4003), connected read-only/display-only — called
     with launch=False (this dashboard never boots the Gateway) and a short timeout;
     every connection opened here is disconnected before the fragment returns. It only
     ever calls ib.accountSummary(), ib.qualifyContracts(), ib.reqMktData()/
@@ -85,7 +85,7 @@ import status as dr_status
 # S8 tab: pure/data modules only at module scope (no IBKR import triggers a connection
 # at import time — s8_config is data-only, s8_strategy/s8_chain's own IBKR imports are
 # just class references (IB/Index/Option), never a connect() call, and ledger.py only
-# defines a path constant). connections.ibkr_live_data itself (the thing that actually
+# defines a path constant). connections.ibkr_live itself (the thing that actually
 # opens a socket) stays a LAZY import inside _s8_connect_readonly_short(), same
 # convention render_accounts() already uses for `from connections import ibkr`.
 import ledger
@@ -729,15 +729,15 @@ def render_accounts() -> None:
 # never calls order_router.place()/ib.placeOrder() — see that module's own docstring).
 # This tab is a pure MONITOR: it reads s8_runner.py's ledger records (paperbot/
 # ledger.py -> C:\TradingDesk-Local\state\paperbot\runs.jsonl, filtered on
-# mode == "s8_runner_pilot" — the only tag ledger.record_run() actually carries; there
+# mode == "s8_live_pilot" — the only tag ledger.record_run() actually carries; there
 # is no separate strategy/runner field, confirmed by reading both ledger.py and every
 # record_run() call site in s8_runner.py) and, for TODAY's still-open logged picks
 # only, layers on a live re-mark against CURRENT IBKR quotes PURELY FOR DISPLAY.
 #
-# As of today (2026-07-13) the live-data Gateway has never completed a login (blocked
-# on IBKR account approval, conductor item #25) — every live-data read below WILL
-# degrade to "offline" and every ledger read WILL come back empty. That is the
-# expected, correctly-handled state for this tab's first deployment, not a bug.
+# Until Andrew provides the S8 live-trading TEST account (s8_config.ACCOUNT is "TBD")
+# and brings the live-TRADING Gateway up, s8_runner.py refuses to run, so every ledger
+# read below WILL come back empty and every live read WILL degrade to "offline". That is
+# the expected, correctly-handled state for this tab, not a bug.
 CT_ZONE = ZoneInfo("America/Chicago")     # matches s8_config.ENTRY_GRID_CT's own convention
 _ET_ZONE = ZoneInfo("America/New_York")   # SPX/SPXW PM settlement is stated in ET
 _S8_SETTLEMENT_ET = dt_time(16, 0)        # 16:00 ET, same instant s5_harvest_engine.py uses
@@ -772,7 +772,7 @@ def _s8_read_today_records() -> list[dict]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("mode") != "s8_runner_pilot":
+                if rec.get("mode") != "s8_live_pilot":
                     continue
                 if not str(rec.get("ts", "")).startswith(today_str):
                     continue
@@ -801,7 +801,7 @@ def _s8_read_all_records(max_rows: int = 2000) -> list[dict]:
                     rec = json.loads(line)
                 except json.JSONDecodeError:
                     continue
-                if rec.get("mode") == "s8_runner_pilot":
+                if rec.get("mode") == "s8_live_pilot":
                     out.append(rec)
     except OSError:
         return []
@@ -907,9 +907,9 @@ def _render_s8_cycle_log() -> None:
     st.markdown("#### Live cycle log (today)")
     records = _s8_read_today_records()
     if not records:
-        st.info("No S8 runner cycles logged yet today — expected until the live-data "
-                 "Gateway's first successful login (conductor item #25) and the "
-                 "scheduled task begin firing.")
+        st.info("No S8 runner cycles logged yet today — expected until the S8 "
+                 "live-trading TEST account is set (s8_config.ACCOUNT is 'TBD') and the "
+                 "scheduled task begins firing.")
         return
     lo, hi = s8_strategy._REAL_DELTA_BAND
     rows = []
@@ -1137,16 +1137,16 @@ def _render_s8_pnl(ib) -> None:
     st.metric(label, f"${total_dollars:,.0f}")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
     if ib is None:
-        st.caption("Live-data Gateway unreachable this cycle — showing logged entry "
+        st.caption("Live-trading Gateway unreachable this cycle — showing logged entry "
                    "data only; live re-mark resumes once the Gateway is reachable.")
 
 
 # --- 4.4 Account / margin snapshot ----------------------------------------------
 def _s8_account_summary(ib) -> dict:
-    """AccountType/BuyingPower/ExcessLiquidity from the live-data connection's own
+    """AccountType/BuyingPower/ExcessLiquidity from the live-trading connection's own
     accountSummary() — the exact same read s8_risk.py's margin_preflight() consumes.
-    Per s8_risk.py's 2026-07-13 note, this IS the real personal live account's own
-    numbers (the live-data Gateway has no sub-account concept), not any paper DU sub."""
+    These are the live-trading account's own numbers (the connected login serves its own
+    summary), not any paper DU sub-account."""
     rows = ib.accountSummary()
     m = {r.tag: r.value for r in rows}
     return {"AccountType": m.get("AccountType"), "BuyingPower": m.get("BuyingPower"),
@@ -1155,12 +1155,11 @@ def _s8_account_summary(ib) -> dict:
 
 def _render_s8_account(ib) -> None:
     st.markdown("#### Account / margin snapshot")
-    st.caption("The real LIVE account's own numbers (live-data Gateway, port 4001 — "
-               "exactly one personal account, no paper sub-account concept; S8 no "
-               "longer touches the paper account at all, per the 2026-07-13 pivot). "
-               "Informational only.")
+    st.caption("The live-trading account's own numbers (live-TRADING Gateway, port 4003 "
+               "— a funded, transmit-capable test account; S8's pilot only reads it, "
+               "never trades). Informational only.")
     if ib is None:
-        st.info("Live-data Gateway unreachable this cycle.")
+        st.info("Live-trading Gateway unreachable this cycle.")
         return
     try:
         summary = _s8_account_summary(ib)
@@ -1177,10 +1176,10 @@ def _render_s8_account(ib) -> None:
 # --- 4.5 Connection health -------------------------------------------------------
 def _render_s8_connection_health(ib, connect_error: Exception | None) -> None:
     st.markdown("#### Connection health")
-    up = _port_open("127.0.0.1", 4001)   # same cheap TCP-probe pattern as the Health
+    up = _port_open("127.0.0.1", 4003)   # same cheap TCP-probe pattern as the Health
                                           # tab's paper-gateway (4002) check above
     tier = "good" if up else "bad"
-    st.markdown(f"{_TIER_DOT[tier]} Live-data Gateway (port 4001) — "
+    st.markdown(f"{_TIER_DOT[tier]} Live-trading Gateway (port 4003) — "
                f"{'UP' if up else 'DOWN'}")
     if ib is not None:
         st.session_state["s8_last_live_probe"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -1231,13 +1230,14 @@ def render_s8_history() -> None:
 
 # --- Connection helper + the auto-refreshing fragment ---------------------------
 def _s8_connect_readonly_short(timeout: int = 5):
-    """Connect to the LIVE-DATA Gateway (port 4001), structurally read-only (no
-    override parameter exists in connections.ibkr_live_data — see that module's own
-    docstring), SHORT timeout, launch=False (an auto-refreshing 30s dashboard fragment
-    must never be the thing that boots a Gateway). Mirrors render_accounts()'s own
-    _connect_readonly_short pattern for the paper side."""
-    from connections import ibkr_live_data
-    return ibkr_live_data.connect("dashboard_s8", launch=False, timeout=timeout)
+    """Connect to the live-TRADING Gateway (port 4003), read-only and display-only, for
+    quote-consistency with s8_runner.py (which reads the same connection). readonly=True
+    is passed explicitly here — this account is transmit-capable at the broker level, but
+    a monitor tab only ever reads. SHORT timeout, launch=False (an auto-refreshing 30s
+    dashboard fragment must never be the thing that boots a Gateway). Mirrors
+    render_accounts()'s own _connect_readonly_short pattern for the paper side."""
+    from connections import ibkr_live
+    return ibkr_live.connect("dashboard_s8", launch=False, readonly=True, timeout=timeout)
 
 
 @st.fragment(run_every="30s")
@@ -1246,7 +1246,7 @@ def render_s8_live() -> None:
     connection health) — wrapped in its own fragment so ONLY this part of the page
     reruns every 30s, not the whole app (and not the Health/Backtests/Accounts tabs).
 
-    30s CHOSEN BECAUSE: (a) a live-data IBKR round trip here (qualify + reqMktData +
+    30s CHOSEN BECAUSE: (a) a live IBKR round trip here (qualify + reqMktData +
     a 3s settle) takes several real seconds, so 30s leaves comfortable headroom
     between round trips rather than queuing up overlapping connections; (b) it's the
     same order of magnitude as this desk's other live-polling cadences (e.g.

@@ -12,27 +12,32 @@ HeartbeatStalenessAlarm/CanslimOverlayWatchdog — NOT N separate fixed-time tri
 Registering that scheduled task is explicitly OUT OF SCOPE for this build (see the
 approved plan) — this file is built and independently testable first.
 
-CONNECTION TARGET — LIVE-DATA GATEWAY ONLY, NEVER THE PAPER GATEWAY (decided 2026-07-13)
+CONNECTION TARGET — THE LIVE-TRADING GATEWAY, NEVER THE PAPER GATEWAY
 ------------------------------------------------------------------------------------------
-This file connects EXCLUSIVELY to the separate, deliberately read-only-only live-side
-Gateway (`connections.ibkr_live_data`, port 4001) for BOTH steps of its monitoring/
-decision cycle — the account-summary read for the margin gate AND the option-chain
-snapshot for strike selection. It never imports or calls `connections.ibkr` (the paper
-Gateway, port 4002) anywhere. This was a deliberate pivot decided in session on
-2026-07-13, away from the build plan's original framing (paper Gateway, clientId
-`paperbot_s8`): `connections/ibkr_live_data.py` was built in the neutral `connections/`
-package specifically so either a future paper-side or live-side consumer could use it,
-and this is that legitimate use — not a boundary violation of anything. Because the
-live-data Gateway only ever authenticates as exactly one personal account (no sub-account
-selection exists or is needed on that connection), the `accountSummary()` this file reads
-is that real personal account's own summary, not any paper DU sub-account's.
+This file connects EXCLUSIVELY to the live-TRADING Gateway (`connections.ibkr_live`,
+port 4003) for BOTH steps of its monitoring/decision cycle — the account-summary read
+for the margin gate AND the option-chain snapshot for strike selection. That is a real,
+FUNDED, transmit-CAPABLE account limited to two individual test accounts — NOT the paper
+Gateway (`connections.ibkr`, port 4002) and NOT the earlier port-4001 live-DATA login
+(`connections.ibkr_live_data`), neither of which this file imports or calls anywhere.
+The live-trading account serves real-time market data directly, so no delayed-data
+fallback (`reqMarketDataType`) is needed for the quotes S8 reads.
 
-PILOT_MODE (below) remains the PRIMARY control blocking any transmission — unchanged by
-this pivot. The live-data connection's own structural read-only-ness (see
-`ibkr_live_data.connect()`'s docstring: no `readonly` override exists, it is hardcoded
-True, and that module exposes no order-placement method anywhere) is a SECOND,
-independent backstop layered underneath PILOT_MODE, not a replacement for it — the two
-guardrails are orthogonal and both must hold.
+Zero-transmit is currently STRUCTURAL: there is NO transmit code path in this file at
+all. `order_router.place()` / `place_laddered()` / `ib.placeOrder()` are never called
+anywhere here — the runner only ever logs/emails "WOULD HAVE TRANSMITTED: ...". Two
+declared walls sit on top of that absence:
+
+  1. PRIMARY: `PILOT_MODE = True` (hardcoded below). It is the declared primary control
+     and becomes the operative gate the day the future S8 executor (reserved clientId
+     `paperbot_s8_exec` = 50) is built with a real transmit path. Today, with no transmit
+     code in this file, PILOT_MODE is belt-and-suspenders over that absence — but it is
+     still the wall of record, not the read-only default.
+  2. SECONDARY fail-safe: the connection is read-only by default
+     (`ibkr_live.connect(readonly=True)` — this file never passes `readonly=False`).
+     Because the account IS transmit-capable at the broker level, read-only is a real,
+     honored session flag here (unlike the port-4001 live-data login, whose read-only-ness
+     was structural). It is a fail-safe default, not a substitute for PILOT_MODE.
 
 DUE-CHECK FAST PATH (ZERO gateway contact on the common no-op cycle)
 ----------------------------------------------------------------------
@@ -57,23 +62,16 @@ If nothing is due for ANY template, this makes literally zero IBKR contact (no c
 no clientId used, no ledger write) — mirrors morning_execute_run.py's own "no staged
 file -> zero gateway touch" fast path.
 
-ACCOUNT == "TBD" REFUSAL (loud, not silent) — NOW A VESTIGIAL/INFORMATIONAL-ONLY CHECK
+ACCOUNT == "TBD" REFUSAL (loud, not silent) — GENUINELY ACTIVE, NOT VESTIGIAL
 ------------------------------------------------------------------------------------------
-s8_config.ACCOUNT was the "TBD" placeholder at the time this refusal was first written;
-Andrew has since decided it (== "DU8922146", 2026-07-13 — see s8_config.py and
-conductor/ACCOUNT_ALLOCATION.md), so this check no longer fires in practice. More
-importantly, as of the live-data pivot (also 2026-07-13, see "CONNECTION TARGET" above),
-this check no longer gates a paper-account CONNECTION at all — this file's Gateway
-connection doesn't touch, select, or depend on any paper DU sub-account any more; the
-live-data Gateway sees exactly one (real, personal) account with no sub-account concept.
-s8_config.ACCOUNT is kept and still read here purely for PROVENANCE/LOGGING (it's
-threaded into `order_ref` and the ledger record below as "which future paper/live
-transmission path this pilot cycle's decisions would eventually belong to") — it is
-informational/reserved for a future paper- or live-transmission build, NOT the account
-this connection actually queries. The refusal itself is left in place as a cheap,
-harmless belt-and-suspenders check (if `s8_config.ACCOUNT` is ever reset to "TBD" for
-some reason, still refuse loudly rather than log provenance-less records) rather than
-because it protects anything about today's connection path.
+s8_config.ACCOUNT is reset to the "TBD" placeholder: the S8 live-trading TEST account
+(one of the two individual accounts under the new live login) has NOT yet been provided
+by Andrew. Until it is, this check fires for real — the runner refuses loudly (returns 2)
+BEFORE any gateway contact. This is not a hypothetical/belt-and-suspenders path any more;
+it is the operative fail-closed guard that keeps the runner from doing anything at all
+until a real test account number is set. Once Andrew supplies the account, s8_config.ACCOUNT
+is updated to it and this refusal stops firing; the account string is then threaded into
+`order_ref` and the ledger record below as honest provenance for the cycle's decisions.
 
 PILOT_MODE = True (HARDCODED — see the constant below)
 ---------------------------------------------------------
@@ -87,9 +85,10 @@ docstring states for its own PILOT_MODE. (Self-check performed before reporting 
 stage done: grepping this file for "order_router.place" and "placeOrder" turns up zero
 call sites — only the import of order_router for its private, non-transmitting helpers
 _check_limit_price/_base_fields, and the bare module import so tests can monkeypatch
-order_router.place and assert it is never invoked.) PILOT_MODE is the PRIMARY control;
-the live-data connection's hardcoded read-only-ness (see "CONNECTION TARGET" above) is a
-second, independent backstop underneath it, not a substitute for it.
+order_router.place and assert it is never invoked.) PILOT_MODE is the declared PRIMARY
+control (operative the day a transmit path exists); the live-trading connection's
+read-only-by-default session (see "CONNECTION TARGET" above) is a second, independent
+fail-safe underneath it, not a substitute for it.
 
 THE ORDER GROUP (design already settled earlier this session — implemented faithfully
 here, not re-derived; see calm-riding-hammock.md's "Design already settled" section)
@@ -165,18 +164,18 @@ import s8_config  # noqa: E402
 import s8_risk  # noqa: E402
 import s8_strategy  # noqa: E402
 import version  # noqa: E402
-from connections import ibkr_live_data  # noqa: E402
+from connections import ibkr_live  # noqa: E402
 from order_router import _base_fields, _check_limit_price  # noqa: E402
 
 # NOTE on gateway_lock: every OTHER paperbot script that imports gateway_lock does so
 # because it operates the shared PAPER Gateway (127.0.0.1:4002) and needs the
 # inter-process mutex documented in gateway_lock.py's own module docstring ("single-
-# process mutex on the paper Gateway"). This file is the one exception, post the
-# 2026-07-13 live-data pivot (see "CONNECTION TARGET" above): it never touches the paper
-# Gateway at all, so wrapping its live-data work in that mutex would protect a resource
-# this script doesn't use, while providing zero real protection on the resource it does
-# use (the live-data Gateway, port 4001, which has no analogous cross-process lock built
-# yet). Deliberately not imported/used here for that reason -- not an oversight.
+# process mutex on the paper Gateway"). This file is the one exception (see "CONNECTION
+# TARGET" above): it never touches the paper Gateway at all, so wrapping its live-trading
+# work in that mutex would protect a resource this script doesn't use, while providing
+# zero real protection on the resource it does use (the live-TRADING Gateway,
+# connections.ibkr_live, port 4003, whose own launch coordination lives in that module's
+# ensure_gateway() launch mutex). Deliberately not imported/used here -- not an oversight.
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "dailyreport"))
@@ -296,7 +295,7 @@ def build_entry_order_group(ib, chain_snap: pd.DataFrame, pick, template_config:
     short_bid = _check_limit_price(f"SPXW {pick.short_strike:g}{right}", short_bid)
     long_ask = _check_limit_price(f"SPXW {pick.long_strike:g}{right}", long_ask)
 
-    order_ref = f"paperbot_s8:{account}:{expiration}:{pick.template_name}"
+    order_ref = f"s8_live:{account}:{expiration}:{pick.template_name}"
 
     entry_short = LimitOrder("SELL", qty, short_bid)     # honest fill: sell short at bid
     _base_fields(entry_short, account, None, "", order_ref + ":short_entry")
@@ -327,30 +326,31 @@ def build_entry_order_group(ib, chain_snap: pd.DataFrame, pick, template_config:
 def _alert_email(subject: str, lines: list[str]) -> None:
     html = "<html><body><pre>" + "\n".join(lines) + "</pre></body></html>"
     try:
-        mailer.send_html(f"[TradingDesk PAPER] {subject}", html)
+        mailer.send_html(f"[TradingDesk S8 LIVE] {subject}", html)
     except Exception as exc:
         print(f"    ! alert email itself failed: {exc}")
 
 
 def bounded_connect(consumer: str):
     """Identical bounded-retry policy to morning_execute_run.bounded_connect, repointed
-    at the LIVE-DATA Gateway (connections.ibkr_live_data, port 4001) instead of the paper
+    at the live-TRADING Gateway (connections.ibkr_live, port 4003) instead of the paper
     Gateway -- see the module docstring's "CONNECTION TARGET" section. Duplicated (not
     imported) on purpose — same rationale stated there: each scheduled script must be
     independently robust and self-contained, and the policy is tiny/stable enough that a
     shared import would be over-engineering for these call sites.
 
-    No `readonly` argument here (unlike morning_execute_run.bounded_connect's paper-side
-    equivalent): `ibkr_live_data.connect()` has no readonly parameter at all -- every
-    connection it makes is hardcoded read-only, so there is nothing for this function to
-    pass through or toggle."""
+    Connects read-only by DEFAULT: `ibkr_live.connect()` exposes a real `readonly`
+    parameter (this account is transmit-capable at the broker level), but it defaults to
+    True and this function never passes readonly=False. The pilot only ever reads, so a
+    read-only session is a fail-safe that costs it nothing -- PILOT_MODE, not this
+    default, is the primary zero-transmit wall."""
     last_exc: Exception | None = None
     for attempt in range(1, CONNECT_MAX_ATTEMPTS + 1):
         print(f"    connect attempt {attempt}/{CONNECT_MAX_ATTEMPTS} "
-              f"(consumer={consumer}, live-data Gateway, hardcoded read-only)...")
+              f"(consumer={consumer}, live-trading Gateway, read-only by default)...")
         try:
-            ib = ibkr_live_data.connect(consumer, launch=True,
-                                        timeout=CONNECT_ATTEMPT_TIMEOUT_SECS)
+            ib = ibkr_live.connect(consumer, launch=True,
+                                   timeout=CONNECT_ATTEMPT_TIMEOUT_SECS)
             print(f"    connected on attempt {attempt}.")
             return ib
         except Exception as exc:
@@ -369,21 +369,18 @@ def main() -> int:
           f"[{version.banner()}]")
     print("=" * 100)
 
-    # ACCOUNT == "TBD": loud, deliberate refusal -- NOT the same as the due-check
-    # fast path below (see module docstring's now-updated "ACCOUNT == TBD REFUSAL"
-    # section: s8_config.ACCOUNT is decided ("DU8922146") and this check no longer
-    # gates a paper-account connection -- this runner's Gateway connection doesn't
-    # touch any paper sub-account at all. Left in place as a cheap belt-and-suspenders
-    # check in case ACCOUNT is ever reset, not because it protects today's connection.
+    # ACCOUNT == "TBD": loud, deliberate refusal -- GENUINELY ACTIVE (see module
+    # docstring's "ACCOUNT == TBD REFUSAL" section). s8_config.ACCOUNT is the "TBD"
+    # placeholder because the S8 live-trading TEST account has not been provided yet,
+    # so this gate fires for real and refuses BEFORE any gateway contact -- it is the
+    # fail-closed guard, not a vestigial check.
     if s8_config.ACCOUNT == "TBD":
         msg = ("S8 SAFETY STOP: s8_config.ACCOUNT is still the placeholder \"TBD\" -- "
-              "no account is on record for S8's future paper/live transmission path "
-              "(see s8_config.py's own comment and conductor/ACCOUNT_ALLOCATION.md). "
-              "REFUSING to proceed until s8_config.ACCOUNT is updated -- this is a LOUD, "
-              "deliberate no-op, not a silent skip. (Note: this connection itself never "
-              "touches a paper sub-account regardless -- see the module docstring's "
-              "\"CONNECTION TARGET\" section -- but a decided ACCOUNT is still required "
-              "for honest provenance/logging.)")
+              "no live-trading TEST account has been provided for S8 yet "
+              "(see s8_config.py's own comment). "
+              "REFUSING to proceed until s8_config.ACCOUNT is updated to a real test "
+              "account -- this is a LOUD, deliberate no-op, not a silent skip, and it "
+              "fires before any Gateway contact.")
         print(f"\n{msg}")
         return 2
 
@@ -399,12 +396,12 @@ def main() -> int:
     print(f"\nDue this cycle ({now.strftime('%H:%M')} CT): "
           + ", ".join(f"{n}@{s}" for n, s in due))
 
-    # PILOT_MODE never needs write access to the account; the live-data Gateway is
-    # hardcoded read-only regardless (see bounded_connect's docstring / module
-    # docstring's "CONNECTION TARGET" section) -- there is no readonly toggle to pass.
-    ib = bounded_connect("paperbot_s8_livedata")
+    # PILOT_MODE never needs write access to the account; bounded_connect uses
+    # ibkr_live.connect()'s read-only default (see bounded_connect's docstring / module
+    # docstring's "CONNECTION TARGET" section) -- readonly=False is never passed here.
+    ib = bounded_connect("s8_live_pilot")
     if ib is None:
-        msg = (f"S8 runner: could not connect to the live-data Gateway after "
+        msg = (f"S8 runner: could not connect to the live-trading Gateway after "
               f"{CONNECT_MAX_ATTEMPTS} attempts. Skipping this cycle; the next "
               f"scheduled fire will retry.")
         print(f"\n{msg}")
@@ -429,16 +426,16 @@ def main() -> int:
 def _do_work(ib, due: list[tuple[str, str]]) -> int:
     account = s8_config.ACCOUNT  # provenance/logging only (order_ref, ledger record) --
     # see the module docstring's "ACCOUNT == TBD REFUSAL" section. NOT passed to
-    # accountSummary() below: the live-data connection has no concept of this (or any)
-    # paper DU sub-account, so filtering by it would be meaningless on this connection.
+    # accountSummary() below: the live-trading login serves the connected account's own
+    # summary directly, so filtering by this string would be redundant on this call.
 
-    print("\n[1] Reading account summary from the live-data connection "
-          f"(exactly one real personal account is visible here; s8_config.ACCOUNT="
-          f"{account!r} is informational-only provenance, not a filter on this call)...")
+    print("\n[1] Reading account summary from the live-trading connection "
+          f"(s8_config.ACCOUNT={account!r} is provenance for the ledger/order_ref, "
+          f"not a filter on this call)...")
     try:
         summary = ib.accountSummary()
     except Exception as exc:
-        msg = f"S8 runner: could not read accountSummary() from the live-data connection: {exc}"
+        msg = f"S8 runner: could not read accountSummary() from the live-trading connection: {exc}"
         print(f"    {msg}")
         _alert_email("S8 runner: accountSummary FAILED", [msg])
         return 1
@@ -451,7 +448,7 @@ def _do_work(ib, due: list[tuple[str, str]]) -> int:
         print(f"    {msg}")
         _alert_email("S8 runner: chain snapshot FAILED", [msg])
         ledger.record_run({
-            "mode": "s8_runner_pilot", "account": account,
+            "mode": "s8_live_pilot", "account": account,
             "due_templates": [n for n, _ in due], "n_intents": len(due),
             "n_approved": 0, "n_transmitted": 0, "halted": True,
             "error": f"chain snapshot failed: {exc}",
@@ -525,7 +522,7 @@ def _do_work(ib, due: list[tuple[str, str]]) -> int:
         results.append(outcome)
 
     ledger.record_run({
-        "mode": "s8_runner_pilot", "account": account,
+        "mode": "s8_live_pilot", "account": account,
         "due_templates": [n for n, _ in due], "n_intents": len(due),
         "n_approved": n_approved, "n_transmitted": 0, "halted": False,
         "results": results,

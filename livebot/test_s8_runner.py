@@ -9,24 +9,24 @@ transmit real S8 orders:
   * the due-check (due_templates) correctly matches/misses within the tolerance window,
     and a template whose ENTRY_GRID_CT is None NEVER fires, at any time of day.
   * s8_config.ACCOUNT == "TBD" -> loud refusal, ZERO gateway contact (bounded_connect
-    never even called) — a belt-and-suspenders check, exercised here via monkeypatch
-    since the real ACCOUNT is now decided ("DU8922146", see s8_config.py and
-    conductor/ACCOUNT_ALLOCATION.md's 2026-07-13 entries).
+    never even called). This is the LIVE default now (s8_config.ACCOUNT is "TBD" until
+    Andrew provides the S8 live-trading TEST account), so the refusal fires for real;
+    tests that need to run the cycle PAST this gate monkeypatch ACCOUNT to a fake
+    non-TBD string ("DU8922144").
   * a full simulated due-cycle (fake IB, fake chain snapshot, real account string)
     completes PILOT_MODE-only end to end and NEVER calls order_router.place() (nor
     anything resembling it) at any point.
 
-CONNECTION TARGET (updated 2026-07-13 — see s8_runner.py's own module docstring,
-"CONNECTION TARGET" section): the runner's live cycle connects exclusively through
-`connections.ibkr_live_data` (the separate, read-only-only live-side Gateway, port
-4001), never `connections.ibkr` (paper, port 4002), and never wraps its work in
-`gateway_lock` (that mutex protects the shared paper Gateway, which this file no longer
-touches at all). Tests below mock `runner.bounded_connect` directly (the same seam the
-old paper-Gateway tests used) rather than reaching into `connections.ibkr_live_data`
-itself — bounded_connect is the one function that would call it.
+CONNECTION TARGET (see s8_runner.py's own module docstring, "CONNECTION TARGET"
+section): the runner's live cycle connects exclusively through `connections.ibkr_live`
+(the live-TRADING Gateway, port 4003, read-only by default), never `connections.ibkr`
+(paper, port 4002) or the earlier port-4001 live-DATA login, and never wraps its work in
+`gateway_lock` (that mutex protects the shared paper Gateway, which this file does not
+touch at all). Tests below mock `runner.bounded_connect` directly (the seam that would
+call `connections.ibkr_live`) rather than reaching into that module itself.
 
 Run:
-  cd paperbot
+  cd livebot
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_s8_runner.py -q
 """
 from __future__ import annotations
@@ -100,13 +100,11 @@ def test_due_templates_matched_slot_always_belongs_to_that_templates_grid():
 
 
 # --- ACCOUNT == "TBD": loud refusal, zero gateway contact ---------------------------
-# NOTE: s8_config.ACCOUNT is now decided ("DU8922146", 2026-07-13 — see s8_config.py and
-# conductor/ACCOUNT_ALLOCATION.md), so these tests monkeypatch it back to the "TBD"
-# placeholder to exercise the belt-and-suspenders refusal path that remains in
-# s8_runner.py's main() for exactly this (now hypothetical) case. This check no longer
-# gates a paper-account CONNECTION either way (the live-data connection has no
-# sub-account concept at all) -- see s8_runner.py's module docstring, "ACCOUNT == TBD
-# REFUSAL" section.
+# NOTE: s8_config.ACCOUNT is "TBD" by default now (the S8 live-trading TEST account has
+# not been provided yet — see s8_config.py), so this refusal is the LIVE fail-closed
+# behavior, not a hypothetical. These tests set it explicitly for clarity/isolation and
+# assert the loud refusal fires BEFORE any gateway contact -- see s8_runner.py's module
+# docstring, "ACCOUNT == TBD REFUSAL" section.
 def test_account_tbd_refuses_without_connecting(monkeypatch):
     monkeypatch.setattr(s8_config, "ACCOUNT", "TBD")
     monkeypatch.setattr(runner.s8_config, "ACCOUNT", "TBD")
@@ -115,7 +113,7 @@ def test_account_tbd_refuses_without_connecting(monkeypatch):
         raise AssertionError("must not attempt a connection while ACCOUNT is 'TBD'")
 
     monkeypatch.setattr(runner, "bounded_connect", _boom)
-    monkeypatch.setattr(runner.ibkr_live_data, "connect", _boom)
+    monkeypatch.setattr(runner.ibkr_live, "connect", _boom)
 
     rc = runner.main()
 
@@ -133,7 +131,7 @@ def test_account_tbd_checked_before_due_check(monkeypatch):
         raise AssertionError("must not connect while ACCOUNT is 'TBD', due or not")
 
     monkeypatch.setattr(runner, "bounded_connect", _boom)
-    monkeypatch.setattr(runner.ibkr_live_data, "connect", _boom)
+    monkeypatch.setattr(runner.ibkr_live, "connect", _boom)
 
     rc = runner.main()
 
@@ -157,9 +155,9 @@ class _FakeIB:
         self.client = _FakeClient()
 
     def accountSummary(self):
-        # Matches the live-data connection's real shape: exactly one personal account is
-        # visible, so accountSummary() takes no account argument (see s8_runner.py's
-        # _do_work -- "NOT passed to accountSummary() below").
+        # Matches the live-trading connection's real shape: accountSummary() takes no
+        # account argument (the login serves the connected account's own summary; see
+        # s8_runner.py's _do_work -- "NOT passed to accountSummary() below").
         return self._summary
 
     def disconnect(self):
@@ -200,7 +198,7 @@ def test_full_due_cycle_never_calls_order_router_place(monkeypatch):
                     "ExcessLiquidity": 5_000_000.0}
     fake_ib = _FakeIB(fake_summary)
     # bounded_connect is the one seam that would otherwise call
-    # connections.ibkr_live_data.connect(...) against the real live-data Gateway.
+    # connections.ibkr_live.connect(...) against the real live-trading Gateway.
     monkeypatch.setattr(runner, "bounded_connect", lambda *a, **k: fake_ib)
 
     monkeypatch.setattr(runner.s8_chain, "snapshot_0dte_chain",
@@ -224,7 +222,7 @@ def test_full_due_cycle_never_calls_order_router_place(monkeypatch):
     # Persisted exactly one ledger record for the cycle, marked PILOT and untransmitted.
     assert len(ledger_calls) == 1
     rec = ledger_calls[0]
-    assert rec["mode"] == "s8_runner_pilot"
+    assert rec["mode"] == "s8_live_pilot"
     assert rec["n_transmitted"] == 0
     assert rec["due_templates"] == ["Puts-80-$4"]
     # The synthetic ladder is constructed so a real pick should be found and approved.
