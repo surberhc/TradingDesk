@@ -151,6 +151,13 @@ from ib_async import LimitOrder, MarketOrder, Option, StopOrder
 # =================================================================================
 PILOT_MODE = True
 
+# ledger.py, order_router.py, version.py stay in paperbot/ (this module was relocated
+# to livebot/ in the S8-package split); add paperbot/ to sys.path so the bare
+# `import ledger` / `import order_router` / `import version` below still resolve. The
+# s8_* siblings moved WITH this file into livebot/, so they resolve without help.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                                "paperbot"))
+
 import ledger  # noqa: E402
 import order_router  # noqa: E402
 import s8_chain  # noqa: E402

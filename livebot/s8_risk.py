@@ -59,9 +59,19 @@ unconditionally (not gated on any exposure threshold):
 """
 from __future__ import annotations
 
+import os
+import sys
 from dataclasses import dataclass, field
 
-from s4_risk import _EPS, _num, _summary_map, account_is_margin
+# s4_risk.py stays in paperbot/ (this module was relocated to livebot/ in the
+# S8-package split); add paperbot/ to sys.path so the bare `from s4_risk import ...`
+# below still resolves. Path derived relative to this file, not the cwd.
+_PAPERBOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                         "paperbot")
+if _PAPERBOT not in sys.path:
+    sys.path.insert(0, _PAPERBOT)
+
+from s4_risk import _EPS, _num, _summary_map, account_is_margin  # noqa: E402
 
 __all__ = [
     "PreflightResult",
