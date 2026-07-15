@@ -13,12 +13,17 @@ is safe and reversible (paper for now), and a clean compliance trail behind ever
    checks and must not be fit to a single period. A fragile win is not a win — flag the
    curve-fit risk and stop rather than ship it. Default to the curve-fit-*preventing*
    read of an ambiguous result.
-2. **Paper only — for now.** Live trading IS a planned future milestone; we just haven't
-   crossed that bridge yet. Until we deliberately decide to, everything runs on the PAPER
-   account (DU…141, port 4002) and nothing trades real money. Never call it "live."
-   Backstop: the only login available reaches the paper account, so live trading isn't
-   reachable by accident. The review → arm → transmit gate stays sacred; nothing transmits
-   without a deliberate, gated, armed action.
+2. **No real-money transmission — for now.** Nothing transmits a real trade yet; that
+   stays a future, deliberately-gated milestone. Most of the desk (S0/S4/…) runs on the
+   PAPER account (DU…141, port 4002). The one exception is **S8's live pilot**: it connects
+   to a real, funded LIVE account — limited to two individual test accounts, on its own
+   Gateway (port 4003) — so it can read genuine real-time data and make correct schedule
+   decisions. But it is **zero-transmit**: `PILOT_MODE=True` is hardcoded and is the
+   load-bearing backstop. The Gateway is transmit-capable by deliberate choice, so
+   PILOT_MODE *is* the wall — it never places, modifies, or transmits an order; it only
+   reports "WOULD HAVE TRANSMITTED." "Live" now accurately describes S8's account and data
+   and may be used for it. The review → arm → transmit gate stays sacred: no real order
+   transmits without a deliberate, gated, armed decision Andrew makes explicitly.
 
 ## The counterweight — judge on net merit
 Rule #1 bars curve-fitting the **strategy**; it does not license curve-fitting the **test** to guarantee failure. Every real strategy has weak spots — the call is whether strengths outweigh weaknesses **on balance**, never whether a weakness exists. Don't reflexively hunt for a reason to fail a result, treat a single weak spot as disqualifying, or move the goalposts once something clears the bar; a weakness disqualifies only when it genuinely outweighs the strengths. Reserve the strict robustness gate for its real job — parameters tuned to a period — not for beating down every honest result. Test a strategy in the **role it's actually used** (its real combination/deployment) against a bar that matches how it's meant to work — not a strawman in isolation (a hedge needn't profit every year; a financing overlay needn't win the crash its paired hedge exists to cover). **Lead with the net verdict, then weigh caveats in proportion.** If you're stacking "buts" onto a good result, stop and state the balance.
