@@ -81,6 +81,17 @@ try:
 except Exception:  # noqa: BLE001 — the alarm must import even if the calendar is missing
     _mktcal = None
 
+# The repo-backup job owns its own heartbeat path; import it rather than keeping a
+# hand-maintained SECOND COPY here. That duplication is exactly what caused the
+# 2026-07-09 false pages (see the deadline-lookup note below): a copied constant
+# drifted from its source and the alarm fired against a reality that no longer
+# existed. Imported defensively — repo_backup is stdlib-only, but if it ever fails
+# to import, the alarm must still run and we fall back to the literal path.
+try:
+    import repo_backup as _repo_backup
+except Exception:  # noqa: BLE001 — the alarm must import even if the job module doesn't
+    _repo_backup = None
+
 
 def _is_trading_day(d: "dt.date") -> bool:
     """Calendar-aware 'is the US market open on day d' that NEVER raises."""
@@ -164,8 +175,58 @@ RAN_MARKER = config.DATA_ROOT / "heartbeat_alarm_ran.txt"
 #   threshold_s : seconds of no-update that counts as STALE
 #   task_name   : the Windows scheduled task that OWNS the watched job (named in the
 #                 alert so the reader knows exactly where to look)
+#   cause_stale : OPTIONAL human explanation for the alert body, overriding the
+#                 default supervisor-died wording (which is SPXW-collector specific
+#                 and would be actively misleading for a non-supervised job).
+#                 May use {age} and {task_name}. cause_missing likewise.
 # --------------------------------------------------------------------------- #
+
+# How long without a VERIFIED repo backup before we page. The backup is intended to
+# run daily; 26h = one day + a 2h grace so a late run never false-pages.
+# NOTE (Andrew's call): this assumes a DAILY cadence. The scheduled task is
+# deliberately NOT registered by this build — if you schedule it at a different
+# cadence, change this number to match, or it will page (too tight) or sleep through
+# a real outage (too loose).
+REPO_BACKUP_THRESHOLD_S = 26 * 3600
+
+_REPO_BACKUP_HB = (
+    _repo_backup.HEARTBEAT_FILE if _repo_backup is not None
+    else Path(r"C:\TradingDesk-Local\backups\repo_backup_heartbeat.txt"))
+
 JOBS: list[dict] = [
+    # repo_backup — THE 2026-07-16 GAP. Google Drive silently synced the WRONG folder
+    # for 9 days (2026-07-07..07-16); 85 commits never left the machine and NO ERROR
+    # WAS EVER RAISED, because nothing failed — Drive faithfully synced a folder that
+    # had stopped changing. A backup that can fail silently is not a backup, so the
+    # only defence is an alarm that fires on SILENCE.
+    #
+    # THE CONTRACT: repo_backup.py refreshes this heartbeat IF AND ONLY IF a bundle
+    # verified okay-with-complete-history AND landed on a confirmed Drive-managed
+    # destination AND re-verified there AND sync was not paused. Every failure path
+    # leaves it untouched. So a failed backup and a never-ran backup look IDENTICAL
+    # from here — both go cold, both page. That symmetry is deliberate: it means this
+    # alarm cannot be fooled by a job that fails in a way we never anticipated.
+    {"name": "repo_backup",
+     "label": "TradingDesk repo backup (git bundle -> Drive)",
+     "heartbeat": _REPO_BACKUP_HB,
+     "progress": None,
+     "threshold_s": REPO_BACKUP_THRESHOLD_S,
+     "task_name": "RepoBackupDaily",
+     "cause_stale": (
+         "No VERIFIED repo backup has landed in {age}. The backup job refreshes its "
+         "heartbeat ONLY on a fully verified success (bundle verified okay + complete "
+         "history, placed on a confirmed Drive-managed destination, re-verified there, "
+         "sync not paused), so this means the backup either FAILED or never ran — and "
+         "your commits may exist on exactly one machine right now. This is the 9-day "
+         "silent-sync failure of 2026-07-16 repeating. Check Task Scheduler task "
+         "<b>{task_name}</b>, then run repo_backup.py by hand and read its output; "
+         "the status file (repo_backup_status.json) records the exact failure."),
+     "cause_missing": (
+         "The repo-backup heartbeat file is ABSENT — no verified backup has EVER been "
+         "recorded. Either the job has never successfully run, or its very first run "
+         "failed. Check Task Scheduler task <b>{task_name}</b> and run repo_backup.py "
+         "by hand; the status file (repo_backup_status.json) records the exact failure."),
+     },
     # spxw_1m (SPXW 1-min collector / Spxw1mCollector task) REMOVED 2026-07-07: the
     # one-time historical backfill finished 2026-07-02 (1127/1127 days, 100%) and the
     # job was intentionally superseded by universe_dl (UniverseDownloadEod) below. The
@@ -541,14 +602,22 @@ def _build_alert(job: dict, a: dict) -> tuple[str, str]:
     """(subject, html_body) for a stale/missing job."""
     age = _fmt_age(a["age_s"])
     subject = f"[TradingDesk ALARM] {job['label']} heartbeat cold {age}"
+    # Default wording assumes a SUPERVISED collector writing every ~30s. That is true
+    # of the SPXW-style jobs this alarm was born for, but false — and misleading — for
+    # jobs with other shapes (e.g. a once-daily repo backup). Such a job supplies its
+    # own cause_stale/cause_missing text; everyone else keeps the original default.
     cause = (f"The supervisor/process appears to have DIED (heartbeat has not "
              f"updated in {age}, well past the {job['threshold_s'] // 60}-minute "
              f"staleness threshold — the supervisor writes every ~30s, so this is "
              f"not a mere stall). Check Windows Task Scheduler task "
              f"<b>{job['task_name']}</b> and restart it if needed.")
+    if job.get("cause_stale"):
+        cause = job["cause_stale"].format(age=age, task_name=job["task_name"])
     if a["status"] == "missing":
         cause = (f"The heartbeat file is ABSENT — the job may never have started. "
                  f"Check Windows Task Scheduler task <b>{job['task_name']}</b>.")
+        if job.get("cause_missing"):
+            cause = job["cause_missing"].format(age=age, task_name=job["task_name"])
     rows = [
         ("Job", job["label"]),
         ("Status", a["status"].upper()),
