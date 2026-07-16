@@ -2,13 +2,26 @@
     register_repo_backup_task.ps1  --  register the RepoBackupDaily scheduled task.
 
     *** NOT RUN BY THE BUILD THAT CREATED IT. ***
-    Andrew owns scheduling. This script exists so registration is one click and is
-    written down rather than improvised; nothing registered it for you. Run it
-    yourself when you want the backup on a schedule:
+    Andrew owns scheduling. This script exists so registration is written down
+    rather than improvised; nothing registered it for you. Run it yourself, from
+    an ELEVATED shell, when you want the backup on a schedule.
 
-        Right-click -> "Run as administrator"
-        (or: powershell -ExecutionPolicy Bypass -File
-             "C:\TradingDesk\datacollector\register_repo_backup_task.ps1")
+    NOTE: an earlier version of this header said to right-click the .ps1 and pick
+    "Run as administrator". That instruction was impossible to follow -- Windows 11
+    puts no such entry on .ps1 files. The only right-click entry is "Run with
+    PowerShell" (buried under "Show more options"), and it is NOT elevated, so it
+    trips the self-check below. Use one of these instead:
+
+      (a) Win+X -> "Terminal (Admin)" -> accept the UAC prompt, then:
+              powershell -ExecutionPolicy Bypass -File
+                  "C:\TradingDesk\datacollector\register_repo_backup_task.ps1"
+
+      (b) From any existing (non-elevated) shell -- pops UAC for you:
+              Start-Process powershell -Verb RunAs -ArgumentList '-NoExit',
+                  '-ExecutionPolicy','Bypass','-File',
+                  'C:\TradingDesk\datacollector\register_repo_backup_task.ps1'
+          -NoExit keeps the new window open so you can read the verification
+          banner instead of watching it flash shut.
 
     WHAT IT REGISTERS (idempotent -- unregisters then re-registers):
       RepoBackupDaily -> run_repo_backup.cmd
@@ -44,7 +57,7 @@ $isAdmin = ([Security.Principal.WindowsPrincipal] `
             [Security.Principal.WindowsIdentity]::GetCurrent()
            ).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 if (-not $isAdmin) {
-    Write-Error "Not elevated. Right-click this file -> 'Run as administrator'."
+    Write-Error "Not elevated. Open Win+X -> 'Terminal (Admin)', then re-run: powershell -ExecutionPolicy Bypass -File `"$PSCommandPath`""
     exit 1
 }
 
