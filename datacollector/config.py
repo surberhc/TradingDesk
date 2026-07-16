@@ -2,7 +2,9 @@
 config.py — single source of truth for the options-data warehouse.
 
 Design split (decided 2026-06-25):
-  * CODE lives in Google Drive (this folder) so it is version-backed.
+  * CODE lives at C:\\TradingDesk (this folder) — a plain local folder, deliberately
+    OUTSIDE Google Drive; git is what version-backs it. Drive is a backup destination
+    for git bundles only, never the working copy.
   * RAW bulk options data lives LOCAL on C: (DATA_ROOT) — it is tens of GB and
     must NOT sync into Drive (sync thrash). Only small DERIVED feature tables
     (GEX/skew dailies) get copied back to Drive for backup.
@@ -20,7 +22,7 @@ import pathlib
 # --------------------------------------------------------------------------- #
 # Paths
 # --------------------------------------------------------------------------- #
-CODE_ROOT = pathlib.Path(__file__).resolve().parent          # Drive (backed up)
+CODE_ROOT = pathlib.Path(__file__).resolve().parent          # C:\TradingDesk (git-backed)
 
 # Local warehouse root — big, never synced to Drive.
 DATA_ROOT = pathlib.Path(r"C:\TradingDesk-Local\warehouse")

@@ -33,7 +33,9 @@ import pandas as pd
 # ---------------------------------------------------------------------------
 # Paths (the prompt-provided ground truth locations)
 # ---------------------------------------------------------------------------
-REPO = r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk"
+# REPO is derived from __file__ so this survives the repo moving (it left Google
+# Drive for C:\TradingDesk on 2026-07-16). DERIVED_DIR is off-Drive local data.
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 DERIVED_DIR = r"C:\TradingDesk-Local\warehouse\derived"
 MSR_DB = os.path.join(REPO, "msr", "msr.db")
 MSR_MARKET_CSV = os.path.join(REPO, "msr", "_msr_features_market.csv")

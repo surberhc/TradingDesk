@@ -6,18 +6,18 @@ _Last verified: 2026-06-27_
 
 There are **two roots**. They are kept separate on purpose:
 
-1. **The CODE root** lives inside Google Drive — it is **synced and backed up**.
+1. **The CODE root** lives on the C: drive, **outside** Google Drive — version-tracked by git.
 2. **The LOCAL root** lives on the C: drive — it is **never synced** (data, state, and the Python engine that runs everything).
 
-The simple rule: **code goes on Drive; data, state, and the venv stay local on C:.** This keeps huge and constantly-changing files out of Drive sync, which is slow and (see the warning below) has corrupted files in the past.
+The simple rule: **code and data both stay local on C:; nothing works out of Drive.** Drive sync is slow, has corrupted files in the past, and (2026-07-16) silently orphaned the repo itself.
 
 ---
 
-## 1. The CODE root (on Google Drive — synced & backed up)
+## 1. The CODE root (plain local folder — NOT Drive)
 
-`C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\`
+`C:\TradingDesk\`
 
-This is the git repository. Everything here is version-tracked and backed up by Drive.
+This is the git repository. It was moved out of Google Drive on 2026-07-16 after Drive silently synced the wrong folder for 9 days (2026-07-07 → 2026-07-16), moving/duplicating its own folders and orphaning the repo. Drive is now only a **backup destination for git bundles — never the working copy**. Backup is git + bundles, not Drive sync.
 
 | Folder | What it is |
 |---|---|

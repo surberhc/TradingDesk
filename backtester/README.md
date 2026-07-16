@@ -7,12 +7,15 @@ produces an HTML results report. Not connected to any brokerage; places no live 
 See **CLAUDE.md** (session rules), **SPEC.md** (strategy logic — source of truth),
 and **DATA.md** (data download spec).
 
-## Where things live (relocated 2026-06-24 for backup)
-- **Project (this folder) lives in Google Drive** → backed up / synced:
-  `C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\backtester`
-- **Virtual environment is LOCAL, outside Drive** (avoids syncing 320 MB):
+## Where things live (moved OFF Drive 2026-07-16)
+- **Project (this folder) is a plain local folder, deliberately OUTSIDE Google Drive:**
+  `C:\TradingDesk\backtester`
+  It left Drive 2026-07-16 after Drive silently synced the wrong folder for 9 days and
+  orphaned the repo. Backup is git + bundles copied to Drive — Drive is never the working
+  copy. Any `My Drive (andrew@surberhc.com)\TradingDesk` copy is a DEAD orphan.
+- **Virtual environment is LOCAL and untracked** (avoids versioning 320 MB):
   `C:\TradingDesk-Local\venv` — run with `C:\TradingDesk-Local\venv\Scripts\python.exe`
-- **API key** = `TIINGO_API_KEY` Windows user env var (secret kept off Drive). No `.env` in Drive.
+- **API key** = `TIINGO_API_KEY` Windows user env var. Never committed.
 - Run the report: `cd` here, then `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m src.run`
 - **PENDING CLEANUP:** delete the stale old local copy `C:\Users\andre\backtester` once the
   `TIINGO_API_KEY` env var is set and this Drive copy is confirmed working. (Left in place

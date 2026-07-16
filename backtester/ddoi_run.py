@@ -42,10 +42,16 @@ import pandas as pd
 import ddoi_gamma as dg
 import s5_intraday_data as s5
 
+# Repo paths are derived from __file__ so the code survives being moved (it left
+# Google Drive for C:\TradingDesk on 2026-07-16). Only the off-Drive local data
+# roots stay absolute -- they are a genuinely fixed location.
+_HERE = os.path.dirname(os.path.abspath(__file__))          # ...\TradingDesk\backtester
+_REPO = os.path.dirname(_HERE)                              # ...\TradingDesk
+
 EOD_WAREHOUSE_BASE = r"C:\TradingDesk-Local\warehouse\raw\options"
-VENDOR_CSV = r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\msr\_msr_features_market.csv"
+VENDOR_CSV = os.path.join(_REPO, "msr", "_msr_features_market.csv")
 CACHE_BASE = r"C:\TradingDesk-Local\warehouse\derived"
-OUTPUT_DIR = r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\backtester\output"
+OUTPUT_DIR = os.path.join(_HERE, "output")
 
 # Filled in by configure_symbol() below; default is SPXW so the module is drop-in
 # compatible with the original SPXW run.

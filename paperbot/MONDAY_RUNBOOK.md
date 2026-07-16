@@ -49,7 +49,7 @@ to the master).
 Market open, gateway logged into PAPER, API on 4002. Prove the account stream answers fast.
 
 ```
-cd "C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\paperbot"
+cd "C:\TradingDesk\paperbot"
 C:\TradingDesk-Local\venv\Scripts\python.exe accounts.py
 ```
 PASS when within a few seconds you see the table with all of DU8922142–146 funded

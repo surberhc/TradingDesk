@@ -58,8 +58,7 @@ DERIVED = WAREHOUSE / "derived"
 SUPERVISOR_HB = WAREHOUSE / "supervisor_heartbeat.txt"
 FORWARD_HB = WAREHOUSE / "forward_heartbeat.txt"
 ALARM_RAN_MARKER = WAREHOUSE / "heartbeat_alarm_ran.txt"
-TIINGO_MANIFEST = Path(r"C:\Users\andre\My Drive (andrew@surberhc.com)"
-                       r"\TradingDesk\backtester\data\_manifest.json")
+TIINGO_MANIFEST = _DAILYREPORT.parent / "backtester" / "data" / "_manifest.json"
 
 _sec = _er._sec
 _is_fresh = _er._is_fresh

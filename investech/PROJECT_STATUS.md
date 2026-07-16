@@ -21,7 +21,7 @@ InvesTech newsletter analysis for the TFR Trading desk. The **dataset** and the 
 ## What InvesTech is
 James B. Stack's risk-first, valuation-capped, technically-triggered defensive market-timing newsletter (Whitefish, MT). Risk dial = published Model Fund Portfolio **net equity exposure** (held a tight **45–61%** band across 2023–2026; never risk-on) plus **cash %**. Master trigger = **Negative Leadership Composite (NLC)**: Selling Vacuum (bullish, needs >+20 to confirm) vs Distribution (bearish, −100 = max danger). Trades execute via intra-month "Hotlines". Tracks but refuses to own mega-cap leadership (proprietary Gorilla & AI indices).
 
-## Deliverables & locations (under C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\investech\)
+## Deliverables & locations (under C:\TradingDesk\investech\)
 
 ### _dataset\ — DONE
 - `InvesTech_Dataset.xlsx` — 5 sheets: Signals, Holdings_Matrix, Changes_Log, Symbol_Legend, ReadMe
@@ -59,7 +59,7 @@ Breadth-based "NLC-like" leadership proxy — a transparent APPROXIMATION, not a
 2. Verify the ThetaData integration using the command in `phase2_feed\README.md` — confirm `is_terminal_up()` is True and a sample EOD pull works.
 
 ```cmd
-cd /d "C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\investech\phase2_feed"
+cd /d "C:\TradingDesk\investech\phase2_feed"
 set PHASE2_DATA_SOURCE=thetadata
 set PHASE2_UNIVERSE_SOURCE=thetadata
 set PHASE2_THETADATA_UNIVERSE_LIMIT=50

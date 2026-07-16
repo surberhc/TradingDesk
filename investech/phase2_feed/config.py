@@ -176,8 +176,12 @@ if _td_uni_limit is not None and _td_uni_limit != "":
 # InvesTech's actual published monthly NLC values/regimes. Used ONLY by the
 # (future) calibration step described in the README -- never scraped, just a
 # local file the desk already licenses.
-NLC_REFERENCE_CSV = (
-    r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\investech\_dataset\InvesTech_Signals.csv"
+# Derived from __file__ (this file lives in investech/phase2_feed/) so it survives
+# the repo moving -- it left Google Drive for C:\TradingDesk on 2026-07-16.
+NLC_REFERENCE_CSV = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),  # ...\investech
+    "_dataset",
+    "InvesTech_Signals.csv",
 )
 
 # --- Output ------------------------------------------------------------------

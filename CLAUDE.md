@@ -29,9 +29,15 @@ is safe and reversible (paper for now), and a clean compliance trail behind ever
 Rule #1 bars curve-fitting the **strategy**; it does not license curve-fitting the **test** to guarantee failure. Every real strategy has weak spots — the call is whether strengths outweigh weaknesses **on balance**, never whether a weakness exists. Don't reflexively hunt for a reason to fail a result, treat a single weak spot as disqualifying, or move the goalposts once something clears the bar; a weakness disqualifies only when it genuinely outweighs the strengths. Reserve the strict robustness gate for its real job — parameters tuned to a period — not for beating down every honest result. Test a strategy in the **role it's actually used** (its real combination/deployment) against a bar that matches how it's meant to work — not a strawman in isolation (a hedge needn't profit every year; a financing overlay needn't win the crash its paired hedge exists to cover). **Lead with the net verdict, then weigh caveats in proportion.** If you're stacking "buts" onto a good result, stop and state the balance.
 
 ## Where things live
-- **Code** is in Google Drive at the `TradingDesk\` root (synced + backed up).
+- **Code** is at `C:\TradingDesk\` — a plain local folder, deliberately OUTSIDE Google
+  Drive. It moved off Drive 2026-07-16 after Drive silently synced the wrong folder for
+  9 days (2026-07-07 → 2026-07-16), moving/duplicating its own folders and orphaning the
+  repo. Drive is now only a **backup destination for git bundles — never the working
+  copy**. Never work in, or point code at, any `My Drive` path.
 - **Data, running state, the venv, and secrets** live on local `C:\TradingDesk-Local\`
   and are NEVER synced. Backtester market data lives there too (Drive sync corrupts it).
+- Derive repo paths from `__file__` (e.g. `Path(__file__).resolve().parents[N]`), not
+  absolute strings — the move above is why.
 - Run Python with the local venv: `C:\TradingDesk-Local\venv\Scripts\python.exe`.
 - Folders: `strategies\` (shared brain — one file per strategy, imported by both backtester
   and paperbot), `backtester\` (research), `paperbot\` (paper execution), `connections\`

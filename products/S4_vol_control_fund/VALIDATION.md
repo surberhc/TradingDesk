@@ -7,8 +7,7 @@ Nothing here was re-derived for the product folder — the engine is the shared 
 
 ## Evidence (the three validated reports)
 
-All paths are relative to the repo root
-(`C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk`).
+All paths are relative to the repo root (`C:\TradingDesk`).
 
 | Report | What it proves | Path |
 |---|---|---|

@@ -100,8 +100,8 @@ Tests: `paperbot/test_s4_strategy_target.py` (parity + causality + stale guard),
 
    ```
    Program:   C:\TradingDesk-Local\venv\Scripts\python.exe
-   Arguments: "C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\paperbot\s4_daily_run.py" --account DU89221XX --profile conservative
-   Start in:  C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\paperbot
+   Arguments: "C:\TradingDesk\paperbot\s4_daily_run.py" --account DU89221XX --profile conservative
+   Start in:  C:\TradingDesk\paperbot
    Settings:  Run whether user is logged on or not; Run with highest privileges
    ```
 

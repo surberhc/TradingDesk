@@ -10,11 +10,14 @@ whole file, then `STATUS.md` and `DECISIONS.md` in this folder, then start condu
 - **You (the Conductor) do NOT do the hands-on work yourself.** The real work runs on the
   **desktop**, where the gateway, the paper account, the Python venv, and the files live. A
   phone session can't run those.
-- **Coordination happens through THIS `conductor/` folder**, which syncs to all of Andrew's
-  devices via Google Drive. You read `STATUS.md` to see where each lane stands, and you read
-  `DECISIONS.md` to see what's waiting on Andrew. When Andrew answers, you append his answer
-  to `DECISIONS.md` so the desktop worker picks it up.
-- **Sync is not instant** (seconds, sometimes a minute). Don't expect live chat speed.
+- **Coordination happens through THIS `conductor/` folder**, at `C:\TradingDesk\conductor` —
+  a plain local folder, deliberately OUTSIDE Google Drive. You read `STATUS.md` to see where
+  each lane stands, and you read `DECISIONS.md` to see what's waiting on Andrew. When Andrew
+  answers, you append his answer to `DECISIONS.md` so the desktop worker picks it up.
+- **None of this syncs to Andrew's other devices.** The conductor DB lives at
+  `C:\TradingDesk-Local\conductor\conductor.db` and does not sync; the folder above is local
+  to the desktop. A git-bundle backup to Drive is being added separately — that is backup,
+  not sync. Don't assume a phone session can see desktop state.
 
 ## The lanes (independent areas — workers should not overlap files)
 See `STATUS.md` for the live state of each. Current lanes:

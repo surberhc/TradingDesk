@@ -10,15 +10,17 @@ The full strategy logic lives in SPEC.md. The data layer lives in DATA.md. Read 
 
 ## Where this project lives (IMPORTANT — read first)
 
-- This project now LIVES IN GOOGLE DRIVE so it is backed up / synced:
-  `C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\backtester`
-  Open future sessions here. (The old local copy at `C:\Users\andre\backtester` is stale.)
-- The virtual environment is kept LOCAL, OUTSIDE Drive, on purpose (so 320 MB of
-  machine-specific files don't churn through Drive sync):
+- This project lives at `C:\TradingDesk\backtester` — a plain local folder, deliberately
+  OUTSIDE Google Drive. Open future sessions here. It moved off Drive 2026-07-16 after
+  Drive silently synced the wrong folder for 9 days and orphaned the repo; Drive is now
+  only a backup destination for git bundles, never the working copy. Any
+  `My Drive (andrew@surberhc.com)\TradingDesk` copy is a DEAD orphan — never use it.
+- The virtual environment is kept LOCAL on purpose (so 320 MB of machine-specific files
+  aren't version-tracked or synced):
   `C:\TradingDesk-Local\venv`  ->  python at `C:\TradingDesk-Local\venv\Scripts\python.exe`
 - The Tiingo API key is read from the `TIINGO_API_KEY` environment variable (set as a
-  Windows USER env var, so the secret stays off Drive). A local `.env` outside Drive
-  also works. `.env` is NOT synced to Drive.
+  Windows USER env var). A local `.env` outside the repo also works. `.env` is never
+  committed.
 
 ## Tech stack and environment
 

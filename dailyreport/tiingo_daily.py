@@ -24,7 +24,7 @@ from pathlib import Path
 
 import status
 
-BT_ROOT = Path(r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\backtester")
+BT_ROOT = Path(__file__).resolve().parents[1] / "backtester"
 # The downloader writes the manifest wherever config points — the dataset was moved
 # off Drive (C:\TradingDesk-Local\bt_data) because Drive sync corrupts it, so the old
 # BT_ROOT/data path is dead. Resolve the SAME manifest the downloader writes, or the

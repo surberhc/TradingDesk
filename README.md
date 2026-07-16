@@ -4,8 +4,10 @@ The one home for the whole trading/market project. Everything that was scattered
 across `Market_Data`, `Tier 1 Alpha`, `backtester`, and two stray local folders gets
 sorted into the folders below.
 
-**The rule:** *code* lives here in Google Drive (synced + backed up). *Data, running
-state, the Python runtime, and secrets* live on local C: and are never synced.
+**The rule:** *code* lives here at `C:\TradingDesk` — a plain local folder, deliberately
+OUTSIDE Google Drive. *Data, running state, the Python runtime, and secrets* live on
+`C:\TradingDesk-Local\`. Drive is a backup destination for git bundles only — never the
+working copy.
 
 ## Folders (what goes where)
 

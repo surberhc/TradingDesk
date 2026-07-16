@@ -1,5 +1,5 @@
-import sys, time
-sys.path.insert(0, r"C:\Users\andre\My Drive (andrew@surberhc.com)\TradingDesk\british_ic")
+import os, sys, time
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import pandas as pd, numpy as np
 import s8_mechanical_simulator as sim
 from dataclasses import asdict
