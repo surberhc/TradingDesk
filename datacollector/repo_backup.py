@@ -28,11 +28,30 @@ Two rules fall out of that, and they are the load-bearing design of this module:
      its own folders — that is the disease), confirmed to actually live on the
      DriveFS volume, and the bundle is re-verified AFTER it lands there.
 
+TWO TRIGGERS, AND WHY BOTH STAY
+-------------------------------
+  1. `wrap` (CLAUDE.md's force-word) runs this job with --wrap, after the session's
+     conductor render/commit. This is the PRIMARY trigger: it backs the work up while
+     it is fresh. A wrap at 15:00 followed by a dead disk at 19:00 used to lose the
+     whole day, because the 20:00 task was the only thing that ever fired.
+  2. The RepoBackupDaily scheduled task (20:00 + AtLogon) STAYS as the safety net, and
+     is deliberately NOT reduced to a backstop-in-name. Andrew does not always wrap;
+     and — the load-bearing reason — the DAILY CADENCE is what feeds
+     heartbeat_alarm.py's 26h staleness check. A wrap-only trigger would go silent
+     every quiet weekend and page for a backup that was never actually missing, which
+     is precisely how an alarm gets trained into noise. The alarm only works because
+     something reliably feeds it whether or not a human showed up.
+
 WHAT IT DOES
 ------------
   * `git bundle create <dest> --all`  — a full, self-contained clone of every ref.
   * `git bundle verify` — must report BOTH "is okay" AND "records a complete
     history". Anything else is a hard failure; we do not report success.
+  * SKIPS creating a bundle when HEAD has not moved AND the most recent bundle is
+    still PROVEN good in both locations — see find_reusable_bundle. Trigger (1) can
+    fire this job many times a day; without the skip, seven identical 41MB bundles of
+    one HEAD would evict seven days of genuinely distinct history under KEEP_LAST.
+    The skip is proof-gated and errs toward bundling — see the note below.
   * Writes the bundle to the resolved Google Drive folder (TradingDesk-Backups)
     AND keeps a local copy under C:\TradingDesk-Local\backups\ (Drive is not
     trusted alone — it is the thing that just failed us).
@@ -60,6 +79,13 @@ believing a check that proved less than it appeared to:
     whole point: name+size proves a file wearing the right label exists; md5
     proves the bundle in the cloud IS the bundle on disk. What it does NOT prove:
     anything about tomorrow, and anything at all while it is UNCONFIGURED.
+  * THE HEAD-UNCHANGED SKIP, when it fires, proves that the pre-existing bundle
+    STILL verifies in BOTH places AND records the repo's CURRENT HEAD — i.e. it
+    re-earns the same guarantee a fresh bundle would, on the same evidence, rather
+    than inheriting a claim from a previous run's status file. It proves NOTHING
+    about UNCOMMITTED work: a bundle covers committed history only. That is exactly
+    why `wrap` commits FIRST and backs up second, and why this job must never commit
+    on its own (see the git helpers section).
   * EVERY OTHER CHECK HERE IS LOCAL AND PROVES NOTHING ABOUT CLOUD ARRIVAL.
     Confirming bytes are in the Drive mount is NOT confirming they are in Google's
     datacenter. With the cloud check unconfigured, the honest guarantee is exactly
@@ -82,11 +108,15 @@ deliberately does NOT match it — the prefix is `tradingdesk-repo-`, not
 `tradingdesk-full-`. Do not loosen that pattern.
 
 Run:
-    <venv python> repo_backup.py            # real run
+    <venv python> repo_backup.py            # real run (the RepoBackupDaily path)
+    <venv python> repo_backup.py --wrap     # same job, interactive: progress on stdout
+                                            #   + a compact-JSON summary as the LAST line
+    <venv python> repo_backup.py --force    # bundle even if HEAD has not moved
     <venv python> repo_backup.py --dry-run  # resolve + report, create nothing, delete nothing
 
 Exit codes: 0 = verified success (heartbeat refreshed). Non-zero = failure of some
 kind (heartbeat deliberately NOT refreshed, so the alarm goes off on schedule).
+--wrap changes the OUTPUT, never the contract: same checks, same fail-closed codes.
 """
 
 from __future__ import annotations
@@ -196,6 +226,14 @@ CLOUD_POLL_INTERVAL_S = 15
 
 MD5_CHUNK = 1024 * 1024      # the bundle is ~41MB — hash it streaming, never in RAM
 
+# The status file's `state` — what this run ACTUALLY DID, as a distinct value rather
+# than an ok=True that blurs "made you a new bundle" into "re-verified an old one".
+# A reader must never have to infer which happened.
+STATE_VERIFIED_NEW = "verified_new_bundle"
+STATE_SKIPPED_HEAD_UNCHANGED = "skipped_head_unchanged"
+STATE_DRY_RUN = "dry_run"
+STATE_FAILED = "failed"
+
 # The status file's `proves` string, one variant per outcome. These are the artifact's
 # honesty: each must be LITERALLY TRUE of the run that carries it. Overstating one is
 # the exact bug class this job exists to kill, so they are constants — pinned by
@@ -212,6 +250,24 @@ PROVES_CLOUD_FAILED = (
 PROVES_FAILED_RUN = (
     "nothing — this run did not complete a verified backup; read `errors` for the "
     "failure, and `verify_local` / `verify_drive` / `cloud` for how far it got")
+
+# The skip's `proves` is a PREFIX composed onto whichever cloud variant above the run
+# earned, because a skip changes only ONE thing about the claim: who made the bundle.
+# It must never read as "backed up" full stop — the whole point is that this run
+# created NOTHING, and the reader is owed the name of the bundle carrying the weight.
+PROVES_SKIPPED_PREFIX = (
+    "NO NEW BUNDLE WAS CREATED BY THIS RUN — HEAD is unchanged and is already covered "
+    "by the pre-existing bundle {bundle}, which records this exact HEAD and was "
+    "RE-VERIFIED just now rather than assumed good; that bundle ")
+
+
+def proves_skipped(bundle_name: str, cloud_proves: str) -> str:
+    """The `proves` string for a skipped run: the prefix + the cloud variant earned.
+
+    Composed rather than written out four times, so the cloud clause can never drift
+    away from what the cloud check actually said on a skip.
+    """
+    return PROVES_SKIPPED_PREFIX.format(bundle=bundle_name) + cloud_proves
 
 
 # --------------------------------------------------------------------------- #
@@ -482,8 +538,15 @@ def resolve_drive_dest(*, db_fn=None, candidates=None, exists_fn=None,
 
 
 # --------------------------------------------------------------------------- #
-# git helpers — READ-ONLY git only (bundle create/verify, rev-parse, rev-list).
-# This job must never mutate the repo: no add/commit/reset/checkout/clean/gc.
+# git helpers — READ-ONLY git only (bundle create/verify/list-heads, rev-parse,
+# rev-list). This job must never mutate the repo: no add/commit/reset/checkout/clean/gc.
+#
+# COMMITTING IS THE SESSION'S JOB, NOT THE BACKUP'S, and that boundary is deliberate
+# rather than incidental. `wrap` commits and THEN calls this job; if this job also
+# committed, a backup would silently change the thing it is supposed to be observing,
+# and "HEAD is unchanged" — the skip's entire premise — would become a statement about
+# the backup's own side effects instead of about Andrew's work. A read-only observer
+# can be trusted to report; a writer cannot be trusted to report on itself.
 # --------------------------------------------------------------------------- #
 def _git(args: list[str], *, cwd=None, timeout: int = GIT_TIMEOUT):
     return subprocess.run(
@@ -522,6 +585,42 @@ def bundle_verify(path, *, run_fn=None) -> tuple[bool, str]:
     return True, "okay + full history"
 
 
+def bundle_head_sha(path, *, run_fn=None) -> tuple[str | None, str]:
+    """The HEAD sha recorded INSIDE a bundle. -> (sha|None, detail)
+
+    Asked of THE BUNDLE ITSELF, never of a status file or a filename. That is the
+    point: the status JSON records what a previous RUN believed, which is exactly the
+    kind of second-hand claim this module exists to stop trusting. `git bundle
+    list-heads` reads the bundle's own header and prints '<sha> <refname>' per ref; a
+    bundle made with --all carries an explicit HEAD line (verified against a real
+    bundle on this machine 2026-07-16):
+        b50e78b9076bc85983f565167f968b0c91cb92f7 refs/heads/main
+        06dc23337b9316cdc7373db18c0074abc6842511 refs/stash
+        b50e78b9076bc85983f565167f968b0c91cb92f7 HEAD
+
+    READ-ONLY: list-heads only reads the bundle file; it does not touch the repo.
+
+    Never raises. Any doubt whatsoever — git failed, the file is not a bundle, there
+    is no HEAD line — returns None, and None means the caller BUNDLES rather than
+    skips. This function is only ever allowed to enable a skip by affirmatively
+    naming a sha.
+    """
+    run_fn = run_fn or (lambda: _git(["bundle", "list-heads", str(path)]))
+    try:
+        proc = run_fn()
+    except Exception as e:  # noqa: BLE001
+        return None, f"git bundle list-heads raised {e!r}"
+    if getattr(proc, "returncode", 1) != 0:
+        return None, (f"git bundle list-heads exited {proc.returncode}: "
+                      f"{(getattr(proc, 'stderr', '') or '')[:200]}")
+    for line in (getattr(proc, "stdout", "") or "").splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[1] == "HEAD":
+            return parts[0], f"bundle records HEAD {parts[0]}"
+    return None, ("the bundle records no HEAD ref — cannot tell which HEAD it covers, "
+                  "so it cannot be reused")
+
+
 def repo_facts(*, run_fn=None) -> dict:
     """HEAD sha + commit count across all refs. Read-only git. Never raises."""
     run_fn = run_fn or _git
@@ -539,6 +638,114 @@ def repo_facts(*, run_fn=None) -> dict:
     except Exception:  # noqa: BLE001
         pass
     return facts
+
+
+# --------------------------------------------------------------------------- #
+# The redundant-bundle skip — proof-gated, and biased toward bundling
+# --------------------------------------------------------------------------- #
+def find_reusable_bundle(local_dir, drive_dir, head_sha, *, verify_fn=None, head_fn=None,
+                         list_fn=None, exists_fn=None, log_fn=None) -> tuple[dict | None, str]:
+    """Is the most recent existing bundle ALREADY a proven-good backup of THIS HEAD?
+
+    -> (reuse_info | None, human_reason). None means CREATE A FRESH BUNDLE.
+
+    WHY THIS EXISTS: `wrap` can fire the backup several times a day. On 2026-07-16
+    three bundles were written carrying the identical head_sha (b50e78b) — ~41MB each,
+    all three redundant. Left alone, that churn evicts genuinely distinct history from
+    under KEEP_LAST=7 and replaces a week of recoverable states with seven copies of
+    one afternoon. The skip is a RETENTION-INTEGRITY measure first and a disk/time
+    saving second.
+
+    THE DANGER, and it is the only thing that matters here: a skip that fires on a bad
+    or absent bundle would report a healthy backup while there is NO good backup — the
+    2026-07-16 silent failure, rebuilt with our own hands and wired to the heartbeat.
+    So the bias is absolute and one-directional:
+
+        SKIP ONLY ON AFFIRMATIVE PROOF. BUNDLE ON ANY DOUBT.
+
+    Every condition below must AFFIRMATIVELY pass. Missing file, unreadable HEAD, a
+    failed verify, an unlistable directory, an unknown repo HEAD, an exception — every
+    one of them returns None and we bundle. The costs are wildly asymmetric: a
+    needless bundle costs ~5 seconds and 41MB; a wrong skip costs the backup. There is
+    no close call to make.
+
+    The conditions, cheapest-first (the HEAD reads parse a header; the verifies scan
+    ~41MB twice, so they go last):
+      1. the repo's current HEAD sha is known at all
+      2. a bundle THIS JOB created (BUNDLE_RE) exists in the local dir
+      3. that same bundle is present at the Drive destination too — a local-only
+         bundle is not the backup this job promises, so it does not license a skip
+      4. the LOCAL bundle's own recorded HEAD == the repo's current HEAD
+      5. the DRIVE copy's recorded HEAD matches as well — same name is not same file
+      6. the LOCAL bundle still verifies (okay + complete history)
+      7. the DRIVE copy still verifies
+    Only then may the caller skip, and only while saying whose bundle it is leaning on.
+    """
+    log_fn = log_fn or log
+    verify_fn = verify_fn or bundle_verify
+    head_fn = head_fn or bundle_head_sha
+    exists_fn = exists_fn or (lambda p: Path(p).is_file())
+    list_fn = list_fn or (lambda d: sorted(p.name for p in Path(d).iterdir()
+                                           if p.is_file()))
+
+    if not head_sha:
+        return None, ("the repo's current HEAD sha could not be read — bundling fresh "
+                      "rather than skipping on a guess")
+
+    try:
+        names = sorted(n for n in list_fn(local_dir) if BUNDLE_RE.match(n))
+    except OSError as e:
+        return None, f"could not list {local_dir} ({e!r}) — bundling fresh"
+    if not names:
+        return None, (f"no bundle this job created exists in {local_dir} yet — "
+                      f"bundling fresh")
+
+    # Newest by FILENAME (the timestamp is in the name and zero-padded, so lexical ==
+    # chronological), for the same reason retention does it that way: a Drive copy's
+    # mtime is whatever the filesystem felt like and must not decide anything.
+    name = names[-1]
+    local_path = Path(local_dir) / name
+    drive_path = Path(drive_dir) / name
+
+    if not exists_fn(local_path):
+        return None, (f"the most recent bundle {name} is MISSING from {local_dir} — "
+                      f"bundling fresh")
+    if not exists_fn(drive_path):
+        return None, (f"the most recent bundle {name} is MISSING from the Drive "
+                      f"destination {drive_dir} — bundling fresh")
+
+    local_head, lnote = head_fn(local_path)
+    if not local_head:
+        return None, (f"could not read the HEAD recorded inside {name} ({lnote}) — "
+                      f"bundling fresh")
+    if local_head != head_sha:
+        return None, (f"HEAD has MOVED since {name} (that bundle records "
+                      f"{local_head[:12]}, the repo is at {head_sha[:12]}) — bundling "
+                      f"fresh")
+
+    drive_head, dnote = head_fn(drive_path)
+    if drive_head != local_head:
+        return None, (f"the Drive copy of {name} does not record the same HEAD as the "
+                      f"local one ({dnote}) — same name is not the same file; bundling "
+                      f"fresh")
+
+    ok, verify_local = verify_fn(local_path)
+    if not ok:
+        return None, (f"the existing bundle {name} FAILED verification — {verify_local}; "
+                      f"bundling fresh (a skip here would report a backup that is not "
+                      f"there)")
+    ok, verify_drive = verify_fn(drive_path)
+    if not ok:
+        return None, (f"the Drive copy of {name} FAILED verification — {verify_drive}; "
+                      f"bundling fresh")
+
+    why = (f"HEAD {head_sha[:12]} is UNCHANGED since {name}, and that bundle was "
+           f"re-verified just now in both places (local: {verify_local}; drive: "
+           f"{verify_drive}) and records this exact HEAD — a new bundle would be a "
+           f"byte-for-byte redundant copy, so this run creates nothing")
+    log_fn(f"skip check: {why}")
+    return {"name": name, "local_path": str(local_path), "drive_path": str(drive_path),
+            "verify_local": verify_local, "verify_drive": verify_drive}, why
 
 
 # --------------------------------------------------------------------------- #
@@ -978,21 +1185,34 @@ def touch_heartbeat(text: str, *, heartbeat_file=None) -> None:
 # --------------------------------------------------------------------------- #
 # The job — injectable so tests drive it offline
 # --------------------------------------------------------------------------- #
-def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, paused_fn=None,
-               create_fn=None, verify_fn=None, copy_fn=None, prune_fn=None,
-               facts_fn=None, size_fn=None, status_fn=None, heartbeat_fn=None,
-               cloud_fn=None, log_fn=None) -> dict:
+def run_backup(*, now=None, dry_run: bool = False, force: bool = False, resolve_fn=None,
+               paused_fn=None, create_fn=None, verify_fn=None, head_fn=None,
+               reuse_fn=None, copy_fn=None, prune_fn=None, facts_fn=None, size_fn=None,
+               status_fn=None, heartbeat_fn=None, cloud_fn=None, log_fn=None) -> dict:
     """One backup run. Returns the status dict. Never raises for policy reasons.
 
     THE INVARIANT, stated once so it cannot be lost in a refactor:
         ok=True  <=>  a bundle verified okay-with-complete-history locally,
-                      AND landed on a confirmed Drive-managed destination,
-                      AND re-verified there,
+                      AND is present on a confirmed Drive-managed destination,
+                      AND verified there too,
+                      AND records the repo's CURRENT HEAD,
                       AND Drive sync was not visibly paused,
                       AND (if CLOUD_VERIFY_REQUIRED) Google confirmed the bundle's
                           md5 in the cloud.
         heartbeat is refreshed IF AND ONLY IF ok=True.
     Any other outcome leaves the heartbeat cold so the alarm fires on silence.
+
+    NOTE WHAT THE INVARIANT DOES *NOT* SAY: "this run created a bundle". A run that
+    proves the above about a bundle an EARLIER run created has established exactly the
+    same fact about the world — a verified, current, off-machine backup exists — and
+    that fact, not the act of writing 41MB, is what the heartbeat has always meant. So
+    a skip legitimately feeds it. `state` is what tells the two apart, and `proves`
+    names the bundle being leaned on; neither is allowed to blur them. Every clause is
+    RE-PROVEN on a skip (see find_reusable_bundle) — nothing is inherited from the
+    previous run's status file.
+
+    `force` bypasses the skip only. It cannot weaken a check: a forced run still has to
+    earn ok=True the same way.
 
     THE ONE ASYMMETRY, and it is deliberate: while CLOUD_VERIFY_REQUIRED is False a
     cloud-check failure does NOT set ok=False — it downgrades `proves` and is
@@ -1005,6 +1225,8 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, paused_fn=No
     resolve_fn = resolve_fn or resolve_drive_dest
     paused_fn = paused_fn or is_sync_paused
     verify_fn = verify_fn or bundle_verify
+    head_fn = head_fn or bundle_head_sha
+    reuse_fn = reuse_fn or find_reusable_bundle
     facts_fn = facts_fn or repo_facts
     prune_fn = prune_fn or prune_old_bundles
     status_fn = status_fn or write_status
@@ -1021,6 +1243,9 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, paused_fn=No
         "job": "repo_backup",
         "timestamp": now.isoformat(timespec="seconds"),
         "ok": False,
+        # What this run DID — never inferred from ok. Like `proves`, it starts at the
+        # pessimistic value and is only ever RAISED by something that actually happened.
+        "state": STATE_FAILED,
         "bundle_name": name,
         "local_path": None,
         "drive_path": None,
@@ -1035,6 +1260,8 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, paused_fn=No
         "drive_note": None,
         "sync_paused": None,
         "sync_note": None,
+        "forced": bool(force),
+        "reuse_note": None,
         "pruned_local": [],
         "pruned_drive": [],
         "cloud": {"checked": False, "state": "skipped_not_configured",
@@ -1054,6 +1281,7 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, paused_fn=No
     def _fail(msg: str) -> dict:
         st["errors"].append(msg)
         st["ok"] = False
+        st["state"] = STATE_FAILED
         st["proves"] = PROVES_FAILED_RUN
         log_fn(f"FAIL: {msg}")
         status_fn(st)
@@ -1089,81 +1317,125 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, paused_fn=No
 
     if dry_run:
         st["ok"] = False
+        st["state"] = STATE_DRY_RUN
         st["errors"].append("dry-run: created nothing, deleted nothing, "
                             "heartbeat NOT refreshed")
         log_fn(f"dry-run: would write {name} to {info['dest']} and {LOCAL_BACKUP_DIR}")
         status_fn(st)
         return st
 
-    # 3. Bundle locally, then verify locally.
     local_dir = LOCAL_BACKUP_DIR
     try:
         local_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         return _fail(f"could not create local backup dir {local_dir} ({e!r})")
-    local_path = local_dir / name
-    st["local_path"] = str(local_path)
-
-    create = create_fn or (lambda dest: _git(["bundle", "create", str(dest), "--all"]))
-    try:
-        proc = create(local_path)
-    except Exception as e:  # noqa: BLE001
-        return _fail(f"git bundle create raised {e!r}")
-    if getattr(proc, "returncode", 1) != 0:
-        return _fail(f"git bundle create failed: "
-                     f"{(getattr(proc, 'stderr', '') or '')[:400]}")
-
-    ok, detail = verify_fn(local_path)
-    st["verify_local"] = detail
-    if not ok:
-        return _fail(f"LOCAL bundle failed verification — {detail}")
-    try:
-        st["size_bytes"] = size_fn(local_path)
-    except OSError:
-        pass
-    log_fn(f"local bundle verified: {local_path} ({st['size_bytes']} bytes)")
-
-    # 4. Copy to Drive, then RE-VERIFY at the destination. Verifying the copy is what
-    #    turns "we called copy()" into "git can read a complete bundle over there".
     dest_dir = Path(info["dest"])
-    try:
-        dest_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        return _fail(f"could not create Drive backup dir {dest_dir} ({e!r})")
-    drive_path = dest_dir / name
-    st["drive_path"] = str(drive_path)
-    try:
-        copy_fn(local_path, drive_path)
-    except Exception as e:  # noqa: BLE001
-        return _fail(f"copy to Drive destination failed ({e!r})")
 
-    ok, detail = verify_fn(drive_path)
-    st["verify_drive"] = detail
-    if not ok:
-        return _fail(f"bundle at the DRIVE destination failed verification — {detail}")
-    log_fn(f"drive bundle verified: {drive_path}")
+    # 3. SKIP CHECK. Is the newest existing bundle already a PROVEN-good backup of the
+    #    current HEAD, in both places? Only affirmative proof buys a skip; anything
+    #    else — including "we couldn't tell" — falls through and bundles. See
+    #    find_reusable_bundle for why the asymmetry is absolute.
+    reused = None
+    if force:
+        st["reuse_note"] = ("--force: the HEAD-unchanged check was not consulted; "
+                            "bundling unconditionally")
+        log_fn(st["reuse_note"])
+    else:
+        reused, why = reuse_fn(local_dir, dest_dir, st["head_sha"],
+                               verify_fn=verify_fn, head_fn=head_fn, log_fn=log_fn)
+        st["reuse_note"] = why
+        if not reused:
+            log_fn(f"bundling fresh: {why}")
+
+    if reused:
+        # 3a. Reuse. Note what did NOT happen: no create, no copy, no claim carried
+        #     over from the previous run. Every field below was PROVEN moments ago by
+        #     find_reusable_bundle against the files as they exist right now.
+        name = reused["name"]
+        local_path = Path(reused["local_path"])
+        drive_path = Path(reused["drive_path"])
+        st["bundle_name"] = name
+        st["local_path"] = reused["local_path"]
+        st["drive_path"] = reused["drive_path"]
+        st["verify_local"] = reused["verify_local"]
+        st["verify_drive"] = reused["verify_drive"]
+        st["state"] = STATE_SKIPPED_HEAD_UNCHANGED
+        try:
+            st["size_bytes"] = size_fn(local_path)
+        except OSError:
+            pass
+        log_fn(f"SKIP: no new bundle — {name} already covers HEAD {st['head_sha']}")
+    else:
+        # 3b. Bundle locally, then verify locally.
+        local_path = local_dir / name
+        st["local_path"] = str(local_path)
+
+        create = create_fn or (lambda dest: _git(["bundle", "create", str(dest), "--all"]))
+        try:
+            proc = create(local_path)
+        except Exception as e:  # noqa: BLE001
+            return _fail(f"git bundle create raised {e!r}")
+        if getattr(proc, "returncode", 1) != 0:
+            return _fail(f"git bundle create failed: "
+                         f"{(getattr(proc, 'stderr', '') or '')[:400]}")
+
+        ok, detail = verify_fn(local_path)
+        st["verify_local"] = detail
+        if not ok:
+            return _fail(f"LOCAL bundle failed verification — {detail}")
+        try:
+            st["size_bytes"] = size_fn(local_path)
+        except OSError:
+            pass
+        log_fn(f"local bundle verified: {local_path} ({st['size_bytes']} bytes)")
+
+        # 4. Copy to Drive, then RE-VERIFY at the destination. Verifying the copy is
+        #    what turns "we called copy()" into "git can read a complete bundle there".
+        try:
+            dest_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            return _fail(f"could not create Drive backup dir {dest_dir} ({e!r})")
+        drive_path = dest_dir / name
+        st["drive_path"] = str(drive_path)
+        try:
+            copy_fn(local_path, drive_path)
+        except Exception as e:  # noqa: BLE001
+            return _fail(f"copy to Drive destination failed ({e!r})")
+
+        ok, detail = verify_fn(drive_path)
+        st["verify_drive"] = detail
+        if not ok:
+            return _fail(f"bundle at the DRIVE destination failed verification — {detail}")
+        log_fn(f"drive bundle verified: {drive_path}")
+        st["state"] = STATE_VERIFIED_NEW
 
     # 5. CLOUD ARRIVAL. Everything above this line is a local filesystem check and
     #    proves nothing about Google having the bytes — which is the failure that ran
     #    silent for 9 days. We md5 the LOCAL bundle (the canonical artifact) and ask
     #    Drive for its own md5: matching md5s prove the cloud copy IS this bundle.
     #    Runs BEFORE retention, so a fail-closed cloud failure deletes nothing.
+    #
+    #    A SKIPPED run runs this too, against the bundle it is leaning on. It must:
+    #    otherwise flipping CLOUD_VERIFY_REQUIRED to True would leave a hole where a
+    #    skip quietly feeds the heartbeat with no cloud proof — the requirement
+    #    silently not applying to the majority of runs. The check is the same, the
+    #    fail-closed decision is the same; only the bundle's author differs.
     cloud = cloud_fn(local_path, name)
     st["cloud"] = cloud
     state = cloud.get("state")
     if state == "verified":
-        st["proves"] = PROVES_CLOUD_VERIFIED
+        cloud_proves = PROVES_CLOUD_VERIFIED
         log_fn(f"cloud arrival VERIFIED: {cloud.get('note')}")
     elif state == "skipped_not_configured":
         # Not configured is not the same as passed, and the artifact must not blur
         # the two. The job still succeeds; `proves` says plainly it wasn't checked.
-        st["proves"] = PROVES_CLOUD_NOT_CHECKED
+        cloud_proves = PROVES_CLOUD_NOT_CHECKED
         log_fn(f"cloud arrival NOT CHECKED: {cloud.get('note')}")
         if CLOUD_VERIFY_REQUIRED:
             return _fail(f"cloud-arrival verification is REQUIRED but no usable Drive "
                          f"API credential is configured — {cloud.get('note')}")
     else:
-        st["proves"] = PROVES_CLOUD_FAILED
+        cloud_proves = PROVES_CLOUD_FAILED
         log_fn(f"CLOUD ARRIVAL CHECK FAILED: {cloud.get('note')}")
         if CLOUD_VERIFY_REQUIRED:
             return _fail(f"cloud-arrival verification FAILED — {cloud.get('note')}")
@@ -1172,20 +1444,98 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, paused_fn=No
             f"False — the local + Drive-volume bundle still verified) — "
             f"{cloud.get('note')}")
 
+    # A skip earns the SAME cloud clause, wrapped in the admission that this run
+    # created nothing and the name of the bundle actually carrying the backup.
+    st["proves"] = proves_skipped(name, cloud_proves) if reused else cloud_proves
+
     # 6. Retention — only our own bundles, only in the two allow-listed dirs.
     allowed = [str(local_dir), str(dest_dir)]
     st["pruned_local"] = prune_fn(local_dir, KEEP_LAST, allowed_dirs=allowed)
     st["pruned_drive"] = prune_fn(dest_dir, KEEP_LAST, allowed_dirs=allowed)
 
-    # 7. Success — and ONLY now does the heartbeat move.
+    # 7. Success — and ONLY now does the heartbeat move. A skip reaches here honestly:
+    #    a verified bundle covering the current HEAD exists in both places, which is
+    #    the only thing this heartbeat has ever asserted. It still SAYS which it was,
+    #    so the one line a paged human reads at 2am cannot imply work that never
+    #    happened.
     st["ok"] = True
     status_fn(st)
+    made = "no-new-bundle(HEAD unchanged, re-verified)" if reused else "new-bundle"
     heartbeat_fn(
         f"{now:%Y-%m-%d %H:%M:%S}  repo backup verified  head={st['head_sha']} "
         f"commits={st['commit_count']} size={st['size_bytes']} "
-        f"verify=okay+full-history cloud={state} drive={drive_path}")
-    log_fn(f"SUCCESS: verified backup {name} -> local + Drive (cloud={state})")
+        f"verify=okay+full-history {made} cloud={state} drive={drive_path}")
+    log_fn(f"SUCCESS: verified backup {name} -> local + Drive "
+           f"(state={st['state']} cloud={state})")
     return st
+
+
+# --------------------------------------------------------------------------- #
+# --wrap — the interactive path (CLAUDE.md's `wrap` force-word runs this)
+# --------------------------------------------------------------------------- #
+# Output only. --wrap adds a banner, a human summary, and a machine-readable last
+# line; it changes NO check and NO exit code. The scheduled path stays as quiet as it
+# is today (log() already prints, and under Task Scheduler that goes nowhere anyway).
+def wrap_summary(st: dict | None, *, error: str | None = None) -> dict:
+    """The compact JSON printed as the LAST line of a --wrap run.
+
+    This is what the calling session reports from — so it carries `proves` and
+    `errors`, not just `ok`. A session that says "backed up ✓" off a bare boolean has
+    reinvented the silent green light in a nicer font; `state` and `proves` are what
+    make the report say what actually happened.
+    """
+    st = st or {}
+    out = {
+        "ok": bool(st.get("ok")),
+        "state": st.get("state") or STATE_FAILED,
+        "bundle_name": st.get("bundle_name"),
+        "head_sha": st.get("head_sha"),
+        "size_bytes": st.get("size_bytes"),
+        "verify_local": st.get("verify_local"),
+        "verify_drive": st.get("verify_drive"),
+        "drive_path": st.get("drive_path"),
+        "cloud_state": (st.get("cloud") or {}).get("state"),
+        "errors": list(st.get("errors") or []),
+        "proves": st.get("proves") or PROVES_FAILED_RUN,
+    }
+    if error:
+        out["ok"] = False
+        out["state"] = STATE_FAILED
+        out["errors"] = out["errors"] + [error]
+        out["proves"] = PROVES_FAILED_RUN
+    return out
+
+
+_WRAP_VERDICT = {
+    STATE_VERIFIED_NEW: "NEW VERIFIED BUNDLE — local + Drive",
+    STATE_SKIPPED_HEAD_UNCHANGED: "NO NEW BUNDLE — HEAD unchanged; the existing bundle "
+                                  "was re-verified in both places",
+    STATE_DRY_RUN: "DRY RUN — nothing created, nothing deleted, heartbeat untouched",
+    STATE_FAILED: "FAILED — this run did NOT establish a verified backup",
+}
+
+
+def print_wrap_report(st: dict | None, *, error: str | None = None, out_fn=None) -> dict:
+    """Human summary, then the compact JSON. The JSON is ALWAYS the final line.
+
+    Emitted on failure too: a session that wraps and gets nothing machine-readable back
+    would have to guess, and guessing about backups is the whole problem.
+    """
+    out_fn = out_fn or (lambda s: print(s, flush=True))
+    s = wrap_summary(st, error=error)
+    out_fn("")
+    out_fn(f"  result : {_WRAP_VERDICT.get(s['state'], s['state'])}")
+    out_fn(f"  bundle : {s['bundle_name']}  ({s['size_bytes']} bytes)")
+    out_fn(f"  head   : {s['head_sha']}")
+    out_fn(f"  verify : local={s['verify_local']}  |  drive={s['verify_drive']}")
+    out_fn(f"  drive  : {s['drive_path']}")
+    out_fn(f"  cloud  : {s['cloud_state']}")
+    for e in s["errors"]:
+        out_fn(f"  ERROR  : {e}")
+    out_fn(f"  proves : {s['proves']}")
+    out_fn("")
+    out_fn(json.dumps(s, separators=(",", ":"), default=str))   # LAST LINE. Keep it last.
+    return s
 
 
 def main() -> int:
@@ -1193,12 +1543,26 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="resolve + report only; create nothing, delete nothing, "
                          "and never refresh the heartbeat.")
+    ap.add_argument("--force", action="store_true",
+                    help="bundle even if HEAD has not moved since the newest verified "
+                         "bundle (bypasses the redundant-bundle skip; weakens no check).")
+    ap.add_argument("--wrap", action="store_true",
+                    help="interactive mode for CLAUDE.md's `wrap` force-word: identical "
+                         "job and identical fail-closed exit codes, plus progress on "
+                         "stdout and a compact-JSON summary as the LAST line.")
     args = ap.parse_args()
+
+    if args.wrap:
+        print(f"repo backup (wrap): {REPO} -> local + Drive, verifying both.", flush=True)
     try:
-        st = run_backup(dry_run=args.dry_run)
+        st = run_backup(dry_run=args.dry_run, force=args.force)
     except Exception as e:  # noqa: BLE001 — an unexpected error is still a FAILED backup
         log(f"UNEXPECTED ERROR (reporting failure, NOT success): {e!r}")
+        if args.wrap:
+            print_wrap_report(None, error=f"unexpected error: {e!r}")
         return 2
+    if args.wrap:
+        print_wrap_report(st)
     if args.dry_run:
         return 0 if st.get("drive_resolved") else 1
     return 0 if st.get("ok") else 1

@@ -44,7 +44,7 @@ Rule #1 bars curve-fitting the **strategy**; it does not license curve-fitting t
   (shared IBKR/Tiingo access + the collision-proof clientId registry), `datacollector\`
   (options warehouse), `dailyreport\` (EOD regime email), `msr\` (newsletter→features),
   `docs\` (specs/handoffs/plans), `conductor\` (STATUS + handoffs).
-- The clientId registry in `connections\clientids.py` is authoritative — never collide.
+- The clientId registry in `connections\connections\clientids.py` is authoritative — never collide.
 
 ## How we work together
 - **Delegate everything.** Andrew's time is the scarce resource. Hand all non-trivial work
@@ -73,7 +73,12 @@ Rule #1 bars curve-fitting the **strategy**; it does not license curve-fitting t
   `conductor\status_export.md` from the DB, don't hand-edit `STATUS.md` directly.
   Also write dated handoffs / memory where appropriate. See `docs\CONCURRENT_SESSIONS.md`
   for the worktree workflow when running genuinely parallel sessions. The force-word
-  **`wrap`** triggers a full sweep on demand.
+  **`wrap`** triggers a full sweep on demand, and then — after the conductor
+  render/commit, so the commit is inside the bundle — runs the repo backup
+  (`datacollector\run_repo_backup_wrap.cmd`). Report its verified result from the
+  summary's last line (`state` + `proves`, never a bare "backed up"); a non-zero exit
+  means there is NO verified backup, so say that plainly. The 20:00 RepoBackupDaily task
+  stays as the safety net regardless.
 - **No ceremony.** No startup audit, no rule recital, no charter prompt, no shutdown
   routine. This contract governs silently. Andrew can override in the moment.
 

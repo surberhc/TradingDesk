@@ -26,6 +26,7 @@ import io
 import json
 import os
 import subprocess
+import sys
 import types
 import urllib.error
 import urllib.parse
@@ -110,8 +111,15 @@ def _run(tmp_path, monkeypatch, **over):
         "heartbeat_fn": over.get("heartbeat_fn", Recorder(None)),
         "cloud_fn": over.get("cloud_fn", Recorder(_cloud())),
         "log_fn": over.get("log_fn", Recorder(None)),
+        # The `git bundle list-heads` seam. reuse_fn is deliberately NOT faked: the
+        # skip DECISION is the thing under test, so the real find_reusable_bundle runs
+        # against real temp dirs with only git faked out from under it. In the tests
+        # that seed no bundle it short-circuits before head_fn is ever called, so this
+        # suite stays as offline as it was.
+        "head_fn": over.get("head_fn", Recorder((None, "no HEAD line"))),
     }
-    st = rb.run_backup(now=NOW, dry_run=over.get("dry_run", False), **fakes)
+    st = rb.run_backup(now=NOW, dry_run=over.get("dry_run", False),
+                       force=over.get("force", False), **fakes)
     return st, fakes
 
 
@@ -487,6 +495,375 @@ def test_dry_run_creates_nothing_and_leaves_heartbeat_alone(tmp_path, monkeypatc
     assert f["prune_fn"].calls == 0
     assert f["heartbeat_fn"].calls == 0
     assert st["ok"] is False          # a dry run is NEVER a successful backup
+
+
+# --------------------------------------------------------------------------- #
+# THE REDUNDANT-BUNDLE SKIP — must never mask a broken backup
+# --------------------------------------------------------------------------- #
+# Real shas from this machine 2026-07-16: three bundles were written that day all
+# carrying HEAD b50e78b (identical, ~41MB each, all three redundant), and the repo has
+# since moved to e820aab. Those are the two states the skip has to tell apart.
+OLD_HEAD = "b50e78b9076bc85983f565167f968b0c91cb92f7"
+CUR_HEAD = "e820aab43efed21b25a380ac8d56e7ab895586f0"
+EXISTING = "tradingdesk-repo-20260716-151950.bundle"    # the real newest bundle's name
+
+# THE BIAS UNDER TEST, stated once: skip ONLY on affirmative proof, bundle on ANY
+# doubt. Every "does not skip" test below is really asserting that a needless 41MB
+# bundle is always the cheaper mistake. The tests are lopsided on purpose — one wrong
+# skip reports a healthy backup while there is none, which is the 2026-07-16 silent
+# failure rebuilt by our own hands and wired straight to the heartbeat.
+
+
+def _seed(tmp_path, name=EXISTING, *, local=True, drive=True, content=b"bundle-bytes"):
+    """Leave a bundle where a previous run would have left it. Mirrors _run's dirs."""
+    ldir = tmp_path / "backups"
+    ddir = tmp_path / "drive" / "My Drive" / "TradingDesk-Backups"
+    ldir.mkdir(parents=True, exist_ok=True)
+    ddir.mkdir(parents=True, exist_ok=True)
+    if local:
+        (ldir / name).write_bytes(content)
+    if drive:
+        (ddir / name).write_bytes(content)
+    return ldir, ddir
+
+
+def _head_fn(local_sha, drive_sha="same"):
+    """Fake `git bundle list-heads`, answering per PATH.
+
+    The local copy and the Drive copy are asked SEPARATELY and can be made to
+    disagree — 'same name' is not 'same file', and the skip has to know that.
+    """
+    def head_fn(path):
+        sha = local_sha if drive_sha == "same" or "TradingDesk-Backups" not in str(path) \
+            else drive_sha
+        return (sha, f"bundle records HEAD {sha}") if sha else (None, "no HEAD line")
+    return head_fn
+
+
+def _facts(head=CUR_HEAD):
+    return Recorder({"head_sha": head, "commit_count": 298})
+
+
+def test_head_unchanged_and_bundle_still_good_skips_and_creates_nothing(tmp_path, monkeypatch):
+    """THE POINT OF THE WHOLE BUILD. `wrap` fires this job whenever Andrew wraps; if
+    HEAD has not moved, a new bundle would be a byte-for-byte twin of the last one.
+    Seven of those evict seven days of genuinely distinct history under KEEP_LAST."""
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD))
+    assert st["state"] == rb.STATE_SKIPPED_HEAD_UNCHANGED
+    assert st["ok"] is True
+    assert f["create_fn"].calls == 0          # no redundant 41MB twin
+    assert f["copy_fn"].calls == 0
+    assert st["bundle_name"] == EXISTING      # the run reports the bundle it LEANED ON
+    # Nothing was inherited from the last run's status file: BOTH copies were verified
+    # again, right now, before the skip was allowed.
+    assert f["verify_fn"].calls == 2
+    verified = [str(a[0][0]) for a in f["verify_fn"].args]
+    assert all(EXISTING in p for p in verified)
+    assert any("TradingDesk-Backups" in p for p in verified)
+
+
+def test_a_skipped_run_refreshes_the_heartbeat(tmp_path, monkeypatch):
+    """A verified, current, off-machine bundle EXISTS — which is the only thing this
+    heartbeat has ever asserted. Leaving it cold would page for a backup that is
+    sitting right there, and a page that is wrong is how the alarm becomes noise."""
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD))
+    assert f["heartbeat_fn"].calls == 1
+    text = f["heartbeat_fn"].args[0][0][0]
+    # ...but the one line a paged human reads at 2am must not imply work that never
+    # happened.
+    assert "no-new-bundle" in text
+    assert "HEAD unchanged" in text
+    assert "COMPLETE" not in text.upper()     # still must not trip assess()'s marker
+
+
+def test_a_skipped_run_proves_string_says_no_new_bundle_and_names_the_covering_one(
+        tmp_path, monkeypatch):
+    """THE HONESTY ASSERTION. An overstated `proves` is the exact bug class this file's
+    recent history is about. A skip must say (a) it created nothing and (b) WHICH
+    bundle is actually carrying the backup — otherwise 'ok: true' reads as 'I backed
+    you up just now', which is false."""
+    _seed(tmp_path)
+    st, _ = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD))
+    assert "NO NEW BUNDLE WAS CREATED BY THIS RUN" in st["proves"]
+    assert EXISTING in st["proves"]                       # names the covering bundle
+    assert "RE-VERIFIED just now" in st["proves"]
+    assert "does NOT prove cloud arrival" in st["proves"]  # the cloud clause survives
+    assert st["proves"] == rb.proves_skipped(EXISTING, rb.PROVES_CLOUD_NOT_CHECKED)
+
+
+def test_head_unchanged_but_no_bundle_exists_bundles_fresh(tmp_path, monkeypatch):
+    """Nothing to lean on — the only honest move is to make one."""
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD))
+    assert st["state"] == rb.STATE_VERIFIED_NEW
+    assert f["create_fn"].calls == 1
+    assert "no bundle this job created exists" in st["reuse_note"]
+    assert "NO NEW BUNDLE" not in st["proves"]
+
+
+def test_head_unchanged_but_the_prior_bundle_is_MISSING_bundles_fresh(tmp_path, monkeypatch):
+    """The bundle is gone from disk. A skip here would report a backup that does not
+    exist — the failure mode this whole module was written after."""
+    _seed(tmp_path)
+    (tmp_path / "backups" / EXISTING).unlink()
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD))
+    assert st["state"] == rb.STATE_VERIFIED_NEW
+    assert f["create_fn"].calls == 1
+    assert f["heartbeat_fn"].calls == 1
+    assert "NO NEW BUNDLE" not in st["proves"]
+    assert st["proves"] == rb.PROVES_CLOUD_NOT_CHECKED
+
+
+def test_a_local_only_bundle_does_not_license_a_skip(tmp_path, monkeypatch):
+    """It is missing from DRIVE. A local-only bundle is not the backup this job
+    promises — the machine is the thing we are insuring against."""
+    _seed(tmp_path, drive=False)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD))
+    assert st["state"] == rb.STATE_VERIFIED_NEW
+    assert f["create_fn"].calls == 1
+    assert "MISSING from the Drive destination" in st["reuse_note"]
+    assert "NO NEW BUNDLE" not in st["proves"]
+
+
+def test_head_unchanged_but_the_prior_bundle_FAILS_verification_bundles_fresh(
+        tmp_path, monkeypatch):
+    """The bundle is there and covers the right HEAD, but it is CORRUPT. Skipping on it
+    would hand the heartbeat a green light backed by an unusable file."""
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD),
+                 verify_fn=Recorder(values=[
+                     (False, "git bundle verify exited 1: corrupt"),   # the reuse probe
+                     (True, "okay + full history"),                    # the fresh local
+                     (True, "okay + full history")]))                  # the fresh drive
+    assert st["state"] == rb.STATE_VERIFIED_NEW
+    assert f["create_fn"].calls == 1
+    assert "FAILED verification" in st["reuse_note"]
+    assert "a skip here would report a backup that is not there" in st["reuse_note"]
+    assert "NO NEW BUNDLE" not in st["proves"]
+
+
+def test_head_moved_bundles_fresh(tmp_path, monkeypatch):
+    """The ordinary case: new commits since the last bundle, so there is new history to
+    back up. The existing bundle records b50e78b; the repo is at e820aab."""
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(CUR_HEAD),
+                 head_fn=_head_fn(OLD_HEAD))
+    assert st["state"] == rb.STATE_VERIFIED_NEW
+    assert f["create_fn"].calls == 1
+    assert f["copy_fn"].calls == 1
+    assert "HEAD has MOVED" in st["reuse_note"]
+    assert st["bundle_name"] == "tradingdesk-repo-20260716-120000.bundle"   # a NEW one
+    assert "NO NEW BUNDLE" not in st["proves"]
+
+
+def test_force_bundles_even_when_head_is_unchanged(tmp_path, monkeypatch):
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD),
+                 force=True)
+    assert st["state"] == rb.STATE_VERIFIED_NEW
+    assert st["forced"] is True
+    assert f["create_fn"].calls == 1
+    assert "--force" in st["reuse_note"]
+    assert "NO NEW BUNDLE" not in st["proves"]
+    # --force bypasses the SKIP. It must not buy a weaker result than any other run.
+    assert st["ok"] is True
+    assert st["proves"] == rb.PROVES_CLOUD_NOT_CHECKED
+
+
+def test_force_cannot_turn_a_failed_backup_into_a_pass(tmp_path, monkeypatch):
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD),
+                 force=True, verify_fn=Recorder((False, "corrupt")))
+    assert st["ok"] is False
+    assert st["state"] == rb.STATE_FAILED
+    assert f["heartbeat_fn"].calls == 0
+    assert st["proves"] == rb.PROVES_FAILED_RUN
+
+
+def test_a_skipped_run_still_runs_the_cloud_check_against_the_bundle_it_leans_on(
+        tmp_path, monkeypatch):
+    """Otherwise flipping CLOUD_VERIFY_REQUIRED to True would silently not apply to the
+    majority of runs — the requirement would look enforced and mostly not be."""
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD),
+                 cloud_fn=Recorder(_cloud("verified")))
+    assert f["cloud_fn"].calls == 1
+    assert f["cloud_fn"].args[0][0][1] == EXISTING        # the EXISTING bundle's name
+    assert st["proves"] == rb.proves_skipped(EXISTING, rb.PROVES_CLOUD_VERIFIED)
+    assert "NO NEW BUNDLE WAS CREATED BY THIS RUN" in st["proves"]
+    assert "confirmed present in Google's cloud" in st["proves"]
+
+
+def test_a_skipped_run_fails_closed_when_the_cloud_check_is_required(tmp_path, monkeypatch):
+    _seed(tmp_path)
+    monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", True)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD),
+                 cloud_fn=Recorder(_cloud("failed", note="MD5 MISMATCH")))
+    assert st["ok"] is False
+    assert st["state"] == rb.STATE_FAILED
+    assert f["heartbeat_fn"].calls == 0
+    assert f["prune_fn"].calls == 0
+    assert st["proves"] == rb.PROVES_FAILED_RUN
+
+
+# --------------------------------------------------------------------------- #
+# find_reusable_bundle() — the decision matrix, at the unit seam
+# --------------------------------------------------------------------------- #
+def _reuse(**over):
+    """Drive find_reusable_bundle with every collaborator faked. -> (info|None, why).
+
+    Defaults are the ALL-CLEAR case, so each test below flips exactly ONE condition
+    and asserts it alone is enough to force a fresh bundle.
+    """
+    head_sha = over.pop("head_sha", CUR_HEAD)
+    kw = {
+        "verify_fn": lambda p: (True, "okay + full history"),
+        "head_fn": lambda p: (CUR_HEAD, f"bundle records HEAD {CUR_HEAD}"),
+        "list_fn": lambda d: [EXISTING],
+        "exists_fn": lambda p: True,
+        "log_fn": lambda m: None,
+    }
+    kw.update(over)
+    return rb.find_reusable_bundle(r"C:\local", r"X:\My Drive\TradingDesk-Backups",
+                                   head_sha, **kw)
+
+
+def test_reuse_all_clear_returns_the_bundle_and_both_verifications():
+    info, why = _reuse()
+    assert info["name"] == EXISTING
+    assert info["verify_local"] == "okay + full history"
+    assert info["verify_drive"] == "okay + full history"
+    assert "UNCHANGED" in why
+
+
+def test_reuse_refuses_when_the_repo_head_is_unknown():
+    """repo_facts() never raises — it returns head_sha=None when git is unhappy. An
+    unknown HEAD cannot be 'unchanged'; it can only be unknown."""
+    info, why = _reuse(head_sha=None)
+    assert info is None
+    assert "could not be read" in why
+    assert "rather than skipping on a guess" in why
+
+
+def test_reuse_refuses_when_the_directory_cannot_be_listed():
+    def boom(d):
+        raise OSError("access denied")
+    info, why = _reuse(list_fn=boom)
+    assert info is None
+    assert "bundling fresh" in why
+
+
+def test_reuse_ignores_files_that_are_not_bundles_this_job_made():
+    """Same strict BUNDLE_RE as retention. The hand-made rescue bundle is not ours and
+    must not be leaned on — we did not make it and cannot vouch for its provenance."""
+    info, why = _reuse(list_fn=lambda d: ["tradingdesk-full-20260716.bundle", "notes.txt"])
+    assert info is None
+    assert "no bundle this job created" in why
+
+
+def test_reuse_picks_the_newest_by_filename_not_by_mtime():
+    """Lexical == chronological by construction, and a Drive copy's mtime is whatever
+    the filesystem felt like — the same reasoning retention uses."""
+    info, why = _reuse(list_fn=lambda d: [
+        "tradingdesk-repo-20260716-144429.bundle",
+        "tradingdesk-repo-20260716-151950.bundle",     # newest
+        "tradingdesk-repo-20260716-145240.bundle"])
+    assert info["name"] == "tradingdesk-repo-20260716-151950.bundle"
+
+
+def test_reuse_refuses_when_the_local_file_vanished_between_list_and_use():
+    info, why = _reuse(exists_fn=lambda p: False)
+    assert info is None
+    assert "MISSING" in why
+
+
+def test_reuse_refuses_when_the_bundles_head_cannot_be_read():
+    """A bundle we cannot interrogate is a bundle we cannot vouch for."""
+    info, why = _reuse(head_fn=lambda p: (None, "the bundle records no HEAD ref"))
+    assert info is None
+    assert "could not read the HEAD recorded inside" in why
+
+
+def test_reuse_refuses_when_head_has_moved():
+    info, why = _reuse(head_fn=lambda p: (OLD_HEAD, "records HEAD"))
+    assert info is None
+    assert "HEAD has MOVED" in why
+    assert OLD_HEAD[:12] in why and CUR_HEAD[:12] in why
+
+
+def test_reuse_refuses_when_the_drive_copy_records_a_different_head():
+    """Same NAME is not same FILE. The Drive folder is the thing that has already lied
+    to us once; a matching filename over there proves nothing on its own."""
+    def head_fn(p):
+        sha = OLD_HEAD if "My Drive" in str(p) else CUR_HEAD
+        return sha, f"bundle records HEAD {sha}"
+    info, why = _reuse(head_fn=head_fn)
+    assert info is None
+    assert "does not record the same HEAD" in why
+    assert "same name is not the same file" in why
+
+
+def test_reuse_refuses_when_the_local_bundle_fails_verification():
+    info, why = _reuse(verify_fn=lambda p: (False, "git bundle verify exited 1: corrupt"))
+    assert info is None
+    assert "FAILED verification" in why
+
+
+def test_reuse_refuses_when_only_the_drive_copy_fails_verification():
+    calls = {"n": 0}
+
+    def verify_fn(p):
+        calls["n"] += 1
+        return (True, "okay + full history") if calls["n"] == 1 else (False, "corrupt")
+    info, why = _reuse(verify_fn=verify_fn)
+    assert info is None
+    assert "Drive copy" in why and "FAILED verification" in why
+
+
+def test_reuse_checks_the_cheap_things_before_scanning_41MB_twice():
+    """Ordering, pinned: the HEAD reads parse a header, the verifies scan the whole
+    bundle. A moved HEAD must not cost two full scans on every single wrap."""
+    verify = Recorder((True, "okay + full history"))
+    info, _ = _reuse(head_fn=lambda p: (OLD_HEAD, "records HEAD"), verify_fn=verify)
+    assert info is None
+    assert verify.calls == 0
+
+
+# --------------------------------------------------------------------------- #
+# bundle_head_sha() — asks the BUNDLE, never a status file
+# --------------------------------------------------------------------------- #
+def test_bundle_head_sha_parses_real_list_heads_output():
+    """Verbatim `git bundle list-heads` output from a real bundle on this machine
+    (2026-07-16). A bundle made with --all carries an explicit HEAD line."""
+    real = (f"{OLD_HEAD} refs/heads/main\n"
+            f"06dc23337b9316cdc7373db18c0074abc6842511 refs/stash\n"
+            f"{OLD_HEAD} HEAD\n")
+    sha, note = rb.bundle_head_sha("x.bundle", run_fn=lambda: _proc(0, stdout=real))
+    assert sha == OLD_HEAD
+    assert OLD_HEAD in note
+
+
+def test_bundle_head_sha_returns_None_when_git_fails():
+    sha, note = rb.bundle_head_sha(
+        "x.bundle", run_fn=lambda: _proc(1, stderr="error: not a bundle"))
+    assert sha is None
+    assert "exited 1" in note
+
+
+def test_bundle_head_sha_returns_None_when_there_is_no_HEAD_line():
+    """A bundle without a HEAD ref cannot tell us which HEAD it covers, so it can never
+    justify a skip — no guessing from refs/heads/main."""
+    sha, note = rb.bundle_head_sha(
+        "x.bundle", run_fn=lambda: _proc(0, stdout=f"{OLD_HEAD} refs/heads/main\n"))
+    assert sha is None
+    assert "no HEAD ref" in note
+
+
+def test_bundle_head_sha_survives_raising_git():
+    sha, note = rb.bundle_head_sha("x.bundle", run_fn=_raise)
+    assert sha is None
+    assert "raised" in note
 
 
 # --------------------------------------------------------------------------- #
@@ -962,6 +1339,166 @@ def test_every_proves_variant_disclaims_what_it_did_not_prove():
         assert "does NOT prove cloud arrival" in s
     assert "does NOT prove" not in rb.PROVES_CLOUD_VERIFIED
     assert rb.PROVES_FAILED_RUN.startswith("nothing")
+
+
+def test_the_skipped_proves_variant_admits_it_created_nothing_and_names_the_bundle():
+    """The skip's `proves` is COMPOSED (prefix + whichever cloud variant the run
+    earned) rather than written out four times, so the cloud clause can never drift
+    from what the cloud check actually said. Pinned across all three variants."""
+    for cloud_variant in (rb.PROVES_CLOUD_VERIFIED, rb.PROVES_CLOUD_NOT_CHECKED,
+                          rb.PROVES_CLOUD_FAILED):
+        s = rb.proves_skipped(EXISTING, cloud_variant)
+        assert s.startswith("NO NEW BUNDLE WAS CREATED BY THIS RUN")
+        assert EXISTING in s                 # never anonymous about what covers HEAD
+        assert cloud_variant in s            # the cloud clause survives composition
+    # A skip may never UPGRADE what the cloud check said.
+    assert "does NOT prove cloud arrival" in rb.proves_skipped(
+        EXISTING, rb.PROVES_CLOUD_NOT_CHECKED)
+
+
+# --------------------------------------------------------------------------- #
+# --wrap — the interactive path CLAUDE.md's `wrap` force-word runs
+# --------------------------------------------------------------------------- #
+# run_backup is faked wholesale here: these tests are about main()'s OUTPUT and EXIT
+# CODE, which is the entire surface --wrap adds. LOG_FILE is redirected in every one of
+# them — main() calls log(), and a test that appends to the real
+# C:\TradingDesk-Local\backups\repo_backup.log would be scribbling on the forensic
+# record it exists to protect.
+def _status(**over):
+    """A status dict shaped exactly like run_backup returns one."""
+    st = {"job": "repo_backup", "ok": True, "state": rb.STATE_VERIFIED_NEW,
+          "bundle_name": BUNDLE, "head_sha": CUR_HEAD, "size_bytes": 41_602_526,
+          "verify_local": "okay + full history", "verify_drive": "okay + full history",
+          "drive_path": r"X:\My Drive\TradingDesk-Backups\\" + BUNDLE,
+          "cloud": _cloud(), "errors": [], "drive_resolved": True,
+          "proves": rb.PROVES_CLOUD_NOT_CHECKED}
+    st.update(over)
+    return st
+
+
+def _main(monkeypatch, tmp_path, argv, st=None, raises=None):
+    """Run main() with the given argv and a faked run_backup. -> (rc, stdout_lines)."""
+    seen = {}
+    monkeypatch.setattr(rb, "LOG_FILE", tmp_path / "repo_backup.log")
+    monkeypatch.setattr(sys, "argv", ["repo_backup.py", *argv])
+
+    def fake_run_backup(**k):
+        seen.update(k)
+        if raises:
+            raise raises
+        return st if st is not None else _status()
+
+    monkeypatch.setattr(rb, "run_backup", fake_run_backup)
+    return rb.main(), seen
+
+
+def test_wrap_last_stdout_line_is_a_single_line_of_valid_json(tmp_path, monkeypatch, capsys):
+    """THE CONTRACT WITH THE CALLING SESSION. It reports the wrap's outcome from this
+    line rather than parsing the status file, so it must always be there, always be
+    LAST, and always be one line."""
+    rc, _ = _main(monkeypatch, tmp_path, ["--wrap"])
+    out = capsys.readouterr().out.strip().splitlines()
+    s = json.loads(out[-1])          # raises if the last line is not valid JSON
+    assert rc == 0
+    for k in ("state", "bundle_name", "head_sha", "size_bytes", "verify_local",
+              "verify_drive", "drive_path"):
+        assert k in s, f"--wrap summary is missing {k}"
+    assert s["state"] == rb.STATE_VERIFIED_NEW
+    assert s["bundle_name"] == BUNDLE
+    assert s["head_sha"] == CUR_HEAD
+    assert "\n" not in out[-1]
+
+
+def test_wrap_summary_carries_proves_so_the_session_cannot_report_a_bare_ok(
+        tmp_path, monkeypatch, capsys):
+    """`ok` alone has never been the honest answer in this module. A session that says
+    'backed up ✓' off a boolean has reinvented the silent green light."""
+    rc, _ = _main(monkeypatch, tmp_path, ["--wrap"])
+    s = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert s["proves"] == rb.PROVES_CLOUD_NOT_CHECKED
+    assert "does NOT prove cloud arrival" in s["proves"]
+
+
+def test_wrap_prints_human_readable_progress_before_the_json(tmp_path, monkeypatch, capsys):
+    rc, _ = _main(monkeypatch, tmp_path, ["--wrap"])
+    out = capsys.readouterr().out
+    assert "repo backup (wrap)" in out
+    assert "result :" in out and "verify :" in out and "proves :" in out
+
+
+def test_wrap_exits_non_zero_on_an_unverified_result(tmp_path, monkeypatch, capsys):
+    """Same fail-closed contract as the scheduled path. --wrap changes the output; it
+    has no opinion about what counts as success."""
+    rc, _ = _main(monkeypatch, tmp_path, ["--wrap"], st=_status(
+        ok=False, state=rb.STATE_FAILED, proves=rb.PROVES_FAILED_RUN,
+        errors=["LOCAL bundle failed verification — corrupt"]))
+    assert rc == 1
+    s = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert s["ok"] is False
+    assert s["state"] == "failed"
+    assert s["proves"].startswith("nothing")
+    assert any("failed verification" in e for e in s["errors"])
+
+
+def test_wrap_reports_a_crash_as_a_failure_rather_than_silence(tmp_path, monkeypatch, capsys):
+    """If the job explodes, the session must still get a machine-readable answer.
+    Guessing about backups is the entire problem this module exists to end."""
+    rc, _ = _main(monkeypatch, tmp_path, ["--wrap"], raises=RuntimeError("git vanished"))
+    assert rc == 2
+    s = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
+    assert s["ok"] is False
+    assert s["state"] == "failed"
+    assert s["proves"] == rb.PROVES_FAILED_RUN
+    assert any("git vanished" in e for e in s["errors"])
+
+
+def test_wrap_reports_a_skipped_run_as_a_skip_not_as_a_fresh_backup(
+        tmp_path, monkeypatch, capsys):
+    rc, _ = _main(monkeypatch, tmp_path, ["--wrap"], st=_status(
+        state=rb.STATE_SKIPPED_HEAD_UNCHANGED, bundle_name=EXISTING,
+        proves=rb.proves_skipped(EXISTING, rb.PROVES_CLOUD_NOT_CHECKED)))
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "NO NEW BUNDLE" in out
+    s = json.loads(out.strip().splitlines()[-1])
+    assert s["state"] == "skipped_head_unchanged"
+    assert EXISTING in s["proves"]
+
+
+def test_wrap_is_output_only_and_does_not_pass_force(tmp_path, monkeypatch, capsys):
+    """--wrap must not quietly imply --force: a wrap that bundled a redundant twin
+    every time would defeat the skip it was built alongside."""
+    rc, seen = _main(monkeypatch, tmp_path, ["--wrap"])
+    capsys.readouterr()
+    assert seen["force"] is False
+    assert seen["dry_run"] is False
+
+
+def test_force_flag_reaches_run_backup(tmp_path, monkeypatch, capsys):
+    rc, seen = _main(monkeypatch, tmp_path, ["--force"])
+    capsys.readouterr()
+    assert seen["force"] is True
+
+
+def test_the_scheduled_path_stays_quiet_and_prints_no_json(tmp_path, monkeypatch, capsys):
+    """Without --wrap nothing new is printed: RepoBackupDaily's stdout goes nowhere,
+    and the machine-readable line is for an interactive caller that asked for it."""
+    rc, _ = _main(monkeypatch, tmp_path, [])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert out.strip() == ""
+
+
+def test_wrap_summary_of_a_dry_run_is_honest(tmp_path, monkeypatch, capsys):
+    rc, _ = _main(monkeypatch, tmp_path, ["--wrap", "--dry-run"], st=_status(
+        ok=False, state=rb.STATE_DRY_RUN, proves=rb.PROVES_FAILED_RUN,
+        errors=["dry-run: created nothing, deleted nothing, heartbeat NOT refreshed"]))
+    out = capsys.readouterr().out
+    assert rc == 0                       # a dry run that resolved Drive is not a failure
+    s = json.loads(out.strip().splitlines()[-1])
+    assert s["ok"] is False              # ...but it is NEVER a successful backup
+    assert s["state"] == "dry_run"
+    assert "DRY RUN" in out
 
 
 # --------------------------------------------------------------------------- #
