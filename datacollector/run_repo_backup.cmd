@@ -13,8 +13,9 @@ REM    non-0 = FAILED. The heartbeat is deliberately left cold so
 REM        heartbeat_alarm.py (job "repo_backup") pages on the silence. Task
 REM        Scheduler will also show the failure as the task's Last Result.
 REM
-REM  This job is READ-ONLY with respect to git: it only runs bundle create/verify,
-REM  rev-parse and rev-list. It never commits, stages, resets, or cleans.
+REM  This job is READ-ONLY with respect to git: it only runs bundle
+REM  create/verify/list-heads, rev-parse and rev-list. It never commits, stages,
+REM  resets, or cleans.
 REM ===========================================================================
 
 set "VENV_PY=C:\TradingDesk-Local\venv\Scripts\python.exe"
