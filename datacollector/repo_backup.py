@@ -56,9 +56,13 @@ WHAT IT DOES
     AND keeps a local copy under C:\TradingDesk-Local\backups\ (Drive is not
     trusted alone — it is the thing that just failed us).
   * Re-verifies the bundle at the Drive destination after the copy.
-  * ASKS GOOGLE whether the bundle actually arrived, by comparing the Drive API's
-    md5Checksum against the local bundle's md5 (verify_cloud_arrival). Inert until
-    a credential exists — see CLOUD_VERIFY_REQUIRED.
+  * ASKS GOOGLE whether the bundle actually arrived: it resolves the backup folder's
+    Drive id from the destination path, LISTS THAT FOLDER (paginated) and matches the
+    bundle client-side, then compares the Drive API's md5Checksum against the local
+    bundle's md5 (verify_cloud_arrival). It deliberately does NOT search Drive by
+    name — that races an eventually-consistent index and false-pages on healthy
+    backups; see the block comment above _drive_list_children. Inert until a
+    credential exists — see CLOUD_VERIFY_REQUIRED.
   * Records a status JSON + heartbeat the alarm reads (heartbeat_alarm.py, job
     key "repo_backup").
   * Retention: keeps the last KEEP_LAST bundles per location.
@@ -213,6 +217,19 @@ CLOUD_VERIFY_REQUIRED = False
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
+
+# Drive's folder mimeType — used to match a FOLDER while walking the path down to the
+# backup dir, so a same-named FILE can never be mistaken for the folder.
+DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
+
+# Paging for the parent-folder listing. The folder holds KEEP_LAST=7 bundles today, so
+# one page covers it — but "today" is not a guarantee, and a MISSED PAGE would look
+# exactly like "the bundle is absent", i.e. a false page on a healthy backup. So we
+# follow nextPageToken to exhaustion, and cap the walk so a pathological/looping token
+# cannot hang the job. Hitting the cap is a QUERY FAILURE (None), never an empty result:
+# "we could not finish enumerating" must never collapse into "Google does not have it".
+DRIVE_LIST_PAGE_SIZE = 100
+DRIVE_LIST_MAX_PAGES = 50
 
 CLOUD_HTTP_TIMEOUT = 30      # per HTTP call — this job must never hang on the network
 
@@ -884,36 +901,158 @@ def _drive_access_token(creds: dict, *, urlopen_fn=None,
     return token, None, "access token refreshed"
 
 
-def _drive_find(name: str, token: str, *, urlopen_fn=None,
-                timeout: int = CLOUD_HTTP_TIMEOUT) -> tuple[list | None, str]:
-    """Find files named `name` in Drive. -> (files|None, note); None == query failed.
+# WHY WE LIST THE PARENT FOLDER INSTEAD OF QUERYING BY NAME (2026-07-16, observed —
+# not theoretical). This check used to locate the bundle with a server-side name query
+# (q=name='<bundle>' and trashed=false). Measured that afternoon:
+#     16:22:42  tradingdesk-repo-20260716-162242.bundle written locally; Drive recorded
+#               createdTime 2026-07-16T21:22:42.976Z, fileSize 41657962 — an exact
+#               match for the local bundle. The file WAS THERE.
+#     ~16:23    a title/name search returned EMPTY.
+#     ~16:25    the same search returned EMPTY again.
+#     ~16:27    the identical search returned the file.
+# The file was in Drive the whole time; only the NAME INDEX lagged, ~3-5 minutes.
+# Meanwhile a parentId listing of the backups folder returned the file IMMEDIATELY and
+# accurately, at a moment when the name search was still empty.
+#
+# That made the old poll race an INDEX rather than the upload: on a perfectly healthy
+# backup it could time out, report "not in the cloud", fail closed, and page. A false
+# page on a healthy backup is exactly how a pager gets trained into noise — which is
+# the mechanism behind the 9-day Drive silence this whole module exists to prevent.
+# And it was intermittent, so it would have read as a flaky network for weeks.
+#
+# HONESTY ABOUT WHAT WE MEASURED: the lag was observed through an MCP Drive connector
+# whose `title` operator very probably maps onto the same `name` field files.list uses,
+# but that is NOT proven for the raw endpoint this module calls. We are not asserting
+# which layer lagged. Listing the parent and matching client-side is the defensively
+# correct approach regardless: it is strictly more reliable and costs nothing.
+def _drive_list_children(folder_id: str, token: str, *, urlopen_fn=None,
+                         timeout: int = CLOUD_HTTP_TIMEOUT,
+                         page_size: int = DRIVE_LIST_PAGE_SIZE,
+                         max_pages: int = DRIVE_LIST_MAX_PAGES
+                         ) -> tuple[list | None, str]:
+    """List EVERY child of a Drive folder. -> (files|None, note); None == query failed.
 
-    `fields` asks for md5Checksum explicitly — the Drive API omits it otherwise, and
-    a silently-absent checksum is precisely the kind of "check that proved less than
-    it appeared to" this repo has already been bitten by. supportsAllDrives /
-    includeItemsFromAllDrives are set so a shared drive would be searched too rather
-    than returning an empty list that reads identically to "the upload never
-    happened".
+    PAGINATED TO EXHAUSTION, deliberately. A missed page is indistinguishable from an
+    absent file, and an absent file fails this check closed — so silently stopping at
+    page one would be a false-page generator of exactly the kind this function was
+    written to remove. Every page is followed; running out of cap returns None (a
+    failure to enumerate), never a short list masquerading as the whole folder.
+
+    `fields` names md5Checksum explicitly — the Drive API omits it otherwise, and a
+    silently-absent checksum is precisely the kind of "check that proved less than it
+    appeared to" this repo has already been bitten by. supportsAllDrives /
+    includeItemsFromAllDrives are set so a shared drive is enumerated too rather than
+    returning an empty list that reads identically to "the upload never happened".
     """
-    # Bundle names come from BUNDLE_RE (no quotes possible), but escape anyway rather
-    # than rely on a caller upstream staying strict forever.
-    safe = name.replace("\\", "\\\\").replace("'", "\\'")
-    url = DRIVE_FILES_URL + "?" + urllib.parse.urlencode({
-        "q": f"name = '{safe}' and trashed = false",
-        "fields": "files(id,name,size,md5Checksum)",
-        "supportsAllDrives": "true",
-        "includeItemsFromAllDrives": "true",
-        "spaces": "drive",
-        "pageSize": "10",
-    })
-    payload, note = _get_json(url, headers={"Authorization": f"Bearer {token}"},
-                              timeout=timeout, urlopen_fn=urlopen_fn)
-    if payload is None:
-        return None, note
-    files = payload.get("files")
-    if files is None:
-        return None, "the Drive API response had no `files` key"
-    return files, f"Drive returned {len(files)} file(s) named {name}"
+    # Folder ids come from Drive itself, but escape anyway rather than rely on the
+    # upstream staying well-behaved forever.
+    safe = str(folder_id).replace("\\", "\\\\").replace("'", "\\'")
+    files: list = []
+    page_token: str | None = None
+    for page in range(1, max_pages + 1):
+        params = {
+            "q": f"'{safe}' in parents and trashed = false",
+            "fields": "nextPageToken,files(id,name,size,md5Checksum,mimeType)",
+            "supportsAllDrives": "true",
+            "includeItemsFromAllDrives": "true",
+            "spaces": "drive",
+            "pageSize": str(page_size),
+        }
+        if page_token:
+            params["pageToken"] = page_token
+        payload, note = _get_json(
+            DRIVE_FILES_URL + "?" + urllib.parse.urlencode(params),
+            headers={"Authorization": f"Bearer {token}"}, timeout=timeout,
+            urlopen_fn=urlopen_fn)
+        if payload is None:
+            return None, f"listing folder {folder_id} failed on page {page} — {note}"
+        batch = payload.get("files")
+        if batch is None:
+            return None, (f"the Drive API response for folder {folder_id} page {page} "
+                          f"had no `files` key")
+        files.extend(batch)
+        page_token = payload.get("nextPageToken")
+        if not page_token:
+            return files, (f"Drive listed {len(files)} file(s) in folder {folder_id} "
+                           f"across {page} page(s)")
+    return None, (f"folder {folder_id} still had more pages after {max_pages} — refusing "
+                  f"to report a TRUNCATED listing, because a short list here is "
+                  f"indistinguishable from the bundle being absent")
+
+
+def _drive_path_components(dest, mount) -> tuple[list[str] | None, str]:
+    """The folder names between the 'My Drive' root and the backup folder.
+
+    -> (components|None, note). Purely lexical — no filesystem, no network.
+
+    DERIVED, NEVER HARDCODED. The live folder id was observed on this machine, and
+    pinning it would be a landmine: an id names one particular folder OBJECT, and
+    Drive moving/recreating its own folders is the exact disease this module exists
+    for. A pinned id survives that by pointing at a ghost which will never receive
+    another bundle — while the check reports a clean, confident miss. The PATH (which
+    resolve_drive_dest already computes at runtime) survives it; the id does not.
+    """
+    if not dest:
+        return None, "no Drive destination path was supplied to the cloud check"
+    if not mount:
+        return None, (f"no Drive mount root was supplied alongside {dest} — cannot tell "
+                      f"which part of that path sits below the 'My Drive' root")
+    dparts = Path(dest).parts
+    mparts = Path(mount).parts
+    # Case-insensitive on the MOUNT PREFIX (Windows paths are), but the components we
+    # carry away keep their ORIGINAL CASE — Drive folder names are case-sensitive, and
+    # a lowercased name would miss a folder that is sitting right there.
+    same = (len(dparts) >= len(mparts) and
+            [os.path.normcase(p) for p in dparts[:len(mparts)]] ==
+            [os.path.normcase(p) for p in mparts])
+    if not same:
+        return None, (f"the Drive destination {dest!r} is not below the resolved mount "
+                      f"root {mount!r} — cannot map it onto a Drive folder path")
+    parts = [p for p in dparts[len(mparts):] if p not in ("", ".")]
+    if not parts:
+        return None, (f"the Drive destination {dest!r} IS the mount root — there is no "
+                      f"backup folder to resolve")
+    return parts, f"backup folder path below 'My Drive': {'/'.join(parts)}"
+
+
+def _drive_resolve_folder_id(components, token, *, list_fn=None, urlopen_fn=None,
+                             timeout: int = CLOUD_HTTP_TIMEOUT
+                             ) -> tuple[str | None, str]:
+    """Walk 'My Drive' down `components` to the backup folder's id. -> (id|None, note).
+
+    Each step LISTS the parent and matches the next component CLIENT-SIDE, so no step
+    of this resolution leans on a server-side name query either. ('root' is Drive's
+    alias for the My Drive root in an `in parents` term.)
+
+    Fails honestly and distinctly on anything ambiguous — Drive permits same-named
+    siblings, and a coin-flip between two candidate folders is not a resolution.
+    """
+    if list_fn is None:
+        def list_fn(fid, tok):
+            return _drive_list_children(fid, tok, urlopen_fn=urlopen_fn, timeout=timeout)
+
+    parent = "root"
+    trail = ["My Drive"]
+    for comp in components:
+        children, note = list_fn(parent, token)
+        if children is None:
+            return None, (f"could not list {'/'.join(trail)} while resolving the backup "
+                          f"folder — {note}")
+        hits = [c for c in children
+                if c.get("name") == comp and c.get("mimeType") == DRIVE_FOLDER_MIME]
+        if not hits:
+            return None, (f"no folder named {comp!r} exists under {'/'.join(trail)} in "
+                          f"Drive ({note})")
+        if len(hits) > 1:
+            return None, (f"{len(hits)} folders named {comp!r} exist under "
+                          f"{'/'.join(trail)} — ambiguous; refusing to guess which one "
+                          f"the bundles are supposed to be in")
+        parent = hits[0].get("id")
+        if not parent:
+            return None, (f"Drive returned a folder named {comp!r} under "
+                          f"{'/'.join(trail)} with no id")
+        trail.append(comp)
+    return parent, f"resolved {'/'.join(trail)} to Drive folder id {parent}"
 
 
 def _creds_age_days(creds: dict | None, *, now=None) -> int | None:
@@ -960,22 +1099,38 @@ def _token_failure_note(err_code: str | None, note: str, creds: dict | None,
     return f"could not obtain a Drive access token — {note}.{age_txt}{status_txt}"
 
 
-def verify_cloud_arrival(bundle_path, bundle_name=None, *, required=None,
-                         creds_fn=None, token_fn=None, find_fn=None, md5_fn=None,
-                         sleep_fn=None, monotonic_fn=None, now=None,
+def verify_cloud_arrival(bundle_path, bundle_name=None, drive_dest=None,
+                         drive_mount=None, *, required=None,
+                         creds_fn=None, token_fn=None, folder_fn=None, list_fn=None,
+                         md5_fn=None, sleep_fn=None, monotonic_fn=None, now=None,
                          deadline_s: int = CLOUD_POLL_DEADLINE_S,
                          interval_s: int = CLOUD_POLL_INTERVAL_S,
                          log_fn=None) -> dict:
     """Did the bundle actually reach Google? -> the status file's `cloud` block.
 
-    THE COMPARISON IS md5, NOT name+size. name+size proves a file wearing the right
-    label and roughly the right shape exists in the cloud; md5 proves the bytes in
-    the cloud ARE the bytes on disk. Only the second one is worth building: the
-    2026-07-16 incident was a folder full of files with plausible names.
+    HOW IT LOOKS: it RESOLVES THE BACKUP FOLDER'S ID and LISTS ITS CHILDREN, matching
+    the bundle's filename client-side. It does NOT ask Drive to find the file by name.
+    See the block comment above _drive_list_children for the 2026-07-16 measurements
+    that forced that: a name search missed a bundle that was demonstrably already in
+    Drive, twice, for ~5 minutes, while a parent listing returned it immediately. The
+    old code polled the NAME INDEX and could therefore fail closed and page on a
+    perfectly healthy backup. If the folder id cannot be resolved we FAIL WITH A
+    DISTINCT NOTE — we never quietly fall back to the name query.
+
+    THE COMPARISON IS STILL md5, AND md5 IS STILL THE REAL PROOF. name+size proves a
+    file wearing the right label and roughly the right shape exists in the cloud; md5
+    proves the bytes in the cloud ARE the bytes on disk. Only the second one is worth
+    building: the 2026-07-16 incident was a folder full of files with plausible names.
+    It also does a second job that the switch to parent-listing makes load-bearing:
+    Drive computes md5Checksum SERVER-SIDE, and only ONCE THE CONTENT HAS LANDED. So
+    md5 is what separates "a metadata row exists in the folder" from "the bytes
+    actually uploaded" — which is exactly why a parentId hit ALONE is not proof, and
+    why an absent md5Checksum is a KEEP POLLING condition rather than either answer.
 
     Returns:
       checked   : bool   did we actually query Google?
       state     : 'verified' | 'failed' | 'skipped_not_configured'
+      folder_id : str | None
       file_id   : str | None
       cloud_md5 : str | None
       local_md5 : str | None
@@ -990,13 +1145,21 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, *, required=None,
     monotonic_fn = monotonic_fn or time.monotonic
     creds_fn = creds_fn or _load_drive_creds
     token_fn = token_fn or _drive_access_token
-    find_fn = find_fn or _drive_find
+    list_fn = list_fn or _drive_list_children
     md5_fn = md5_fn or file_md5
     name = bundle_name or Path(bundle_path).name
     required = CLOUD_VERIFY_REQUIRED if required is None else required
 
-    res = {"checked": False, "state": "skipped_not_configured", "file_id": None,
-           "cloud_md5": None, "local_md5": None, "required": bool(required), "note": ""}
+    if folder_fn is None:
+        def folder_fn(tok):
+            comps, cnote = _drive_path_components(drive_dest, drive_mount)
+            if comps is None:
+                return None, cnote
+            return _drive_resolve_folder_id(comps, tok)
+
+    res = {"checked": False, "state": "skipped_not_configured", "folder_id": None,
+           "file_id": None, "cloud_md5": None, "local_md5": None,
+           "required": bool(required), "note": ""}
 
     creds, cstate, cnote = creds_fn()
     if cstate == "absent":
@@ -1025,33 +1188,55 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, *, required=None,
         res["note"] = _token_failure_note(err_code, tnote, creds, now=now)
         return res
 
+    # Resolve the FOLDER we are about to list. Outside the poll: an unresolvable folder
+    # is not a thing that becomes resolvable by waiting, and re-walking it every 15s
+    # would just be a slower way of reporting the same failure.
+    folder_id, folnote = folder_fn(token)
+    if not folder_id:
+        res["state"] = "failed"
+        res["note"] = (
+            f"could NOT resolve the Drive folder id for the backup destination — "
+            f"{folnote}. Refusing to fall back to a name query: Drive's name index is "
+            f"eventually consistent (a name search missed a bundle that was already in "
+            f"Drive for ~5 minutes on 2026-07-16), so that fallback is the false-page "
+            f"generator this check was rebuilt to remove. Cloud arrival is NOT proven, "
+            f"and the reason is THIS — not an absent bundle.")
+        return res
+    res["folder_id"] = folder_id
+
     # Poll: the copy into the DriveFS mount returns before the upload finishes, so
     # "not there yet" is expected for a while and is NOT evidence of failure. The
-    # deadline is what stops that tolerance from becoming indefinite patience.
+    # deadline is what stops that tolerance from becoming indefinite patience. Note
+    # what we now wait ON: the UPLOAD (via md5, which Drive only computes once content
+    # lands) rather than an index catching up with a file that is already there.
     end = monotonic_fn() + max(0, deadline_s)
     attempts = 0
-    last = "no query was performed"
+    last = "no listing was performed"
     while True:
         attempts += 1
-        files, fnote = find_fn(name, token)
+        files, fnote = list_fn(folder_id, token)
         if files is None:
+            # A failed listing and an empty folder mean OPPOSITE things. Never blur them.
             res["state"] = "failed"
-            res["note"] = f"the Drive API query FAILED — {fnote}"
+            res["note"] = f"the Drive API folder listing FAILED — {fnote}"
             return res
-        if files:
-            hit = files[0]
+        # THE MATCH IS CLIENT-SIDE, against the folder's actual contents.
+        hits = [f for f in files if f.get("name") == name]
+        if hits:
+            hit = hits[0]
             res["file_id"] = hit.get("id")
             cloud_md5 = hit.get("md5Checksum")
             if cloud_md5:
                 res["cloud_md5"] = cloud_md5
-                extra = (f" NOTE: {len(files)} files share this name; checked the first."
-                         if len(files) > 1 else "")
+                extra = (f" NOTE: {len(hits)} files in the folder share this name; "
+                         f"checked the first." if len(hits) > 1 else "")
                 if cloud_md5.lower() == (res["local_md5"] or "").lower():
                     res["state"] = "verified"
                     res["note"] = (
-                        f"CONFIRMED IN THE CLOUD: Drive file id {res['file_id']} has "
-                        f"md5 {cloud_md5}, matching the local bundle byte-for-byte "
-                        f"(after {attempts} query attempt(s)).{extra}")
+                        f"CONFIRMED IN THE CLOUD: Drive file id {res['file_id']} in "
+                        f"folder {folder_id} has md5 {cloud_md5}, matching the local "
+                        f"bundle byte-for-byte (after {attempts} listing attempt(s))."
+                        f"{extra}")
                     return res
                 # A concrete, differing checksum is not an in-flight upload — Drive
                 # publishes md5Checksum for completed content. Fail now, do not wait.
@@ -1062,21 +1247,30 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, *, required=None,
                     f"in the cloud are NOT the bytes on disk; cloud arrival of THIS "
                     f"bundle is NOT proven.{extra}")
                 return res
-            last = (f"Drive has a file named {name} (id {res['file_id']}) but reports no "
-                    f"md5Checksum yet — the upload is still in flight")
+            # REGISTERED, NOT LANDED. Drive computes md5Checksum server-side and only
+            # once the content is there, so its absence means the bytes are still in
+            # flight. That is neither success nor failure — it is the one honest reason
+            # to keep polling, and it is why a parentId hit alone proves nothing.
+            last = (f"Drive HAS a file named {name} (id {res['file_id']}) in the backup "
+                    f"folder {folder_id}, but reports NO md5Checksum for it — the "
+                    f"metadata row is REGISTERED and the CONTENT HAS NOT LANDED "
+                    f"(Drive computes md5 server-side only after content lands), so "
+                    f"the upload is still in flight")
         else:
-            last = f"no file named {name} is in Drive yet ({fnote})"
+            last = (f"the backup folder {folder_id} contains no file named {name} — it "
+                    f"is ABSENT from the folder's own listing, not merely unindexed "
+                    f"({fnote})")
         if monotonic_fn() >= end:
             break
         sleep_fn(min(interval_s, max(0, end - monotonic_fn())))
 
     res["state"] = "failed"
     res["note"] = (
-        f"NOT CONFIRMED IN THE CLOUD within {deadline_s}s ({attempts} query "
+        f"NOT CONFIRMED IN THE CLOUD within {deadline_s}s ({attempts} listing "
         f"attempt(s)): {last}. The bundle is on the Drive volume, but Google has not "
-        f"acknowledged it. That is either an unusually slow upload or the silent "
-        f"non-upload this check exists to catch — and we do not get to assume which. "
-        f"Cloud arrival is NOT proven.")
+        f"acknowledged its content. That is either an unusually slow upload or the "
+        f"silent non-upload this check exists to catch — and we do not get to assume "
+        f"which. Cloud arrival is NOT proven.")
     return res
 
 
@@ -1265,8 +1459,8 @@ def run_backup(*, now=None, dry_run: bool = False, force: bool = False, resolve_
         "pruned_local": [],
         "pruned_drive": [],
         "cloud": {"checked": False, "state": "skipped_not_configured",
-                  "file_id": None, "cloud_md5": None, "local_md5": None,
-                  "required": bool(CLOUD_VERIFY_REQUIRED),
+                  "folder_id": None, "file_id": None, "cloud_md5": None,
+                  "local_md5": None, "required": bool(CLOUD_VERIFY_REQUIRED),
                   "note": ("cloud arrival was NOT checked — the run did not get far "
                            "enough to have a bundle to look for")},
         "errors": [],
@@ -1420,7 +1614,12 @@ def run_backup(*, now=None, dry_run: bool = False, force: bool = False, resolve_
     #    skip quietly feeds the heartbeat with no cloud proof — the requirement
     #    silently not applying to the majority of runs. The check is the same, the
     #    fail-closed decision is the same; only the bundle's author differs.
-    cloud = cloud_fn(local_path, name)
+    #
+    #    The destination + mount are handed DOWN from the resolve step rather than
+    #    re-derived (let alone hardcoded) inside the check: the folder the check
+    #    interrogates in the cloud must be the same folder this run actually wrote to,
+    #    and resolve_drive_dest() is the one place that decides what that is.
+    cloud = cloud_fn(local_path, name, str(dest_dir), info.get("mount"))
     st["cloud"] = cloud
     state = cloud.get("state")
     if state == "verified":

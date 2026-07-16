@@ -30,6 +30,7 @@ import sys
 import types
 import urllib.error
 import urllib.parse
+from pathlib import Path
 
 import pytest
 
@@ -78,7 +79,8 @@ def _unresolved():
 def _cloud(state="skipped_not_configured", note=None, **over):
     """A `cloud` block shaped exactly like verify_cloud_arrival() returns one."""
     d = {"checked": state != "skipped_not_configured", "state": state,
-         "file_id": None, "cloud_md5": None, "local_md5": None, "required": False,
+         "folder_id": None, "file_id": None, "cloud_md5": None, "local_md5": None,
+         "required": False,
          "note": note if note is not None else f"cloud state {state}"}
     d.update(over)
     return d
@@ -881,6 +883,14 @@ BUNDLE = "tradingdesk-repo-20260716-120000.bundle"
 LOCAL_MD5 = "9f86d081884c7d659a2feaa0c55ad015"
 CLOUD_UTC = dt.datetime(2026, 7, 16, 12, 0, tzinfo=dt.timezone.utc)
 
+# The Drive-side coordinates. FOLDER_ID is a stand-in, never a pin: the production code
+# RESOLVES the id from the destination path every run (see the folder-resolution tests
+# below), because an id names one folder object and Drive recreating its own folders is
+# the disease this module exists for.
+FOLDER_ID = "0folderIDresolved"
+DRIVE_MOUNT = r"X:\My Drive"
+DRIVE_DEST = r"X:\My Drive\TradingDesk-Backups"
+
 # obtained_utc is exactly 7 days before CLOUD_UTC — the fingerprint of the Testing-mode
 # trap, so the rejection test below exercises the age the note is meant to call out.
 CREDS = {"client_id": "cid", "client_secret": "SECRET-csec",
@@ -920,18 +930,24 @@ def _verify(**over):
 
     deadline_s defaults to 0 so the poll makes exactly one attempt and never sleeps —
     tests that care about polling pass their own clock.
+
+    `list_fn` is a PARENT-FOLDER LISTING, not a name search — that is the whole shape
+    of the fix. It is handed the folder id and returns the folder's CONTENTS; the
+    filename match happens client-side, inside the code under test.
     """
     kw = {
         "creds_fn": lambda: (dict(CREDS), "ok", "loaded"),
         "token_fn": lambda c: ("at-token", None, "access token refreshed"),
-        "find_fn": lambda n, t: ([DRIVE_FILE], "Drive returned 1 file(s)"),
+        "folder_fn": lambda t: (FOLDER_ID, f"resolved to {FOLDER_ID}"),
+        "list_fn": lambda fid, t: ([DRIVE_FILE], "Drive listed 1 file(s)"),
         "md5_fn": lambda p: LOCAL_MD5,
         "sleep_fn": Recorder(None),
         "deadline_s": 0,
         "now": CLOUD_UTC,
     }
     kw.update(over)
-    return rb.verify_cloud_arrival("C:\\fake\\backups\\" + BUNDLE, BUNDLE, **kw)
+    return rb.verify_cloud_arrival("C:\\fake\\backups\\" + BUNDLE, BUNDLE,
+                                   DRIVE_DEST, DRIVE_MOUNT, **kw)
 
 
 def test_cloud_md5_match_is_verified():
@@ -940,6 +956,7 @@ def test_cloud_md5_match_is_verified():
     c = _verify()
     assert c["state"] == "verified"
     assert c["checked"] is True
+    assert c["folder_id"] == FOLDER_ID
     assert c["file_id"] == "1abcFILEID"
     assert c["cloud_md5"] == LOCAL_MD5
     assert c["local_md5"] == LOCAL_MD5
@@ -951,7 +968,7 @@ def test_cloud_md5_mismatch_is_never_reported_as_success():
     the wrong CONTENT is exactly what a name+size check would have blessed. md5 is
     the only version worth building, so a mismatch must never read as arrival."""
     wrong = dict(DRIVE_FILE, md5Checksum="00000000000000000000000000000000")
-    c = _verify(find_fn=lambda n, t: ([wrong], "1 file"))
+    c = _verify(list_fn=lambda fid, t: ([wrong], "1 file"))
     assert c["state"] == "failed"
     assert c["state"] != "verified"
     assert "MD5 MISMATCH" in c["note"]
@@ -962,21 +979,32 @@ def test_cloud_md5_mismatch_is_never_reported_as_success():
 
 def test_cloud_file_absent_from_the_cloud_is_a_failure():
     """The bundle is on the Drive volume but Google does not have it — this IS the
-    9-day silent failure, caught. 'Not there' must never be shrugged off."""
-    c = _verify(find_fn=lambda n, t: ([], "Drive returned 0 file(s)"))
+    9-day silent failure, caught. 'Not there' must never be shrugged off.
+
+    Note WHICH claim this now makes: the bundle is absent from the FOLDER'S OWN
+    LISTING. That is a far stronger statement than the old 'a name search did not
+    return it', which was true of healthy backups for minutes at a time."""
+    c = _verify(list_fn=lambda fid, t: ([], "Drive listed 0 file(s)"))
     assert c["state"] == "failed"
     assert "NOT CONFIRMED IN THE CLOUD" in c["note"]
     assert "we do not get to assume which" in c["note"]
+    assert "ABSENT from the folder's own listing" in c["note"]
 
 
 def test_cloud_file_present_without_a_checksum_is_not_success():
     """Drive can publish the file entry before the content finishes uploading. No
-    md5 means nothing is proven yet — it must not be mistaken for a match."""
-    c = _verify(find_fn=lambda n, t: ([{"id": "x", "name": BUNDLE}], "1 file"))
+    md5 means nothing is proven yet — it must not be mistaken for a match.
+
+    This is why a parentId hit ALONE is not proof and md5 remains the real one: Drive
+    computes md5 server-side and only once the content lands, so its absence is the
+    difference between 'a metadata row exists' and 'the bytes uploaded'."""
+    c = _verify(list_fn=lambda fid, t: ([{"id": "x", "name": BUNDLE}], "1 file"))
     assert c["state"] == "failed"
+    assert c["state"] != "verified"
     assert c["file_id"] == "x"
     assert c["cloud_md5"] is None
     assert "still in flight" in c["note"]
+    assert "CONTENT HAS NOT LANDED" in c["note"]
 
 
 def test_cloud_refresh_token_rejected_names_the_7_day_testing_trap():
@@ -1014,10 +1042,10 @@ def test_cloud_network_error_is_a_failure_not_a_pass():
 
 
 def test_cloud_query_failure_is_a_failure():
-    c = _verify(find_fn=lambda n, t: (None, "HTTP 403 from the Drive API "
-                                            "(insufficient scope)"))
+    c = _verify(list_fn=lambda fid, t: (None, "HTTP 403 from the Drive API "
+                                              "(insufficient scope)"))
     assert c["state"] == "failed"
-    assert "Drive API query FAILED" in c["note"]
+    assert "Drive API folder listing FAILED" in c["note"]
     assert "403" in c["note"]
 
 
@@ -1051,26 +1079,296 @@ def test_cloud_poll_waits_while_the_upload_is_still_in_flight():
 
     find = Recorder(values=[([], "0 file(s)"), ([DRIVE_FILE], "1 file(s)")])
     sleep = Recorder(None)
-    c = _verify(find_fn=find, sleep_fn=sleep, monotonic_fn=clock, deadline_s=300)
+    c = _verify(list_fn=find, sleep_fn=sleep, monotonic_fn=clock, deadline_s=300)
     assert c["state"] == "verified"
     assert find.calls == 2
     assert sleep.calls == 1
-    assert "after 2 query attempt(s)" in c["note"]
+    assert "after 2 listing attempt(s)" in c["note"]
 
 
 def test_cloud_poll_is_bounded_and_gives_up_honestly():
     """...and the tolerance above must not become indefinite patience."""
     sleep = Recorder(None)
-    c = _verify(find_fn=lambda n, t: ([], "0 file(s)"), sleep_fn=sleep, deadline_s=0)
+    c = _verify(list_fn=lambda fid, t: ([], "0 file(s)"), sleep_fn=sleep, deadline_s=0)
     assert c["state"] == "failed"
     assert sleep.calls == 0
     assert "within 0s" in c["note"]
 
 
 def test_cloud_multiple_same_named_files_are_disclosed():
-    c = _verify(find_fn=lambda n, t: ([DRIVE_FILE, dict(DRIVE_FILE, id="dupe")], "2"))
+    c = _verify(list_fn=lambda fid, t: ([DRIVE_FILE, dict(DRIVE_FILE, id="dupe")], "2"))
     assert c["state"] == "verified"
-    assert "2 files share this name" in c["note"]
+    assert "2 files in the folder share this name" in c["note"]
+
+
+def test_cloud_matches_the_bundle_client_side_out_of_a_folder_full_of_others():
+    """The listing returns the whole folder — the filename match is ours, not the
+    server's. Neighbours must not be mistaken for the bundle under test."""
+    folder = [{"id": "r", "name": "tradingdesk-full-20260716.bundle",
+               "md5Checksum": "ffff" * 8},
+              {"id": "o", "name": "tradingdesk-repo-20260715-200000.bundle",
+               "md5Checksum": "eeee" * 8},
+              DRIVE_FILE]
+    c = _verify(list_fn=lambda fid, t: (folder, "3 file(s)"))
+    assert c["state"] == "verified"
+    assert c["file_id"] == "1abcFILEID"        # not the rescue bundle, not yesterday's
+
+
+def test_cloud_finds_the_bundle_when_it_is_on_the_LAST_page_of_the_listing():
+    """END-TO-END THROUGH THE REAL LISTING with only the transport faked. A missed
+    page would report the bundle absent, fail closed, and page — on a healthy backup.
+    So the bundle is deliberately put on the last page here."""
+    pages = [
+        {"files": [{"id": "a", "name": "tradingdesk-repo-20260714-200000.bundle",
+                    "md5Checksum": "aaaa" * 8}], "nextPageToken": "p2"},
+        {"files": [{"id": "b", "name": "tradingdesk-repo-20260715-200000.bundle",
+                    "md5Checksum": "bbbb" * 8}], "nextPageToken": "p3"},
+        {"files": [DRIVE_FILE]},                       # <- the bundle, on the LAST page
+    ]
+    calls = {"n": 0}
+
+    def fake_urlopen(req, timeout=None):
+        calls["n"] += 1
+        return _Resp(pages[calls["n"] - 1])
+
+    def list_fn(fid, tok):
+        return rb._drive_list_children(fid, tok, urlopen_fn=fake_urlopen)
+
+    c = _verify(list_fn=list_fn)
+    assert c["state"] == "verified"
+    assert calls["n"] == 3
+    assert c["cloud_md5"] == LOCAL_MD5
+
+
+def test_cloud_md5_absent_then_present_on_a_later_poll_is_verified():
+    """THE CONTENT-STILL-LANDING CASE. Drive registers the metadata row before the
+    bytes finish, and computes md5 server-side only once they have. So 'no md5 yet' is
+    a KEEP POLLING condition — not success (nothing is proven), not failure (nothing
+    is wrong). The poll now waits on the UPLOAD, which is the thing that legitimately
+    takes time, rather than on a name index catching up with a file already there."""
+    ticks = {"t": 0}
+
+    def clock():
+        ticks["t"] += 1          # 1s per call — nowhere near the 300s deadline
+        return ticks["t"]
+
+    registered = {"id": "1abcFILEID", "name": BUNDLE}        # no md5Checksum yet
+    lst = Recorder(values=[([registered], "1 file(s)"),
+                           ([registered], "1 file(s)"),
+                           ([DRIVE_FILE], "1 file(s)")])     # content landed
+    sleep = Recorder(None)
+    c = _verify(list_fn=lst, sleep_fn=sleep, monotonic_fn=clock, deadline_s=300)
+    assert c["state"] == "verified"
+    assert lst.calls == 3
+    assert sleep.calls == 2
+    assert c["cloud_md5"] == LOCAL_MD5
+    assert "after 3 listing attempt(s)" in c["note"]
+
+
+def test_cloud_md5_absent_for_the_whole_window_says_REGISTERED_BUT_NOT_LANDED():
+    """...and when it never lands, the note must say WHICH failure this is. 'The row
+    exists but the content never arrived' and 'the file is not there at all' point at
+    different problems; collapsing them wastes the reader's night."""
+    registered = {"id": "1abcFILEID", "name": BUNDLE}        # never gains an md5
+    c = _verify(list_fn=lambda fid, t: ([registered], "1 file(s)"), deadline_s=0)
+    assert c["state"] == "failed"
+    assert c["state"] != "verified"
+    assert c["file_id"] == "1abcFILEID"
+    assert c["cloud_md5"] is None
+    assert "NOT CONFIRMED IN THE CLOUD" in c["note"]
+    assert "REGISTERED" in c["note"]
+    assert "CONTENT HAS NOT LANDED" in c["note"]
+    # ...and must NOT claim the file was missing, because it was not.
+    assert "ABSENT from the folder's own listing" not in c["note"]
+
+
+def test_cloud_absent_and_not_landed_timeouts_do_not_wear_each_others_wording():
+    """The mirror of the test above: a genuinely absent bundle must not be described
+    as a registered-but-unlanded one."""
+    c = _verify(list_fn=lambda fid, t: ([], "0 file(s)"), deadline_s=0)
+    assert c["state"] == "failed"
+    assert "ABSENT from the folder's own listing" in c["note"]
+    assert "REGISTERED" not in c["note"]
+    assert c["file_id"] is None
+
+
+def test_cloud_unresolvable_folder_is_a_distinct_failure_and_never_falls_back():
+    """If the folder id will not resolve, the check FAILS AND SAYS SO. It must never
+    quietly fall back to a name query — that fallback is the eventually-consistent
+    index this whole change removed, and reaching for it under failure would reinstate
+    the false page at exactly the worst moment."""
+    lst = Recorder(([DRIVE_FILE], "1 file(s)"))
+    c = _verify(folder_fn=lambda t: (None, "no folder named 'TradingDesk-Backups' "
+                                           "exists under My Drive in Drive"),
+                list_fn=lst)
+    assert c["state"] == "failed"
+    assert c["folder_id"] is None
+    assert "could NOT resolve the Drive folder id" in c["note"]
+    assert "Refusing to fall back to a name query" in c["note"]
+    assert "no folder named 'TradingDesk-Backups'" in c["note"]   # the REAL reason
+    # The honest distinction: this is not the bundle being missing.
+    assert "not an absent bundle" in c["note"]
+    assert lst.calls == 0, "a query was still attempted after resolution failed"
+
+
+def test_cloud_folder_resolution_happens_once_not_once_per_poll():
+    """An unresolvable folder does not become resolvable by waiting, and re-walking it
+    every 15s is just a slower way of reporting the same failure."""
+    folder = Recorder((FOLDER_ID, "resolved"))
+    ticks = {"t": 0}
+
+    def clock():
+        ticks["t"] += 1
+        return ticks["t"]
+
+    lst = Recorder(values=[([], "0 file(s)"), ([DRIVE_FILE], "1 file(s)")])
+    c = _verify(folder_fn=folder, list_fn=lst, monotonic_fn=clock, deadline_s=300)
+    assert c["state"] == "verified"
+    assert lst.calls == 2
+    assert folder.calls == 1
+
+
+# --------------------------------------------------------------------------- #
+# Resolving the backup folder's Drive id — walked from the path, never pinned
+# --------------------------------------------------------------------------- #
+def _folder(name, fid):
+    return {"id": fid, "name": name, "mimeType": rb.DRIVE_FOLDER_MIME}
+
+
+def test_the_observed_folder_id_is_never_hardcoded_in_the_source():
+    """The live id was measured on this machine 2026-07-16. Pinning it would be a
+    landmine: an id names one folder OBJECT, and Drive moving/recreating its own
+    folders is the disease this module exists for. A pinned id survives that by
+    pointing at a ghost that will never receive another bundle — while the check
+    reports a clean, confident miss. The PATH survives; the id does not."""
+    src = Path(rb.__file__).read_text(encoding="utf-8")
+    assert "1ppfS44BaR25_TnD8WT6g8vqwCAjKbTGA" not in src
+
+
+def test_folder_id_is_resolved_by_listing_from_the_My_Drive_root():
+    """'root' is Drive's alias for the My Drive root. Note the resolution ITSELF also
+    lists-and-matches-client-side rather than name-querying: no step of this leans on
+    the index that lagged."""
+    seen = []
+
+    def list_fn(fid, tok):
+        seen.append(fid)
+        return ([_folder("TradingDesk-Backups", FOLDER_ID),
+                 _folder("Some Other Folder", "zzz"),
+                 {"id": "f", "name": "a-loose-file.txt"}], "listed")
+
+    fid, note = rb._drive_resolve_folder_id(["TradingDesk-Backups"], "at-token",
+                                            list_fn=list_fn)
+    assert fid == FOLDER_ID
+    assert seen == ["root"]
+    assert "My Drive/TradingDesk-Backups" in note
+
+
+def test_folder_id_resolution_walks_every_component():
+    def list_fn(fid, tok):
+        if fid == "root":
+            return ([_folder("Nested", "n1")], "listed")
+        if fid == "n1":
+            return ([_folder("TradingDesk-Backups", FOLDER_ID)], "listed")
+        return ([], "listed")
+
+    fid, note = rb._drive_resolve_folder_id(["Nested", "TradingDesk-Backups"],
+                                            "at-token", list_fn=list_fn)
+    assert fid == FOLDER_ID
+    assert "My Drive/Nested/TradingDesk-Backups" in note
+
+
+def test_folder_id_resolution_refuses_a_FILE_wearing_the_folder_name():
+    """mimeType is checked: a same-named FILE is not the folder, and listing a file's
+    'children' would return nothing — i.e. a manufactured 'the bundle is absent'."""
+    def list_fn(fid, tok):
+        return ([{"id": "notafolder", "name": "TradingDesk-Backups",
+                  "mimeType": "application/octet-stream"}], "listed")
+
+    fid, note = rb._drive_resolve_folder_id(["TradingDesk-Backups"], "at-token",
+                                            list_fn=list_fn)
+    assert fid is None
+    assert "no folder named 'TradingDesk-Backups'" in note
+
+
+def test_folder_id_resolution_refuses_ambiguous_same_named_folders():
+    """Drive permits same-named siblings. A coin-flip between two candidates is not a
+    resolution — and picking the empty one would page for a healthy backup."""
+    def list_fn(fid, tok):
+        return ([_folder("TradingDesk-Backups", "one"),
+                 _folder("TradingDesk-Backups", "two")], "listed")
+
+    fid, note = rb._drive_resolve_folder_id(["TradingDesk-Backups"], "at-token",
+                                            list_fn=list_fn)
+    assert fid is None
+    assert "2 folders named" in note
+    assert "refusing to guess" in note
+
+
+def test_folder_id_resolution_reports_a_listing_failure_as_a_failure():
+    fid, note = rb._drive_resolve_folder_id(
+        ["TradingDesk-Backups"], "at-token",
+        list_fn=lambda f, t: (None, "HTTP 403 (insufficient scope)"))
+    assert fid is None
+    assert "could not list My Drive" in note
+    assert "403" in note
+
+
+def test_folder_id_resolution_rejects_a_folder_with_no_id():
+    fid, note = rb._drive_resolve_folder_id(
+        ["TradingDesk-Backups"], "at-token",
+        list_fn=lambda f, t: ([{"name": "TradingDesk-Backups",
+                                "mimeType": rb.DRIVE_FOLDER_MIME}], "listed"))
+    assert fid is None
+    assert "no id" in note
+
+
+# --------------------------------------------------------------------------- #
+# _drive_path_components() — the Drive-side path, DERIVED from what we wrote to
+# --------------------------------------------------------------------------- #
+def test_path_components_come_from_the_destination_resolve_already_computed():
+    parts, note = rb._drive_path_components(DRIVE_DEST, DRIVE_MOUNT)
+    assert parts == ["TradingDesk-Backups"]
+    assert "TradingDesk-Backups" in note
+
+
+def test_path_components_handle_a_nested_destination():
+    parts, _ = rb._drive_path_components(r"X:\My Drive\Nested\TradingDesk-Backups",
+                                         r"X:\My Drive")
+    assert parts == ["Nested", "TradingDesk-Backups"]
+
+
+def test_path_components_are_case_insensitive_about_the_mount_but_not_the_name():
+    """Windows paths are case-insensitive; Drive folder NAMES are not. So the mount
+    prefix may match loosely, but the component we go looking for must keep its
+    original case or the client-side match will miss a folder that is right there."""
+    parts, _ = rb._drive_path_components(r"x:\my drive\TradingDesk-Backups",
+                                         r"X:\My Drive")
+    assert parts == ["TradingDesk-Backups"]
+
+
+def test_path_components_refuse_a_destination_outside_the_mount():
+    parts, note = rb._drive_path_components(r"C:\Somewhere\Else", DRIVE_MOUNT)
+    assert parts is None
+    assert "not below the resolved mount root" in note
+
+
+def test_path_components_refuse_when_the_mount_is_unknown():
+    parts, note = rb._drive_path_components(DRIVE_DEST, None)
+    assert parts is None
+    assert "no Drive mount root" in note
+
+
+def test_path_components_refuse_when_the_dest_is_the_mount_itself():
+    parts, note = rb._drive_path_components(DRIVE_MOUNT, DRIVE_MOUNT)
+    assert parts is None
+    assert "no backup folder to resolve" in note
+
+
+def test_path_components_refuse_when_there_is_no_destination_at_all():
+    parts, note = rb._drive_path_components(None, DRIVE_MOUNT)
+    assert parts is None
+    assert "no Drive destination path" in note
 
 
 # --------------------------------------------------------------------------- #
@@ -1152,8 +1450,25 @@ def test_access_token_survives_a_non_json_error_body():
     assert "HTTP 502" in note
 
 
-def test_drive_find_asks_for_md5_explicitly_and_parses_the_answer():
-    """`fields` must name md5Checksum — the Drive API omits it otherwise, and a
+def test_drive_list_children_queries_the_PARENT_and_never_the_name_index():
+    """THE SHAPE OF THE FIX, pinned at the wire. The `q` term must be a parentId
+    membership test — NOT `name = '<bundle>'`.
+
+    Observed 2026-07-16: the bundle written at 16:22:42 (Drive's own createdTime
+    2026-07-16T21:22:42.976Z, fileSize 41657962 — an exact match for the local file)
+    was MISSED by a name search at ~16:23 and again at ~16:25, and only appeared at
+    ~16:27. It was in Drive the entire time; the NAME INDEX lagged ~3-5 minutes. A
+    parentId listing returned it immediately, while the name search was still empty.
+    Racing that index meant a healthy backup could time out, fail closed and PAGE —
+    and a pager that cries wolf is the mechanism behind the 9-day silence this module
+    exists to prevent.
+
+    (Honest scope: that lag was measured through an MCP Drive connector whose `title`
+    operator very probably maps onto files.list's `name`, but that is not proven for
+    this raw endpoint. The assertion stands either way — listing the parent is
+    strictly more reliable and costs nothing.)
+
+    `fields` must still name md5Checksum — the API omits it otherwise, and a
     silently-absent checksum is how a check ends up proving less than it looks."""
     seen = {}
 
@@ -1162,26 +1477,81 @@ def test_drive_find_asks_for_md5_explicitly_and_parses_the_answer():
         seen["auth"] = req.get_header("Authorization")
         return _Resp({"files": [DRIVE_FILE]})
 
-    files, note = rb._drive_find(BUNDLE, "at-token", urlopen_fn=fake_urlopen)
+    files, note = rb._drive_list_children(FOLDER_ID, "at-token", urlopen_fn=fake_urlopen)
     assert files == [DRIVE_FILE]
-    assert "files(id,name,size,md5Checksum)" in seen["url"]
-    assert f"name = '{BUNDLE}' and trashed = false" in seen["url"]
+    assert f"'{FOLDER_ID}' in parents and trashed = false" in seen["url"]
+    assert "name = " not in seen["url"], "the bundle is being located by NAME again"
+    assert BUNDLE not in seen["url"], "the bundle NAME reached the server-side query"
+    assert "md5Checksum" in seen["url"]
+    assert "nextPageToken" in seen["url"]
     assert "supportsAllDrives=true" in seen["url"]
     assert "includeItemsFromAllDrives=true" in seen["url"]
     assert seen["auth"] == "Bearer at-token"
 
 
-def test_drive_find_reports_a_query_failure_as_None_not_as_empty():
-    """A failed query and an empty result mean OPPOSITE things — 'we could not ask'
+def test_drive_list_children_follows_pagination_to_exhaustion():
+    """A MISSED PAGE IS A FALSE PAGE. An unfollowed nextPageToken looks exactly like
+    'the bundle is absent', which fails this check closed and pages — on a backup that
+    is sitting right there. KEEP_LAST=7 fits one page today; 'today' is not a
+    guarantee, and the folder also holds the hand-made rescue bundle and whatever else
+    accumulates."""
+    pages = [
+        {"files": [{"id": "a", "name": "old-1.bundle"}], "nextPageToken": "p2"},
+        {"files": [{"id": "b", "name": "old-2.bundle"}], "nextPageToken": "p3"},
+        {"files": [DRIVE_FILE]},                       # the bundle is on the LAST page
+    ]
+    seen = []
+
+    def fake_urlopen(req, timeout=None):
+        seen.append(urllib.parse.unquote_plus(req.full_url))
+        return _Resp(pages[len(seen) - 1])
+
+    files, note = rb._drive_list_children(FOLDER_ID, "at-token", urlopen_fn=fake_urlopen)
+    assert len(seen) == 3
+    assert [f["id"] for f in files] == ["a", "b", "1abcFILEID"]
+    assert "pageToken=p2" in seen[1] and "pageToken=p3" in seen[2]
+    assert "across 3 page(s)" in note
+
+
+def test_drive_list_children_reports_a_query_failure_as_None_not_as_empty():
+    """A failed listing and an empty folder mean OPPOSITE things — 'we could not ask'
     vs 'Google says it is not there'. Collapsing them would turn an outage into a
     false 'the backup never uploaded' page (or worse, the reverse)."""
     def boom(req, timeout=None):
         raise urllib.error.HTTPError("https://www.googleapis.com/drive/v3/files", 403,
                                      "Forbidden", {}, io.BytesIO(b'{"error":"scope"}'))
-    files, note = rb._drive_find(BUNDLE, "at-token", urlopen_fn=boom)
+    files, note = rb._drive_list_children(FOLDER_ID, "at-token", urlopen_fn=boom)
     assert files is None
     assert files != []
     assert "HTTP 403" in note
+
+
+def test_drive_list_children_fails_a_mid_walk_page_rather_than_returning_a_short_list():
+    """Page 1 lands, page 2 dies. Returning page 1 alone would be a TRUNCATED listing
+    presented as the whole folder — i.e. a manufactured 'absent'."""
+    def fake_urlopen(req, timeout=None):
+        if "pageToken" in req.full_url:
+            raise urllib.error.URLError("connection reset")
+        return _Resp({"files": [{"id": "a", "name": "old-1.bundle"}],
+                      "nextPageToken": "p2"})
+
+    files, note = rb._drive_list_children(FOLDER_ID, "at-token", urlopen_fn=fake_urlopen)
+    assert files is None
+    assert "page 2" in note
+
+
+def test_drive_list_children_caps_the_walk_and_calls_it_a_failure_not_an_answer():
+    """A pathological/looping nextPageToken must not hang the job — and giving up must
+    report a FAILURE TO ENUMERATE, never a short list that reads as 'not there'."""
+    def fake_urlopen(req, timeout=None):
+        return _Resp({"files": [{"id": "x", "name": "n.bundle"}],
+                      "nextPageToken": "forever"})
+
+    files, note = rb._drive_list_children(FOLDER_ID, "at-token",
+                                          urlopen_fn=fake_urlopen, max_pages=3)
+    assert files is None
+    assert "TRUNCATED" in note
+    assert "indistinguishable from the bundle being absent" in note
 
 
 # --------------------------------------------------------------------------- #
@@ -1292,7 +1662,7 @@ def test_network_error_fails_closed_when_required(tmp_path, monkeypatch):
     faked: a network error must not be tolerated once the check is required."""
     monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", True)
 
-    def cloud_fn(path, name):
+    def cloud_fn(path, name, dest=None, mount=None):
         return _verify(token_fn=lambda c: (None, None, "network error contacting "
                                            "https://oauth2.googleapis.com/token (timeout)"))
 
@@ -1308,9 +1678,9 @@ def test_md5_mismatch_end_to_end_fails_closed_when_required(tmp_path, monkeypatc
     whose cloud copy differs byte-for-byte must never produce a green run."""
     monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", True)
 
-    def cloud_fn(path, name):
-        return _verify(find_fn=lambda n, t: ([dict(DRIVE_FILE, md5Checksum="dead" * 8)],
-                                             "1 file"))
+    def cloud_fn(path, name, dest=None, mount=None):
+        return _verify(list_fn=lambda fid, t: ([dict(DRIVE_FILE, md5Checksum="dead" * 8)],
+                                               "1 file"))
 
     st, f = _run(tmp_path, monkeypatch, cloud_fn=cloud_fn)
     assert st["ok"] is False
@@ -1318,6 +1688,86 @@ def test_md5_mismatch_end_to_end_fails_closed_when_required(tmp_path, monkeypatc
     assert st["cloud"]["state"] == "failed"
     assert "MD5 MISMATCH" in st["cloud"]["note"]
     assert st["proves"] == rb.PROVES_FAILED_RUN
+
+
+def test_run_backup_hands_the_cloud_check_the_dest_it_actually_wrote_to(
+        tmp_path, monkeypatch):
+    """WIRING. The folder interrogated in the cloud must be the folder this run wrote
+    to, so the destination + mount are handed DOWN from the resolve step rather than
+    re-derived (let alone pinned) inside the check. resolve_drive_dest() is the one
+    place allowed to decide what the destination is."""
+    st, f = _run(tmp_path, monkeypatch)
+    args = f["cloud_fn"].args[0][0]
+    assert args[1] == st["bundle_name"]
+    assert args[2] == str(tmp_path / "drive" / "My Drive" / "TradingDesk-Backups")
+    assert args[3] == str(tmp_path / "drive" / "My Drive")
+    # And the pair really does map onto a Drive-side path.
+    parts, _ = rb._drive_path_components(args[2], args[3])
+    assert parts == ["TradingDesk-Backups"]
+
+
+def test_a_skipped_run_also_hands_over_the_dest(tmp_path, monkeypatch):
+    """A skip runs the same cloud check, so it needs the same coordinates — otherwise
+    flipping CLOUD_VERIFY_REQUIRED to True would fail every skip on a resolution
+    error, which is a false page wearing a new hat."""
+    _seed(tmp_path)
+    st, f = _run(tmp_path, monkeypatch, facts_fn=_facts(), head_fn=_head_fn(CUR_HEAD))
+    args = f["cloud_fn"].args[0][0]
+    assert args[1] == EXISTING
+    assert args[2] == str(tmp_path / "drive" / "My Drive" / "TradingDesk-Backups")
+    assert args[3] == str(tmp_path / "drive" / "My Drive")
+
+
+def test_unresolvable_folder_end_to_end_downgrades_proves_and_names_the_real_reason(
+        tmp_path, monkeypatch):
+    """Driven through run_backup with only the transport-level seam faked. While the
+    check is not REQUIRED this stays a downgrade rather than a failure — the local +
+    Drive-volume bundle really did verify, and that is still a backup — but `proves`
+    must admit cloud arrival was not established, and `cloud.note` must say the reason
+    was the FOLDER, not a missing bundle."""
+    monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", False)
+
+    def cloud_fn(path, name, dest=None, mount=None):
+        return _verify(folder_fn=lambda t: (
+            None, "no folder named 'TradingDesk-Backups' exists under My Drive"))
+
+    st, f = _run(tmp_path, monkeypatch, cloud_fn=cloud_fn)
+    assert st["ok"] is True
+    assert st["cloud"]["state"] == "failed"
+    assert "could NOT resolve the Drive folder id" in st["cloud"]["note"]
+    assert st["proves"] == rb.PROVES_CLOUD_FAILED
+    assert "does NOT prove cloud arrival" in st["proves"]
+    assert any("cloud-arrival check FAILED" in e for e in st["errors"])
+
+
+def test_unresolvable_folder_fails_closed_once_the_check_is_required(tmp_path, monkeypatch):
+    monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", True)
+
+    def cloud_fn(path, name, dest=None, mount=None):
+        return _verify(folder_fn=lambda t: (None, "could not list My Drive — HTTP 403"))
+
+    st, f = _run(tmp_path, monkeypatch, cloud_fn=cloud_fn)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert f["prune_fn"].calls == 0
+    assert st["proves"] == rb.PROVES_FAILED_RUN
+
+
+def test_content_not_landed_end_to_end_is_never_a_verified_run(tmp_path, monkeypatch):
+    """The registered-but-unlanded timeout, through run_backup: a metadata row in the
+    folder is NOT arrival, and must never reach `proves` as one."""
+    monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", True)
+
+    def cloud_fn(path, name, dest=None, mount=None):
+        return _verify(list_fn=lambda fid, t: ([{"id": "x", "name": BUNDLE}], "1 file"))
+
+    st, f = _run(tmp_path, monkeypatch, cloud_fn=cloud_fn)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert st["cloud"]["state"] == "failed"
+    assert "CONTENT HAS NOT LANDED" in st["cloud"]["note"]
+    assert st["proves"] == rb.PROVES_FAILED_RUN
+    assert "confirmed present in Google's cloud" not in st["proves"]
 
 
 def test_a_failed_run_never_carries_an_overstated_proves_string(tmp_path, monkeypatch):
