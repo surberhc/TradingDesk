@@ -127,7 +127,7 @@ not just zero gateway contact).
 
 Run (fires harmlessly and instantly on a day/minute nothing is due):
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe ^
-    "C:\\Users\\andre\\My Drive (andrew@surberhc.com)\\TradingDesk\\paperbot\\s8_runner.py"
+    "C:\\TradingDesk\\livebot\\s8_runner.py"
 """
 from __future__ import annotations
 
