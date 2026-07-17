@@ -205,6 +205,12 @@ def test_full_due_cycle_never_calls_order_router_place(monkeypatch):
     monkeypatch.setattr(runner.s8_chain, "snapshot_0dte_chain",
                         lambda ib, *a, **k: _synthetic_chain_snapshot())
 
+    # Phase-1 rich entry capture reaches out to the live gateway for greeks/quotes; stub it
+    # to a deterministic no-op so this offline cycle stays hermetic (its live behavior is
+    # exercised by the s8_capture live smoke, not here). Keeps all other assertions intact.
+    monkeypatch.setattr(runner.s8_capture, "capture_and_persist_entry",
+                        lambda *a, **k: "fake_trade_id")
+
     # The hard guarantee: neither order_router.place nor place_laddered is ever called.
     monkeypatch.setattr(runner.order_router, "place", _boom_place)
     monkeypatch.setattr(runner.order_router, "place_laddered", _boom_place)
@@ -247,6 +253,8 @@ def test_full_due_cycle_builds_a_stop_parent_and_b2_child(monkeypatch):
     monkeypatch.setattr(runner, "bounded_connect", lambda *a, **k: fake_ib)
     monkeypatch.setattr(runner.s8_chain, "snapshot_0dte_chain",
                         lambda ib, *a, **k: _synthetic_chain_snapshot())
+    monkeypatch.setattr(runner.s8_capture, "capture_and_persist_entry",
+                        lambda *a, **k: "fake_trade_id")
     monkeypatch.setattr(runner.order_router, "place", _boom_place)
     monkeypatch.setattr(runner.ledger, "record_run", lambda record: "fake.jsonl")
     monkeypatch.setattr(runner, "_alert_email", lambda *a, **k: None)

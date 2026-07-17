@@ -1,0 +1,364 @@
+"""
+s8_capture.py — S8 live-pilot RICH ENTRY CAPTURE (Phase 1 of the S8 live-pilot
+data-capture build; see docs/S8_LIVE_PILOT_DATA_CAPTURE_PLAN.md, component 2).
+
+WHAT THIS IS FOR
+----------------
+When the S8 runner APPROVES a (would-be) entry in PILOT_MODE, this module grabs a full
+real-data snapshot of BOTH legs — quotes/sizes/volume/OI PLUS the model greeks/IV — along
+with spot and VIX at the entry instant, assembles an s8_schema.TradeRecord (status="open"),
+and persists it via s8_store. It is a pure OBSERVATION layer wrapped around the frozen S8
+strategy: it changes NOTHING about how S8 picks entries or exits (rule #1 stays clean), and
+it never places, modifies, or transmits an order (zero-transmit preserved — there is no
+ib.placeOrder / order_router.place path anywhere in this file).
+
+THE GREEKS SETTLE-DELAY FIX (the whole point of Phase 1)
+-------------------------------------------------------
+The earlier bare-snapshot path recorded short_delta=null because IBKR's model greeks arrive
+only AFTER a market-data subscription settles — a snapshot read immediately after subscribing
+sees ticker.modelGreeks is None. grab_leg_live() therefore SUBSCRIBES (streaming, not a
+one-shot snapshot) and WAITS with a bounded timeout for ticker.modelGreeks to populate before
+harvesting, then records what is present and flags completeness rather than silently writing
+nulls (plan Risk #3).
+
+STRUCTURE
+---------
+  * leg_grab_from_ticker(ticker, right, strike)  PURE, offline-testable — extract one leg's
+      quotes + greeks from an ib_async Ticker-like object into an s8_schema.LegGrab.
+  * build_entry_trade_record(...)                PURE, offline-testable — assemble an
+      "open" TradeRecord from a SpreadPick + two LegGrabs + entry context.
+  * grab_leg_live(ib, contract, ...)             LIVE — subscribe, bounded-wait for greeks,
+      harvest, cancel. Thin; verified against the installed ib_async, not offline-unit-tested.
+  * grab_vix_live(ib, ...)                        LIVE — best-effort VIX last/close.
+  * capture_and_persist_entry(ib, pick, ...)     LIVE — the top-level entry hook. BEST-EFFORT:
+      it NEVER raises into the caller; any failure returns None so the pilot cycle is never
+      broken by a capture problem.
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from typing import Any, Optional
+
+from ib_async import Index, Option
+
+# version.py lives in paperbot/ (see s8_runner.py's own sys.path shim for the same reason —
+# the livebot/ package split left version.py, ledger.py, order_router.py in paperbot/). Add
+# paperbot/ so `import version` resolves for the Provenance stamp. Path is derived from
+# __file__ (per CLAUDE.md), never an absolute string.
+_PAPERBOT = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "paperbot")
+if _PAPERBOT not in sys.path:
+    sys.path.insert(0, _PAPERBOT)
+
+import s8_chain            # noqa: E402  (sibling in livebot/)
+import s8_schema           # noqa: E402
+import s8_store            # noqa: E402
+import version             # noqa: E402  (from paperbot/)
+
+_CT_ZONE = ZoneInfo("America/Chicago")
+
+# SpreadPick.side ("PUT"/"CALL") -> ib_async Option.right ("P"/"C"). Same mapping direction
+# as s8_runner._SIDE_TO_OPT_RIGHT; duplicated (not imported) to keep this module importable
+# without pulling in the whole runner (which would be a circular import — the runner imports
+# THIS module).
+_SIDE_TO_RIGHT = {"PUT": "P", "CALL": "C"}
+
+
+# --------------------------------------------------------------------------- #
+# NaN/None normaliser (same convention as s8_chain._num / ibkr_forward._num)
+# --------------------------------------------------------------------------- #
+def _num(x: Any) -> Optional[float]:
+    """IBKR returns NaN for missing numerics; normalise NaN/None -> None, else float."""
+    if x is None:
+        return None
+    try:
+        return None if x != x else float(x)   # NaN != NaN
+    except (TypeError, ValueError):
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# PURE: Ticker -> LegGrab
+# --------------------------------------------------------------------------- #
+def leg_grab_from_ticker(ticker: Any, right: Any, strike: Any) -> s8_schema.LegGrab:
+    """Extract one option leg's full data grab from an ib_async Ticker-like object.
+
+    Reads quotes/sizes/volume from the top-level ticker fields and delta/gamma/vega/theta/
+    IV/underlying-spot from ``ticker.modelGreeks``. Open interest is taken from the
+    right-appropriate field (``callOpenInterest`` for calls, ``putOpenInterest`` for puts).
+
+    ``complete`` is True ONLY when ``ticker.modelGreeks`` was present and non-None at grab
+    time (the settle-delay flag — see module docstring); an incomplete grab records whatever
+    quotes are present with all greeks None and complete=False, rather than silently writing
+    null greeks as if they were real. All NaN/None numerics are normalised to None.
+    """
+    right_str = None if right is None else str(right)
+
+    greeks = getattr(ticker, "modelGreeks", None)
+    complete = greeks is not None
+
+    delta = _num(getattr(greeks, "delta", None)) if complete else None
+    gamma = _num(getattr(greeks, "gamma", None)) if complete else None
+    vega = _num(getattr(greeks, "vega", None)) if complete else None
+    theta = _num(getattr(greeks, "theta", None)) if complete else None
+    iv = _num(getattr(greeks, "impliedVol", None)) if complete else None
+    und = _num(getattr(greeks, "undPrice", None)) if complete else None
+
+    # Right-appropriate open interest (calls vs puts have distinct ticker fields).
+    is_call = right_str in ("C", "CALL", "Call", "call")
+    oi_field = "callOpenInterest" if is_call else "putOpenInterest"
+    open_interest = _num(getattr(ticker, oi_field, None))
+
+    return s8_schema.LegGrab(
+        right=right_str,
+        strike=_num(strike),
+        bid=_num(getattr(ticker, "bid", None)),
+        ask=_num(getattr(ticker, "ask", None)),
+        last=_num(getattr(ticker, "last", None)),
+        bid_size=_num(getattr(ticker, "bidSize", None)),
+        ask_size=_num(getattr(ticker, "askSize", None)),
+        volume=_num(getattr(ticker, "volume", None)),
+        open_interest=open_interest,
+        delta=delta,
+        gamma=gamma,
+        vega=vega,
+        theta=theta,
+        iv=iv,
+        underlying_spot=und,
+        grab_ts=datetime.now(tz=_CT_ZONE).isoformat(timespec="milliseconds"),
+        complete=complete,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# PURE: SpreadPick + LegGrabs + context -> open TradeRecord
+# --------------------------------------------------------------------------- #
+def _date_slot_from_ts(entry_ts: Any) -> tuple[Optional[str], Optional[str]]:
+    """Derive (YYYYMMDD date, HH:MM slot) from an ISO entry timestamp string.
+
+    entry_ts is captured in CT (see capture_and_persist_entry), so the HH:MM slot lines up
+    with s8_config.ENTRY_GRID_CT's CT grid. Returns (None, None) if entry_ts is unusable.
+    """
+    if not entry_ts or not isinstance(entry_ts, str) or len(entry_ts) < 16:
+        return None, None
+    try:
+        date = entry_ts[:10].replace("-", "")
+        slot = entry_ts[11:16]
+        return date, slot
+    except Exception:
+        return None, None
+
+
+def build_entry_trade_record(
+    pick: Any,
+    template_cfg: dict,
+    account: Optional[str],
+    qty: Optional[int],
+    entry_ts: Optional[str],
+    entry_spot: Optional[float],
+    entry_vix: Optional[float],
+    entry_realized_vol: Optional[float],
+    short_leg: s8_schema.LegGrab,
+    long_leg: s8_schema.LegGrab,
+    stop_price: Optional[float],
+    paperbot_version: Optional[str],
+    pilot_mode: bool,
+) -> s8_schema.TradeRecord:
+    """Assemble a well-formed status="open" TradeRecord for one approved (would-be) entry.
+
+    Fills the entry group from the frozen SpreadPick + the two live LegGrabs + entry-time
+    context; exit stays None (Phase 2's shadow-monitor fills it). ``greeks_complete`` is the
+    conjunction of both legs' ``complete`` flags. ``trade_id`` is s8_schema.make_trade_id over
+    (date, template, slot, short_strike, long_strike) with date/slot derived from entry_ts.
+    """
+    date, slot = _date_slot_from_ts(entry_ts)
+    greeks_complete = bool(short_leg.complete and long_leg.complete)
+
+    entry = s8_schema.EntryInfo(
+        entry_ts=entry_ts,
+        entry_spot=_num(entry_spot),
+        entry_vix=_num(entry_vix),
+        entry_realized_vol=_num(entry_realized_vol),
+        short_strike=_num(pick.short_strike),
+        long_strike=_num(pick.long_strike),
+        width=_num(pick.width),
+        realized_credit=_num(pick.realized_credit),
+        stop_multiple=_num(template_cfg.get("stop_multiple")),
+        stop_price=_num(stop_price),
+        short_leg=short_leg,
+        long_leg=long_leg,
+        greeks_complete=greeks_complete,
+    )
+
+    trade_id = s8_schema.make_trade_id(
+        date, pick.template_name, slot, pick.short_strike, pick.long_strike
+    )
+
+    return s8_schema.TradeRecord(
+        trade_id=trade_id,
+        date=date,
+        account=account,
+        template=pick.template_name,
+        slot=slot,
+        side=pick.side,
+        expiration=None,   # set by capture_and_persist_entry from the chain snapshot
+        qty=qty,
+        status="open",
+        entry=entry,
+        exit=None,
+        provenance=s8_schema.Provenance(
+            paperbot_version=paperbot_version, pilot_mode=bool(pilot_mode)
+        ),
+    )
+
+
+# --------------------------------------------------------------------------- #
+# LIVE: subscribe, bounded-wait for greeks, harvest
+# --------------------------------------------------------------------------- #
+# Generic tick list: 100 = Option Volume, 101 = Option Open Interest, 106 = Option Implied
+# Volatility. Model greeks stream automatically for a qualified option subscription; the
+# bounded wait below is what lets them populate before we harvest (the settle-delay fix).
+_GREEKS_GENERIC_TICKS = "100,101,106"
+_POLL_INTERVAL_SECS = 0.25
+
+
+def grab_leg_live(ib, contract, right, strike, timeout: float = 8.0) -> s8_schema.LegGrab:
+    """Subscribe to one option leg, WAIT (bounded) for model greeks, harvest, cancel.
+
+    Streams live market data (snapshot=False) for `contract`, polling with ib.sleep every
+    _POLL_INTERVAL_SECS until ticker.modelGreeks populates OR `timeout` elapses, then reads
+    the leg via leg_grab_from_ticker. Always cancels the subscription in a finally. If greeks
+    never arrive within the timeout, the returned LegGrab has complete=False (flagged, not
+    fabricated).
+    """
+    ticker = ib.reqMktData(contract, genericTickList=_GREEKS_GENERIC_TICKS,
+                           snapshot=False, regulatorySnapshot=False)
+    try:
+        deadline = time.monotonic() + float(timeout)
+        while getattr(ticker, "modelGreeks", None) is None and time.monotonic() < deadline:
+            ib.sleep(_POLL_INTERVAL_SECS)
+        return leg_grab_from_ticker(ticker, right, strike)
+    finally:
+        try:
+            ib.cancelMktData(contract)
+        except Exception:
+            pass
+
+
+def grab_vix_live(ib, timeout: float = 5.0) -> Optional[float]:
+    """Best-effort live VIX level (last, else close, else marketPrice). None on any failure."""
+    vix = Index("VIX", "CBOE")
+    try:
+        try:
+            ib.qualifyContracts(vix)
+        except Exception:
+            pass
+        ticker = ib.reqMktData(vix, "", False, False)
+        try:
+            deadline = time.monotonic() + float(timeout)
+            while time.monotonic() < deadline:
+                val = _num(getattr(ticker, "last", None))
+                if val is None:
+                    val = _num(getattr(ticker, "close", None))
+                if val is not None:
+                    return val
+                ib.sleep(_POLL_INTERVAL_SECS)
+            # last resort: whatever marketPrice()/close is available at timeout
+            try:
+                mp = _num(ticker.marketPrice())
+            except Exception:
+                mp = None
+            return mp if mp is not None else _num(getattr(ticker, "close", None))
+        finally:
+            try:
+                ib.cancelMktData(vix)
+            except Exception:
+                pass
+    except Exception:
+        return None
+
+
+# --------------------------------------------------------------------------- #
+# LIVE: the top-level entry hook — BEST-EFFORT, never raises into the caller
+# --------------------------------------------------------------------------- #
+def _pilot_mode() -> bool:
+    """Read s8_runner.PILOT_MODE honestly (lazy import avoids the circular import — the
+    runner imports THIS module). Falls back to True (the safe assumption) on any import
+    problem, so the provenance stamp never under-reports the zero-transmit wall."""
+    try:
+        import s8_runner
+        return bool(s8_runner.PILOT_MODE)
+    except Exception:
+        return True
+
+
+def capture_and_persist_entry(ib, pick, template_cfg, account, qty, chain_snap,
+                              stop_price) -> Optional[str]:
+    """Grab both legs live (quotes+greeks) + spot + VIX at entry, build an "open"
+    TradeRecord, persist it via s8_store, and return its trade_id.
+
+    BEST-EFFORT by contract: this NEVER raises into the caller — any failure is caught,
+    logged, and returns None so a capture problem can never break the pilot cycle. Never
+    transmits: it only reads market data and writes to the local off-Drive store.
+
+    entry_realized_vol is left None here — session realized-vol enrichment is a DEFERRED
+    Phase-1 follow-up (the raw ticks captured by Phase 2's shadow-monitor are the intended
+    source), noted rather than silently faked.
+    """
+    try:
+        right = _SIDE_TO_RIGHT.get(pick.side)
+        if right is None:
+            print(f"    ! s8_capture: unknown pick.side {pick.side!r}; skipping capture")
+            return None
+
+        exp = chain_snap.attrs.get("expiration")
+        if not exp:
+            print("    ! s8_capture: chain_snap.attrs['expiration'] missing; skipping capture")
+            return None
+
+        # Contracts built the same way s8_runner.build_entry_order_group builds them (same
+        # SPXW trading class from s8_chain). Qualify so reqMktData has a resolved conId.
+        short_contract = Option("SPX", exp, pick.short_strike, right, "SMART",
+                                tradingClass=s8_chain._SPXW_TRADING_CLASS, currency="USD")
+        long_contract = Option("SPX", exp, pick.long_strike, right, "SMART",
+                               tradingClass=s8_chain._SPXW_TRADING_CLASS, currency="USD")
+        try:
+            ib.qualifyContracts(short_contract, long_contract)
+        except Exception as exc:
+            print(f"    ! s8_capture: qualifyContracts failed ({exc}); attempting grab anyway")
+
+        entry_ts = datetime.now(tz=_CT_ZONE).isoformat(timespec="milliseconds")
+        entry_spot = _num(chain_snap.attrs.get("spot"))
+        entry_vix = grab_vix_live(ib)
+
+        short_leg = grab_leg_live(ib, short_contract, right, pick.short_strike)
+        long_leg = grab_leg_live(ib, long_contract, right, pick.long_strike)
+
+        rec = build_entry_trade_record(
+            pick=pick,
+            template_cfg=template_cfg,
+            account=account,
+            qty=qty,
+            entry_ts=entry_ts,
+            entry_spot=entry_spot,
+            entry_vix=entry_vix,
+            entry_realized_vol=None,   # deferred enrichment (see docstring)
+            short_leg=short_leg,
+            long_leg=long_leg,
+            stop_price=stop_price,
+            paperbot_version=getattr(version, "VERSION", None),
+            pilot_mode=_pilot_mode(),
+        )
+        rec.expiration = exp
+
+        s8_store.upsert_trade_record(rec)
+        print(f"    s8_capture: persisted entry {rec.trade_id} "
+              f"(greeks_complete={rec.entry.greeks_complete})")
+        return rec.trade_id
+    except Exception as exc:
+        print(f"    ! s8_capture: entry capture FAILED ({type(exc).__name__}: {exc}); "
+              f"pilot cycle continues, nothing persisted")
+        return None

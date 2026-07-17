@@ -173,6 +173,7 @@ for _pkg_parent in ("connections", "strategies"):
 
 import ledger  # noqa: E402
 import order_router  # noqa: E402
+import s8_capture  # noqa: E402
 import s8_chain  # noqa: E402
 import s8_config  # noqa: E402
 import s8_risk  # noqa: E402
@@ -570,6 +571,23 @@ def _do_work(ib, due: list[tuple[str, str]]) -> int:
         would_lines.append(f"  {line}")
         outcome["would_transmit"] = line
         n_approved += 1
+
+        # RICH ENTRY CAPTURE (Phase 1, observation-only): grab both legs live
+        # (quotes + model greeks/IV) + spot + VIX at the entry instant, assemble an
+        # "open" TradeRecord and persist it via s8_store. This is a pure data-capture
+        # side effect that NEVER transmits and — being best-effort by contract — must
+        # NEVER break the pilot cycle. Wrapped defensively here too (belt-and-suspenders
+        # over capture_and_persist_entry's own internal try/except): a capture failure
+        # logs a warning and the cycle proceeds exactly as before.
+        try:
+            trade_id = s8_capture.capture_and_persist_entry(
+                ib, pick, cfg, account, QTY_PER_ENTRY, chain_snap, group.stop_price)
+            outcome["trade_id"] = trade_id
+        except Exception as exc:
+            print(f"    [{template_name}@{slot}] ! entry capture raised "
+                  f"({type(exc).__name__}: {exc}); pilot cycle continues")
+            outcome["trade_id"] = None
+
         results.append(outcome)
 
     ledger.record_run({
