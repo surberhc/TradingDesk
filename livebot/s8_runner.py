@@ -457,6 +457,103 @@ def filter_account_summary(summary, account: str):
     return [r for r in summary if getattr(r, "account", None) == account]
 
 
+def evaluate_and_capture_due_template(ib, chain_snap, summary, template_name: str,
+                                      slot: str, account: str,
+                                      qty: int = QTY_PER_ENTRY) -> dict:
+    """Evaluate ONE due (template, slot) end to end and return its outcome dict.
+
+    This is the SINGLE SHARED entry code path used by BOTH s8_runner._do_work (the
+    scheduled standalone runner) AND livebot/s8_service.py (the unified all-day service),
+    so the per-template decision logic exists in exactly one place and can never drift
+    between the two. It performs, in order:
+
+      1. s8_strategy.pick_spread_by_credit  — the FROZEN pick (rule #1; never re-derived)
+      2. s8_risk.margin_preflight           — margin gate on the (filtered) account summary
+      3. build_entry_order_group            — builds (NEVER transmits) the entry/stop/B2 group
+      4. the "WOULD HAVE TRANSMITTED" log line
+      5. s8_capture.capture_and_persist_entry — rich open-TradeRecord capture (best-effort)
+
+    ZERO-TRANSMIT: like build_entry_order_group, this only ever BUILDS the order group and
+    LOGS the would-have line — order_router.place() / ib.placeOrder() are NEVER called here.
+
+    Returns an outcome dict shaped exactly as _do_work's per-template results always were:
+      {"template", "slot"} always; then one of:
+        {"error": ...}                              (pick raised / order-group build failed)
+        {"pick": None, "reason": ...}               (no viable spread)
+        {"pick": {...}, "preflight": {...}, "reason": "margin preflight REFUSED"}
+        {"pick": {...}, "preflight": {...}, "would_transmit": <line>, "trade_id": <id|None>}
+    An approved entry is exactly the outcome carrying a "would_transmit" line.
+    """
+    cfg = s8_config.TEMPLATES[template_name]
+    outcome: dict = {"template": template_name, "slot": slot}
+
+    try:
+        pick = s8_strategy.pick_spread_by_credit(
+            chain_snap, template_name, cfg,
+            spot=chain_snap.attrs.get("spot"),
+            expiration=chain_snap.attrs.get("expiration"))
+    except Exception as exc:
+        outcome["error"] = f"pick_spread_by_credit raised: {type(exc).__name__}: {exc}"
+        print(f"    [{template_name}@{slot}] SKIP -- {outcome['error']}")
+        return outcome
+
+    if pick is None:
+        outcome["pick"] = None
+        outcome["reason"] = "no viable spread within tolerance of target credit"
+        print(f"    [{template_name}@{slot}] SKIP -- {outcome['reason']}")
+        return outcome
+
+    outcome["pick"] = {
+        "short_strike": pick.short_strike, "long_strike": pick.long_strike,
+        "width": pick.width, "realized_credit": pick.realized_credit,
+        "short_delta": pick.short_delta, "delta_note": pick.delta_note,
+    }
+
+    preflight = s8_risk.margin_preflight(
+        summary, width_points=pick.width, realized_credit=pick.realized_credit,
+        qty=qty)
+    outcome["preflight"] = {"ok": preflight.ok, "reasons": preflight.reasons,
+                            "required_notional": preflight.required_notional}
+    if not preflight.ok:
+        outcome["reason"] = "margin preflight REFUSED"
+        print(f"    [{template_name}@{slot}] SKIP -- margin preflight REFUSED: "
+              f"{'; '.join(preflight.reasons)}")
+        return outcome
+
+    try:
+        group = build_entry_order_group(ib, chain_snap, pick, cfg, account, qty)
+    except Exception as exc:
+        outcome["error"] = f"order-group construction FAILED: {type(exc).__name__}: {exc}"
+        print(f"    [{template_name}@{slot}] SKIP -- {outcome['error']}")
+        return outcome
+
+    # PILOT_MODE: log/email only. order_router.place() / ib.placeOrder() are NEVER
+    # called anywhere in this function (see module docstring's self-check).
+    line = (f"WOULD HAVE TRANSMITTED: S8 entry {template_name} "
+            f"short={pick.short_strike:g}/long={pick.long_strike:g} "
+            f"qty={qty} stop={group.stop_price:.2f} + B2 child")
+    print(f"    [{template_name}@{slot}] {line}")
+    outcome["would_transmit"] = line
+
+    # RICH ENTRY CAPTURE (Phase 1, observation-only): grab both legs live
+    # (quotes + model greeks/IV) + spot + VIX at the entry instant, assemble an
+    # "open" TradeRecord and persist it via s8_store. This is a pure data-capture
+    # side effect that NEVER transmits and — being best-effort by contract — must
+    # NEVER break the pilot cycle. Wrapped defensively here too (belt-and-suspenders
+    # over capture_and_persist_entry's own internal try/except): a capture failure
+    # logs a warning and the cycle proceeds exactly as before.
+    try:
+        trade_id = s8_capture.capture_and_persist_entry(
+            ib, pick, cfg, account, qty, chain_snap, group.stop_price)
+        outcome["trade_id"] = trade_id
+    except Exception as exc:
+        print(f"    [{template_name}@{slot}] ! entry capture raised "
+              f"({type(exc).__name__}: {exc}); pilot cycle continues")
+        outcome["trade_id"] = None
+
+    return outcome
+
+
 def _do_work(ib, due: list[tuple[str, str]]) -> int:
     account = s8_config.ACCOUNT  # provenance for order_ref/ledger AND the summary filter
     # below. The live-trade login exposes MORE THAN ONE managed account, so the account
@@ -514,81 +611,15 @@ def _do_work(ib, due: list[tuple[str, str]]) -> int:
 
     print(f"\n[3] Evaluating {len(due)} due template(s)...")
     for template_name, slot in due:
-        cfg = s8_config.TEMPLATES[template_name]
-        outcome: dict = {"template": template_name, "slot": slot}
-
-        try:
-            pick = s8_strategy.pick_spread_by_credit(
-                chain_snap, template_name, cfg,
-                spot=chain_snap.attrs.get("spot"),
-                expiration=chain_snap.attrs.get("expiration"))
-        except Exception as exc:
-            outcome["error"] = f"pick_spread_by_credit raised: {type(exc).__name__}: {exc}"
-            print(f"    [{template_name}@{slot}] SKIP -- {outcome['error']}")
-            results.append(outcome)
-            continue
-
-        if pick is None:
-            outcome["pick"] = None
-            outcome["reason"] = "no viable spread within tolerance of target credit"
-            print(f"    [{template_name}@{slot}] SKIP -- {outcome['reason']}")
-            results.append(outcome)
-            continue
-
-        outcome["pick"] = {
-            "short_strike": pick.short_strike, "long_strike": pick.long_strike,
-            "width": pick.width, "realized_credit": pick.realized_credit,
-            "short_delta": pick.short_delta, "delta_note": pick.delta_note,
-        }
-
-        preflight = s8_risk.margin_preflight(
-            summary, width_points=pick.width, realized_credit=pick.realized_credit,
-            qty=QTY_PER_ENTRY)
-        outcome["preflight"] = {"ok": preflight.ok, "reasons": preflight.reasons,
-                               "required_notional": preflight.required_notional}
-        if not preflight.ok:
-            outcome["reason"] = "margin preflight REFUSED"
-            print(f"    [{template_name}@{slot}] SKIP -- margin preflight REFUSED: "
-                  f"{'; '.join(preflight.reasons)}")
-            results.append(outcome)
-            continue
-
-        try:
-            group = build_entry_order_group(ib, chain_snap, pick, cfg, account,
-                                            QTY_PER_ENTRY)
-        except Exception as exc:
-            outcome["error"] = f"order-group construction FAILED: {type(exc).__name__}: {exc}"
-            print(f"    [{template_name}@{slot}] SKIP -- {outcome['error']}")
-            results.append(outcome)
-            continue
-
-        # PILOT_MODE: log/email only. order_router.place() / ib.placeOrder() are NEVER
-        # called anywhere in this function (see module docstring's self-check).
-        line = (f"WOULD HAVE TRANSMITTED: S8 entry {template_name} "
-               f"short={pick.short_strike:g}/long={pick.long_strike:g} "
-               f"qty={QTY_PER_ENTRY} stop={group.stop_price:.2f} + B2 child")
-        print(f"    [{template_name}@{slot}] {line}")
-        would_lines.append(f"  {line}")
-        outcome["would_transmit"] = line
-        n_approved += 1
-
-        # RICH ENTRY CAPTURE (Phase 1, observation-only): grab both legs live
-        # (quotes + model greeks/IV) + spot + VIX at the entry instant, assemble an
-        # "open" TradeRecord and persist it via s8_store. This is a pure data-capture
-        # side effect that NEVER transmits and — being best-effort by contract — must
-        # NEVER break the pilot cycle. Wrapped defensively here too (belt-and-suspenders
-        # over capture_and_persist_entry's own internal try/except): a capture failure
-        # logs a warning and the cycle proceeds exactly as before.
-        try:
-            trade_id = s8_capture.capture_and_persist_entry(
-                ib, pick, cfg, account, QTY_PER_ENTRY, chain_snap, group.stop_price)
-            outcome["trade_id"] = trade_id
-        except Exception as exc:
-            print(f"    [{template_name}@{slot}] ! entry capture raised "
-                  f"({type(exc).__name__}: {exc}); pilot cycle continues")
-            outcome["trade_id"] = None
-
+        # The per-template decision logic now lives in evaluate_and_capture_due_template
+        # (shared verbatim with livebot/s8_service.py — one code path, no drift). This
+        # loop only accumulates the cycle-level ledger/email aggregates around it.
+        outcome = evaluate_and_capture_due_template(
+            ib, chain_snap, summary, template_name, slot, account)
         results.append(outcome)
+        if outcome.get("would_transmit"):
+            would_lines.append(f"  {outcome['would_transmit']}")
+            n_approved += 1
 
     ledger.record_run({
         "mode": "s8_live_pilot", "account": account,
