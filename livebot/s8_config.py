@@ -19,17 +19,17 @@ plainly in a comment rather than silently resolved either direction.
 from __future__ import annotations
 
 # ---------------------------------------------------------------------------
-# Account — INTENTIONALLY "TBD" (fail-closed)
+# Account — SET to U14438624 (was "TBD"; chosen 2026-07-17)
 # ---------------------------------------------------------------------------
 # S8's live pilot targets the new live-TRADING Gateway (connections.ibkr_live_trade, port
-# 4003), whose login covers two individual live-trading TEST accounts. S8 will use ONE
-# of those two test accounts — but Andrew has not yet provided the specific account
-# number, so this stays the "TBD" placeholder on purpose (fail-closed).
+# 4003), whose login covers two individual live-trading TEST accounts: the trust account
+# U14438624 (last-4 8624) and the individual account U5721712. On 2026-07-17 Andrew chose
+# the trust test account U14438624, so ACCOUNT is now SET — no longer TBD.
 #
-# While ACCOUNT == "TBD", livebot/s8_runner.py REFUSES to run (returns 2) before making
-# any Gateway contact — see its main() TBD guard and module docstring. Set this to the
-# real test-account number only when Andrew provides it; do NOT invent one.
-ACCOUNT = "TBD"
+# Historical context: while ACCOUNT == "TBD", livebot/s8_runner.py REFUSED to run
+# (returned 2) before making any Gateway contact (see its main() TBD guard). That guard
+# no longer trips now that a real account is set.
+ACCOUNT = "U14438624"
 
 
 # ---------------------------------------------------------------------------

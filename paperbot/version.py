@@ -15,10 +15,30 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.15.0"
+VERSION = "0.16.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.16.0", "2026-07-17", "S8 live-pilot margin preflight fixed for the real "
+                             "live-trade account (port 4003, U14438624). Two order-gating "
+                             "corrections, both found by reading the live account: (1) the "
+                             "login exposes TWO managed accounts (trust U14438624 + "
+                             "individual U5721712) plus an 'All' aggregate, so s8_runner "
+                             "now filters ib.accountSummary() to s8_config.ACCOUNT before "
+                             "the preflight (new filter_account_summary; fail-closed refuse "
+                             "if the target account is absent) -- previously _summary_map's "
+                             "last-write-wins collapse let the preflight read the WRONG "
+                             "account's numbers. (2) s4_risk.account_is_margin now also "
+                             "treats BuyingPower > NetLiquidation as margin: IBKR reports "
+                             "AccountType='TRUST'/'INDIVIDUAL' (legal-entity label, no "
+                             "'MARGIN' token) for this account, which the string-only test "
+                             "wrongly refused; BP>NLV is impossible on a cash account, a "
+                             "definitive margin tell with no tunable threshold (rule #1 "
+                             "clean). s8_risk passes BuyingPower/NetLiquidation into the "
+                             "check; S4's own call stays string-only (unchanged). "
+                             "Order-affecting: fixes whether an S8 spread entry is approved "
+                             "by the margin gate. Still zero-transmit (PILOT_MODE=True, "
+                             "connect readonly=True, gateway ReadOnlyApi=yes); +6 tests."),
     ("0.15.0", "2026-07-09", "DU8922144 and DU8922146 removed from ENROLLMENT "
                              "(Andrew's explicit decision, freeing them up for testing "
                              "other strategies later, e.g. S4/S8). Balanced and Growth "

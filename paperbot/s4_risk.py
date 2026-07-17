@@ -127,13 +127,29 @@ def _num(m: dict, tag: str, default: float = 0.0) -> float:
         return default
 
 
-def account_is_margin(account_type: str) -> bool:
-    """True if the reported AccountType string denotes a margin-capable account.
+def account_is_margin(account_type: str, buying_power: float | None = None,
+                      net_liq: float | None = None) -> bool:
+    """True if the account is margin-capable. Two independent signals, in order:
 
-    Requires a MARGIN token; a type that is purely CASH (no MARGIN token) is NOT margin.
-    (IBKR uses e.g. "MARGIN", "REG T MARGIN", "PORTFOLIO MARGIN" vs "CASH"/"REG T CASH".)"""
+      1. The AccountType string carries a MARGIN token ("MARGIN", "REG T MARGIN",
+         "PORTFOLIO MARGIN") and not a pure CASH type -- IBKR's cleanest signal WHEN it
+         reports one.
+      2. BuyingPower exceeds NetLiquidation. IBKR's AccountType tag does NOT always
+         report margin-vs-cash: for some accounts it reports the legal-ENTITY type
+         instead (e.g. "TRUST", "INDIVIDUAL"), which carries no MARGIN token even though
+         the account plainly trades on margin. A cash account's BuyingPower can never
+         exceed its NetLiquidation, so BuyingPower > NetLiquidation is a definitive
+         margin tell that needs no tunable threshold (rule #1 clean). Consulted only when
+         BOTH figures are supplied; string-only callers keep the exact old behavior.
+
+    Fail closed: unknown/blank type with no buying-power evidence -> NOT margin.
+    (Verified 2026-07-17 against live-trade account U14438624, which reports
+    AccountType="TRUST" with BuyingPower ~$378k vs NetLiq ~$117k -- margin, via signal 2.)"""
     t = (account_type or "").upper()
     if any(tok in t for tok in _MARGIN_TOKENS):
+        return True
+    if (buying_power is not None and net_liq is not None
+            and net_liq > 0 and buying_power > net_liq + _EPS):
         return True
     if any(tok in t for tok in _CASH_TOKENS):
         return False

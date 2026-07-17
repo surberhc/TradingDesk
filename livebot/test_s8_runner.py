@@ -155,9 +155,10 @@ class _FakeIB:
         self.client = _FakeClient()
 
     def accountSummary(self):
-        # Matches the live-trading connection's real shape: accountSummary() takes no
-        # account argument (the login serves the connected account's own summary; see
-        # s8_runner.py's _do_work -- "NOT passed to accountSummary() below").
+        # accountSummary() takes no account argument. Returns whatever this fake was
+        # seeded with -- either a single-account dict (which filter_account_summary passes
+        # through unchanged) or a list of per-account rows (which it filters to
+        # s8_config.ACCOUNT, mirroring the real two-account live-trade login).
         return self._summary
 
     def disconnect(self):
@@ -271,3 +272,61 @@ def test_full_due_cycle_builds_a_stop_parent_and_b2_child(monkeypatch):
     assert group.entry_long_order.action == "BUY"
     assert group.stop_order.action == "BUY"      # closes (buys back) the short leg
     assert group.b2_close_order.action == "SELL"  # closes (sells) the long leg
+
+
+class _Row:
+    """A minimal accountSummary row: has .account/.tag/.value like ib_async's AccountValue."""
+    def __init__(self, account, tag, value):
+        self.account = account
+        self.tag = tag
+        self.value = value
+
+
+def test_filter_account_summary_picks_target_from_multi_account_login():
+    rows = [
+        _Row("All", "BuyingPower", "999"),
+        _Row("U14438624", "AccountType", "TRUST"),
+        _Row("U14438624", "BuyingPower", "378279"),
+        _Row("U14438624", "NetLiquidation", "116852"),
+        _Row("U14438624", "ExcessLiquidity", "94569"),
+        _Row("U5721712", "AccountType", "INDIVIDUAL"),
+        _Row("U5721712", "BuyingPower", "957"),
+        _Row("U5721712", "NetLiquidation", "957"),
+    ]
+    filtered = runner.filter_account_summary(rows, "U14438624")
+    assert {r.account for r in filtered} == {"U14438624"}
+
+    import s8_risk
+    pf = s8_risk.margin_preflight(filtered, width_points=50.0, realized_credit=2.0, qty=1)
+    assert pf.ok, pf.reasons
+    assert pf.buying_power == pytest.approx(378279)
+
+
+def test_filter_account_summary_dict_passes_through():
+    d = {"AccountType": "MARGIN", "BuyingPower": 1, "ExcessLiquidity": 1}
+    assert runner.filter_account_summary(d, "anything") is d
+
+
+def test_full_cycle_refuses_when_target_account_absent(monkeypatch):
+    monkeypatch.setattr(runner.s8_config, "ACCOUNT", "U14438624")
+    monkeypatch.setattr(runner, "due_templates", lambda now: [("Puts-80-$4", "08:45")])
+    rows = [
+        _Row("U5721712", "AccountType", "INDIVIDUAL"),
+        _Row("U5721712", "BuyingPower", "957"),
+        _Row("U5721712", "NetLiquidation", "957"),
+    ]
+    fake_ib = _FakeIB(rows)
+    monkeypatch.setattr(runner, "bounded_connect", lambda *a, **k: fake_ib)
+    monkeypatch.setattr(runner.s8_chain, "snapshot_0dte_chain",
+                        lambda ib, *a, **k: _synthetic_chain_snapshot())
+    monkeypatch.setattr(runner.order_router, "place", _boom_place)
+    recs = []
+    monkeypatch.setattr(runner.ledger, "record_run", lambda r: recs.append(r) or "f.jsonl")
+    monkeypatch.setattr(runner, "_alert_email", lambda *a, **k: None)
+
+    rc = runner.main()
+
+    assert rc == 1
+    assert recs and recs[0]["halted"] is True
+    assert "not found" in recs[0]["error"]
+    assert fake_ib.disconnected is True

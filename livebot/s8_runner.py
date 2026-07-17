@@ -423,21 +423,58 @@ def main() -> int:
 # file never operates the shared PAPER Gateway, so that mutex is not applicable to it.
 
 
-def _do_work(ib, due: list[tuple[str, str]]) -> int:
-    account = s8_config.ACCOUNT  # provenance/logging only (order_ref, ledger record) --
-    # see the module docstring's "ACCOUNT == TBD REFUSAL" section. NOT passed to
-    # accountSummary() below: the live-trading login serves the connected account's own
-    # summary directly, so filtering by this string would be redundant on this call.
+def filter_account_summary(summary, account: str):
+    """Keep only the accountSummary rows for `account`.
 
-    print("\n[1] Reading account summary from the live-trading connection "
-          f"(s8_config.ACCOUNT={account!r} is provenance for the ledger/order_ref, "
-          f"not a filter on this call)...")
+    The live-trade login exposes MORE THAN ONE managed account (e.g. a trust + an
+    individual test account), so `ib.accountSummary()` returns rows for every account
+    under the login PLUS an aggregate 'All' scope. s8_risk._summary_map collapses rows
+    last-write-wins, so handing it the unfiltered blend would let the margin preflight
+    read the WRONG account's AccountType/BuyingPower/NetLiquidation. Filtering to the
+    target account first makes the preflight deterministic and correct.
+
+    A dict {tag: value} already represents a single account's summary (the offline-test
+    shape, same dual-shape convention as s8_risk._summary_map) and is returned unchanged.
+    A live accountSummary() list is filtered to the rows whose `.account` matches.
+    """
+    if isinstance(summary, dict):
+        return summary
+    return [r for r in summary if getattr(r, "account", None) == account]
+
+
+def _do_work(ib, due: list[tuple[str, str]]) -> int:
+    account = s8_config.ACCOUNT  # provenance for order_ref/ledger AND the summary filter
+    # below. The live-trade login exposes MORE THAN ONE managed account, so the account
+    # summary MUST be filtered to this account before the margin preflight (see
+    # filter_account_summary). An earlier version assumed a single account under the login
+    # and did NOT filter, which let the preflight read the wrong account's numbers.
+
+    print("\n[1] Reading account summary from the live-trading connection and filtering "
+          f"to s8_config.ACCOUNT={account!r} (the live-trade login exposes more than one "
+          f"account, so this filter is REQUIRED -- see filter_account_summary)...")
     try:
-        summary = ib.accountSummary()
+        summary_all = ib.accountSummary()
     except Exception as exc:
         msg = f"S8 runner: could not read accountSummary() from the live-trading connection: {exc}"
         print(f"    {msg}")
         _alert_email("S8 runner: accountSummary FAILED", [msg])
+        return 1
+
+    summary = filter_account_summary(summary_all, account)
+    if not summary:
+        seen = sorted(str(a) for a in {getattr(r, "account", None) for r in summary_all}
+                      if a is not None)
+        msg = (f"S8 runner: target account {account!r} not found under the live-trade "
+               f"login (accounts seen: {seen}) -- REFUSING this cycle. Check "
+               f"s8_config.ACCOUNT against the login's managed accounts.")
+        print(f"    {msg}")
+        _alert_email("S8 runner: target account not found", [msg])
+        ledger.record_run({
+            "mode": "s8_live_pilot", "account": account,
+            "due_templates": [n for n, _ in due], "n_intents": len(due),
+            "n_approved": 0, "n_transmitted": 0, "halted": True,
+            "error": f"target account {account!r} not found under login; accounts seen: {seen}",
+        })
         return 1
 
     print("\n[2] Snapshotting today's live 0DTE SPXW chain...")

@@ -8,16 +8,17 @@ WHOSE accountSummary THIS ACTUALLY IS
 --------------------------------------
 s8_runner.py routes its live cycle exclusively through `connections.ibkr_live_trade` (the
 live-TRADING Gateway, port 4003 — a funded, transmit-capable test account, connected
-read-only during the pilot), not the paper Gateway. So the `summary` this function
-receives in practice is the live-trading account's own `accountSummary()` — not a paper
-DU sub-account's (the login serves the connected account's own summary directly). This
-function itself needed no logic change for that: it was already generic over any
-accountSummary shape (dict or ib_async row list, see `_summary_map`) and doesn't care
-whose account produced the tags. This note exists purely so a reader doesn't assume
-`summary` is filtered by `livebot/s8_config.py`'s `ACCOUNT` — it is not; that constant
-(currently "TBD" until the S8 test account is provided) is provenance for the ledger/
-order_ref, not a filter applied anywhere in this module or in the accountSummary() call
-that feeds it.
+read-only during the pilot), not the paper Gateway. That login exposes MORE THAN ONE
+managed account (a trust + an individual test account), so s8_runner.py filters
+`ib.accountSummary()` down to `livebot/s8_config.py`'s `ACCOUNT` BEFORE calling this
+function (see `s8_runner.filter_account_summary`). The `summary` this function receives is
+therefore the TARGET account's own rows only. This function is generic over any
+accountSummary shape (dict or ib_async row list, see `_summary_map`) and does not itself
+filter — the caller owns that. (An earlier version of this note claimed the login served a
+single account so no filter was needed; that became wrong once the login carried two
+accounts, and the runner now filters explicitly. `_summary_map` is last-write-wins across
+rows, so feeding it an UNfiltered two-account summary would let it read the wrong
+account's AccountType/BuyingPower — exactly what the filter prevents.)
 
 WHY A SIBLING (not an edit to s4_risk.py)
 ------------------------------------------
@@ -119,9 +120,13 @@ def margin_preflight(summary, width_points: float, realized_credit: float, qty: 
     """
     m = _summary_map(summary)
     account_type = m.get("AccountType", "")
-    is_margin = account_is_margin(account_type)
     buying_power = _num(m, "BuyingPower")
     excess_liq = _num(m, "ExcessLiquidity")
+    net_liq = _num(m, "NetLiquidation")
+    # account_is_margin gets the buying-power/net-liq signal too: this account's IBKR
+    # AccountType is a legal-entity label ("TRUST"), not "MARGIN", so the string test
+    # alone would wrongly refuse it -- BuyingPower > NetLiquidation proves it is margin.
+    is_margin = account_is_margin(account_type, buying_power=buying_power, net_liq=net_liq)
     need = required_notional(width_points, realized_credit, qty)
 
     reasons: list[str] = []

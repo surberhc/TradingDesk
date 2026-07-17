@@ -108,3 +108,29 @@ def test_account_is_margin_reused_from_s4_risk():
     # drift between S4 and S8.
     assert s8_risk.account_is_margin("MARGIN")
     assert not s8_risk.account_is_margin("CASH")
+
+
+def test_preflight_accepts_trust_account_when_buying_power_exceeds_net_liq():
+    summary = {"AccountType": "TRUST", "BuyingPower": 378_279,
+               "ExcessLiquidity": 94_569, "NetLiquidation": 116_852}
+    r = s8_risk.margin_preflight(summary, **WIDTH_80_CREDIT_4)
+    assert r.ok, r.reasons
+    assert r.is_margin
+
+
+def test_preflight_refuses_entity_labeled_account_when_bp_not_over_net_liq():
+    summary = {"AccountType": "TRUST", "BuyingPower": 50_000,
+               "ExcessLiquidity": 50_000, "NetLiquidation": 116_852}
+    r = s8_risk.margin_preflight(summary, **WIDTH_80_CREDIT_4)
+    assert not r.ok
+    assert not r.is_margin
+    assert any("require a MARGIN account" in x for x in r.reasons)
+
+
+def test_account_is_margin_buying_power_signal():
+    assert s8_risk.account_is_margin("TRUST", buying_power=378_000, net_liq=116_000)
+    assert s8_risk.account_is_margin("INDIVIDUAL", buying_power=200_000, net_liq=100_000)
+    assert not s8_risk.account_is_margin("TRUST", buying_power=100_000, net_liq=116_000)
+    assert not s8_risk.account_is_margin("INDIVIDUAL", buying_power=957, net_liq=957)
+    assert s8_risk.account_is_margin("REG T MARGIN")
+    assert not s8_risk.account_is_margin("TRUST", buying_power=100, net_liq=0)
