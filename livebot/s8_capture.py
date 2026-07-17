@@ -27,8 +27,9 @@ STRUCTURE
       quotes + greeks from an ib_async Ticker-like object into an s8_schema.LegGrab.
   * build_entry_trade_record(...)                PURE, offline-testable — assemble an
       "open" TradeRecord from a SpreadPick + two LegGrabs + entry context.
-  * grab_leg_live(ib, contract, ...)             LIVE — subscribe, bounded-wait for greeks,
-      harvest, cancel. Thin; verified against the installed ib_async, not offline-unit-tested.
+  * grab_leg_live(ib, contract, ...)             LIVE — subscribe, bounded-wait for greeks
+      THEN a short bounded-wait for open interest, harvest, cancel. Thin; verified against
+      the installed ib_async, not offline-unit-tested (wait_for_oi's logic IS unit-tested).
   * grab_vix_live(ib, ...)                        LIVE — best-effort VIX last/close.
   * capture_and_persist_entry(ib, pick, ...)     LIVE — the top-level entry hook. BEST-EFFORT:
       it NEVER raises into the caller; any failure returns None so the pilot cycle is never
@@ -56,6 +57,7 @@ if _PAPERBOT not in sys.path:
 import s8_chain            # noqa: E402  (sibling in livebot/)
 import s8_schema           # noqa: E402
 import s8_store            # noqa: E402
+import s8_vol              # noqa: E402  (sibling in livebot/)
 import version             # noqa: E402  (from paperbot/)
 
 _CT_ZONE = ZoneInfo("America/Chicago")
@@ -78,6 +80,23 @@ def _num(x: Any) -> Optional[float]:
         return None if x != x else float(x)   # NaN != NaN
     except (TypeError, ValueError):
         return None
+
+
+def _is_call(right: Any) -> bool:
+    """True if `right` denotes a CALL (accepts ib_async 'C'/'CALL' spellings)."""
+    return None if right is None else str(right) in ("C", "CALL", "Call", "call")
+
+
+def oi_from_ticker(ticker: Any, right: Any) -> Optional[float]:
+    """Right-appropriate open interest off an ib_async Ticker-like object.
+
+    Calls and puts carry OI on distinct ticker fields: ``callOpenInterest`` for a call,
+    ``putOpenInterest`` for a put. Reads the correct one for `right` and normalises
+    NaN/None (the "not ticked in yet" state) to None. Falls back gracefully to None when
+    the field is absent entirely.
+    """
+    oi_field = "callOpenInterest" if _is_call(right) else "putOpenInterest"
+    return _num(getattr(ticker, oi_field, None))
 
 
 # --------------------------------------------------------------------------- #
@@ -108,9 +127,7 @@ def leg_grab_from_ticker(ticker: Any, right: Any, strike: Any) -> s8_schema.LegG
     und = _num(getattr(greeks, "undPrice", None)) if complete else None
 
     # Right-appropriate open interest (calls vs puts have distinct ticker fields).
-    is_call = right_str in ("C", "CALL", "Call", "call")
-    oi_field = "callOpenInterest" if is_call else "putOpenInterest"
-    open_interest = _num(getattr(ticker, oi_field, None))
+    open_interest = oi_from_ticker(ticker, right)
 
     return s8_schema.LegGrab(
         right=right_str,
@@ -225,21 +242,66 @@ _GREEKS_GENERIC_TICKS = "100,101,106"
 _POLL_INTERVAL_SECS = 0.25
 
 
-def grab_leg_live(ib, contract, right, strike, timeout: float = 8.0) -> s8_schema.LegGrab:
-    """Subscribe to one option leg, WAIT (bounded) for model greeks, harvest, cancel.
+def _env_float(name: str, default: float) -> float:
+    """Read a float from env, falling back to `default` on missing/garbage."""
+    try:
+        return float(os.environ.get(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+# Additional bounded wait for the option OPEN-INTEREST tick (generic tick 101) AFTER model
+# greeks (tick 106) have populated. OI ticks in slightly later than greeks, so harvesting
+# the instant greeks arrive left open_interest=None. For SPXW 0DTE the OI figure is the
+# PRIOR session's (it updates once daily), so it should be available with a small wait.
+# Configurable via env so the timeout can be tuned without a code edit.
+_OI_EXTRA_WAIT_SECS = _env_float("S8_OI_WAIT_SECS", 3.0)
+
+
+def wait_for_oi(ticker: Any, right: Any, timeout: float, *, sleep,
+                monotonic=time.monotonic,
+                poll_interval: float = _POLL_INTERVAL_SECS) -> Optional[float]:
+    """Poll until the right-appropriate open interest is present on `ticker`, or `timeout`.
+
+    BOUNDED — never hangs: polls every `poll_interval` (via the injected `sleep`) until
+    oi_from_ticker(ticker, right) is non-None OR `timeout` seconds have elapsed on the
+    injected `monotonic` clock, then returns whatever OI is present (possibly None). `sleep`
+    and `monotonic` are injected so the pure wait/predicate logic is offline-testable with a
+    fake clock and a ticker that never populates OI.
+    """
+    deadline = monotonic() + float(timeout)
+    oi = oi_from_ticker(ticker, right)
+    while oi is None and monotonic() < deadline:
+        sleep(poll_interval)
+        oi = oi_from_ticker(ticker, right)
+    return oi
+
+
+def grab_leg_live(ib, contract, right, strike, timeout: float = 8.0,
+                  oi_timeout: Optional[float] = None) -> s8_schema.LegGrab:
+    """Subscribe to one option leg, WAIT (bounded) for model greeks THEN open interest,
+    harvest, cancel.
 
     Streams live market data (snapshot=False) for `contract`, polling with ib.sleep every
-    _POLL_INTERVAL_SECS until ticker.modelGreeks populates OR `timeout` elapses, then reads
-    the leg via leg_grab_from_ticker. Always cancels the subscription in a finally. If greeks
-    never arrive within the timeout, the returned LegGrab has complete=False (flagged, not
-    fabricated).
+    _POLL_INTERVAL_SECS until ticker.modelGreeks populates OR `timeout` elapses. Then does a
+    SHORT additional bounded wait (up to `oi_timeout` secs, default _OI_EXTRA_WAIT_SECS) for
+    the right-appropriate open-interest tick, which arrives slightly after greeks. Finally
+    reads the leg via leg_grab_from_ticker and always cancels the subscription in a finally.
+
+    Neither wait ever hangs: if greeks never arrive the LegGrab is complete=False (flagged,
+    not fabricated); if OI never arrives it is recorded as None (flagged, not fabricated).
     """
+    ot = _OI_EXTRA_WAIT_SECS if oi_timeout is None else oi_timeout
     ticker = ib.reqMktData(contract, genericTickList=_GREEKS_GENERIC_TICKS,
                            snapshot=False, regulatorySnapshot=False)
     try:
         deadline = time.monotonic() + float(timeout)
         while getattr(ticker, "modelGreeks", None) is None and time.monotonic() < deadline:
             ib.sleep(_POLL_INTERVAL_SECS)
+        # Short additional bounded wait for the OI tick (arrives after greeks). Bounded by
+        # `ot`; never hangs even if OI never populates.
+        if ot and ot > 0:
+            wait_for_oi(ticker, right, ot, sleep=ib.sleep)
         return leg_grab_from_ticker(ticker, right, strike)
     finally:
         try:
@@ -304,9 +366,9 @@ def capture_and_persist_entry(ib, pick, template_cfg, account, qty, chain_snap,
     logged, and returns None so a capture problem can never break the pilot cycle. Never
     transmits: it only reads market data and writes to the local off-Drive store.
 
-    entry_realized_vol is left None here — session realized-vol enrichment is a DEFERRED
-    Phase-1 follow-up (the raw ticks captured by Phase 2's shadow-monitor are the intended
-    source), noted rather than silently faked.
+    entry_realized_vol is populated best-effort from s8_vol.realized_vol_live (annualized
+    close-to-close realized vol of SPX over ~21 trading days; see that module for the exact
+    definition). It is CONTEXT data, not a strategy input — None on any failure, never faked.
     """
     try:
         right = _SIDE_TO_RIGHT.get(pick.side)
@@ -333,6 +395,7 @@ def capture_and_persist_entry(ib, pick, template_cfg, account, qty, chain_snap,
         entry_ts = datetime.now(tz=_CT_ZONE).isoformat(timespec="milliseconds")
         entry_spot = _num(chain_snap.attrs.get("spot"))
         entry_vix = grab_vix_live(ib)
+        entry_realized_vol = s8_vol.realized_vol_live(ib)   # best-effort; None on failure
 
         short_leg = grab_leg_live(ib, short_contract, right, pick.short_strike)
         long_leg = grab_leg_live(ib, long_contract, right, pick.long_strike)
@@ -345,7 +408,7 @@ def capture_and_persist_entry(ib, pick, template_cfg, account, qty, chain_snap,
             entry_ts=entry_ts,
             entry_spot=entry_spot,
             entry_vix=entry_vix,
-            entry_realized_vol=None,   # deferred enrichment (see docstring)
+            entry_realized_vol=entry_realized_vol,
             short_leg=short_leg,
             long_leg=long_leg,
             stop_price=stop_price,

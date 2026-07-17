@@ -100,6 +100,17 @@ def test_leg_grab_call_reads_call_open_interest():
     assert leg.open_interest == 3333   # call leg reads callOpenInterest
 
 
+def test_leg_grab_open_interest_none_when_absent():
+    # OI field never ticked in (None) for the relevant right -> recorded None, not fabricated.
+    greeks = _FakeGreeks(delta=-0.2)
+    t_put = _FakeTicker(bid=1.0, ask=1.1, putOpenInterest=None, callOpenInterest=500,
+                        modelGreeks=greeks)
+    leg = s8_capture.leg_grab_from_ticker(t_put, "P", 7480.0)
+    assert leg.open_interest is None       # put reads putOpenInterest (absent), not the call's
+    # greeks behaviour unchanged by the OI read.
+    assert leg.complete is True and leg.delta == -0.2
+
+
 def test_leg_grab_incomplete_and_null_greeks_when_modelgreeks_absent():
     # modelGreeks is None (the settle-delay case that caused the observed short_delta=null).
     t = _FakeTicker(bid=4.10, ask=4.30, modelGreeks=None)
@@ -136,6 +147,58 @@ def test_leg_grab_normalises_nan_to_none():
     # Nothing NaN survives into the record.
     for v in leg.to_dict().values():
         assert not (isinstance(v, float) and math.isnan(v))
+
+
+# --------------------------------------------------------------------------- #
+# wait_for_oi — bounded wait/predicate logic (pure, no IB, no real sleeps)
+# --------------------------------------------------------------------------- #
+class _FakeClock:
+    """A controllable monotonic clock: sleep() advances virtual time, no real waiting."""
+    def __init__(self):
+        self.t = 0.0
+
+    def monotonic(self):
+        return self.t
+
+    def sleep(self, secs):
+        self.t += float(secs)
+
+
+def test_wait_for_oi_bounded_returns_none_when_oi_never_populates():
+    # A put ticker whose putOpenInterest never arrives — the wait must TERMINATE at the
+    # timeout (not hang) and return None (flagged, not fabricated).
+    clock = _FakeClock()
+    t = _FakeTicker(bid=1.0, ask=1.1, putOpenInterest=None, callOpenInterest=None)
+
+    oi = s8_capture.wait_for_oi(t, "P", timeout=3.0,
+                                sleep=clock.sleep, monotonic=clock.monotonic,
+                                poll_interval=0.25)
+
+    assert oi is None
+    # Bounded: the virtual clock advanced past the timeout, i.e. the loop actually exited
+    # on the deadline rather than spinning forever.
+    assert clock.t >= 3.0
+
+
+def test_wait_for_oi_returns_immediately_when_already_present():
+    clock = _FakeClock()
+    t = _FakeTicker(bid=1.0, ask=1.1, putOpenInterest=4200)
+    oi = s8_capture.wait_for_oi(t, "P", timeout=3.0,
+                                sleep=clock.sleep, monotonic=clock.monotonic,
+                                poll_interval=0.25)
+    assert oi == 4200
+    assert clock.t == 0.0   # never slept — OI was there on the first read
+
+
+def test_wait_for_oi_reads_right_appropriate_field():
+    clock = _FakeClock()
+    # OI only present on the CALL field; a PUT wait must NOT read it and must time out None.
+    t = _FakeTicker(bid=1.0, ask=1.1, putOpenInterest=None, callOpenInterest=9999)
+    assert s8_capture.wait_for_oi(t, "P", timeout=1.0, sleep=clock.sleep,
+                                  monotonic=clock.monotonic, poll_interval=0.25) is None
+    clock2 = _FakeClock()
+    assert s8_capture.wait_for_oi(t, "C", timeout=1.0, sleep=clock2.sleep,
+                                  monotonic=clock2.monotonic, poll_interval=0.25) == 9999
 
 
 # --------------------------------------------------------------------------- #
