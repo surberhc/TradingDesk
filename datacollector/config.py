@@ -31,6 +31,14 @@ DERIVED = DATA_ROOT / "derived"                              # computed feature 
 CATALOG_DB = DATA_ROOT / "catalog.duckdb"                    # DuckDB views over the parquet
 MANIFEST = RAW_OPTIONS / "_manifest.json"                    # what we've pulled, for resumability
 
+# Parallel IBKR-sourced namespace, used ONLY during the ThetaData A/B validation
+# window so IBKR (port-4001) and ThetaData days can coexist for daily comparison
+# (they otherwise collide in raw/options via storage.have_day). Kept OUT of the
+# main catalog.duckdb; the A/B check reads these parquet files directly. Same
+# column schema as the ThetaData parquet, so a future cutover can union cleanly.
+RAW_OPTIONS_IBKR = DATA_ROOT / "raw" / "options_ibkr"
+MANIFEST_IBKR = RAW_OPTIONS_IBKR / "_manifest.json"
+
 # Secrets live OUTSIDE Drive in the consolidated local secrets file. We only ever
 # READ the key by name; its value is never printed/echoed. (Repointed 2026-06-26:
 # the old backtester\.env was deleted in the reorg. The key now sits alongside

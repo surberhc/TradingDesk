@@ -23,11 +23,12 @@ import pandas as pd
 import config
 
 
-def _manifest() -> dict:
-    if not config.MANIFEST.exists():
+def _manifest(manifest_path=None) -> dict:
+    mp = manifest_path or config.MANIFEST
+    if not mp.exists():
         return {}
     try:
-        return json.loads(config.MANIFEST.read_text())
+        return json.loads(mp.read_text())
     except (json.JSONDecodeError, OSError):
         # A truncated/corrupt manifest (e.g. a kill mid-write before atomic writes
         # existed) must NOT brick the grab. Treat as empty — have_day() keys off
@@ -35,25 +36,26 @@ def _manifest() -> dict:
         return {}
 
 
-def _save_manifest(m: dict) -> None:
-    config.MANIFEST.parent.mkdir(parents=True, exist_ok=True)
+def _save_manifest(m: dict, manifest_path=None) -> None:
+    mp = manifest_path or config.MANIFEST
+    mp.parent.mkdir(parents=True, exist_ok=True)
     # Atomic: write to a temp file then replace, so a kill mid-write can never
     # leave a torn manifest that would fail json.loads on every later write_day.
-    tmp = config.MANIFEST.with_name(config.MANIFEST.name + ".tmp")
+    tmp = mp.with_name(mp.name + ".tmp")
     tmp.write_text(json.dumps(m, indent=2, sort_keys=True))
-    os.replace(tmp, config.MANIFEST)
+    os.replace(tmp, mp)
 
 
-def partition_path(symbol: str, daystr: str):
-    return config.RAW_OPTIONS / symbol / f"{daystr}.parquet"
+def partition_path(symbol: str, daystr: str, base=None):
+    return (base or config.RAW_OPTIONS) / symbol / f"{daystr}.parquet"
 
 
-def have_day(symbol: str, daystr: str) -> bool:
+def have_day(symbol: str, daystr: str, base=None) -> bool:
     """True if this (symbol, day) is already on disk (file present = done)."""
-    return partition_path(symbol, daystr).exists()
+    return partition_path(symbol, daystr, base).exists()
 
 
-def write_day(symbol: str, daystr: str, df: pd.DataFrame) -> int:
+def write_day(symbol: str, daystr: str, df: pd.DataFrame, base=None) -> int:
     """Write one (symbol, day) parquet (zstd) and record the row count. 0-row OK.
 
     The parquet is written atomically (temp file + os.replace). The supervisor
@@ -63,14 +65,15 @@ def write_day(symbol: str, daystr: str, df: pd.DataFrame) -> int:
     have_day()/catalog globs, so an orphaned temp (kill between write and replace)
     is harmless and is overwritten when that same day is re-pulled.
     """
-    p = partition_path(symbol, daystr)
+    p = partition_path(symbol, daystr, base)
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_name(p.name + ".tmp")
     df.to_parquet(tmp, engine="pyarrow", compression="zstd", index=False)
     os.replace(tmp, p)
-    m = _manifest()
+    manifest_path = (base / "_manifest.json") if base else config.MANIFEST
+    m = _manifest(manifest_path)
     m.setdefault(symbol, {})[daystr] = int(len(df))
-    _save_manifest(m)
+    _save_manifest(m, manifest_path)
     return len(df)
 
 

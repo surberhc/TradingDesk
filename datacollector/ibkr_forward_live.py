@@ -18,8 +18,15 @@ Design choices that keep it safe alongside other Gateway clients:
   * Streams in batches under IBKR's ~100 simultaneous market-data-line cap, so it
     won't exhaust the account's data lines out from under another client.
 
-Pulls the SAME root/universe list as ibkr_forward.py (config.all_roots()) and writes
-into the SAME warehouse shape via storage.py — only the connection/Gateway differs.
+Pulls the SAME root/universe list as ibkr_forward.py (config.all_roots()), but during
+the ThetaData A/B validation window it writes to the PARALLEL raw/options_ibkr
+namespace (config.RAW_OPTIONS_IBKR) via storage.py's base= redirect — NOT the main
+warehouse — so IBKR and ThetaData days for the same root/day can coexist (they would
+otherwise collide via storage.have_day) and be diffed daily by forward_ab_check.py.
+It does NOT union into the ThetaData catalog during validation (that namespace is kept
+out of catalog.duckdb). The collected column schema is byte-for-byte the SAME as the
+ThetaData parquet, so a future cutover can union the two or simply repoint back to the
+main namespace. Only the connection/Gateway and the write namespace differ.
 
 Usage:
     <venv python> ibkr_forward_live.py --test [ROOT]     # safe small slice (≈40 lines), default SPY
@@ -44,7 +51,8 @@ from connections import ibkr_live_data as gw
 
 CLIENT = "live_data_forward"          # clientId 48 (see connections.clientids)
 
-# Exact warehouse column order (matches the ThetaData parquet so the catalog unions).
+# Exact warehouse column order (matches the ThetaData parquet so a future cutover can
+# union or repoint cleanly; during the A/B window these land in raw/options_ibkr).
 SCHEMA_COLS = [
     "date", "symbol", "expiration", "strike", "right", "timestamp",
     "open", "high", "low", "close", "volume", "count", "bid_size", "bid",
@@ -208,7 +216,7 @@ def collect_day(ib: IB, sym: str, daystr: str,
     (after-hours, farm hiccup), and a false marker would poison the day forever via
     have_day(). Leaving it unwritten lets the next run retry.
     """
-    if storage.have_day(sym, daystr):
+    if storage.have_day(sym, daystr, base=config.RAW_OPTIONS_IBKR):
         return ("skip", 0)
     c, spot, contracts = build_chain(ib, sym, band, max_exps)
     if not contracts:
@@ -219,7 +227,7 @@ def collect_day(ib: IB, sym: str, daystr: str,
     if populated == 0:
         return ("no-data", 0)        # don't poison the day; retry next run
     df = _to_df(rows, sym, daystr, snap_ts, spot)
-    n = storage.write_day(sym, daystr, df)
+    n = storage.write_day(sym, daystr, df, base=config.RAW_OPTIONS_IBKR)
     return ("ok", n)
 
 

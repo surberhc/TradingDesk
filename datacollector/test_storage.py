@@ -37,6 +37,7 @@ def warehouse(tmp_path, monkeypatch):
     raw.mkdir(parents=True)
     catalog_db = tmp_path / "catalog.duckdb"
     monkeypatch.setattr(config, "RAW_OPTIONS", raw)
+    monkeypatch.setattr(config, "MANIFEST", raw / "_manifest.json")
     monkeypatch.setattr(config, "CATALOG_DB", catalog_db)
     monkeypatch.setattr(storage, "CATALOG_CHUNK_SIZE", 2)  # force multi-chunk behavior
     return raw, catalog_db
@@ -182,3 +183,48 @@ def test_second_rebuild_with_nothing_changed_is_a_noop(warehouse):
     storage.rebuild_catalog()   # nothing changed on disk
     df2 = _query_all(catalog_db)
     assert df1.equals(df2)
+
+
+def test_base_param_writes_to_isolated_namespace(warehouse, tmp_path):
+    """The optional base= redirect (used by ibkr_forward_live for the parallel
+    raw/options_ibkr namespace during the ThetaData A/B window) must land the
+    parquet + its OWN _manifest.json under the alt base, be visible to have_day/
+    partition_path when base= is passed, and be INVISIBLE to the default namespace
+    — the two namespaces are fully isolated."""
+    raw, _ = warehouse
+    alt = tmp_path / "raw" / "options_ibkr"
+    df = pd.DataFrame({"date": ["20260101"], "symbol": ["SPX"], "close": [1.23]})
+
+    n = storage.write_day("SPX", "20260101", df, base=alt)
+    assert n == 1
+
+    # Landed under the alt base, not the default namespace.
+    assert (alt / "SPX" / "20260101.parquet").exists()
+    assert not (raw / "SPX" / "20260101.parquet").exists()
+
+    # partition_path / have_day honor base=.
+    assert storage.partition_path("SPX", "20260101", base=alt) == alt / "SPX" / "20260101.parquet"
+    assert storage.have_day("SPX", "20260101", base=alt) is True
+
+    # Default namespace does NOT see it (isolation).
+    assert storage.have_day("SPX", "20260101") is False
+
+    # The alt base got its OWN manifest, recording the row count.
+    alt_manifest = alt / "_manifest.json"
+    assert alt_manifest.exists()
+    import json
+    assert json.loads(alt_manifest.read_text())["SPX"]["20260101"] == 1
+    # ...and the default manifest was untouched (still absent for this scratch warehouse).
+    assert not config.MANIFEST.exists()
+
+
+def test_default_write_day_behavior_unchanged(warehouse):
+    """Regression guard: write_day with NO base= must still write to the default
+    RAW_OPTIONS namespace + config.MANIFEST exactly as before."""
+    raw, _ = warehouse
+    df = pd.DataFrame({"date": ["20260101"], "symbol": ["SPY"], "close": [9.9]})
+    storage.write_day("SPY", "20260101", df)
+    assert (raw / "SPY" / "20260101.parquet").exists()
+    assert storage.have_day("SPY", "20260101") is True
+    import json
+    assert json.loads(config.MANIFEST.read_text())["SPY"]["20260101"] == 1
