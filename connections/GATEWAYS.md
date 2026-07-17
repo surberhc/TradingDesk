@@ -77,3 +77,4 @@ call sites, which are authoritative over any drifted registry comment).
 - 52 `dashboard_s8` (dashboard S8 tab read-only display re-marking)
 - 54 `s8_live_pilot` (s8_runner live-cycle read: account summary + 0DTE chain)
 - 55 `s8_monitor` (streaming exit-monitor read-only; runs concurrently with s8_live_pilot)
+- 56 `s8_collector` (intraday ATM-band market collector read-only; runs concurrently with s8_live_pilot + s8_monitor; band bounded to a conservative line budget so the monitor's position-leg lines keep headroom)
