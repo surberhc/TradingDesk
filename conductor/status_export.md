@@ -35,6 +35,70 @@
 > **PENDING DECISIONS:**
 > - (#6) [premium-selling] Universe download stopped (26.31%% done, data preserved). Per PREREG_short_strangle_alpha_2026-07-06.md's own pre-committed logic, the SPX strangle refutation = comprehensive refutation of mechanical premium-selling (condor+CSP+strangle) -- treat it as closed? OR run a cheap EOD-only sanity check (10-15 liquid high-IV-rank names, no new pull, hours not weeks) on the diversified single-name strangle-basket idea before fully closing the book? | options: Treat as comprehensively closed (per PREREG's own logic) | Run the cheap EOD-only basket sanity check first | Resume the full snapshot pull at narrower scope (not recommended -- desk's rec was the cheap test)
 
+### 2026-07-17 (main) — infra: Drive-sync tripwire — pages if TradingDesk-Local ever comes under Drive management
+Built a Drive-sync TRIPWIRE that pages the moment C:\TradingDesk-Local (the ~99 GB
+irreplaceable market-data + secrets + venv folder) comes under Google Drive
+sync/backup/mirror management.
+
+WHY (the human residual risk): TradingDesk-Local is deliberately OFF Drive because
+Drive's sync client corrupts market data and once silently synced the WRONG FOLDER
+for 9 days (2026-07-07..16). We are now backing the REPO up to Drive via rclone
+(explicit checksummed API uploads — safe) which does NOT put TradingDesk-Local under
+the Drive Desktop sync client. The leftover risk is purely human: someone later opens
+Google Drive Desktop and adds C:\TradingDesk-Local (or a subfolder, or an ancestor)
+to sync/mirror/backup, re-arming the exact bomb. This converts "everyone must remember
+never to" into "you get paged the moment anyone does."
+
+WHAT IT DETECTS (investigated on the live machine first, honestly):
+- THREAT 1 (mirror/streaming — tree ends up UNDER a DriveFS volume): RELIABLY
+  detectable. Reuses repo_backup.is_drive_managed() (OS volume mount-root + 'Google
+  Drive' label test). Verified: every protected path currently resolves to the SYSTEM
+  volume (healthy).
+- THREAT 2 (folder backup / mirror-of-a-local-folder — files stay local, so a volume
+  test does NOT catch it; this is the dangerous wrong-folder shape): detectable via
+  DriveFS's own registry. root_preference_sqlite.db `roots` table carries root_path +
+  last_seen_absolute_path (full absolute local paths); mirror_sqlite.db mirror_item /
+  root_config corroborate. Measured today: 0 rows (clean streaming install) = the
+  healthy baseline. The tripwire flags ANY registered local root overlapping the tree
+  (equal / ancestor / descendant), so it does not need to distinguish backup-vs-mirror
+  sync_type. An UNRELATED backup root does NOT false-page.
+- PROXY (positive-only): shallow scan for NTFS reparse-point/placeholder attrs and
+  Drive transfer temp dirs (.tmp.drivedownload/.tmp.driveupload). A hit pages; absence
+  proves nothing and never contributes to green.
+
+HONEST LIMIT: the THREAT-2 registry tables are EMPTY right now, so the overlap-match
+logic has NOT been exercised against a real populated backup row on this machine. The
+column semantics are self-evident and match repo_backup's existing use of `roots`, but
+a future Drive-client schema change (or a backup recorded only in a form whose path we
+don't recognise) could be missed by the DB read alone. That gap is exactly why the
+tripwire does not rely on the DB alone — it also runs THREAT 1 and the schema-independent
+proxy, and it fails closed rather than silently passing when it cannot read the registry.
+Also noted: one transient read of root_preference_sqlite.db showed only max_ids (a
+mid-write/WAL flicker); re-reads were stable. Handled by fail-closed + the 3h cooldown.
+
+FAIL-OPEN vs FAIL-CLOSED (deliberate): the tripwire FAILS CLOSED. A check that
+affirmatively finds a threat pages the remediation; a check that CANNOT be evaluated
+(DriveFS installed but its registry DB unreadable / the volume mount root
+undeterminable / the tripwire module failed to import) ALSO pages, with "could not
+evaluate" wording. The single safe exception: if DriveFS is not installed at all, the
+registry checks are trivially clean (nothing could be managing the tree). A guard that
+goes silent when it can't look is the exact silent failure this whole body of work
+exists to kill.
+
+READS GREEN TODAY: live run exits 0 (threat1 clean / threat2 0-rows / proxy clean).
+If it paged in the current healthy state it would be worthless.
+
+INTEGRATION: new stdlib-only module datacollector/drive_sync_tripwire.py (imports
+repo_backup for the DriveFS helpers, exactly as heartbeat_alarm already does).
+heartbeat_alarm.py evaluates it every 15-min sweep via a new handle_tripwire() — a
+STATE ASSERTION, not a staleness/heartbeat job — reusing the same _send() path and 3h
+cooldown de-dupe. No new scheduled task. Tests: test_drive_sync_tripwire.py (29,
+including a live-green assertion, THREAT-1/THREAT-2 trips, unreadable-registry
+fail-closed, and the page naming the folder + remediation). Full datacollector suite
+215 passing. This makes the "never touch the sync client for TradingDesk-Local" rule
+LOUD instead of discipline-only.
+
+
 ### 2026-07-17 (main) — Session 6de1ab9b wrap: three loose ends flagged to Andrew, unanswered
 During the repo-backup session, three items were flagged and left unanswered: (1) CLAUDE.md ~line 47 says the clientId registry lives at connections\clientids.py; the real path is the nested connections\connections\clientids.py -- left untouched because it is the contract file. (2) .claude\settings.local.json carries a standing pre-approval to read secrets\.env and print its key NAMES; Andrew should deliberately confirm or revoke it rather than inherit it. (3) products\ folder purpose is unsourced -- one line from Andrew would let its README be de-hedged. The backup work itself (#28 daily task registered+verified, #29 cloud-arrival enforcement) is DONE and cloud-verified through commit 28b8132.
 

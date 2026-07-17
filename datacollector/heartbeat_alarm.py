@@ -92,6 +92,17 @@ try:
 except Exception:  # noqa: BLE001 — the alarm must import even if the job module doesn't
     _repo_backup = None
 
+# The Drive-sync tripwire — a STATE ASSERTION (not a staleness check): it pages the
+# moment C:\TradingDesk-Local comes under Google Drive sync/backup management (the
+# 2026-07-16 wrong-folder corruption risk). Evaluated every sweep by handle_tripwire()
+# below. Imported defensively — it is stdlib-only, but if it ever fails to import the
+# alarm must still run; handle_tripwire() then FAILS CLOSED and pages "could not
+# evaluate" rather than silently dropping the guard.
+try:
+    import drive_sync_tripwire as _tripwire
+except Exception:  # noqa: BLE001 — the alarm must import even if the tripwire doesn't
+    _tripwire = None
+
 
 def _is_trading_day(d: "dt.date") -> bool:
     """Calendar-aware 'is the US market open on day d' that NEVER raises."""
@@ -397,6 +408,98 @@ def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
         js["last_alert_ts"] = now
         return f"{name}: MISSING ({detail}) — ALERT SENT"
     return f"{name}: MISSING ({detail}) — SEND FAILED (will retry next run)"
+
+
+# --------------------------------------------------------------------------- #
+# Drive-sync tripwire — a STATE ASSERTION, not a staleness check
+# --------------------------------------------------------------------------- #
+# Unlike the JOBS/DEADLINE_JOBS above (which page when a heartbeat/status goes
+# STALE), this pages when a bad condition becomes TRUE: C:\TradingDesk-Local coming
+# under Google Drive sync/backup management. It rides the same 15-min sweep and reuses
+# the same COOLDOWN de-dupe + _send() path, so no new scheduled task is needed. The
+# evaluation itself lives in drive_sync_tripwire.py (which reuses repo_backup's DriveFS
+# helpers); this handler only owns the page decision, exactly like handle_deadline.
+_TRIPWIRE_NAME = "drive_sync_tripwire"
+
+
+def handle_tripwire(state: dict, now: float, dry_run: bool) -> str:
+    """Evaluate the Drive-sync tripwire and page if it TRIPPED or is UNEVALUABLE.
+
+    FAILS CLOSED: if the tripwire module could not be imported, or a check inside it
+    could not be evaluated, that is itself a page ("could not evaluate") rather than
+    silence — a guard that quietly can't look is the exact silent failure the whole
+    body of work exists to kill. Reuses handle_job/handle_deadline's cooldown +
+    recovery-reset so a healthy machine never re-pages and a real trip re-alerts once
+    it recovers-then-recurs."""
+    name = _TRIPWIRE_NAME
+    js = state.setdefault(name, {})
+
+    if _tripwire is None:
+        v = {"ok": False, "tripped": False, "unevaluable": True, "should_page": True,
+             "reasons": ["[import] COULD NOT EVALUATE — drive_sync_tripwire failed to "
+                         "import, so the Drive-management guard is not running"],
+             "remediation": (r"C:\TradingDesk-Local appears to be under Google Drive "
+                             r"sync/backup management — this is the wrong-folder "
+                             r"corruption risk; disconnect it in Google Drive Desktop "
+                             r"immediately."),
+             "protected": [r"C:\TradingDesk-Local"]}
+    else:
+        v = _tripwire.evaluate()
+
+    if not v.get("should_page"):
+        if js.pop("last_alert_ts", None) is not None:
+            log(f"{name}: recovered (GREEN) — cleared alert cooldown")
+        return f"{name}: GREEN (TradingDesk-Local not under Drive management) — no alert"
+
+    kind = "TRIPPED" if v.get("tripped") else "UNEVALUABLE"
+
+    last = js.get("last_alert_ts")
+    cool_remaining = (last + COOLDOWN_SECS - now) if last else 0
+    if last and cool_remaining > 0:
+        return (f"{name}: {kind} — alert SUPPRESSED "
+                f"(cooldown {int(cool_remaining // 60)}m left)")
+
+    if v.get("tripped"):
+        subject = "[TradingDesk ALARM] C:\\TradingDesk-Local is under Google Drive management"
+        headline = "TradingDesk-Local under Google Drive management"
+        lead = v.get("remediation")
+    else:
+        subject = "[TradingDesk ALARM] Drive-sync tripwire could NOT evaluate TradingDesk-Local"
+        headline = "Drive-sync tripwire could not evaluate"
+        lead = ("The tripwire that guards C:\\TradingDesk-Local against Google Drive "
+                "sync/backup management could NOT complete a check this run, so it is "
+                "FAILING CLOSED and paging rather than going silent. Investigate — the "
+                "guard is not currently proving the folder is safe. " + v.get("remediation", ""))
+
+    reasons = v.get("reasons") or []
+    reasons_html = "".join(
+        f'<tr><td style="padding:2px 0;color:#111827;">{r}</td></tr>' for r in reasons)
+    protected = ", ".join(v.get("protected") or [])
+    html = (
+        f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
+        f'max-width:640px;margin:0 auto;color:#111827;">'
+        f'<div style="font-size:18px;font-weight:700;color:#ef4444;">'
+        f'&#9679; TradingDesk ALARM — {headline}</div>'
+        f'<div style="font-size:13px;color:#374151;margin:8px 0;">{lead}</div>'
+        f'<table style="border-collapse:collapse;font-size:13px;">'
+        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Kind</td>'
+        f'<td style="padding:2px 0;color:#111827;">{kind}</td></tr>'
+        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Protected</td>'
+        f'<td style="padding:2px 0;color:#111827;">{protected}</td></tr></table>'
+        f'<div style="font-size:12px;color:#6b7280;margin-top:8px;">Findings:</div>'
+        f'<table style="border-collapse:collapse;font-size:13px;">{reasons_html}</table>'
+        f'<div style="font-size:11px;color:#9ca3af;margin-top:10px;">'
+        f'Automated state-assertion tripwire · '
+        f'TradingDesk\\datacollector\\drive_sync_tripwire.py</div></div>')
+
+    if dry_run:
+        log(f"WOULD-SEND: {subject}")
+        return f"{name}: {kind} — WOULD-SEND (dry-run)"
+    sent = _send(subject, html)
+    if sent:
+        js["last_alert_ts"] = now
+        return f"{name}: {kind} — ALERT SENT"
+    return f"{name}: {kind} — SEND FAILED (will retry next run)"
 
 
 # --------------------------------------------------------------------------- #
@@ -731,6 +834,14 @@ def main() -> int:
             line = f"{job.get('name', '?')}: CHECK ERROR — {type(e).__name__}: {e}"
         lines.append(line)
         log(line)
+
+    # Drive-sync tripwire (state assertion, not staleness). Same sweep, same de-dupe.
+    try:
+        line = handle_tripwire(state, now, args.dry_run)
+    except Exception as e:  # noqa: BLE001 — one bad check must not kill the sweep
+        line = f"{_TRIPWIRE_NAME}: CHECK ERROR — {type(e).__name__}: {e}"
+    lines.append(line)
+    log(line)
 
     if not args.dry_run:
         _save_state(state)
