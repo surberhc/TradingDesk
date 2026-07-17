@@ -119,6 +119,17 @@ _LINE_LIMIT_SHRINK = 0.5            # on a line-limit error, halve the band and 
 # SPXW 0DTE cash-settles at 15:00 CT; the collector stops sampling at the close.
 _MARKET_CLOSE_CT = (15, 0)
 
+# --- Startup data-wait (Phase 4b boot robustness) -------------------------------------- #
+# An all-day scheduled collector must NOT die on boot just because live SPX data isn't
+# flowing yet (started pre-open, into a data gap, or restarted during one). Startup spot/
+# chain resolution BOUNDED-retries: poll every STARTUP_DATA_POLL_SECS for a valid live SPX
+# spot, up to STARTUP_DATA_WAIT_SECS total, before giving up. If the window elapses the
+# collector exits CLEANLY (logged message + nonzero rc) so a Task Scheduler restart-on-
+# failure can retry — never a raw uncaught traceback. Mid-session drops keep the existing
+# reconnect path; this bounded wait is startup-only.
+STARTUP_DATA_WAIT_SECS = 600.0   # ~10 min bounded startup window for live SPX data
+STARTUP_DATA_POLL_SECS = 15.0    # re-check for a valid live SPX spot every ~15s
+
 # Substrings that mark an IBKR "too many market-data lines" style error (matched
 # case-insensitively). Used to trigger graceful band-shrink rather than a crash.
 _LINE_LIMIT_MARKERS = ("max number of tickers", "max tickers", "market data lines",
@@ -264,6 +275,76 @@ def build_market_frame(
         for (tk, right, strike) in specs
     ]
     return pd.DataFrame(rows, columns=s8_schema.MARKET_COLUMNS)
+
+
+# =========================================================================== #
+# STARTUP DATA-WAIT — a PURE, offline-testable seam (clock/sleep/resolver injected).
+# =========================================================================== #
+
+class StartupDataTimeout(RuntimeError):
+    """Raised when the bounded startup wait elapses with still no valid live SPX spot.
+
+    A CAUGHT, handled condition — run() turns it into a clean logged exit + nonzero rc so a
+    scheduled restart-on-failure can retry, never a raw uncaught traceback. Distinct type so
+    the startup path can catch exactly this and let genuine bugs propagate.
+    """
+
+
+def _spot_is_valid(spot: Any) -> bool:
+    """A resolved SPX spot is usable iff it is a real, positive number (not None/NaN/<=0).
+
+    Mirrors _resolve_chain's ``spot == spot and spot`` guard (None/NaN/0 all rejected), the
+    condition that used to crash the process on boot.
+    """
+    try:
+        return spot is not None and spot == spot and float(spot) > 0.0
+    except (TypeError, ValueError):
+        return False
+
+
+def wait_for_live_spot(
+    resolve_spot,
+    *,
+    timeout_secs: float = STARTUP_DATA_WAIT_SECS,
+    poll_secs: float = STARTUP_DATA_POLL_SECS,
+    clock=time.monotonic,
+    sleep=time.sleep,
+    log=print,
+) -> float:
+    """Poll ``resolve_spot`` until it yields a valid live SPX spot, or the window elapses.
+
+    PURE seam — ``clock``, ``sleep`` and the ``resolve_spot`` callable are injected, so a fake
+    clock makes this instant and fully offline-testable with no broker/network/real sleeps.
+
+    ``resolve_spot()`` returns a candidate spot (a float, or None/NaN when data is not flowing
+    yet); it MAY also raise (pre-open the gateway often has no SPX ticker at all) — a raise is
+    treated as "data not ready yet" (logged, then retried), NOT a crash. Returns the first
+    valid spot (``_spot_is_valid``). Raises ``StartupDataTimeout`` if ``timeout_secs`` elapses
+    with still no valid spot — the caller turns that into a clean exit, never a traceback.
+    """
+    deadline = clock() + float(timeout_secs)
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            spot = resolve_spot()
+        except Exception as exc:  # noqa: BLE001  — resolver not ready is expected pre-open
+            log(f"s8_collector: waiting for live SPX data... (attempt {attempt}, "
+                f"resolver not ready: {type(exc).__name__}: {exc})")
+        else:
+            if _spot_is_valid(spot):
+                if attempt > 1:
+                    log(f"s8_collector: live SPX data resolved (spot={float(spot):g}) "
+                        f"after {attempt} attempt(s).")
+                return float(spot)
+            log(f"s8_collector: waiting for live SPX data... "
+                f"(attempt {attempt}, spot={spot!r} not yet valid)")
+        # Give up only once the bounded window is exhausted.
+        if clock() >= deadline:
+            raise StartupDataTimeout(
+                f"no valid live SPX spot after {float(timeout_secs):g}s "
+                f"({attempt} attempt(s)) — giving up startup for a scheduled restart.")
+        sleep(float(poll_secs))
 
 
 # =========================================================================== #
@@ -490,7 +571,14 @@ class S8Collector:
         ib = ibkr_live_trade.connect(consumer, launch=False, readonly=True)
         self._ib = ib
         try:
-            self._build_and_subscribe()
+            try:
+                # Startup is bounded-retry: waits for live SPX data rather than crashing on
+                # boot if it isn't flowing yet (pre-open / data gap / restart during one).
+                self._build_and_subscribe(wait_for_data=True)
+            except StartupDataTimeout as exc:
+                print(f"s8_collector.run: {exc} Exiting cleanly with rc=2 so a scheduled "
+                      f"restart-on-failure can retry (no live SPX data at startup).")
+                raise SystemExit(2)
             if settle_secs:
                 ib.sleep(settle_secs)  # let quotes + model greeks populate before harvest #1
 
@@ -538,9 +626,27 @@ class S8Collector:
                 pass
             print("s8_collector.run: disconnected.")
 
-    def _build_and_subscribe(self) -> None:
-        """Resolve the chain and (re)subscribe the band. Raises only on a hard chain-resolve
-        failure (no spot / no today-expiration); band subscribe itself degrades gracefully."""
+    def _build_and_subscribe(self, wait_for_data: bool = False) -> None:
+        """Resolve the chain and (re)subscribe the band.
+
+        On STARTUP (``wait_for_data=True``) the SPX-spot resolution is first wrapped in a
+        bounded retry (``wait_for_live_spot``): a boot before live data is flowing (pre-open,
+        a data gap, or a restart during one) waits gracefully — logging "waiting for live SPX
+        data..." — instead of dying on an uncaught 'SPX spot did not resolve'. If the bounded
+        window elapses, ``StartupDataTimeout`` propagates to run(), which exits cleanly with a
+        nonzero rc. On a MID-SESSION reconnect (``wait_for_data=False``) behaviour is unchanged:
+        a hard chain-resolve failure (no spot / no today-expiration) propagates to run()'s
+        reconnect loop as before; band subscribe itself always degrades gracefully.
+        """
+        if wait_for_data:
+            import s8_chain
+
+            def _resolve_spot():
+                _c, spot = s8_chain.get_underlying(self._ib)
+                return spot
+
+            # Blocks until a valid live spot is seen, or raises StartupDataTimeout on giving up.
+            wait_for_live_spot(_resolve_spot)
         _c, spot, exp, strikes = self._resolve_chain()
         self._subscribe_band(spot, strikes, exp)
 

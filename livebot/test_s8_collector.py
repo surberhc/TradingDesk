@@ -28,11 +28,13 @@ import pytest
 import s8_collector
 import s8_store
 from s8_collector import (
+    StartupDataTimeout,
     band_line_count,
     build_market_frame,
     clamp_max_strikes,
     compute_atm_band,
     market_row_from_ticker,
+    wait_for_live_spot,
 )
 from s8_schema import MARKET_COLUMNS
 
@@ -223,3 +225,99 @@ def test_build_frame_write_market_round_trip(_isolated_root):
     assert set(back["vix"]) == {14.0}
     # Greeks survived the parquet round-trip.
     assert back.loc[back["right"] == "P", "delta"].iloc[0] == -0.21
+
+
+# =========================================================================== #
+# Startup data-wait (Phase 4b boot robustness) — PURE, instant, fake clock.
+# An all-day scheduled collector must not crash on boot just because live SPX
+# data isn't flowing yet; the bounded wait retries then gives up CLEANLY.
+# =========================================================================== #
+
+class _FakeClock:
+    """Injectable monotonic clock + sleep: sleep advances virtual time. Records sleeps so a
+    test can assert prompt returns (no sleeps) vs. bounded retry (sleeps then a clean give-up).
+    Makes wait_for_live_spot instant — no real waiting, no hang."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = []
+
+    def now(self):
+        return self.t
+
+    def sleep(self, secs):
+        self.sleeps.append(secs)
+        self.t += secs
+
+
+def test_wait_for_live_spot_returns_promptly_when_data_present():
+    clk = _FakeClock()
+    resolver_calls = []
+
+    def resolver():
+        resolver_calls.append(1)
+        return 7412.5  # valid on the very first poll
+
+    spot = wait_for_live_spot(resolver, timeout_secs=600.0, poll_secs=15.0,
+                              clock=clk.now, sleep=clk.sleep)
+    assert spot == 7412.5
+    assert len(resolver_calls) == 1     # resolved on the first attempt
+    assert clk.sleeps == []             # returned without ever sleeping/waiting
+
+
+def test_wait_for_live_spot_retries_without_raising_until_data_arrives():
+    clk = _FakeClock()
+    # None (no mark), NaN (bad tick), 0.0/None again, then a real spot on the 5th poll.
+    seq = [None, float("nan"), 0.0, None, 7400.0]
+    it = iter(seq)
+
+    spot = wait_for_live_spot(lambda: next(it), timeout_secs=600.0, poll_secs=15.0,
+                              clock=clk.now, sleep=clk.sleep)
+    assert spot == 7400.0
+    assert len(clk.sleeps) == 4                 # slept once between each of the 4 misses
+    assert all(s == 15.0 for s in clk.sleeps)   # polled at the configured cadence
+
+
+def test_wait_for_live_spot_treats_a_raising_resolver_as_not_ready():
+    clk = _FakeClock()
+    calls = {"n": 0}
+
+    def resolver():
+        calls["n"] += 1
+        if calls["n"] < 3:
+            raise RuntimeError("SPX ticker not available yet")  # pre-open: no ticker at all
+        return 7399.0
+
+    spot = wait_for_live_spot(resolver, timeout_secs=600.0, poll_secs=15.0,
+                              clock=clk.now, sleep=clk.sleep)
+    assert spot == 7399.0
+    assert calls["n"] == 3          # a raising resolver is retried, not crashed
+    assert len(clk.sleeps) == 2
+
+
+def test_wait_for_live_spot_gives_up_cleanly_after_bounded_window():
+    clk = _FakeClock()
+    calls = {"n": 0}
+
+    def resolver():
+        calls["n"] += 1
+        return None  # data never arrives
+
+    # Bounded: it must RAISE the caught StartupDataTimeout (not hang, not crash raw).
+    with pytest.raises(StartupDataTimeout):
+        wait_for_live_spot(resolver, timeout_secs=600.0, poll_secs=15.0,
+                           clock=clk.now, sleep=clk.sleep)
+    # Gave up within the bounded window: virtual time did not exceed the budget unboundedly.
+    assert clk.now() <= 600.0 + 15.0
+    assert calls["n"] >= 2          # actually polled more than once before giving up
+    # ~600s / 15s ≈ 40 polls, never an unbounded loop.
+    assert calls["n"] <= 45
+
+
+def test_wait_for_live_spot_rejects_nonpositive_and_nan_spots():
+    # The validity predicate rejects exactly the values that crashed the old boot path.
+    assert s8_collector._spot_is_valid(7400.0) is True
+    assert s8_collector._spot_is_valid(None) is False
+    assert s8_collector._spot_is_valid(float("nan")) is False
+    assert s8_collector._spot_is_valid(0.0) is False
+    assert s8_collector._spot_is_valid(-1.0) is False
