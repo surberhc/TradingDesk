@@ -57,12 +57,13 @@ WHAT IT DOES
     trusted alone — it is the thing that just failed us).
   * Re-verifies the bundle at the Drive destination after the copy.
   * ASKS GOOGLE whether the bundle actually arrived: it resolves the backup folder's
-    Drive id from the destination path, LISTS THAT FOLDER (paginated) and matches the
-    bundle client-side, then compares the Drive API's md5Checksum against the local
-    bundle's md5 (verify_cloud_arrival). It deliberately does NOT search Drive by
-    name — that races an eventually-consistent index and false-pages on healthy
-    backups; see the block comment above _drive_list_children. Inert until a
-    credential exists — see CLOUD_VERIFY_REQUIRED.
+    Drive id from the destination path, asks Drive for a file of the bundle's name
+    IN THAT FOLDER, and compares the Drive API's md5Checksum against the local
+    bundle's md5 (verify_cloud_arrival). The query is deliberately SCOPED TO THE
+    RESOLVED FOLDER rather than asking whether the name exists anywhere in the Drive —
+    the 9-day incident was Drive syncing the WRONG FOLDER, so folder identity is
+    exactly what must be proven; see the block comment above _drive_find_in_folder.
+    Inert until a credential exists — see CLOUD_VERIFY_REQUIRED.
   * Records a status JSON + heartbeat the alarm reads (heartbeat_alarm.py, job
     key "repo_backup").
   * Retention: keeps the last KEEP_LAST bundles per location.
@@ -222,12 +223,13 @@ DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"
 # backup dir, so a same-named FILE can never be mistaken for the folder.
 DRIVE_FOLDER_MIME = "application/vnd.google-apps.folder"
 
-# Paging for the parent-folder listing. The folder holds KEEP_LAST=7 bundles today, so
-# one page covers it — but "today" is not a guarantee, and a MISSED PAGE would look
-# exactly like "the bundle is absent", i.e. a false page on a healthy backup. So we
-# follow nextPageToken to exhaustion, and cap the walk so a pathological/looping token
-# cannot hang the job. Hitting the cap is a QUERY FAILURE (None), never an empty result:
-# "we could not finish enumerating" must never collapse into "Google does not have it".
+# Paging for _drive_list_children, which exists to enumerate a folder's children while
+# RESOLVING the backup folder's id (see _drive_resolve_folder_id). A 'My Drive' root can
+# hold far more than one page of folders, and a MISSED PAGE there reads as "no folder
+# named TradingDesk-Backups exists" — a resolution failure on a perfectly healthy Drive.
+# So we follow nextPageToken to exhaustion, and cap the walk so a pathological/looping
+# token cannot hang the job. Hitting the cap is a QUERY FAILURE (None), never an empty
+# result: "we could not finish enumerating" must never collapse into "it is not there".
 DRIVE_LIST_PAGE_SIZE = 100
 DRIVE_LIST_MAX_PAGES = 50
 
@@ -235,7 +237,10 @@ CLOUD_HTTP_TIMEOUT = 30      # per HTTP call — this job must never hang on the
 
 # DriveFS uploads ASYNCHRONOUSLY: the copy into the mount returns long before the
 # bytes reach Google, so querying once, immediately, would report "not in the cloud"
-# on a perfectly healthy run and cry wolf nightly. We poll on a BOUNDED deadline
+# on a perfectly healthy run and cry wolf nightly. MEASURED 2026-07-16, across two
+# bundles: Drive's API lagged the local write by roughly 1-5 MINUTES before it would
+# answer for the file at all — see the block comment above _drive_find_in_folder. That
+# lag is why this poll is essential rather than optional. We poll on a BOUNDED deadline
 # instead. ~41MB is seconds-to-a-minute on any sane link, so 5 minutes is generous
 # without putting the job at risk of running forever.
 CLOUD_POLL_DEADLINE_S = 300
@@ -901,30 +906,6 @@ def _drive_access_token(creds: dict, *, urlopen_fn=None,
     return token, None, "access token refreshed"
 
 
-# WHY WE LIST THE PARENT FOLDER INSTEAD OF QUERYING BY NAME (2026-07-16, observed —
-# not theoretical). This check used to locate the bundle with a server-side name query
-# (q=name='<bundle>' and trashed=false). Measured that afternoon:
-#     16:22:42  tradingdesk-repo-20260716-162242.bundle written locally; Drive recorded
-#               createdTime 2026-07-16T21:22:42.976Z, fileSize 41657962 — an exact
-#               match for the local bundle. The file WAS THERE.
-#     ~16:23    a title/name search returned EMPTY.
-#     ~16:25    the same search returned EMPTY again.
-#     ~16:27    the identical search returned the file.
-# The file was in Drive the whole time; only the NAME INDEX lagged, ~3-5 minutes.
-# Meanwhile a parentId listing of the backups folder returned the file IMMEDIATELY and
-# accurately, at a moment when the name search was still empty.
-#
-# That made the old poll race an INDEX rather than the upload: on a perfectly healthy
-# backup it could time out, report "not in the cloud", fail closed, and page. A false
-# page on a healthy backup is exactly how a pager gets trained into noise — which is
-# the mechanism behind the 9-day Drive silence this whole module exists to prevent.
-# And it was intermittent, so it would have read as a flaky network for weeks.
-#
-# HONESTY ABOUT WHAT WE MEASURED: the lag was observed through an MCP Drive connector
-# whose `title` operator very probably maps onto the same `name` field files.list uses,
-# but that is NOT proven for the raw endpoint this module calls. We are not asserting
-# which layer lagged. Listing the parent and matching client-side is the defensively
-# correct approach regardless: it is strictly more reliable and costs nothing.
 def _drive_list_children(folder_id: str, token: str, *, urlopen_fn=None,
                          timeout: int = CLOUD_HTTP_TIMEOUT,
                          page_size: int = DRIVE_LIST_PAGE_SIZE,
@@ -932,17 +913,21 @@ def _drive_list_children(folder_id: str, token: str, *, urlopen_fn=None,
                          ) -> tuple[list | None, str]:
     """List EVERY child of a Drive folder. -> (files|None, note); None == query failed.
 
-    PAGINATED TO EXHAUSTION, deliberately. A missed page is indistinguishable from an
-    absent file, and an absent file fails this check closed — so silently stopping at
-    page one would be a false-page generator of exactly the kind this function was
-    written to remove. Every page is followed; running out of cap returns None (a
-    failure to enumerate), never a short list masquerading as the whole folder.
+    USED FOR ONE THING: walking 'My Drive' down to the backup folder to resolve its id
+    (_drive_resolve_folder_id). The bundle lookup itself does NOT go through here — it
+    is a single parent-scoped name query; see _drive_find_in_folder.
+
+    PAGINATED TO EXHAUSTION, deliberately. The resolution walk matches each path
+    component against a folder's children, so a MISSED PAGE reads as "no folder named
+    TradingDesk-Backups exists" — a confident, wrong resolution failure on a healthy
+    Drive. Every page is followed; running out of cap returns None (a failure to
+    enumerate), never a short list masquerading as the whole folder.
 
     `fields` names md5Checksum explicitly — the Drive API omits it otherwise, and a
     silently-absent checksum is precisely the kind of "check that proved less than it
     appeared to" this repo has already been bitten by. supportsAllDrives /
     includeItemsFromAllDrives are set so a shared drive is enumerated too rather than
-    returning an empty list that reads identically to "the upload never happened".
+    returning an empty list that reads identically to "it is not there".
     """
     # Folder ids come from Drive itself, but escape anyway rather than rely on the
     # upstream staying well-behaved forever.
@@ -977,7 +962,88 @@ def _drive_list_children(folder_id: str, token: str, *, urlopen_fn=None,
                            f"across {page} page(s)")
     return None, (f"folder {folder_id} still had more pages after {max_pages} — refusing "
                   f"to report a TRUNCATED listing, because a short list here is "
-                  f"indistinguishable from the bundle being absent")
+                  f"indistinguishable from the folder we are looking for not existing")
+
+
+# HOW WE LOOK THE BUNDLE UP, AND WHAT THE 2026-07-16 MEASUREMENTS ACTUALLY SHOW.
+# One parent-scoped name query:
+#     q=name='<bundle>' and '<folder_id>' in parents and trashed = false
+#
+# THE DATA, both bundles, local write time then what each query shape answered:
+#   tradingdesk-repo-20260716-162242.bundle, written 16:22:42:
+#       ~16:23   name query      -> EMPTY
+#       ~16:25   name query      -> EMPTY
+#       ~16:27   parent listing  -> FOUND
+#       ~16:27   name query      -> FOUND   (moments after the parent listing hit)
+#   tradingdesk-repo-20260716-163838.bundle, written 16:38:38:
+#       ~16:40   parent listing  -> NOT FOUND  (it still showed 162242 as the newest)
+#       ~16:41   name query      -> FOUND      <- the NAME query saw it FIRST here
+#       ~16:42   parent listing  -> FOUND
+#
+# THE ONLY CLAIM THAT DATA SUPPORTS, and the only one anything here may assert: DRIVE'S
+# API LAGS THE LOCAL WRITE BY ROUGHLY 1-5 MINUTES, REGARDLESS OF QUERY TYPE. On the
+# second bundle the name query found the file BEFORE the parent listing did — the two
+# shapes are not measurably different, and one observation runs against the idea that
+# listing is faster. That lag is real, it was measured, and it is exactly what makes
+# CLOUD_POLL_DEADLINE_S essential rather than optional.
+#
+# WHAT THIS CORRECTS: an earlier version of this file (commit 8a07993, conductor #32)
+# asserted that Drive's NAME INDEX was eventually consistent while a parentId listing
+# was IMMEDIATELY consistent, and replaced this query with a paginated full-folder
+# listing plus a client-side filename match on that basis. THAT MECHANISM WAS FALSE. It
+# was read off the first bundle alone, where ~5 minutes had already elapsed before the
+# parent listing was first tried; "parentId is immediate" was elapsed time mistaken for
+# a property of the query. The second bundle then cut the other way. The retraction is
+# conductor entry #33; 8a07993 stays in the history unamended. Do not reintroduce a
+# mechanism claim here that the measurements do not carry.
+#
+# HONEST LIMIT ON EVEN THE TRUE PART: the lag was measured through an MCP Drive
+# connector, not through the raw endpoint this module calls. Its `title` operator
+# probably maps onto `name` in files.list, but that is not proven. n=2 bundles.
+#
+# WHY THE QUERY IS PARENT-SCOPED — NOT part of that retraction, and load-bearing:
+# the 2026-07-07..16 incident was Drive syncing the WRONG FOLDER. A check that asked
+# only "does a file with this name and md5 exist SOMEWHERE in the Drive" would have
+# passed happily throughout all 9 days of it. FOLDER IDENTITY is precisely what has to
+# be verified, so the query is scoped to the folder id RESOLVED (never hardcoded) from
+# the path this run actually wrote to.
+def _drive_find_in_folder(name: str, folder_id: str, token: str, *, urlopen_fn=None,
+                          timeout: int = CLOUD_HTTP_TIMEOUT
+                          ) -> tuple[list | None, str]:
+    """Find files named `name` INSIDE folder `folder_id`. -> (files|None, note).
+
+    None == the query FAILED (we could not ask Google). [] == Google ANSWERED and says
+    no such file is in that folder. Those mean opposite things and must never blur.
+
+    `fields` asks for md5Checksum explicitly — the Drive API omits it otherwise, and a
+    silently-absent checksum is precisely the kind of "check that proved less than it
+    appeared to" this repo has already been bitten by. supportsAllDrives /
+    includeItemsFromAllDrives are set so a shared drive is searched too rather than
+    returning an empty list that reads identically to "the upload never happened".
+    """
+    # Bundle names come from BUNDLE_RE and folder ids come from Drive itself (no quotes
+    # possible in either), but escape anyway rather than rely on an upstream staying
+    # well-behaved forever.
+    safe_name = str(name).replace("\\", "\\\\").replace("'", "\\'")
+    safe_folder = str(folder_id).replace("\\", "\\\\").replace("'", "\\'")
+    url = DRIVE_FILES_URL + "?" + urllib.parse.urlencode({
+        "q": (f"name = '{safe_name}' and '{safe_folder}' in parents and "
+              f"trashed = false"),
+        "fields": "files(id,name,size,md5Checksum)",
+        "supportsAllDrives": "true",
+        "includeItemsFromAllDrives": "true",
+        "spaces": "drive",
+        "pageSize": "10",
+    })
+    payload, note = _get_json(url, headers={"Authorization": f"Bearer {token}"},
+                              timeout=timeout, urlopen_fn=urlopen_fn)
+    if payload is None:
+        return None, note
+    files = payload.get("files")
+    if files is None:
+        return None, "the Drive API response had no `files` key"
+    return files, (f"Drive returned {len(files)} file(s) named {name} in folder "
+                   f"{folder_id}")
 
 
 def _drive_path_components(dest, mount) -> tuple[list[str] | None, str]:
@@ -1020,12 +1086,20 @@ def _drive_resolve_folder_id(components, token, *, list_fn=None, urlopen_fn=None
                              ) -> tuple[str | None, str]:
     """Walk 'My Drive' down `components` to the backup folder's id. -> (id|None, note).
 
-    Each step LISTS the parent and matches the next component CLIENT-SIDE, so no step
-    of this resolution leans on a server-side name query either. ('root' is Drive's
-    alias for the My Drive root in an `in parents` term.)
+    Each step LISTS the parent and matches the next component CLIENT-SIDE against the
+    children's name AND mimeType. ('root' is Drive's alias for the My Drive root in an
+    `in parents` term.) Enumerating is not a claim that a listing is faster or fresher
+    than a name query — no such claim survives the measurements; see
+    _drive_find_in_folder. It is simply that this walk has to SEE each candidate to
+    reject a same-named FILE and to notice ambiguous same-named siblings, and it needs
+    the children of each level anyway.
 
     Fails honestly and distinctly on anything ambiguous — Drive permits same-named
     siblings, and a coin-flip between two candidate folders is not a resolution.
+
+    THIS RESOLUTION IS NOT OPTIONAL AND HAS NO FALLBACK. It is what pins the check to
+    the folder this run actually wrote to, which is the whole question the 2026-07-07..16
+    wrong-folder incident turned on.
     """
     if list_fn is None:
         def list_fn(fid, tok):
@@ -1101,30 +1175,34 @@ def _token_failure_note(err_code: str | None, note: str, creds: dict | None,
 
 def verify_cloud_arrival(bundle_path, bundle_name=None, drive_dest=None,
                          drive_mount=None, *, required=None,
-                         creds_fn=None, token_fn=None, folder_fn=None, list_fn=None,
+                         creds_fn=None, token_fn=None, folder_fn=None, find_fn=None,
                          md5_fn=None, sleep_fn=None, monotonic_fn=None, now=None,
                          deadline_s: int = CLOUD_POLL_DEADLINE_S,
                          interval_s: int = CLOUD_POLL_INTERVAL_S,
                          log_fn=None) -> dict:
     """Did the bundle actually reach Google? -> the status file's `cloud` block.
 
-    HOW IT LOOKS: it RESOLVES THE BACKUP FOLDER'S ID and LISTS ITS CHILDREN, matching
-    the bundle's filename client-side. It does NOT ask Drive to find the file by name.
-    See the block comment above _drive_list_children for the 2026-07-16 measurements
-    that forced that: a name search missed a bundle that was demonstrably already in
-    Drive, twice, for ~5 minutes, while a parent listing returned it immediately. The
-    old code polled the NAME INDEX and could therefore fail closed and page on a
-    perfectly healthy backup. If the folder id cannot be resolved we FAIL WITH A
-    DISTINCT NOTE — we never quietly fall back to the name query.
+    HOW IT LOOKS: it RESOLVES THE BACKUP FOLDER'S ID, then asks Drive ONE parent-scoped
+    question — is there a file of this name IN THAT FOLDER (see _drive_find_in_folder).
+    The scoping is the point and is not negotiable: the 2026-07-07..16 incident was
+    Drive syncing the WRONG FOLDER, and a check that asked only "does this name exist
+    somewhere in the Drive" would have passed straight through it. If the folder id
+    cannot be resolved we FAIL WITH A DISTINCT NOTE — we never quietly fall back to an
+    unscoped query, because an unscoped answer is not an answer to this question.
 
-    THE COMPARISON IS STILL md5, AND md5 IS STILL THE REAL PROOF. name+size proves a
-    file wearing the right label and roughly the right shape exists in the cloud; md5
-    proves the bytes in the cloud ARE the bytes on disk. Only the second one is worth
-    building: the 2026-07-16 incident was a folder full of files with plausible names.
-    It also does a second job that the switch to parent-listing makes load-bearing:
-    Drive computes md5Checksum SERVER-SIDE, and only ONCE THE CONTENT HAS LANDED. So
-    md5 is what separates "a metadata row exists in the folder" from "the bytes
-    actually uploaded" — which is exactly why a parentId hit ALONE is not proof, and
+    WHY IT POLLS: Drive's API lags the local write by roughly 1-5 minutes (measured
+    2026-07-16, both bundles, regardless of query type — the numbers are in the block
+    comment above _drive_find_in_folder). So a single immediate query would report "not
+    in the cloud" on a perfectly healthy backup. The deadline is what keeps that
+    tolerance from becoming indefinite patience.
+
+    THE COMPARISON IS md5, AND md5 IS THE REAL PROOF. name+size proves a file wearing
+    the right label and roughly the right shape exists in the cloud; md5 proves the
+    bytes in the cloud ARE the bytes on disk. Only the second one is worth building:
+    the 2026-07-16 incident was a folder full of files with plausible names. md5 does a
+    second job too: Drive computes md5Checksum SERVER-SIDE, and only ONCE THE CONTENT
+    HAS LANDED. So md5 is what separates "a metadata row exists in that folder" from
+    "the bytes actually uploaded" — which is why a metadata hit ALONE is not proof, and
     why an absent md5Checksum is a KEEP POLLING condition rather than either answer.
 
     Returns:
@@ -1145,7 +1223,7 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, drive_dest=None,
     monotonic_fn = monotonic_fn or time.monotonic
     creds_fn = creds_fn or _load_drive_creds
     token_fn = token_fn or _drive_access_token
-    list_fn = list_fn or _drive_list_children
+    find_fn = find_fn or _drive_find_in_folder
     md5_fn = md5_fn or file_md5
     name = bundle_name or Path(bundle_path).name
     required = CLOUD_VERIFY_REQUIRED if required is None else required
@@ -1188,7 +1266,7 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, drive_dest=None,
         res["note"] = _token_failure_note(err_code, tnote, creds, now=now)
         return res
 
-    # Resolve the FOLDER we are about to list. Outside the poll: an unresolvable folder
+    # Resolve the FOLDER we are about to query. Outside the poll: an unresolvable folder
     # is not a thing that becomes resolvable by waiting, and re-walking it every 15s
     # would just be a slower way of reporting the same failure.
     folder_id, folnote = folder_fn(token)
@@ -1196,32 +1274,34 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, drive_dest=None,
         res["state"] = "failed"
         res["note"] = (
             f"could NOT resolve the Drive folder id for the backup destination — "
-            f"{folnote}. Refusing to fall back to a name query: Drive's name index is "
-            f"eventually consistent (a name search missed a bundle that was already in "
-            f"Drive for ~5 minutes on 2026-07-16), so that fallback is the false-page "
-            f"generator this check was rebuilt to remove. Cloud arrival is NOT proven, "
-            f"and the reason is THIS — not an absent bundle.")
+            f"{folnote}. Refusing to fall back to an UNSCOPED name query: 'a file with "
+            f"this name and md5 exists somewhere in the Drive' would have been TRUE "
+            f"throughout the 9-day wrong-folder incident this check exists to catch, so "
+            f"it is not an answer to the question being asked. Cloud arrival is NOT "
+            f"proven, and the reason is THIS — not an absent bundle.")
         return res
     res["folder_id"] = folder_id
 
-    # Poll: the copy into the DriveFS mount returns before the upload finishes, so
+    # Poll: the copy into the DriveFS mount returns before the upload finishes, AND
+    # Drive's API lags the local write by ~1-5 minutes regardless of how it is asked
+    # (measured 2026-07-16 — see the block comment above _drive_find_in_folder). So
     # "not there yet" is expected for a while and is NOT evidence of failure. The
-    # deadline is what stops that tolerance from becoming indefinite patience. Note
-    # what we now wait ON: the UPLOAD (via md5, which Drive only computes once content
-    # lands) rather than an index catching up with a file that is already there.
+    # deadline is what stops that tolerance from becoming indefinite patience, and md5
+    # is what makes the eventual answer mean "the bytes landed" rather than "a row
+    # appeared".
     end = monotonic_fn() + max(0, deadline_s)
     attempts = 0
-    last = "no listing was performed"
+    last = "no query was performed"
     while True:
         attempts += 1
-        files, fnote = list_fn(folder_id, token)
+        files, fnote = find_fn(name, folder_id, token)
         if files is None:
-            # A failed listing and an empty folder mean OPPOSITE things. Never blur them.
+            # "We could not ask" and "Google says it is not there" mean OPPOSITE
+            # things. Never blur them.
             res["state"] = "failed"
-            res["note"] = f"the Drive API folder listing FAILED — {fnote}"
+            res["note"] = f"the Drive API query FAILED — {fnote}"
             return res
-        # THE MATCH IS CLIENT-SIDE, against the folder's actual contents.
-        hits = [f for f in files if f.get("name") == name]
+        hits = list(files)
         if hits:
             hit = hits[0]
             res["file_id"] = hit.get("id")
@@ -1235,7 +1315,7 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, drive_dest=None,
                     res["note"] = (
                         f"CONFIRMED IN THE CLOUD: Drive file id {res['file_id']} in "
                         f"folder {folder_id} has md5 {cloud_md5}, matching the local "
-                        f"bundle byte-for-byte (after {attempts} listing attempt(s))."
+                        f"bundle byte-for-byte (after {attempts} query attempt(s))."
                         f"{extra}")
                     return res
                 # A concrete, differing checksum is not an in-flight upload — Drive
@@ -1250,27 +1330,27 @@ def verify_cloud_arrival(bundle_path, bundle_name=None, drive_dest=None,
             # REGISTERED, NOT LANDED. Drive computes md5Checksum server-side and only
             # once the content is there, so its absence means the bytes are still in
             # flight. That is neither success nor failure — it is the one honest reason
-            # to keep polling, and it is why a parentId hit alone proves nothing.
+            # to keep polling, and it is why a metadata hit alone proves nothing.
             last = (f"Drive HAS a file named {name} (id {res['file_id']}) in the backup "
                     f"folder {folder_id}, but reports NO md5Checksum for it — the "
                     f"metadata row is REGISTERED and the CONTENT HAS NOT LANDED "
                     f"(Drive computes md5 server-side only after content lands), so "
                     f"the upload is still in flight")
         else:
-            last = (f"the backup folder {folder_id} contains no file named {name} — it "
-                    f"is ABSENT from the folder's own listing, not merely unindexed "
-                    f"({fnote})")
+            last = (f"Drive reports NO file named {name} in the backup folder "
+                    f"{folder_id} — the bundle is ABSENT from Drive's answer for that "
+                    f"folder ({fnote})")
         if monotonic_fn() >= end:
             break
         sleep_fn(min(interval_s, max(0, end - monotonic_fn())))
 
     res["state"] = "failed"
     res["note"] = (
-        f"NOT CONFIRMED IN THE CLOUD within {deadline_s}s ({attempts} listing "
+        f"NOT CONFIRMED IN THE CLOUD within {deadline_s}s ({attempts} query "
         f"attempt(s)): {last}. The bundle is on the Drive volume, but Google has not "
-        f"acknowledged its content. That is either an unusually slow upload or the "
-        f"silent non-upload this check exists to catch — and we do not get to assume "
-        f"which. Cloud arrival is NOT proven.")
+        f"acknowledged its content. That is either an unusually slow upload, the "
+        f"API lag outlasting the deadline, or the silent non-upload this check exists "
+        f"to catch — and we do not get to assume which. Cloud arrival is NOT proven.")
     return res
 
 
