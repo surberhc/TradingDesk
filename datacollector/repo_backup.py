@@ -214,7 +214,7 @@ DRIVE_OAUTH_FILE = Path(os.environ.get(
 #                             the grace period for confirming the setup works.
 #   True  + missing/failed -> FAIL CLOSED: non-zero exit, heartbeat left cold, the
 #                             alarm pages. Same contract as every other check here.
-CLOUD_VERIFY_REQUIRED = False
+CLOUD_VERIFY_REQUIRED = True
 
 GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
 DRIVE_FILES_URL = "https://www.googleapis.com/drive/v3/files"

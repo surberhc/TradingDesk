@@ -111,7 +111,13 @@ def _run(tmp_path, monkeypatch, **over):
         "size_fn": over.get("size_fn", Recorder(41_573_813)),
         "status_fn": over.get("status_fn", Recorder(None)),
         "heartbeat_fn": over.get("heartbeat_fn", Recorder(None)),
-        "cloud_fn": over.get("cloud_fn", Recorder(_cloud())),
+        # Default represents the world AS OF 2026-07-17: the Drive API credential is
+        # configured and a normal run's bytes verify in the cloud. (Before the credential
+        # existed this defaulted to "skipped_not_configured"; with CLOUD_VERIFY_REQUIRED
+        # now True a skipped cloud fails closed, so the general-path tests must see the
+        # verified state their subject assumes.) Tests specifically about the NO-credential
+        # condition construct that state explicitly rather than leaning on this default.
+        "cloud_fn": over.get("cloud_fn", Recorder(_cloud("verified"))),
         "log_fn": over.get("log_fn", Recorder(None)),
         # The `git bundle list-heads` seam. reuse_fn is deliberately NOT faked: the
         # skip DECISION is the thing under test, so the real find_reusable_bundle runs
@@ -591,8 +597,10 @@ def test_a_skipped_run_proves_string_says_no_new_bundle_and_names_the_covering_o
     assert "NO NEW BUNDLE WAS CREATED BY THIS RUN" in st["proves"]
     assert EXISTING in st["proves"]                       # names the covering bundle
     assert "RE-VERIFIED just now" in st["proves"]
-    assert "does NOT prove cloud arrival" in st["proves"]  # the cloud clause survives
-    assert st["proves"] == rb.proves_skipped(EXISTING, rb.PROVES_CLOUD_NOT_CHECKED)
+    # The cloud clause survives the skip wrapper; with the credential now configured the
+    # default run verifies in the cloud, so it is the verified clause that flows through.
+    assert "confirmed present in Google's cloud" in st["proves"]
+    assert st["proves"] == rb.proves_skipped(EXISTING, rb.PROVES_CLOUD_VERIFIED)
 
 
 def test_head_unchanged_but_no_bundle_exists_bundles_fresh(tmp_path, monkeypatch):
@@ -614,7 +622,7 @@ def test_head_unchanged_but_the_prior_bundle_is_MISSING_bundles_fresh(tmp_path, 
     assert f["create_fn"].calls == 1
     assert f["heartbeat_fn"].calls == 1
     assert "NO NEW BUNDLE" not in st["proves"]
-    assert st["proves"] == rb.PROVES_CLOUD_NOT_CHECKED
+    assert st["proves"] == rb.PROVES_CLOUD_VERIFIED
 
 
 def test_a_local_only_bundle_does_not_license_a_skip(tmp_path, monkeypatch):
@@ -670,7 +678,7 @@ def test_force_bundles_even_when_head_is_unchanged(tmp_path, monkeypatch):
     assert "NO NEW BUNDLE" not in st["proves"]
     # --force bypasses the SKIP. It must not buy a weaker result than any other run.
     assert st["ok"] is True
-    assert st["proves"] == rb.PROVES_CLOUD_NOT_CHECKED
+    assert st["proves"] == rb.PROVES_CLOUD_VERIFIED
 
 
 def test_force_cannot_turn_a_failed_backup_into_a_pass(tmp_path, monkeypatch):
@@ -1597,12 +1605,14 @@ def test_drive_list_children_caps_the_walk_and_calls_it_a_failure_not_an_answer(
 # --------------------------------------------------------------------------- #
 # THE ENABLEMENT FLAG — what the job does per outcome, and what `proves` admits
 # --------------------------------------------------------------------------- #
-def test_cloud_verify_required_ships_disabled():
-    """It ships INERT: the credential does not exist yet, so wiring it fail-closed
-    would fail tonight's 20:00 run and page about a missing credential rather than a
-    missing backup — teaching exactly the 'that alarm is noise' reflex this job
-    exists to defeat. Flip it once a real run reports cloud state 'verified'."""
-    assert rb.CLOUD_VERIFY_REQUIRED is False
+def test_cloud_verify_required_is_enabled():
+    """It shipped INERT (False) until the credential existed — wiring it fail-closed
+    before GCP setup would have paged about a missing credential rather than a missing
+    backup, teaching the 'that alarm is noise' reflex this job exists to defeat. As of
+    2026-07-17 the credential is configured and a real --wrap run reported cloud state
+    'verified', so per the flag's own instruction it is now True: the cloud-arrival
+    check is enforced and a missing/mismatched cloud confirmation fails closed."""
+    assert rb.CLOUD_VERIFY_REQUIRED is True
 
 
 def test_the_credential_lives_outside_the_repo():
@@ -1627,7 +1637,9 @@ def test_no_credential_with_required_false_skips_and_proves_says_not_checked(
     run does not page — but the artifact must ADMIT the check did not happen. An
     un-run check that leaves no trace is how 'we have backups' becomes a belief."""
     monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", False)
-    st, f = _run(tmp_path, monkeypatch)          # default cloud_fn = skipped
+    # This test IS the no-credential scenario, so it constructs that state explicitly
+    # (the harness default now represents a configured, verified cloud).
+    st, f = _run(tmp_path, monkeypatch, cloud_fn=Recorder(_cloud("skipped_not_configured")))
     assert st["ok"] is True
     assert f["heartbeat_fn"].calls == 1
     assert st["cloud"]["state"] == "skipped_not_configured"
@@ -1639,7 +1651,8 @@ def test_no_credential_with_required_false_skips_and_proves_says_not_checked(
 
 def test_no_credential_with_required_true_fails_closed(tmp_path, monkeypatch):
     monkeypatch.setattr(rb, "CLOUD_VERIFY_REQUIRED", True)
-    st, f = _run(tmp_path, monkeypatch)
+    # Constructs the no-credential state explicitly; the harness default is now verified.
+    st, f = _run(tmp_path, monkeypatch, cloud_fn=Recorder(_cloud("skipped_not_configured")))
     assert st["ok"] is False
     assert f["heartbeat_fn"].calls == 0          # cold heartbeat -> the alarm pages
     assert any("REQUIRED but no usable Drive API credential" in e for e in st["errors"])
