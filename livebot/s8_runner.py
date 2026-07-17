@@ -157,6 +157,20 @@ PILOT_MODE = True
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
                                 "paperbot"))
 
+# connections/ and strategies/ are separate top-level packages installed editable into
+# the venv. After the 2026-07-16 move off Drive the editable installs still point at the
+# old (now-deleted) My Drive location, so `from connections import ...` fails from a clean
+# venv invocation -- which would break this scheduled runner. Rather than depend on that
+# install being regenerated, add the repo's own connections/ and strategies/ parents to
+# sys.path (derived from __file__, per CLAUDE.md) so this runner is self-contained --
+# same pattern already used above for paperbot/ and below for dailyreport/. Fixing the
+# venv editable install desk-wide is a SEPARATE matter; this makes S8 independent of it.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _pkg_parent in ("connections", "strategies"):
+    _p = os.path.join(_REPO_ROOT, _pkg_parent)
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
 import ledger  # noqa: E402
 import order_router  # noqa: E402
 import s8_chain  # noqa: E402
