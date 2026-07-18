@@ -95,6 +95,7 @@ for _pkg_parent in ("paperbot", "connections", "strategies"):
 
 import s8_capture          # noqa: E402  (leg_grab_from_ticker — quotes + greeks harvest, REUSED)
 import s8_schema           # noqa: E402  (MARKET_COLUMNS)
+import s8_startup          # noqa: E402  (bounded startup connect-retry — shared pure seam)
 import s8_store            # noqa: E402  (write_market)
 
 _CT_ZONE = ZoneInfo("America/Chicago")
@@ -568,7 +569,23 @@ class S8Collector:
 
         print(f"s8_collector.run: connecting read-only to the live-trading Gateway "
               f"(consumer={consumer!r}, port {ibkr_live_trade.LIVE_TRADE_PORT})...")
-        ib = ibkr_live_trade.connect(consumer, launch=False, readonly=True)
+        # STARTUP connect is BOUNDED-RETRY (see s8_startup), and it sits UPSTREAM of the
+        # startup DATA wait below: a MISSING GATEWAY is handled here (the collector is
+        # launched by Task Scheduler shortly after the Gateway's own start, so IBC boot or a
+        # pending 2FA can still be refusing API connections at trigger time), while MISSING
+        # DATA on an established connection is handled by wait_for_live_spot. Windows
+        # restart-on-failure is NOT a reliable net (it fires on unexpected termination, not
+        # reliably on a non-zero exit code from cmd.exe), so the collector self-heals; if the
+        # window elapses it exits CLEANLY with one legible line + nonzero rc, no traceback.
+        try:
+            ib = s8_startup.connect_with_retry(
+                lambda: ibkr_live_trade.connect(consumer, launch=False, readonly=True),
+                label="s8_collector", port=ibkr_live_trade.LIVE_TRADE_PORT,
+            )
+        except s8_startup.StartupConnectTimeout as exc:
+            print(f"s8_collector.run: {exc} Exiting cleanly with rc=3 (no IB Gateway at "
+                  f"startup); relaunch once the gateway is up.")
+            raise SystemExit(3)
         self._ib = ib
         try:
             try:
@@ -672,6 +689,26 @@ def _ticker_price(ticker: Any) -> Optional[float]:
     return val
 
 
-if __name__ == "__main__":
+def _main() -> None:
+    """Entrypoint wrapper — keeps startup failures LEGIBLE.
+
+    A clean bounded-window give-up (gateway never came up / data never flowed) already exits
+    via SystemExit with one logged line and no traceback. Anything else gets a one-line
+    headline FIRST so the scheduled-task log is readable at a glance; the traceback is still
+    printed underneath because a genuine bug must stay diagnosable.
+    """
     sys.stdout.reconfigure(line_buffering=True)
-    S8Collector().run()
+    try:
+        S8Collector().run()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        print(f"s8_collector: FATAL startup/run failure "
+              f"({type(exc).__name__}: {exc}) — exiting with rc=1.")
+        traceback.print_exc()
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    _main()

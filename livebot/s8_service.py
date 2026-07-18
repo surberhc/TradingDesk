@@ -67,6 +67,7 @@ import s8_chain            # noqa: E402
 import s8_config           # noqa: E402
 import s8_monitor          # noqa: E402  (S8Monitor — exit side reused VERBATIM)
 import s8_runner           # noqa: E402  (evaluate_and_capture_due_template — entry side, shared)
+import s8_startup          # noqa: E402  (bounded startup connect-retry — shared pure seam)
 import s8_store            # noqa: E402
 
 _CT_ZONE = ZoneInfo("America/Chicago")
@@ -250,7 +251,22 @@ class S8Service:
         print(f"s8_service.run: connecting read-only to the live-trading Gateway "
               f"(consumer={_CONSUMER!r}, port {ibkr_live_trade.LIVE_TRADE_PORT}, "
               f"account={self.account!r})...")
-        ib = ibkr_live_trade.connect(_CONSUMER, launch=False, readonly=True)
+        # STARTUP connect is BOUNDED-RETRY (see s8_startup): this service is launched by Task
+        # Scheduler shortly after the Gateway's own start, so at trigger time the Gateway may
+        # still be booting (IBC) or waiting on a 2FA approval and will REFUSE the API
+        # connection. We must not lean on Windows restart-on-failure as the net (it fires on
+        # unexpected termination, not reliably on a non-zero exit code from cmd.exe), so the
+        # service self-heals: poll the connect, and if the window elapses exit CLEANLY with a
+        # single legible line + nonzero rc rather than a raw traceback.
+        try:
+            ib = s8_startup.connect_with_retry(
+                lambda: ibkr_live_trade.connect(_CONSUMER, launch=False, readonly=True),
+                label="s8_service", port=ibkr_live_trade.LIVE_TRADE_PORT,
+            )
+        except s8_startup.StartupConnectTimeout as exc:
+            print(f"s8_service.run: {exc} Exiting cleanly with rc=3 (no IB Gateway at "
+                  f"startup); relaunch once the gateway is up.")
+            raise SystemExit(3)
         self._bind_ib(ib)
         try:
             ib.pendingTickersEvent += self.monitor._on_pending_tickers
@@ -330,6 +346,26 @@ class S8Service:
             print("s8_service.run: disconnected.")
 
 
-if __name__ == "__main__":
+def _main() -> None:
+    """Entrypoint wrapper — keeps startup failures LEGIBLE.
+
+    A clean bounded-window give-up (gateway never came up) already exits via SystemExit with
+    one logged line and no traceback. Anything else gets a one-line headline FIRST so the
+    scheduled-task log is readable at a glance; the traceback is still printed underneath
+    because a genuine bug must stay diagnosable.
+    """
     sys.stdout.reconfigure(line_buffering=True)
-    S8Service().run()
+    try:
+        S8Service().run()
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        print(f"s8_service: FATAL startup/run failure "
+              f"({type(exc).__name__}: {exc}) — exiting with rc=1.")
+        traceback.print_exc()
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    _main()
