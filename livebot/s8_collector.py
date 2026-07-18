@@ -94,6 +94,7 @@ for _pkg_parent in ("paperbot", "connections", "strategies"):
         sys.path.insert(0, _p)
 
 import s8_capture          # noqa: E402  (leg_grab_from_ticker — quotes + greeks harvest, REUSED)
+import s8_gateway_alert    # noqa: E402  (gateway down/relaunch email failsafe — best-effort)
 import s8_lock             # noqa: E402  (single-instance / orphan guard — shared pure seam)
 import s8_schema           # noqa: E402  (MARKET_COLUMNS)
 import s8_startup          # noqa: E402  (bounded startup connect-retry — shared pure seam)
@@ -602,6 +603,9 @@ class S8Collector:
 
             started = time.monotonic()
             last_harvest = 0.0
+            # Wall-clock stamp of the last KNOWN-GOOD connect, reported to the gateway-down
+            # alerter as the observed "seconds since last good connect".
+            last_connect_ok_ts = time.time()
             while True:
                 try:
                     ib.waitOnUpdate(timeout=1.0)
@@ -618,6 +622,13 @@ class S8Collector:
 
                 if not ib.isConnected():
                     print("s8_collector.run: gateway disconnected — reconnecting...")
+                    # MID-SESSION gateway loss (NOT the startup connect path above, which
+                    # bounded-retries on its own). Email the failsafe alert and relaunch via
+                    # ensure_gateway()'s existing launch mutex + cooldown. The alerter dedups
+                    # against the service's simultaneous detection of the SAME drop, so this
+                    # yields ONE email, not two — and it never raises in here.
+                    s8_gateway_alert.handle_gateway_down(
+                        "s8_collector", last_connect_ok_ts=last_connect_ok_ts)
                     try:
                         ib = ibkr_live_trade.connect(consumer, launch=False, readonly=True)
                         self._ib = ib
@@ -625,6 +636,7 @@ class S8Collector:
                         if settle_secs:
                             ib.sleep(settle_secs)
                         last_harvest = 0.0
+                        last_connect_ok_ts = time.time()
                     except Exception as exc:  # noqa: BLE001
                         print(f"s8_collector.run: reconnect failed ({exc}); retrying...")
                         time.sleep(5)

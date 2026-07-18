@@ -65,6 +65,7 @@ for _pkg_parent in ("paperbot", "connections", "strategies"):
 
 import s8_chain            # noqa: E402
 import s8_config           # noqa: E402
+import s8_gateway_alert    # noqa: E402  (gateway down/relaunch email failsafe — best-effort)
 import s8_lock             # noqa: E402  (single-instance / orphan guard — shared pure seam)
 import s8_monitor          # noqa: E402  (S8Monitor — exit side reused VERBATIM)
 import s8_runner           # noqa: E402  (evaluate_and_capture_due_template — entry side, shared)
@@ -329,6 +330,10 @@ class S8Service:
 
             started = time.monotonic()
             last_entry = last_rescan = last_flush = started
+            # Wall-clock stamp of the last KNOWN-GOOD connect, fed to the gateway-down
+            # alerter as an observed fact ("seconds since last good connect"). Wall clock,
+            # not monotonic, because it is reported to a human.
+            last_connect_ok_ts = time.time()
             while True:
                 # Bounded wait for the next tick batch; the pendingTickers handler drives
                 # exit monitoring (on_sample) for every open position.
@@ -350,6 +355,15 @@ class S8Service:
                 # Reconnect + re-subscribe on a gateway drop.
                 if not ib.isConnected():
                     print("s8_service.run: gateway disconnected — reconnecting...")
+                    # MID-SESSION gateway loss (NOT the startup connect path above, which
+                    # has its own bounded wait). Email the failsafe alert and relaunch the
+                    # Gateway via ensure_gateway()'s existing launch mutex + cooldown, so
+                    # an unexpected 2FA push on Andrew's phone is explained by an email he
+                    # can trust — and its ABSENCE stays the security signal (see
+                    # s8_gateway_alert's docstring). Strictly best-effort: it dedups against
+                    # the collector's simultaneous detection and never raises in here.
+                    s8_gateway_alert.handle_gateway_down(
+                        "s8_service", last_connect_ok_ts=last_connect_ok_ts)
                     try:
                         ib = ibkr_live_trade.connect(_CONSUMER, launch=False, readonly=True)
                         self._bind_ib(ib)
@@ -358,6 +372,7 @@ class S8Service:
                         self.monitor._ticker_owner.clear()
                         for trade_id in list(self.monitor._positions.keys()):
                             self.monitor._subscribe(trade_id)
+                        last_connect_ok_ts = time.time()
                     except Exception as exc:  # noqa: BLE001
                         print(f"s8_service.run: reconnect failed ({exc}); retrying...")
                         time.sleep(5)
