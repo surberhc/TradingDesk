@@ -324,3 +324,83 @@ def test_module_has_no_order_path():
     src = pathlib.Path(ga.__file__).read_text(encoding="utf-8")
     for forbidden in ("placeOrder", "bracketOrder", "order_router", "transmit = True"):
         assert forbidden not in src
+
+
+# --------------------------------------------------------------------------- #
+# SHARPENED GATEWAY PROCESS PROBE
+#
+# The old probe matched ANY javaw.exe/java.exe, so it could not tell THIS Gateway's JVM
+# apart from the paper gateway's or the ThetaData terminal's. It now discriminates on the
+# live-trade listening port / install dir. These tests feed the parser FAKE PowerShell
+# output -- no PowerShell is spawned, no process is touched.
+# --------------------------------------------------------------------------- #
+
+class _Out:
+    def __init__(self, stdout=""):
+        self.stdout = stdout
+
+
+def _nt(monkeypatch):
+    monkeypatch.setattr(ga.os, "name", "nt")
+
+
+def test_probe_identifies_the_live_trade_gateway(monkeypatch):
+    _nt(monkeypatch)
+    out = _Out('{"found":true,"pids":[4242]}')
+    assert ga.gateway_process_alive(run=lambda *a, **k: out) is True
+
+
+def test_probe_reports_false_when_the_scan_ran_and_found_nothing(monkeypatch):
+    """An enumeration that genuinely succeeded and matched nothing is a real NO."""
+    _nt(monkeypatch)
+    out = _Out('{"found":false,"pids":[]}')
+    assert ga.gateway_process_alive(run=lambda *a, **k: out) is False
+
+
+def test_probe_does_not_misidentify_an_unrelated_java_process(monkeypatch):
+    """The paper gateway / ThetaData terminal are java too. The PowerShell filters them
+    out by port+install dir, so an 'unrelated java only' box reports found=false -- NOT
+    the old blanket True."""
+    _nt(monkeypatch)
+    out = _Out('{"found":false,"pids":[]}')
+    assert ga.gateway_process_alive(run=lambda *a, **k: out) is not True
+
+
+def test_probe_scopes_its_query_to_this_instance(monkeypatch):
+    """The command actually sent must carry BOTH discriminators: the live-trade port and
+    the live-trade install dir."""
+    _nt(monkeypatch)
+    seen = {}
+
+    def fake_run(cmd, **_k):
+        seen["cmd"] = cmd
+        return _Out('{"found":true,"pids":[1]}')
+
+    ga.gateway_process_alive(run=fake_run)
+    script = seen["cmd"][-1]
+    assert str(ga.LIVE_TRADE_PORT) in script
+    assert "IBC-Live-Trade" in script
+    assert "4002" not in script            # never the PAPER gateway's port
+    assert "25503" not in script           # never the ThetaData terminal's port
+
+
+def test_probe_returns_none_not_false_when_it_cannot_determine(monkeypatch):
+    """UNKNOWN must never collapse into a confident 'NO' -- that is the whole point."""
+    _nt(monkeypatch)
+    for stdout in ("PROBE_FAILED", "", "   ", "not json at all", '"a string"', "[1,2]"):
+        assert ga.gateway_process_alive(run=lambda *a, **k: _Out(stdout)) is None
+
+    def boom(*_a, **_k):
+        raise OSError("powershell missing")
+
+    assert ga.gateway_process_alive(run=boom) is None
+
+
+def test_probe_returns_none_off_windows(monkeypatch):
+    monkeypatch.setattr(ga.os, "name", "posix")
+    assert ga.gateway_process_alive() is None
+
+
+def test_unknown_probe_renders_as_unknown_in_the_email():
+    lines = ga.format_diagnostics_lines({"gateway_process_alive": None, "port": 4003})
+    assert any("UNKNOWN (could not be determined)" in ln for ln in lines)

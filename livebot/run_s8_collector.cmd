@@ -55,6 +55,20 @@ REM --- PYTHONPATH: venv deps + repo packages (connections/strategies/paperbot) 
 set "PYTHONPATH=%VENV_SITE%;%REPO%\connections;%REPO%\strategies;%REPO%\paperbot;%PYTHONPATH%"
 
 if not exist "%LOGDIR%" mkdir "%LOGDIR%"
+
+REM --- PRE-LAUNCH ORPHAN REAP (must stay ABOVE every day-log touch below) -----
+REM  Stop-ScheduledTask kills this .cmd but not its python child. That orphan keeps a
+REM  readonly gateway connection, its clientId, its lock AND THE DAY LOG'S FILE HANDLE --
+REM  which is why a restart used to fall back to a timestamped file and split one
+REM  session's logs across two. s8_reap.py terminates a stale, cmdline-VERIFIED
+REM  s8_collector python (it can never kill an unrelated process) and clears its lock.
+REM  Running it HERE, before the day log is probed/opened, means the handle is already
+REM  released when logging starts.
+REM  BEST-EFFORT: s8_reap always exits 0, writes to stdout + its own logs\s8_reap.log
+REM  (never the day log), and its result is IGNORED -- a failed reap must NEVER prevent
+REM  the launch (the mandatory-launch guarantee).
+if exist "%BASE_PY%" "%BASE_PY%" -u "%REPO%\livebot\s8_reap.py" s8_collector
+
 REM One (stable, locale-independent) PowerShell call resolves the per-day filename
 REM plus a unique HHmmss stamp for the fallback name.
 for /f "usebackq tokens=1,2 delims=_" %%a in (`powershell -NoProfile -Command "Get-Date -Format yyyyMMdd_HHmmss"`) do (

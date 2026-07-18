@@ -24,7 +24,9 @@ Silence must never be interpretable as "everything is fine".
 OBSERVATIONS ONLY — NEVER A GUESSED ROOT CAUSE
 ----------------------------------------------
 ``capture_diagnostics`` reports only what can be directly observed from this machine:
-is a gateway process alive? is port 4003 accepting a TCP connection? what exact exception
+is THIS gateway's JVM alive (discriminated by its own listening port / install dir, so the
+paper gateway and the ThetaData terminal cannot be mistaken for it — and UNKNOWN rather
+than a guess whenever that cannot be told)? is port 4003 accepting a TCP connection? what exact exception
 was seen? what time (CT)? how long since the last known-good connect? The *underlying
 cause* — IBKR-side maintenance, a network blip, an IBC restart, the machine sleeping — is
 NOT determinable from here, and every email says so in plain words. Guessing a cause in an
@@ -130,32 +132,86 @@ def port_listening(port: int = LIVE_TRADE_PORT, host: str = "127.0.0.1",
         return None
 
 
-def gateway_process_alive() -> Optional[bool]:
-    """True if an IB Gateway JVM process appears to be running; None if undeterminable.
+def _ps_single_quote(s: str) -> str:
+    """Escape a string for embedding in a PowerShell single-quoted literal."""
+    return str(s).replace("'", "''")
 
-    ``tasklist`` is the dependency-free process probe on Windows (same tool
-    ``s8_lock.pid_alive`` / ``ibkr_live_trade._pid_alive`` use). The Gateway runs under a
-    Java process, so ``javaw.exe``/``java.exe`` presence is the observable fact available
-    here. NOTE the honest limitation, stated in the email too: this cannot distinguish THIS
-    Gateway's JVM from another Java process, so it is reported as a raw observation and
-    never as proof of anything.
+
+# THIS Gateway instance's install dir. The live-trading Gateway is a SEPARATE IBC install
+# from the paper one (see connections.ibkr_live_trade.GATEWAY_BAT); kept as a plain
+# constant so this module stays importable with no connections/ import at test time.
+LIVE_TRADE_DIR = r"C:\IBC-Live-Trade"
+
+# Discriminate THIS Gateway's JVM from every other java process on the box (the PAPER
+# gateway on 4002, the ThetaData terminal, anything else). Same two-part discriminator
+# ``connections.gateway_watchdog._KILL_PS_TEMPLATE`` already uses:
+#   * PRIMARY   — the process actually LISTENING on this instance's port, and
+#   * SECONDARY — a java/javaw whose CommandLine contains this instance's install dir
+#                 (catches the window before it has bound the port).
+# ``$all.Count -eq 0`` can only mean the enumeration itself failed, so that path reports
+# PROBE_FAILED -> None ("UNKNOWN") rather than a confident, wrong "NO".
+_PROBE_PS_TEMPLATE = r"""
+$ErrorActionPreference = 'SilentlyContinue'
+$dirSubstring = '{dir_substring}'
+$all = @(Get-CimInstance Win32_Process)
+if ($all.Count -eq 0) {{ Write-Output 'PROBE_FAILED'; exit 0 }}
+$gwPid = (Get-NetTCPConnection -LocalPort {port} -State Listen).OwningProcess |
+         Select-Object -Unique
+$procs = @($all | Where-Object {{
+    ($_.Name -eq 'java.exe' -or $_.Name -eq 'javaw.exe') -and
+    (
+        ($_.ProcessId -in $gwPid) -or
+        ($_.CommandLine -match [regex]::Escape($dirSubstring))
+    )
+}})
+@{{ found = [bool]($procs.Count -gt 0); pids = @($procs | ForEach-Object {{ $_.ProcessId }}) }} |
+    ConvertTo-Json -Compress
+"""
+
+
+def gateway_process_alive(
+    port: int = LIVE_TRADE_PORT,
+    dir_substring: str = LIVE_TRADE_DIR,
+    *,
+    run: Callable[..., Any] = subprocess.run,
+) -> Optional[bool]:
+    """True if **THIS** Gateway's JVM appears to be running; None if undeterminable.
+
+    Sharpened (was: any ``javaw.exe``/``java.exe``, which could not tell this Gateway's JVM
+    apart from the paper gateway's or the ThetaData terminal's). A java/javaw process now
+    counts only if it is the one LISTENING on this instance's port, or its command line
+    contains this instance's install dir — the same port + install-dir discriminator
+    ``connections.gateway_watchdog`` uses to scope its kill to one Gateway instance.
+
+    Honest by construction: if the probe cannot answer — not Windows, PowerShell failed,
+    the process enumeration came back empty, unparsable output — it returns **None**, which
+    renders as "UNKNOWN (could not be determined)". A confident wrong answer in an alert
+    Andrew reads on his phone would be worse than no answer.
+
+    NOT a hot path: this runs only when an alert actually fires, which is rare, so the
+    PowerShell spawn is affordable here and is never taken during normal operation.
     """
     if os.name != "nt":
         return None
+    ps = _PROBE_PS_TEMPLATE.format(port=int(port),
+                                   dir_substring=_ps_single_quote(dir_substring))
     try:
-        out = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq javaw.exe", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, timeout=15,
+        out = run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=60,
         )
-        if "javaw.exe" in (out.stdout or ""):
-            return True
-        out2 = subprocess.run(
-            ["tasklist", "/FI", "IMAGENAME eq java.exe", "/NH", "/FO", "CSV"],
-            capture_output=True, text=True, timeout=15,
-        )
-        return "java.exe" in (out2.stdout or "")
-    except Exception:  # noqa: BLE001
+    except Exception:  # noqa: BLE001 — undeterminable, not "down"
         return None
+    text = (getattr(out, "stdout", "") or "").strip()
+    if not text or "PROBE_FAILED" in text:
+        return None
+    try:
+        parsed = json.loads(text.splitlines()[-1].strip())
+    except (ValueError, TypeError, IndexError):
+        return None
+    if not isinstance(parsed, dict) or "found" not in parsed:
+        return None
+    return bool(parsed.get("found"))
 
 
 def _default_mailer():
@@ -227,7 +283,9 @@ def capture_diagnostics(
       ``observed_at_ct``            CT wall-clock timestamp of the observation
       ``observed_at_epoch``         the same instant as an epoch float
       ``port`` / ``port_listening`` is 4003 accepting a TCP connection? (None = unknown)
-      ``gateway_process_alive``     is a Gateway JVM process visible? (None = unknown)
+      ``gateway_process_alive``     is THIS Gateway's JVM visible — discriminated by its
+                                    listening port / install dir, not just "some java"?
+                                    (None = unknown)
       ``error_type`` / ``error``    the exact exception type + message observed, or None
       ``seconds_since_last_connect``  seconds since the last known-good connect, or None
     """
@@ -292,7 +350,7 @@ def format_diagnostics_lines(diagnostics: Dict[str, Any]) -> list:
         "OBSERVED (facts only — no cause is inferred):",
         f"  detected by ............... {d.get('source')}",
         f"  time (CT) ................. {_fmt(d.get('observed_at_ct'))}",
-        f"  gateway process alive? .... {_fmt(d.get('gateway_process_alive'))}",
+        f"  THIS gateway's JVM alive? . {_fmt(d.get('gateway_process_alive'))}",
         f"  port {d.get('port', LIVE_TRADE_PORT)} accepting TCP? ..... "
         f"{_fmt(d.get('port_listening'))}",
         f"  exact error observed ...... {_fmt(d.get('error_type'))}: "
