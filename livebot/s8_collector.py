@@ -94,6 +94,7 @@ for _pkg_parent in ("paperbot", "connections", "strategies"):
         sys.path.insert(0, _p)
 
 import s8_capture          # noqa: E402  (leg_grab_from_ticker — quotes + greeks harvest, REUSED)
+import s8_lock             # noqa: E402  (single-instance / orphan guard — shared pure seam)
 import s8_schema           # noqa: E402  (MARKET_COLUMNS)
 import s8_startup          # noqa: E402  (bounded startup connect-retry — shared pure seam)
 import s8_store            # noqa: E402  (write_market)
@@ -698,6 +699,16 @@ def _main() -> None:
     printed underneath because a genuine bug must stay diagnosable.
     """
     sys.stdout.reconfigure(line_buffering=True)
+    # SINGLE-INSTANCE / ORPHAN GUARD (see s8_lock) — its OWN lock, separate from the
+    # service's. Stop-ScheduledTask kills the .cmd wrapper but not this python child, so a
+    # surviving orphan would still hold clientId 56 at the gateway and collide with
+    # tomorrow's scheduled start. The collector is a stateless context feed, so terminating
+    # a verified prior instance and taking over loses nothing but the in-flight cadence
+    # window. Released in the finally below, which also covers the SystemExit paths.
+    lock = s8_lock.SingleInstanceLock("s8_collector", "s8_collector.py")
+    if not lock.acquire():
+        print("s8_collector: could not take the single-instance lock — exiting with rc=4.")
+        raise SystemExit(4)
     try:
         S8Collector().run()
     except (SystemExit, KeyboardInterrupt):
@@ -708,6 +719,8 @@ def _main() -> None:
               f"({type(exc).__name__}: {exc}) — exiting with rc=1.")
         traceback.print_exc()
         raise SystemExit(1)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":

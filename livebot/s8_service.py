@@ -65,6 +65,7 @@ for _pkg_parent in ("paperbot", "connections", "strategies"):
 
 import s8_chain            # noqa: E402
 import s8_config           # noqa: E402
+import s8_lock             # noqa: E402  (single-instance / orphan guard — shared pure seam)
 import s8_monitor          # noqa: E402  (S8Monitor — exit side reused VERBATIM)
 import s8_runner           # noqa: E402  (evaluate_and_capture_due_template — entry side, shared)
 import s8_startup          # noqa: E402  (bounded startup connect-retry — shared pure seam)
@@ -86,6 +87,34 @@ def current_ct_date() -> str:
     return datetime.now(tz=_CT_ZONE).strftime("%Y%m%d")
 
 
+def resolve_trading_day(today=None, is_trading_day=None, log=print) -> bool:
+    """Is the market open at all today? PURE seam (date + calendar callable injected).
+
+    WHY: the entry grid is purely TIME-based, so on a market holiday every due slot is
+    "due" — the service attempted an entry each cycle, failed the chain snapshot, and
+    logged a line per cycle (hundreds a day). This answers the question ONCE per session.
+
+    FAILS OPEN by design: any calendar problem (an un-tabled year raising
+    ``CalendarYearMissing``, an import failure, anything else) returns True — assume a
+    trading day and behave exactly as today — because a calendar glitch must NEVER silently
+    suppress real entries. The fallback is logged so it is visible.
+    """
+    if today is None:
+        # Derive from the SAME CT date the entry identity uses (current_ct_date), so the
+        # guard can never disagree with the date a trade would be recorded under.
+        today = datetime.strptime(current_ct_date(), "%Y%m%d").date()
+    try:
+        if is_trading_day is None:
+            from connections import market_calendar as _mc
+            is_trading_day = _mc.is_trading_day
+        return bool(is_trading_day(today))
+    except Exception as exc:  # noqa: BLE001 — fail OPEN, never suppress real entries
+        log(f"s8_service: market-calendar lookup failed for {today} "
+            f"({type(exc).__name__}: {exc}) — FAILING OPEN: assuming a trading day and "
+            f"running entries normally.")
+        return True
+
+
 class S8Service:
     """The unified all-day entry+exit service.
 
@@ -101,6 +130,10 @@ class S8Service:
         # reused verbatim — this service never reimplements the stop/B2 logic.
         self.monitor = s8_monitor.S8Monitor()
         self._ib = None
+        # Trading-day guard state — resolved ONCE per session, logged once (see
+        # _ensure_trading_day_checked / resolve_trading_day).
+        self._trading_day_checked = False
+        self._entries_enabled = True
 
     # ------------------------------------------------------------------ #
     # Connection binding — keep the service and the composed monitor on ONE ib
@@ -141,6 +174,22 @@ class S8Service:
             return None
         return summary
 
+    def _ensure_trading_day_checked(self, today=None, is_trading_day=None) -> bool:
+        """Resolve the trading-day guard once per session; return whether entries may run.
+
+        Idempotent and logged EXACTLY once (the whole point — a per-cycle holiday log is the
+        noise this fixes). Exit monitoring is unaffected either way.
+        """
+        if not self._trading_day_checked:
+            self._trading_day_checked = True
+            self._entries_enabled = resolve_trading_day(today, is_trading_day)
+            if not self._entries_enabled:
+                day = today if today is not None else current_ct_date()
+                print(f"s8_service: {day} is NOT a trading day (weekend/market holiday) — "
+                      f"skipping ALL entry attempts for this session; exit monitoring "
+                      f"continues normally.")
+        return self._entries_enabled
+
     def entry_cycle(self, ib, now=None) -> List[dict]:
         """Evaluate any due (template, slot) right now and ENTER the ones not already in the
         store. Returns the list of per-template outcome dicts (empty if nothing was due /
@@ -156,6 +205,11 @@ class S8Service:
           4. on a real entry (a persisted open TradeRecord), pick it up + subscribe its legs
              via the monitor's own rescan path.
         """
+        if not self._ensure_trading_day_checked():
+            # Market holiday / weekend: the time-based grid would otherwise "come due" all
+            # day. Skip entries entirely (logged once above); exits keep running.
+            return []
+
         if self.account == "TBD":
             # Fail-closed: with no real test account set, enter nothing (exit monitoring of
             # any pre-existing positions still continues). Mirrors the runner's TBD refusal.
@@ -355,6 +409,17 @@ def _main() -> None:
     because a genuine bug must stay diagnosable.
     """
     sys.stdout.reconfigure(line_buffering=True)
+    # SINGLE-INSTANCE / ORPHAN GUARD (see s8_lock): Stop-ScheduledTask kills the .cmd
+    # wrapper but not this python child, so a surviving orphan would still hold clientId 55
+    # at the gateway and collide with tomorrow's scheduled start. Take the lock first: free
+    # -> acquire; dead holder -> reclaim; LIVE holder verified to be this same script ->
+    # terminate the orphan and take over (this service is a singleton and reloads all state
+    # from the durable store, so takeover is safe). Released in the finally below, which
+    # also covers the SystemExit paths.
+    lock = s8_lock.SingleInstanceLock("s8_service", "s8_service.py")
+    if not lock.acquire():
+        print("s8_service: could not take the single-instance lock — exiting with rc=4.")
+        raise SystemExit(4)
     try:
         S8Service().run()
     except (SystemExit, KeyboardInterrupt):
@@ -365,6 +430,8 @@ def _main() -> None:
               f"({type(exc).__name__}: {exc}) — exiting with rc=1.")
         traceback.print_exc()
         raise SystemExit(1)
+    finally:
+        lock.release()
 
 
 if __name__ == "__main__":
