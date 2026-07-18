@@ -88,7 +88,10 @@ def _run(tmp_path, monkeypatch, **over):
         "heartbeat_fn": over.get("heartbeat_fn", Recorder(None)),
         "log_fn": over.get("log_fn", Recorder(None)),
     }
-    st = db.run_backup(now=NOW, dry_run=over.get("dry_run", False), **fakes)
+    extra = {}
+    if "mtime_fn" in over:
+        extra["mtime_fn"] = over["mtime_fn"]
+    st = db.run_backup(now=NOW, dry_run=over.get("dry_run", False), **fakes, **extra)
     return st, fakes
 
 
@@ -157,7 +160,11 @@ def test_check_difference_is_caught_and_never_reports_success(tmp_path, monkeypa
     assert st["check_returncode"] == 1
     assert st["differences"] == 3
     assert any("rclone check FAILED verification" in e for e in st["errors"])
-    assert st["proves"] == db.PROVES_FAILED
+    # A changed file under warehouse/raw/ is TIER 1 — `proves` names it, and never
+    # implies anything was verified.
+    assert "warehouse/raw/x.parquet" in st["proves"]
+    assert "TIER-1" in st["proves"]
+    assert st["proves"].startswith("nothing")
     assert "verified byte-identical" not in st["proves"]   # must not overstate
 
 
@@ -172,6 +179,304 @@ def test_check_difference_with_exit_zero_still_fails(tmp_path, monkeypatch):
     assert f["heartbeat_fn"].calls == 0
     assert any("despite exit 0" in e for e in st["errors"])
     assert st["proves"] == db.PROVES_FAILED
+
+
+# --------------------------------------------------------------------------- #
+# THE THREE TIERS — the 2026-07-18 false-page fix, and the guarantee it must NOT blunt.
+#
+# Context (from the real first run): the initial 99 GB backup completed and verified
+# 499,534 files byte-identical, then `rclone check` exited 1 with 17 differences — all of
+# them benign live-file churn, ZERO .parquet among them. The job as built treated ANY
+# difference as failure, so it would have false-paged EVERY night. The fix classifies
+# differences into three tiers. These tests pin BOTH halves of that: benign churn no
+# longer pages, AND a real corruption still does.
+# --------------------------------------------------------------------------- #
+BEFORE_RUN = (NOW - dt.timedelta(hours=3)).timestamp()   # existed before the run began
+DURING_RUN = (NOW + dt.timedelta(hours=4)).timestamp()   # created 4h into the run
+
+
+def _err(path, reason):
+    return f"2026/07/17 21:05:00 ERROR : {path}: {reason}\n"
+
+
+def _summary(differences, matching, missing=0, extra_errors=None):
+    """rclone check's trailer. `errors` counts the same files as `differences` (they
+    overlap), which is why the accounting rule uses max(), not a sum."""
+    n_err = differences if extra_errors is None else extra_errors
+    out = ""
+    if missing:
+        out += f"ERROR : Google drive root 'X': {missing} files missing\n"
+    out += (f"ERROR : Google drive root 'X': {differences} differences found\n"
+            f"ERROR : Google drive root 'X': {n_err} errors while checking\n"
+            f"NOTICE: Google drive root 'X': {matching} matching files\n")
+    return out
+
+
+def test_TIER1_parquet_size_mismatch_hard_fails_and_never_moves_the_heartbeat(
+        tmp_path, monkeypatch):
+    """THE MOST IMPORTANT TEST IN THIS FILE. warehouse/raw/** is write-once market data.
+    If one of those files differs, that is corruption or a failed upload — the classifier
+    must NOT forgive it. This proves the false-page fix did not blunt real corruption
+    detection."""
+    out = (_err("warehouse/raw/options/spy/2024-01-02.parquet", "sizes differ") +
+           _summary(differences=1, matching=499538))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0                  # cold heartbeat -> it pages
+    assert len(st["hard_failures"]) == 1
+    assert st["hard_failures"][0]["path"] == "warehouse/raw/options/spy/2024-01-02.parquet"
+    assert "TIER-1" in st["proves"]
+    assert "2024-01-02.parquet" in st["proves"]          # proves NAMES the failure
+    assert "verified byte-identical" not in st["proves"]
+    assert st["benign_differences"]["count"] == 0
+
+
+def test_TIER1_parquet_hash_differ_wording_is_also_caught(tmp_path, monkeypatch):
+    """rclone says 'sizes differ' or 'md5 differ' depending on what tripped. Both must
+    reach tier 1 — a classifier that only understood one wording would be a silent hole."""
+    out = (_err("warehouse/raw/options/x.parquet", "md5 differ") +
+           _summary(differences=1, matching=10))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert st["hard_failures"][0]["reason"] == "md5 differ"
+
+
+def test_TIER1_missing_file_older_than_run_start_hard_fails(tmp_path, monkeypatch):
+    """A file that EXISTED when rclone walked past, yet is not on the remote, is a real
+    'should have been backed up and wasn't'. Only the mtime distinguishes it from the
+    benign tier-3 case, so this is where that rule earns its keep."""
+    out = (_err("warehouse/raw/options/old.parquet", "file not in Google drive root 'X'") +
+           _summary(differences=1, matching=10, missing=1))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert st["hard_failures"][0]["path"] == "warehouse/raw/options/old.parquet"
+    assert "existed BEFORE the run" in st["hard_failures"][0]["why"]
+
+
+def test_TIER1_missing_file_with_unreadable_mtime_fails_closed(tmp_path, monkeypatch):
+    """If we cannot read the local mtime we cannot PROVE the file was created during the
+    run, so we must not forgive it. Fail closed."""
+    out = (_err("state/whatever.dat", "file not in Google drive root 'X'") +
+           _summary(differences=1, matching=10, missing=1))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: None)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+
+
+def test_TIER1_unknown_reason_fails_closed(tmp_path, monkeypatch):
+    """A reason the classifier does not understand is not a reason it may forgive."""
+    out = (_err("some/file.txt", "something rclone has never said before") +
+           _summary(differences=1, matching=10))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert "unrecognised" in st["hard_failures"][0]["why"]
+
+
+def test_TIER1_changed_file_matching_no_volatile_pattern_fails_closed(
+        tmp_path, monkeypatch):
+    """Outside warehouse/raw/ the default is still FAIL. Legitimate churn is added to
+    VOLATILE_PATTERNS deliberately, with a reason — it is never assumed."""
+    out = (_err("strategies/s0.py", "sizes differ") + _summary(differences=1, matching=10))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert "failing closed" in st["hard_failures"][0]["why"]
+
+
+def test_TIER3_missing_file_created_during_the_run_is_benign(tmp_path, monkeypatch):
+    """rclone cannot copy a file that did not exist when it walked that path. The next
+    run picks it up. This is 9 of the 17 real-world differences."""
+    out = (_err("s8_pilot/logs/pilot.log", "file not in Google drive root 'X'") +
+           _summary(differences=1, matching=499538, missing=1))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: DURING_RUN)
+    assert st["ok"] is True
+    assert f["heartbeat_fn"].calls == 1                  # a GOOD backup is not blocked
+    assert st["hard_failures"] == []
+    assert st["benign_differences"]["tier3_created_during_run"] == 1
+    assert "created during the run" in st["benign_differences"]["sample"][0]["why"]
+
+
+@pytest.mark.parametrize("path", [
+    "conductor/conductor.db",
+    "warehouse/heartbeat_alarm.log",
+    "state/paperbot/runs.jsonl",
+    "warehouse/raw/options/_manifest.json",     # index sidecar INSIDE warehouse/raw
+    "warehouse/register_forward_live.ps1",
+    "warehouse/run_forward_live.bat",
+])
+def test_TIER2_known_volatile_files_are_benign(tmp_path, monkeypatch, path):
+    """Files the desk rewrites while it runs. A difference between copy time and check
+    time is expected, not corruption."""
+    out = _err(path, "sizes differ") + _summary(differences=1, matching=499538)
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is True, f"{path} should be classified benign"
+    assert f["heartbeat_fn"].calls == 1
+    assert st["hard_failures"] == []
+    assert st["benign_differences"]["tier2_known_volatile"] == 1
+
+
+def test_TIER2_parquet_is_deliberately_NOT_volatile():
+    """The one entry that must never appear in the volatile list. Parquet is the data we
+    are insuring."""
+    assert not db.is_volatile("warehouse/raw/options/spy/2024-01-02.parquet")
+    assert db.is_precious("warehouse/raw/options/spy/2024-01-02.parquet")
+    assert not any("parquet" in p for p in db.VOLATILE_PATTERNS)
+
+
+def test_MIXED_benign_churn_never_masks_a_real_tier1_failure(tmp_path, monkeypatch):
+    """The failure mode a lazy fix would introduce: forgive the noise and lose the signal
+    with it. One corrupt parquet among a pile of legitimate churn must STILL page."""
+    out = (_err("conductor/conductor.db", "sizes differ") +
+           _err("warehouse/heartbeat_alarm.log", "sizes differ") +
+           _err("s8_pilot/logs/a.log", "file not in Google drive root 'X'") +
+           _err("warehouse/raw/options/spy/2024-01-02.parquet", "sizes differ") +
+           _summary(differences=4, matching=499535, missing=1))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: DURING_RUN if "s8_pilot" in p else BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0                  # the signal survives the noise
+    assert len(st["hard_failures"]) == 1
+    assert "2024-01-02.parquet" in st["proves"]
+    assert st["benign_differences"]["count"] == 3        # the churn is still RECORDED
+
+
+def test_unaccounted_differences_fail_closed(tmp_path, monkeypatch):
+    """The summary says 5 problems but only one per-file ERROR line explains one of them.
+    The four we cannot see we cannot classify — and an unclassified problem is a failure,
+    never a benign one. This is what stops the fix from becoming a blanket amnesty."""
+    out = (_err("conductor/conductor.db", "sizes differ") +
+           _summary(differences=5, matching=10))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert any("could not be accounted for" in e for e in st["errors"])
+    assert st["proves"] == db.PROVES_FAILED
+
+
+def test_unverifiable_hashes_fail_closed(tmp_path, monkeypatch):
+    """'hashes could not be checked' produces no path to classify. Unverifiable is not
+    verified."""
+    out = ("ERROR : Google drive root 'X': 2 hashes could not be checked\n"
+           "NOTICE: Google drive root 'X': 10 matching files\n")
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert any("could not be checked" in e for e in st["errors"])
+
+
+# --------------------------------------------------------------------------- #
+# THE REGRESSION TEST: replay the EXACT 17 differences from the real 2026-07-18 run.
+# --------------------------------------------------------------------------- #
+REAL_S8_LOGS = [f"s8_pilot/logs/s8_pilot_{i}.log" for i in range(9)]
+REAL_CHANGED = [
+    "conductor/conductor.db",
+    "warehouse/heartbeat_alarm.log",
+    "warehouse/morning_execute.log",
+    "warehouse/register_forward_live.ps1",
+    "warehouse/run_forward_live.bat",
+    "state/paperbot/paperbot.log",
+    "state/paperbot/runs.jsonl",
+    "warehouse/raw/options/_manifest.json",
+]
+REAL_CHECK_OUTPUT = (
+    "".join(_err(p, "file not in Google drive root 'TradingDesk-DataBackup'")
+            for p in REAL_S8_LOGS) +
+    "".join(_err(p, "sizes differ") for p in REAL_CHANGED) +
+    _summary(differences=17, matching=499534, missing=9)
+)
+
+
+def test_replay_the_real_17_differences_is_fully_benign_and_does_not_page(
+        tmp_path, monkeypatch):
+    """THE FALSE-PAGE REGRESSION TEST. This is verbatim the result of the first real
+    99 GB backup: 499,534 files byte-identical, then 17 differences — 9 s8_pilot logs a
+    concurrent session created ~4h into the run, and 8 live files that changed between
+    copy and check. Zero corruption, zero .parquet. The as-built job failed on this and
+    would have paged EVERY night."""
+    st, f = _run(tmp_path, monkeypatch,
+                 check_fn=Recorder(_proc(1, stderr=REAL_CHECK_OUTPUT)),
+                 mtime_fn=lambda p: DURING_RUN if p.startswith("s8_pilot/") else BEFORE_RUN)
+    assert st["ok"] is True
+    assert f["heartbeat_fn"].calls == 1                  # NO PAGE. That is the whole fix.
+    assert st["hard_failures"] == []
+    assert st["benign_differences"]["count"] == 17
+    assert st["benign_differences"]["tier3_created_during_run"] == 9
+    assert st["benign_differences"]["tier2_known_volatile"] == 8
+    assert st["files_checked"] == 499534
+
+
+def test_replay_the_real_17_proves_string_is_honest_about_them(tmp_path, monkeypatch):
+    """It must NOT read as a clean 100%. The 17 are named, and the sentence says outright
+    that those files are not proven current."""
+    st, _ = _run(tmp_path, monkeypatch,
+                 check_fn=Recorder(_proc(1, stderr=REAL_CHECK_OUTPUT)),
+                 mtime_fn=lambda p: DURING_RUN if p.startswith("s8_pilot/") else BEFORE_RUN)
+    assert st["proves"] == db.PROVES_VERIFIED_WITH_BENIGN.format(
+        n=499534, m=17, v=8, c=9, src=db.DATA_SOURCE, remote=db.RCLONE_REMOTE)
+    assert "499534 files verified byte-identical (md5)" in st["proves"]
+    assert "17 benign differences" in st["proves"]
+    assert "NOT proven current" in st["proves"]
+    assert "0 mismatches in the immutable warehouse/raw data" in st["proves"]
+    # It must not claim the clean-run wording.
+    assert "0 differences and 0 errors" not in st["proves"]
+
+
+def test_benign_sample_in_the_status_file_is_capped(tmp_path, monkeypatch):
+    """Audit-able, not a dump: thousands of churning paths must never land in the status
+    JSON."""
+    n = db.BENIGN_SAMPLE_CAP + 20
+    paths = [f"warehouse/job{i}.log" for i in range(n)]
+    out = ("".join(_err(p, "sizes differ") for p in paths) +
+           _summary(differences=n, matching=10))
+    st, f = _run(tmp_path, monkeypatch, check_fn=Recorder(_proc(1, stderr=out)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is True
+    assert st["benign_differences"]["count"] == n
+    assert len(st["benign_differences"]["sample"]) == db.BENIGN_SAMPLE_CAP
+
+
+# --------------------------------------------------------------------------- #
+# parse_check_errors — the per-file ERROR lines, and NOT rclone's summary lines
+# --------------------------------------------------------------------------- #
+def test_parse_check_errors_extracts_path_reason_and_kind():
+    d = db.parse_check_errors(
+        _err("conductor/conductor.db", "sizes differ") +
+        _err("warehouse/raw/x.parquet", "md5 differ") +
+        _err("s8_pilot/logs/a.log", "file not in Google drive root 'X'"))
+    assert [x["kind"] for x in d] == ["differ", "differ", "missing"]
+    assert d[0]["path"] == "conductor/conductor.db"
+
+
+def test_parse_check_errors_ignores_rclones_own_summary_lines():
+    """The summary trailer is written at ERROR level too. Mistaking it for a file would
+    invent a phantom path and, worse, make the accounting look satisfied."""
+    assert db.parse_check_errors(_summary(differences=17, matching=499534, missing=9)) == []
+
+
+def test_parse_check_errors_normalises_windows_separators():
+    d = db.parse_check_errors(_err(r"warehouse\raw\x.parquet", "sizes differ"))
+    assert d[0]["path"] == "warehouse/raw/x.parquet"
+
+
+def test_required_accounted_uses_max_not_sum():
+    """rclone's counts OVERLAP — the same 17 files are '17 differences' AND '17 errors',
+    9 of which are also '9 missing'. Summing them would demand 43 ERROR lines and
+    false-fail every run."""
+    parsed = db.parse_check_output(_summary(differences=17, matching=499534, missing=9))
+    assert db.required_accounted(parsed) == 17
 
 
 # --------------------------------------------------------------------------- #
