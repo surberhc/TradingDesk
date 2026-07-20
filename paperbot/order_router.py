@@ -8,9 +8,14 @@ LOGS them, but it refuses to transmit unless ALL of these hold together:
 Under the current safety config (READONLY + DRY_RUN, plus ReadOnlyApi=yes on the
 gateway) transmission is physically impossible. The guard fails CLOSED.
 
-Idempotency: every order carries a deterministic orderRef
-  paperbot:<account>:<as_of>:<side>:<symbol>
-so a restart re-derives the SAME id and a duplicate can be detected, not double-sent.
+Idempotency (ENFORCED, not just aspirational): every order carries a deterministic orderRef
+  paperbot:<account>:<as_of>:<side>:<symbol>   (or paperbot:<fa_group>:... for FA blocks)
+so a restart re-derives the SAME id. Before the FIRST placeOrder for a leg, the pre-transmit
+dedup gate `already_present()` reads BROKER TRUTH (reqAllOpenOrders + reqExecutions) and the
+transmit journal, and lets ONLY a genuinely FRESH leg through — a working/filled/partial/
+uncertain leg transmits NOTHING. This is what actually prevents a crash-resume, retry, or a
+stacked ladder from double-sending. It fails CLOSED (any broker-read failure -> UNKNOWN ->
+skip). whatIfOrder is NEVER used (known hang).
 """
 from __future__ import annotations
 
@@ -20,6 +25,99 @@ from ib_async import (LimitOrder, Order, PriceCondition, Stock, TagValue,
                       TimeCondition)
 
 import config
+
+
+# =============================================================================
+# PRE-TRANSMIT DEDUP GATE (S0 order-idempotency, docs/S0_ORDER_IDEMPOTENCY_SPEC.md §3.A).
+# Broker-truth-first, with the transmit journal as a crash-window tripwire underneath.
+# Both fail CLOSED: if we cannot prove a leg is safe to send, we do NOT send it.
+# =============================================================================
+class LegState:
+    """The per-leg dedup verdict. Only FRESH proceeds to transmit."""
+    FRESH = "FRESH"        # ref not open, 0 filled today          -> place normally
+    WORKING = "WORKING"    # ref is in open orders                 -> SKIP (already live)
+    COMPLETE = "COMPLETE"  # filled today >= target (or SENT)      -> SKIP (already done)
+    PARTIAL = "PARTIAL"    # 0 < filled < target, nothing open     -> SKIP + ALERT (human)
+    UNKNOWN = "UNKNOWN"    # broker read failed, or mid-transmit   -> SKIP + ALERT (closed)
+
+
+# Sentinel: "no journal_state supplied — query the transmit journal on disk." Distinct from
+# None, which is a valid journal_state meaning "the ref was never journaled".
+_JOURNAL_UNSET = object()
+
+# Which LegStates warrant a human alert (vs. a benign already-handled skip).
+_ALERTING_STATES = frozenset({LegState.PARTIAL, LegState.UNKNOWN})
+
+
+def leg_state_needs_alert(state: str) -> bool:
+    """PARTIAL / UNKNOWN require a human; WORKING / COMPLETE are benign no-ops."""
+    return state in _ALERTING_STATES
+
+
+def already_present(ib, order_ref, target_qty, *, day=None,
+                    journal_state=_JOURNAL_UNSET) -> str:
+    """Pre-transmit dedup for ONE leg's orderRef. Returns a LegState. Reads live broker
+    state with the SAFE read APIs only — reqAllOpenOrders (working refs) + reqExecutions
+    (today's fills per ref); it NEVER calls whatIfOrder (known hang). Fails CLOSED: any
+    broker-read exception/timeout -> UNKNOWN.
+
+    Layer B (journal) is consulted first as the crash-window tripwire:
+      * journaled SENT today        -> COMPLETE (defense-in-depth with the broker read);
+      * journaled ATTEMPTING, no SENT -> the process died mid-transmit -> UNKNOWN (skip +
+        alert, never auto-retry — broker truth alone can't tell if the order landed).
+    `journal_state` may be passed in by the caller (the snapshot taken BEFORE it wrote its
+    own ATTEMPTING, so the gate never trips on this run's own record); when left unset the
+    gate queries transmit_journal itself. transmit_journal is imported at leaf level here
+    so order_router's import graph stays acyclic."""
+    if journal_state is _JOURNAL_UNSET:
+        try:
+            import transmit_journal
+            journal_state = transmit_journal.state_for(order_ref, day)
+        except Exception:
+            journal_state = None
+    if journal_state == "SENT":
+        return LegState.COMPLETE
+    if journal_state == "ATTEMPTING":
+        return LegState.UNKNOWN
+
+    # Layer A: broker truth (authoritative for "is it there?"). Fail closed on any error.
+    try:
+        from ib_async import ExecutionFilter
+        open_trades = ib.reqAllOpenOrders()
+        working_refs = set()
+        for t in (open_trades or []):
+            o = getattr(t, "order", None) or t
+            ref = getattr(o, "orderRef", None)
+            if ref:
+                working_refs.add(ref)
+        if order_ref in working_refs:
+            return LegState.WORKING       # catches a resting GTC remainder or in-flight order
+        fills = ib.reqExecutions(ExecutionFilter())
+        filled = 0.0
+        for f in (fills or []):
+            ex = getattr(f, "execution", None) or f
+            if getattr(ex, "orderRef", None) == order_ref:
+                filled += float(getattr(ex, "shares", 0.0) or 0.0)
+    except Exception as exc:
+        print(f"    ! already_present broker read FAILED for {order_ref}: "
+              f"{type(exc).__name__}: {exc} -> UNKNOWN (fail closed, transmit nothing).")
+        return LegState.UNKNOWN
+
+    target = float(target_qty or 0.0)
+    if target > 0 and filled >= target:
+        return LegState.COMPLETE
+    if filled > 0:
+        return LegState.PARTIAL
+    return LegState.FRESH
+
+
+def order_ref_for_route(route, as_of) -> str:
+    """The deterministic orderRef for a staged route, matching EXACTLY what build() /
+    build_fa_block() stamp — so the dedup gate keys on the same string the transmit path
+    uses. FA blocks key on the group; direct legs key on the account."""
+    if getattr(route, "route", None) == "fa_block":
+        return f"paperbot:{route.fa_group}:{as_of}:{route.side}:{route.symbol}"
+    return _order_ref(route.account, as_of, route.side, route.symbol)
 
 
 @dataclass
@@ -269,9 +367,17 @@ def transmit_guard(armed: bool) -> tuple[bool, str]:
     return True, "ARMED"
 
 
-def place(ib, built, armed: bool = False, fill_timeout: int = 60) -> dict:
+def place(ib, built, armed: bool = False, fill_timeout: int = 60, *,
+          day=None, journal_states: dict | None = None) -> dict:
     """Log every constructed order; transmit ONLY if the guard fully permits, then
-    watch each order up to fill_timeout seconds for fills."""
+    watch each order up to fill_timeout seconds for fills.
+
+    Pre-transmit dedup (S0 idempotency): once permitted, EACH leg runs through
+    already_present() — only a FRESH leg is sent; a WORKING/COMPLETE/PARTIAL/UNKNOWN leg
+    transmits nothing and is reported in `skipped`/`leg_states` for the caller to alert on.
+    `journal_states` optionally maps order_ref -> the caller's PRE-ATTEMPTING journal
+    snapshot (so the gate never trips on this run's own ATTEMPTING record); absent, the gate
+    queries the transmit journal itself."""
     permit, why = transmit_guard(armed)
     print(f"\n    OrderRouter: transmission {'PERMITTED' if permit else 'BLOCKED'} ({why}).")
     if not built:
@@ -287,10 +393,22 @@ def place(ib, built, armed: bool = False, fill_timeout: int = 60) -> dict:
         print("    -> NOTHING TRANSMITTED (dry run / not armed).")
         return {"transmitted": 0, "logged": len(built), "fills": []}
 
-    # --- ARMED + permitted: transmit to the PAPER account and watch fills. ---
+    # --- ARMED + permitted: dedup PER LEG against broker truth, then transmit FRESH legs. ---
     print("    *** ARMED: transmitting LIMIT orders to the PAPER account ***")
     trades = []
+    leg_states: dict[str, str] = {}
+    skipped: list[dict] = []
     for b in built:
+        js = journal_states.get(b.order_ref, _JOURNAL_UNSET) if journal_states else _JOURNAL_UNSET
+        state = already_present(ib, b.order_ref, b.order.totalQuantity, day=day,
+                                journal_state=js)
+        leg_states[b.order_ref] = state
+        if state != LegState.FRESH:
+            print(f"      GATE {state}: {b.symbol} ref={b.order_ref} — SKIP "
+                  f"(transmit nothing).")
+            skipped.append({"symbol": b.symbol, "order_ref": b.order_ref, "state": state,
+                            "alert": leg_state_needs_alert(state)})
+            continue
         b.order.transmit = True                 # actually send
         trades.append(ib.placeOrder(b.contract, b.order))
 
@@ -307,7 +425,8 @@ def place(ib, built, armed: bool = False, fill_timeout: int = 60) -> dict:
                       "avgFillPrice": float(st.avgFillPrice or 0.0)})
         print(f"      {t.contract.symbol:6s} {st.status:12s} filled={st.filled:g} "
               f"remaining={st.remaining:g} @ {st.avgFillPrice or 0.0:,.2f}")
-    return {"transmitted": len(trades), "logged": len(built), "fills": fills}
+    return {"transmitted": len(trades), "logged": len(built), "fills": fills,
+            "leg_states": leg_states, "skipped": skipped}
 
 
 def _shown_cap(order) -> float:
@@ -351,7 +470,8 @@ def _watch_trade(ib, trade, rung_seconds: float, poll: float, label: str) -> tup
 def place_laddered(ib, *, symbol, side, total_qty, caps, instrument_class,
                    account=None, fa_group=None, fa_method="", order_ref=None,
                    armed: bool = False, rung_seconds: float | None = None,
-                   poll: float | None = None) -> dict:
+                   poll: float | None = None, day=None,
+                   journal_state=_JOURNAL_UNSET) -> dict:
     """Place ONE leg through its instrument-class ladder: place rung 1 for the full qty,
     watch fills for a bounded window, and if not fully filled CANCEL the residual and
     escalate the UNFILLED REMAINDER to the next rung — until filled or the terminal
@@ -384,6 +504,21 @@ def place_laddered(ib, *, symbol, side, total_qty, caps, instrument_class,
               f"cap={_shown_cap(o)}  -> NOTHING TRANSMITTED.", flush=True)
         return {"transmitted": 0, "filled": 0.0, "remaining": float(total_qty),
                 "rungs_used": 0, "fills": []}
+
+    # --- PRE-TRANSMIT DEDUP GATE (per leg, before rung 1). Broker truth + journal; only a
+    # FRESH leg proceeds. A WORKING (incl. a resting GTC remainder) / COMPLETE / PARTIAL /
+    # UNKNOWN leg transmits NOTHING — this is what stops a crash-resume or a re-run from
+    # stacking a fresh ladder on top of an order the broker already has. A None order_ref
+    # (no dedup key) can't be gated, so it proceeds (only the keyed transmit paths dedup).
+    if order_ref:
+        gate = already_present(ib, order_ref, total_qty, day=day,
+                               journal_state=journal_state)
+        if gate != LegState.FRESH:
+            print(f"    GATE {gate}: {symbol} ref={order_ref} — SKIP laddered leg "
+                  f"(transmit nothing).", flush=True)
+            return {"transmitted": 0, "filled": 0.0, "remaining": float(total_qty),
+                    "rungs_used": 0, "fills": [], "leg_state": gate, "skipped": True,
+                    "alert": leg_state_needs_alert(gate)}
 
     contract = Stock(symbol, "SMART", "USD")
     if ib is not None:
@@ -455,8 +590,9 @@ def place_laddered(ib, *, symbol, side, total_qty, caps, instrument_class,
     # remainder to a RESTING plain GTC limit at the cap and leave it at IB, so the leg
     # survives session disconnect/end (the failure that killed TFLO/VGSH). The rest is a
     # plain LMT — Adaptive/MIDPRICE cannot be GTC. The deterministic orderRef is preserved
-    # so a reconnect detects the resting order rather than double-sending. This is a single
-    # place() with no watch loop, so no new hang path is introduced.
+    # AND the pre-transmit gate above reads it back via reqAllOpenOrders on the next run:
+    # a still-resting GTC returns WORKING and the leg is skipped, so a reconnect does not
+    # double-send. This is a single place() with no watch loop, so no new hang path.
     # Recompute the genuinely-unfilled remainder from CUMULATIVE filled (not from any single
     # order's orderStatus.remaining) so a rejected rung can never poison the GTC-rest amount.
     remaining = target - filled

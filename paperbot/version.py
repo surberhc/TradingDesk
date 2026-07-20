@@ -15,10 +15,32 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.16.0"
+VERSION = "0.17.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.17.0", "2026-07-20", "S0 order idempotency: the deterministic orderRef is now "
+                             "ENFORCED, not just documented. New pre-transmit dedup gate "
+                             "order_router.already_present() reads BROKER TRUTH "
+                             "(reqAllOpenOrders working refs + reqExecutions today's fills "
+                             "per orderRef; NEVER whatIfOrder) and a new append-only "
+                             "transmit_journal.py (ATTEMPTING/SENT/CYCLE_COMPLETE JSONL "
+                             "under STATE_DIR, off Drive) to classify each leg FRESH/"
+                             "WORKING/COMPLETE/PARTIAL/UNKNOWN; only FRESH transmits, "
+                             "everything else transmits nothing (PARTIAL/UNKNOWN also "
+                             "alert). Fails CLOSED: any broker-read error -> UNKNOWN. Wired "
+                             "per-leg at the top of the transmit branch of place() and "
+                             "before rung 1 of place_laddered(). morning_execute_run path "
+                             "[4] now journals ATTEMPTING before / SENT after each leg, "
+                             "runs the gate in BOTH pilot (zero-transmit rehearsal, logs "
+                             "WOULD SEND/WOULD SKIP) and armed modes, and calls "
+                             "ledger.record_run() per cycle (closes the missing per-run "
+                             "audit line). Staged-file archive is now a tidy-up, not the "
+                             "safety mechanism. Order-affecting (routing/idempotency): a "
+                             "crash-resume, retry, manual re-run, or stacked ladder no "
+                             "longer double-sends what the broker already has working or "
+                             "filled. Still zero-transmit today (PILOT_MODE/READONLY/"
+                             "DRY_RUN unchanged); +order-idempotency test matrix."),
     ("0.16.0", "2026-07-17", "S8 live-pilot margin preflight fixed for the real "
                              "live-trade account (port 4003, U14438624). Two order-gating "
                              "corrections, both found by reading the live account: (1) the "

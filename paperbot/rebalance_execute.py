@@ -548,11 +548,17 @@ def _ladder_caps(side: str, q) -> dict | None:
     return {"marketable_limit": cap, "midprice": cap, "adaptive": cap, "rel": cap}
 
 
-def _place_direct_laddered(ib, route, q, as_of, armed: bool):
+def _place_direct_laddered(ib, route, q, as_of, armed: bool, *, day=None,
+                           journal_state=order_router._JOURNAL_UNSET):
     """Place ONE direct route through the laddered router. Returns the ladder result, or
     None to signal the caller to fall back to the legacy single-limit path (quote
     unusable for caps). Classification is data-driven via order_router.classify_instrument
-    using the live relative spread; the per-rung PRICE GUARD still validates every cap."""
+    using the live relative spread; the per-rung PRICE GUARD still validates every cap.
+
+    `day`/`journal_state` are threaded to the ladder's pre-transmit dedup gate: the
+    automated morning path passes its PRE-ATTEMPTING journal snapshot so the gate keys on
+    broker truth without tripping on this run's own ATTEMPTING record. The manual executor
+    leaves them defaulted (the gate then queries the journal itself)."""
     caps = _ladder_caps(route.side, q)
     if caps is None:
         print("      (no usable quote for ladder caps — using legacy capped-limit path)")
@@ -564,7 +570,7 @@ def _place_direct_laddered(ib, route, q, as_of, armed: bool):
     return order_router.place_laddered(
         ib, symbol=route.symbol, side=route.side, total_qty=route.total_qty, caps=caps,
         instrument_class=instrument_class, account=route.account, order_ref=order_ref,
-        armed=armed)
+        armed=armed, day=day, journal_state=journal_state)
 
 
 def _build_all(ib, routes, account_inputs, targets, quotes=None):
