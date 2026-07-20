@@ -93,6 +93,15 @@ class MockIB:
         self.placed.append((contract, order))
         return t
 
+    def reqAllOpenOrders(self):
+        # No orders working at the broker -> the pre-transmit dedup gate sees the leg FRESH,
+        # so these ladder tests exercise the normal place path unchanged.
+        return []
+
+    def reqExecutions(self, _flt=None):
+        # No fills today -> gate sees 0 filled -> FRESH.
+        return []
+
     def cancelOrder(self, order):
         self.cancelled.append(order)
 
@@ -119,12 +128,15 @@ def _armed_caps(side="BUY"):
 
 
 @pytest.fixture(autouse=True)
-def _arm(monkeypatch):
+def _arm(monkeypatch, tmp_path):
     """Open the gate IN MEMORY for the ladder-placement tests only (config on disk is left
     locked). Each test that needs transmission passes armed=True; this flips READONLY/
-    DRY_RUN so transmit_guard permits. Tests that assert the guard are explicit."""
+    DRY_RUN so transmit_guard permits. Tests that assert the guard are explicit. Also
+    redirect STATE_DIR to a tmp dir so the pre-transmit dedup gate's transmit-journal read
+    is hermetic (empty journal -> FRESH), never touching real off-Drive state."""
     monkeypatch.setattr(config, "READONLY", False)
     monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(config, "STATE_DIR", str(tmp_path))
 
 
 # --- (1) classification ------------------------------------------------------

@@ -52,11 +52,13 @@ PILOT_MODE = True
 import accounts  # noqa: E402
 import arming  # noqa: E402
 import config  # noqa: E402
+import ledger  # noqa: E402
 import live_quotes  # noqa: E402
 import order_router  # noqa: E402
 import rebalance_execute  # noqa: E402
 import rebalance_guard  # noqa: E402
 import rebalance_run  # noqa: E402
+import transmit_journal  # noqa: E402
 import version  # noqa: E402
 from connections import clientids, ibkr_paper  # noqa: E402
 from gateway_lock import GatewayBusyRefuse, gateway_lock  # noqa: E402
@@ -96,6 +98,41 @@ def _alert_email(subject: str, lines: list[str]) -> None:
         mailer.send_html(f"[TradingDesk PAPER] {subject}", html)
     except Exception as exc:
         print(f"    ! alert email itself failed: {exc}")
+
+
+def _leg_summary(res: dict) -> dict:
+    """Distill a place()/place_laddered() result into the transmit-journal SENT fields.
+    place() returns per-order `fills`; place_laddered() returns filled/remaining/rested."""
+    fills = res.get("fills") or []
+    filled = res.get("filled")
+    if filled is None:
+        filled = sum(float(f.get("filled", 0.0) or 0.0) for f in fills) if fills else None
+    rested = res.get("rested")
+    if rested is None and fills:
+        rested = any(f.get("rested_gtc") for f in fills)
+    return {"filled": filled, "remaining": res.get("remaining"),
+            "rested_gtc": rested, "avg_px": res.get("avgFillPrice")}
+
+
+def _ledger_cycle(*, mode: str, routes: list, as_of, n_sent: int, n_skipped: int,
+                  fills: list, pilot: bool) -> None:
+    """Coarse per-cycle audit line via ledger.record_run() (closes finding #4 — the
+    morning path never called it before). Best-effort: never let a logging failure break
+    the run's disconnect/archive discipline."""
+    try:
+        ledger.record_run({
+            "mode": mode, "account": "ALL_ENROLLED", "nav": 0.0,
+            "target_as_of": str(as_of),
+            "intents": [{"route": r.route, "side": r.side, "symbol": r.symbol,
+                         "qty": r.total_qty, "group": r.fa_group, "account": r.account}
+                        for r in routes],
+            "n_intents": len(routes), "n_approved": len(routes),
+            "n_transmitted": n_sent, "n_skipped": n_skipped, "fills": fills,
+            "pilot_mode": pilot, "halted": False,
+            **version.stamp(),
+        })
+    except Exception as exc:
+        print(f"    ! ledger.record_run failed (non-fatal): {exc}")
 
 
 def _stage_path(today: date) -> str:
@@ -265,24 +302,52 @@ def _do_work(ib, today: date, stage_path: str, staged: dict, routes: list) -> in
         # Leave the staged file in place — do NOT archive a rejected run silently.
         return 1
 
-    # [3] PILOT MODE: log + email "WOULD HAVE TRANSMITTED", transmit nothing.
+    # The cycle's as_of (per-tier); used to derive the deterministic orderRef the gate and
+    # journal key on, matching what build()/build_fa_block() stamp on the wire.
+    as_of = staged.get("as_of", {})
+    default_as_of = next(iter(as_of.values()), today.isoformat())
+
+    # [3] PILOT MODE: run the REAL dedup gate as a ZERO-TRANSMIT rehearsal (Q3) — the exact
+    # reqAllOpenOrders/reqExecutions read path the armed run uses, on the read-only session —
+    # log "WOULD SEND / WOULD SKIP", email "WOULD HAVE TRANSMITTED", transmit nothing.
     if PILOT_MODE:
         lines = [f"PILOT MODE — nothing was transmitted. This is what WOULD have been "
-                f"sent if PILOT_MODE were False:", ""]
+                f"sent if PILOT_MODE were False (with the dedup gate rehearsed live):", ""]
+        n_would_send = 0
+        n_would_skip = 0
+        alerts: list[str] = []
         for r in routes:
             px = prices_by_symbol.get(r.symbol, float("nan"))
+            order_ref = order_router.order_ref_for_route(r, default_as_of)
+            state = order_router.already_present(ib, order_ref, r.total_qty, day=today)
+            if state == order_router.LegState.FRESH:
+                n_would_send += 1
+                verb = "WOULD SEND (FRESH)"
+            else:
+                n_would_skip += 1
+                verb = f"WOULD SKIP ({state})"
+                if order_router.leg_state_needs_alert(state):
+                    alerts.append(f"{state}: {r.side} {r.symbol} x{r.total_qty} ref={order_ref}")
             if r.route == "fa_block":
                 split = ", ".join(f"{a}:{q}" for a, q in sorted(r.per_account_split.items()))
-                lines.append(f"  WOULD HAVE TRANSMITTED: fa_block {r.side} {r.symbol} "
+                lines.append(f"  {verb} | fa_block {r.side} {r.symbol} "
                             f"x{r.total_qty} @~{px:.2f}  group={r.fa_group}  split=[{split}]")
             else:
-                lines.append(f"  WOULD HAVE TRANSMITTED: direct {r.side} {r.symbol} "
+                lines.append(f"  {verb} | direct {r.side} {r.symbol} "
                             f"x{r.total_qty} @~{px:.2f}  account={r.account}")
+        if alerts:
+            lines += ["", "GATE ALERTS (partial/uncertain legs — would need a human):"] + \
+                     [f"  - {a}" for a in alerts]
         print("\n".join(lines))
-        _alert_email(f"morning execute PILOT: {len(routes)} route(s) would have transmitted",
-                    lines)
-        _write_status("ok", metrics={"n_routes": len(routes), "pilot_mode": True},
-                     message=f"pilot dry-run: {len(routes)} route(s) logged, nothing transmitted")
+        _alert_email(f"morning execute PILOT: {n_would_send} would send / {n_would_skip} "
+                    f"would skip", lines)
+        _write_status("ok", metrics={"n_routes": len(routes), "pilot_mode": True,
+                                     "would_send": n_would_send, "would_skip": n_would_skip},
+                     message=f"pilot dry-run: {len(routes)} route(s) rehearsed, nothing transmitted")
+        _ledger_cycle(mode="MORNING_EXECUTE_PILOT", routes=routes, as_of=default_as_of,
+                      n_sent=0, n_skipped=n_would_skip, fills=[], pilot=True)
+        transmit_journal.record_cycle_complete(as_of=default_as_of, n_routes=len(routes),
+                                                n_sent=0, n_skipped=n_would_skip, day=today)
         dest = _archive(stage_path)
         print(f"\nStaged file archived -> {dest or '(archive failed, left in place)'}")
         return 0
@@ -302,14 +367,34 @@ def _do_work(ib, today: date, stage_path: str, staged: dict, routes: list) -> in
             _write_status("fail", message=msg)
             return 2
 
-    as_of = staged.get("as_of", {})
-    default_as_of = next(iter(as_of.values()), today.isoformat())
     fills: list[dict] = []
     backup_path = ""
+    n_sent = 0
+    n_skipped = 0
+    gate_alerts: list[str] = []
     try:
         backup_path = rebalance_execute.backup_fa_groups(ib)
         print(f"    FA groups backed up -> {backup_path}")
         for r in routes:
+            order_ref = order_router.order_ref_for_route(r, default_as_of)
+            # Snapshot the journal BEFORE we write our own ATTEMPTING, so neither our gate
+            # here nor place()'s internal gate trips on this run's own record. The gate reads
+            # broker truth against this pre-run snapshot.
+            snap = transmit_journal.state_for(order_ref, today)
+            state = order_router.already_present(ib, order_ref, r.total_qty, day=today,
+                                                 journal_state=snap)
+            if state != order_router.LegState.FRESH:
+                n_skipped += 1
+                msg = (f"GATE SKIP ({state}): {r.side} {r.symbol} x{r.total_qty} "
+                       f"ref={order_ref}")
+                print(f"    {msg} — transmitting nothing for this leg.")
+                if order_router.leg_state_needs_alert(state):
+                    gate_alerts.append(msg)
+                continue
+
+            # FRESH: journal ATTEMPTING (pre-place tripwire), transmit, journal SENT.
+            transmit_journal.record_attempting(order_ref, as_of=default_as_of, symbol=r.symbol,
+                                                side=r.side, target_qty=r.total_qty, day=today)
             if r.route == "fa_block":
                 limit = round(float(prices_by_symbol.get(r.symbol, float("nan"))), 2)
                 print(f"    [block] {r.side} {r.symbol} x{r.total_qty} group={r.fa_group} "
@@ -318,25 +403,52 @@ def _do_work(ib, today: date, stage_path: str, staged: dict, routes: list) -> in
                                                                 r.per_account_split)
                 bo = order_router.build_fa_block(r.symbol, r.side, r.total_qty, limit,
                                                   r.fa_group, r.fa_method, default_as_of, ib=ib)
-                res = order_router.place(ib, [bo], armed=True)
-                fills.extend(res.get("fills", []))
+                res = order_router.place(ib, [bo], armed=True, day=today,
+                                         journal_states={order_ref: snap})
             else:
                 q = quotes.get(r.symbol)
-                res = rebalance_execute._place_direct_laddered(ib, r, q, default_as_of, armed=True)
+                res = rebalance_execute._place_direct_laddered(
+                    ib, r, q, default_as_of, armed=True, day=today, journal_state=snap)
                 if res is None:
                     limit = round(float(prices_by_symbol.get(r.symbol, float("nan"))), 2)
                     intent = rebalance_run._DirectIntent(r.symbol, r.side, r.total_qty, limit)
                     built = order_router.build([intent], r.account, default_as_of, ib=ib)
-                    res = order_router.place(ib, built, armed=True)
+                    res = order_router.place(ib, built, armed=True, day=today,
+                                             journal_states={order_ref: snap})
+            res = res or {}
+            if res.get("skipped"):
+                # A rare race: broker state changed between our gate and place()'s gate.
+                # Nothing transmitted — alert, and DON'T mark SENT (leave ATTEMPTING so the
+                # next run also fails closed on this uncertain leg).
+                n_skipped += 1
+                gate_alerts.append(f"GATE SKIP (place internal): {r.side} {r.symbol} "
+                                   f"ref={order_ref}")
+            else:
+                summary = _leg_summary(res)
+                transmit_journal.record_sent(order_ref, day=today, **summary)
+                n_sent += 1
                 fills.extend(res.get("fills", []))
     finally:
-        lines = [f"ARMED morning execution complete. {len(fills)} fill event(s).", ""]
+        lines = [f"ARMED morning execution complete. {n_sent} leg(s) sent, "
+                 f"{n_skipped} skipped by the dedup gate. {len(fills)} fill event(s).", ""]
         for f in fills:
             lines.append(f"  {f}")
-        _alert_email(f"morning execute ARMED: {len(routes)} route(s) transmitted", lines)
+        if gate_alerts:
+            lines += ["", "GATE ALERTS (partial/uncertain legs — human review needed):"] + \
+                     [f"  - {a}" for a in gate_alerts]
+        subject = f"morning execute ARMED: {n_sent} sent / {n_skipped} skipped"
+        if gate_alerts:
+            subject = "[ACTION NEEDED] " + subject
+        _alert_email(subject, lines)
         _write_status("ok", metrics={"n_routes": len(routes), "n_fills": len(fills),
+                                     "n_sent": n_sent, "n_skipped": n_skipped,
                                      "pilot_mode": False},
-                     message=f"armed execution: {len(fills)} fill event(s)")
+                     message=f"armed execution: {n_sent} sent, {n_skipped} skipped, "
+                             f"{len(fills)} fill event(s)")
+        _ledger_cycle(mode="MORNING_EXECUTE_ARMED", routes=routes, as_of=default_as_of,
+                      n_sent=n_sent, n_skipped=n_skipped, fills=fills, pilot=False)
+        transmit_journal.record_cycle_complete(as_of=default_as_of, n_routes=len(routes),
+                                                n_sent=n_sent, n_skipped=n_skipped, day=today)
         dest = _archive(stage_path)
         print(f"\nStaged file archived -> {dest or '(archive failed, left in place)'}")
     return 0
