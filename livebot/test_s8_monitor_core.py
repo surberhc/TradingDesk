@@ -100,8 +100,10 @@ def test_pnl_at_none_when_price_missing():
 
 def test_stop_hit_triggers_at_first_crossing():
     pos = make_position()
-    # short_ask rises and crosses stop_price (6.0). long_bid constant 0.5.
-    asks = [2.0, 4.0, 5.9, 6.0, 7.0]     # first cross at index 3 (== 6.0, the >= boundary)
+    # NET-SPREAD stop: fires when (short_ask - long_bid) crosses stop_price (6.0).
+    # long_bid constant 0.5, so the spread cost to close is short_ask - 0.5.
+    asks = [2.0, 4.0, 6.0, 6.5, 7.0]     # closes = 1.5, 3.5, 5.5, 6.0, 6.5
+    #                                      first cross at index 3 (close == 6.0, the >= boundary)
     samples = [
         Sample(ts=ENTRY_TS + 60 * (i + 1), short_ask=a, short_bid=a - 0.2,
                long_bid=0.5, long_ask=0.7, spot=7400.0 - i)
@@ -111,18 +113,19 @@ def test_stop_hit_triggers_at_first_crossing():
 
     assert state.triggered is True
     assert state.exit_reason == "stop_hit"
-    # The exit sample is the FIRST one at/above the stop (short_ask == 6.0), not later.
+    # The exit sample is the FIRST one whose spread cost to close reaches the stop
+    # (short_ask 6.5 - long_bid 0.5 = 6.0), not the earlier short_ask==6.0 (close 5.5).
     assert state.exit_sample is samples[3]
-    assert state.exit_sample.short_ask == 6.0
+    assert state.exit_sample.short_ask == 6.5
     assert state.n_samples == 5
 
     # pnl at the crossing is negative and correct:
-    # spread_close = 6.0 - 0.5 = 5.5; pnl = (4.05 - 5.5)*100 = -145.0
+    # spread_close = 6.5 - 0.5 = 6.0; pnl = (4.05 - 6.0)*100 = -195.0
     info = build_exit_info(pos, state)
     assert info["exit_reason"] == "stop_hit"
-    assert info["pnl"] == pytest.approx(-145.0)
+    assert info["pnl"] == pytest.approx(-195.0)
     assert info["pnl"] < 0
-    assert info["spread_value_at_exit"] == pytest.approx(5.5)
+    assert info["spread_value_at_exit"] == pytest.approx(6.0)
     assert info["exit_ts"] == samples[3].ts
     assert info["exit_spot"] == samples[3].spot
     assert info["duration_secs"] == pytest.approx(samples[3].ts - ENTRY_TS)
@@ -130,7 +133,7 @@ def test_stop_hit_triggers_at_first_crossing():
 
 def test_stop_hit_strictly_below_does_not_trigger():
     pos = make_position()
-    # short_ask reaches 5.9 (just under 6.0) — must NOT fire.
+    # spread cost to close = 5.9 - 0.5 = 5.4 (just under 6.0) — must NOT fire.
     samples = [Sample(ts=ENTRY_TS + 60, short_ask=5.9, long_bid=0.5)]
     state = run_stream(pos, samples)
     assert state.triggered is False
@@ -226,7 +229,8 @@ def test_mae_stays_zero_when_never_underwater():
 
 def test_idempotent_after_trigger_more_extreme_samples_do_not_move_exit():
     pos = make_position()
-    cross = Sample(ts=ENTRY_TS + 60, short_ask=6.0, short_bid=5.8, long_bid=0.5,
+    # cross: spread cost to close = 6.5 - 0.5 = 6.0 == stop_price -> fires.
+    cross = Sample(ts=ENTRY_TS + 60, short_ask=6.5, short_bid=6.3, long_bid=0.5,
                    long_ask=0.7, spot=7400.0)
     worse = Sample(ts=ENTRY_TS + 120, short_ask=9.0, short_bid=8.8, long_bid=0.9,
                    long_ask=1.1, spot=7390.0)
@@ -259,8 +263,8 @@ def test_idempotent_after_trigger_more_extreme_samples_do_not_move_exit():
     assert info["exit_reason"] == "stop_hit"
     assert info["exit_ts"] == cross.ts
     # pnl reported at the crossing sample, not the later worse one.
-    # close = 6.0 - 0.5 = 5.5 -> pnl (4.05-5.5)*100 = -145
-    assert info["pnl"] == pytest.approx(-145.0)
+    # close = 6.5 - 0.5 = 6.0 -> pnl (4.05-6.0)*100 = -195
+    assert info["pnl"] == pytest.approx(-195.0)
 
 
 def test_close_at_session_end_is_noop_when_already_stopped():
@@ -293,19 +297,80 @@ def test_missing_short_ask_does_not_crash_or_false_trigger():
     assert state.last_pnl == pytest.approx((4.05 - (3.0 - 0.5)) * 100)
 
 
-def test_missing_long_bid_still_allows_stop_trigger():
+def test_missing_long_bid_does_not_trigger():
     pos = make_position()
-    # short_ask alone determines the stop; long_bid missing must not block the trigger,
-    # even though pnl at that sample is unknown (None).
+    # NET-SPREAD stop needs BOTH legs: with long_bid missing, the spread's cost to close
+    # is genuinely unknown, so the trigger is SKIPPED (no fire, no crash) — even though
+    # short_ask alone (6.0) meets the old, wrong short-leg-only threshold.
     s = Sample(ts=ENTRY_TS + 60, short_ask=6.0, long_bid=None, spot=7400.0)
+    state = MonitorState()
+    process_sample(pos, state, s)
+    assert state.triggered is False
+    assert state.exit_reason is None
+    assert state.exit_sample is None
+    assert pnl_at(pos, s) is None
+
+
+# --------------------------------------------------------------------------- #
+# NET-SPREAD stop regression: the 2026-07-20 false-fire incident
+#
+# The stop is on the SPREAD's cost to close (short_ask - long_bid), NOT the short leg
+# alone. On 2026-07-20 the old short_ask>=stop_price code false-fired 24 live stop-outs
+# whose true spread cost (4.0-6.75) was well below the 7.30 target. These lock the fix.
+# stop_price here is set directly (the core reads position.stop_price verbatim); the
+# frozen formula that produced 7.30 is not exercised — only the monitor's comparison is.
+# --------------------------------------------------------------------------- #
+
+def _incident_position(stop_price: float = 7.30) -> MonitorPosition:
+    return MonitorPosition(
+        trade_id="20260720:incident",
+        side="PUT",
+        short_strike=7480.0,
+        long_strike=7445.0,
+        qty=1,
+        realized_credit=5.30,     # PriceOpen; stop = 5.30 + 2.0 = 7.30
+        stop_price=stop_price,
+        entry_ts=ENTRY_TS,
+    )
+
+
+def test_short_leg_alone_over_stop_but_spread_cost_below_does_not_trigger():
+    # THE INCIDENT: short_ask alone (7.30) meets stop_price, but the SPREAD cost to close
+    # is 7.30 - 2.95 = 4.35, far below the 7.30 target -> NO stop. This test FAILS against
+    # the old `short_ask >= stop_price` code (which would fire) and passes with the fix.
+    pos = _incident_position(stop_price=7.30)
+    s = Sample(ts=ENTRY_TS + 60, short_ask=7.30, short_bid=7.10, long_bid=2.95,
+               long_ask=3.15, spot=7400.0)
+    state = MonitorState()
+    process_sample(pos, state, s)
+    assert state.triggered is False
+    assert state.exit_reason is None
+    assert state.exit_sample is None
+
+
+def test_net_spread_cost_at_or_above_stop_triggers():
+    # short_ask 9.5 - long_bid 2.0 = 7.5 >= 7.3 -> the net-spread stop fires.
+    pos = _incident_position(stop_price=7.30)
+    s = Sample(ts=ENTRY_TS + 60, short_ask=9.5, short_bid=9.3, long_bid=2.0,
+               long_ask=2.2, spot=7350.0)
     state = MonitorState()
     process_sample(pos, state, s)
     assert state.triggered is True
     assert state.exit_reason == "stop_hit"
-    assert pnl_at(pos, s) is None
-    info = build_exit_info(pos, state)
-    assert info["pnl"] is None
-    assert info["spread_value_at_exit"] is None
+    assert state.exit_sample is s
+
+
+def test_net_spread_missing_long_bid_unknown_cost_does_not_trigger():
+    # long_bid missing -> spread cost to close is unknown -> SKIP trigger (no fire, no crash),
+    # even though short_ask (9.5) alone would clear the old short-leg threshold.
+    pos = _incident_position(stop_price=7.30)
+    s = Sample(ts=ENTRY_TS + 60, short_ask=9.5, short_bid=9.3, long_bid=None,
+               long_ask=2.2, spot=7350.0)
+    state = MonitorState()
+    process_sample(pos, state, s)   # must not raise
+    assert state.triggered is False
+    assert state.exit_reason is None
+    assert state.exit_sample is None
 
 
 def test_none_short_ask_never_false_triggers_even_if_huge_other_prices():
@@ -323,7 +388,8 @@ def test_none_short_ask_never_false_triggers_even_if_huge_other_prices():
 
 def test_build_exit_info_legs_are_price_only_no_greeks():
     pos = make_position()
-    s = Sample(ts=ENTRY_TS + 60, short_bid=5.8, short_ask=6.0, short_last=5.9,
+    # spread cost to close = 6.5 - 0.5 = 6.0 == stop_price -> fires, giving an exit sample.
+    s = Sample(ts=ENTRY_TS + 60, short_bid=6.3, short_ask=6.5, short_last=6.4,
                long_bid=0.5, long_ask=0.7, long_last=0.6, spot=7400.0)
     state = MonitorState()
     process_sample(pos, state, s)
@@ -332,7 +398,7 @@ def test_build_exit_info_legs_are_price_only_no_greeks():
     short_leg = info["short_leg_exit"]
     long_leg = info["long_leg_exit"]
     # prices carried through
-    assert short_leg["ask"] == 6.0 and short_leg["bid"] == 5.8 and short_leg["last"] == 5.9
+    assert short_leg["ask"] == 6.5 and short_leg["bid"] == 6.3 and short_leg["last"] == 6.4
     assert short_leg["strike"] == pos.short_strike
     assert long_leg["bid"] == 0.5 and long_leg["strike"] == pos.long_strike
     assert short_leg["underlying_spot"] == 7400.0
@@ -360,7 +426,8 @@ def test_exit_info_keys_match_schema_exitinfo_fields():
     # The dict must be droppable into s8_schema.ExitInfo.from_dict without surprises.
     from s8_schema import ExitInfo, LegGrab
     pos = make_position()
-    s = Sample(ts=ENTRY_TS + 60, short_bid=5.8, short_ask=6.0, long_bid=0.5,
+    # spread cost to close = 6.5 - 0.5 = 6.0 == stop_price -> fires.
+    s = Sample(ts=ENTRY_TS + 60, short_bid=6.3, short_ask=6.5, long_bid=0.5,
                long_ask=0.7, spot=7400.0)
     state = MonitorState()
     process_sample(pos, state, s)
@@ -368,9 +435,9 @@ def test_exit_info_keys_match_schema_exitinfo_fields():
 
     ei = ExitInfo.from_dict(info)
     assert ei.exit_reason == "stop_hit"
-    assert ei.pnl == pytest.approx(-145.0)
+    assert ei.pnl == pytest.approx(-195.0)
     assert isinstance(ei.short_leg_exit, LegGrab)
-    assert ei.short_leg_exit.ask == 6.0
+    assert ei.short_leg_exit.ask == 6.5
     assert ei.short_leg_exit.delta is None
     assert ei.duration_secs == pytest.approx(60.0)
 

@@ -252,16 +252,17 @@ def test_full_lifecycle_entry_subscribe_stopout(monkeypatch):
     assert tid in svc.monitor._tickers
     assert len(ib.subscribed) == 2                       # short + long legs
 
-    # --- EXIT: a synthetic tick stream crosses the 6.0 stop -> finalize ---
-    for i, a in enumerate([2.0, 4.0, 5.9, 6.0]):         # crosses at 6.0
+    # --- EXIT: a synthetic tick stream whose net-spread cost to close crosses the
+    #          6.0 stop -> finalize (long_bid steady at 0.5, so close = short_ask - 0.5) ---
+    for i, a in enumerate([2.0, 4.0, 6.0, 6.5]):         # closes 1.5,3.5,5.5,6.0 -> cross at 6.5
         svc.monitor.on_sample(tid, _sample(60 * (i + 1), a, 0.5),
                               short_leg=_leg(SHORT), long_leg=_leg(LONG))
 
     rec = _records_by_id()[tid]
     assert rec.status == "closed"
     assert rec.exit.exit_reason == "stop_hit"
-    # crossing short_ask=6.0, long_bid=0.5 -> close 5.5 -> pnl (4.05-5.5)*100 = -145
-    assert rec.exit.pnl == pytest.approx(-145.0)
+    # crossing short_ask=6.5, long_bid=0.5 -> close 6.0 -> pnl (4.05-6.0)*100 = -195
+    assert rec.exit.pnl == pytest.approx(-195.0)
     assert tid not in s8_store.read_open_state()
     assert tid not in svc.monitor._positions
     # ticks were written to the date-partitioned parquet

@@ -115,9 +115,10 @@ def test_stop_out_end_to_end():
     mon = S8Monitor()
     assert mon.load_open_positions() == ["t-stop"]
 
-    # short_ask climbs and crosses the 6.0 stop; long_bid steady. Full LegGrabs (greeks)
-    # attached so the persisted ticks — and the exit legs — carry greeks.
-    asks = [2.0, 4.0, 5.9, 6.0, 7.0]   # first cross at index 3 (== 6.0)
+    # NET-SPREAD stop: the spread cost to close (short_ask - long_bid) crosses the 6.0
+    # stop; long_bid steady at 0.5. Full LegGrabs (greeks) attached so the persisted
+    # ticks — and the exit legs — carry greeks.
+    asks = [2.0, 4.0, 6.0, 6.5, 7.0]   # closes 1.5,3.5,5.5,6.0,6.5 -> first cross at index 3
     for i, a in enumerate(asks):
         s = _sample(60 * (i + 1), a, 0.5)
         mon.on_sample("t-stop", s,
@@ -127,12 +128,12 @@ def test_stop_out_end_to_end():
     assert rec.status == "closed"
     assert rec.exit is not None
     assert rec.exit.exit_reason == "stop_hit"
-    # crossing at short_ask=6.0, long_bid=0.5 -> close 5.5 -> pnl (4.05-5.5)*100 = -145
-    assert rec.exit.pnl == pytest.approx(-145.0)
+    # crossing at short_ask=6.5, long_bid=0.5 -> close 6.0 -> pnl (4.05-6.0)*100 = -195
+    assert rec.exit.pnl == pytest.approx(-195.0)
     assert rec.exit.pnl < 0
     # on_sample finalizes AT the crossing and drops the position, so the 5th (worse) tick
     # is never processed — MAE reflects life up to the exit (the crossing is the worst point).
-    assert rec.exit.max_adverse_excursion == pytest.approx(-145.0)
+    assert rec.exit.max_adverse_excursion == pytest.approx(-195.0)
     assert rec.exit.duration_secs == pytest.approx(4 * 60)          # crossed at 4th sample
     # exit legs carry greeks harvested from the live LegGrabs
     assert rec.exit.short_leg_exit.delta == pytest.approx(-0.2)

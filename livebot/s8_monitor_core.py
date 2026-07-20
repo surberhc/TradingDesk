@@ -17,12 +17,19 @@ FROZEN EXIT MECHANICS (implemented exactly, not invented)
 ---------------------------------------------------------
 An S8 position is a credit spread. At entry we SOLD the short leg (received short_bid)
 and BOUGHT the long leg (paid long_ask); the net received is ``realized_credit`` (points).
+This net credit is ``PriceOpen`` in the frozen formula: PriceOpen = PriceShort - PriceLong.
 
-  * The stop is a BUY-to-close on the SHORT leg. It fires when the short leg's current
-    ASK reaches ``stop_price`` (we buy to close at the ask):  short_ask >= stop_price.
-    exit_reason = "stop_hit".
+  * The stop is a NET-SPREAD stop on the WHOLE spread, not the short leg alone. It fires
+    when the spread's mark-to-market COST TO CLOSE reaches ``stop_price``: we buy the
+    short back at its ask AND sell the long out at its bid, so the cost to close is
+    ``short_ask - long_bid``. Trigger:  (short_ask - long_bid) >= stop_price.
+    ``stop_price`` was frozen at entry as PriceOpen (the net credit) + StopMultiple.
+    The short leg's OWN price (PriceShort) does NOT determine the stop — short-leg-price
+    formulas were explicitly tested and REJECTED in british_ic/STRATEGY_MECHANICS.md §4
+    (4,610 rows). Using ``short_ask >= stop_price`` drops the ``- long_bid`` term and
+    stops far too early. exit_reason = "stop_hit".
   * B2 rule: when the stop fires, the LONG leg is closed simultaneously at market
-    (sell to close at its current BID). The pnl formula below already accounts for this.
+    (sell to close at its current BID). The cost-to-close above already accounts for this.
   * If the stop never fires by session end: exit_reason = "eod" (or "expiry" at
     expiration) — both legs valued at their final marks.
 
@@ -135,6 +142,25 @@ class MonitorState:
 # Pure evaluation
 # --------------------------------------------------------------------------- #
 
+def spread_close_value(sample: Sample) -> Optional[float]:
+    """Mark-to-market COST TO CLOSE the whole spread now (points).
+
+        spread_close_value = short_ask - long_bid
+
+    We close by buying the short back at its ask and selling the long out at its bid.
+    Returns None if EITHER price is missing — the cost to close is genuinely unknown
+    then, so we don't guess. This is the SINGLE definition shared by both the P&L and
+    the stop trigger so the two can never drift (see module docstring §FROZEN).
+    """
+    if sample is None:
+        return None
+    short_ask = sample.short_ask
+    long_bid = sample.long_bid
+    if short_ask is None or long_bid is None:
+        return None
+    return float(short_ask) - float(long_bid)
+
+
 def pnl_at(position: MonitorPosition, sample: Sample) -> Optional[float]:
     """Running P&L (dollars) of the spread if closed at this sample's marks.
 
@@ -145,15 +171,11 @@ def pnl_at(position: MonitorPosition, sample: Sample) -> Optional[float]:
     its ask, sell the long out at its bid). Returns None if either is missing — the
     close value is genuinely unknown then, so we don't guess.
     """
-    if sample is None:
+    close_value = spread_close_value(sample)
+    if close_value is None:
         return None
-    short_ask = sample.short_ask
-    long_bid = sample.long_bid
-    if short_ask is None or long_bid is None:
-        return None
-    spread_close_value = float(short_ask) - float(long_bid)
     qty = position.qty if position.qty is not None else 1
-    return (float(position.realized_credit) - spread_close_value) * 100.0 * float(qty)
+    return (float(position.realized_credit) - close_value) * 100.0 * float(qty)
 
 
 def process_sample(
@@ -164,14 +186,16 @@ def process_sample(
     Always: increment n_samples; if the sample is priceable, update last_pnl and the
     running MAE (worst/min pnl).
 
-    Trigger (only if NOT already triggered): if short_ask is present and
-    ``short_ask >= position.stop_price``, the stop fires — mark triggered, set
-    exit_reason="stop_hit", and record this sample as the exit_sample.
+    Trigger (only if NOT already triggered): if the spread's cost to close is priceable
+    and ``spread_close_value(sample) = short_ask - long_bid >= position.stop_price``, the
+    NET-SPREAD stop fires — mark triggered, set exit_reason="stop_hit", and record this
+    sample as the exit_sample. The short leg's own price does NOT determine the stop.
 
     IDEMPOTENT: once triggered, a later sample never re-triggers and never overwrites
     exit_reason or exit_sample (it still counts toward n_samples and still updates
-    last_pnl / MAE, which are life-of-position statistics). A sample missing short_ask
-    simply skips the trigger check without crashing or false-firing.
+    last_pnl / MAE, which are life-of-position statistics). A sample missing EITHER
+    short_ask or long_bid has an unknown cost to close, so it simply skips the trigger
+    check without crashing or false-firing.
     """
     state.n_samples += 1
 
@@ -182,8 +206,8 @@ def process_sample(
             state.mae = pnl
 
     if not state.triggered:
-        short_ask = sample.short_ask
-        if short_ask is not None and float(short_ask) >= float(position.stop_price):
+        close_value = spread_close_value(sample)
+        if close_value is not None and close_value >= float(position.stop_price):
             state.triggered = True
             state.exit_reason = "stop_hit"
             state.exit_sample = sample
