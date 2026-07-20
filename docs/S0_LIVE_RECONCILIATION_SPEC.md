@@ -90,30 +90,40 @@ untouched). The single `UNTRACKED` status splits into three precise ones:
 
 | New status   | Condition (held, model weight 0)                     | Meaning                          |
 |--------------|------------------------------------------------------|----------------------------------|
-| `ROTATE_OUT` | symbol ∈ `universe`, integer share qty ≥ 1           | model dropped it → **sell** (normal) |
-| `ALIEN`      | symbol ∉ `universe` (and not the cash sweep)         | corp-action / manual → **review**    |
+| `SWEEP`      | symbol is the cash symbol or ∈ `config.SWEEP_WHITELIST` | money-market sweep held by design → not `ALIEN`, no order, no page |
 | `FRACTIONAL` | `int(actual_shares) == 0` and `actual_shares != 0`   | DRIP stub → record, do not action    |
+| `ROTATE_OUT` | symbol ∈ `universe`, `int(actual_shares) ≥ 1`        | model dropped it → **sell** (normal) |
+| `ALIEN`      | symbol ∉ `universe` (and not sweep / cash / whitelist) | corp-action / manual → **review**    |
 
-`MATCHED` / `DRIFTED` / `MISSING` are unchanged. When `universe is None`, all three collapse back
-to today's `UNTRACKED` (behavior-preserving default). The cash / money-market sweep symbol is
-whitelisted out of `ALIEN` (see open question 4).
+Precedence is top-to-bottom (as implemented in `reconcile.classify_untracked`): a whitelisted
+symbol is `SWEEP` even if fractional; a sub-1-share stub is `FRACTIONAL` before universe membership
+is consulted (you can't trade a sub-share lot either way); otherwise a known symbol is `ROTATE_OUT`
+and everything else is `ALIEN`. `MATCHED` / `DRIFTED` / `MISSING` are unchanged. When
+`universe is None`, all four collapse back to today's `UNTRACKED` (behavior-preserving default).
+`classify_untracked` is the single predicate; `reconcile.alien_holdings(positions, universe,
+whitelist)` reuses it so the morning executor's positions-only alien check cannot drift from it.
 
-### 3.B Gate the engine on the new statuses (live-scoped)
+### 3.B Gate the engine on the new statuses (account-type-independent — Q1 UNIFY)
 
-`band_breached` and `plan_account` (`rebalance_engine.py:78-151`) consult an explicit
-per-account flag `auto_clear_untracked` (True for paper, False for live — see §3.D):
+`band_breached` and `plan_account` (`rebalance_engine.py`) key off the reconcile **status** only —
+there is **no** per-account flag (Q1 = UNIFY removed the earlier draft's `auto_clear_untracked`).
+The universe-based split does all the work, identically on paper and live:
 
-- `ROTATE_OUT` — breaches the band and emits its sell delta, **on both paper and live**. This is
-  the load-bearing "don't freeze real rebalances" behavior.
-- `ALIEN` —
-  - **live (`auto_clear_untracked=False`)**: does **not** breach the band by itself and emits **no
-    delta**. It is collected into a per-cycle review list (§3.E). A cycle that has *only* alien
-    holdings and no genuine model drift stages nothing and is not "dirty" — it is "needs review."
-  - **paper (`auto_clear_untracked=True`)**: preserves today's auto-sweep (leftover test positions
-    get cleared) — unless the reviewer chooses to unify (open question 1).
-- `FRACTIONAL` — never breaches, never emits a delta, never triggers the "band breach, no routes"
-  alert. Recorded in the reconciliation readout, not actioned. Applies on both account types (it is
-  a truncation-seam correctness fix, not a live-only policy).
+- `ROTATE_OUT` / `UNTRACKED` — always breach the band and emit the sell delta (a known dropped
+  ticker must clear regardless of size). This is the load-bearing "don't freeze real rebalances"
+  behavior. (`UNTRACKED` is the `universe=None` equivalent of `ROTATE_OUT`.)
+- `ALIEN` — does **not** breach the band by itself and emits **no** delta. It is collected onto
+  `AccountPlan.alien_lines` for the per-cycle review alert (§3.E). A cycle whose only off-model line
+  is an alien holding stages nothing and is not "dirty" — it is "needs review", never a false "band
+  breach, no routes" page.
+- `FRACTIONAL` / `SWEEP` — never breach, never emit a delta, never trigger the "band breach, no
+  routes" alert. Recorded in the reconciliation readout, not actioned. (`FRACTIONAL` is a
+  truncation-seam correctness fix; `SWEEP` is a whitelisted cash/MMF held by design.)
+
+The engine's shared frozensets `_NO_AUTOTRADE_STATUSES = {ALIEN, FRACTIONAL, SWEEP}` and
+`_ALWAYS_BREACH_STATUSES = {UNTRACKED, ROTATE_OUT}` are the single definitions, replicated
+byte-identically in `recon_report.plan_account` (which imports `AccountPlan` **from** recon_report,
+so importing the engine back would be circular).
 
 ### 3.C Fix the fractional truncation seam
 
@@ -122,14 +132,15 @@ The `int(actual_shares)` at `rebalance_engine.py:146` and `_trade_weight`
 `FRACTIONAL` classification (§3.A) is computed from the raw float so a sub-1-share stub is
 recognized and suppressed from the breach path rather than looping through it forever.
 
-### 3.D Live-account scoping
+### 3.D Live-account scoping — NOT NEEDED (Q1 = UNIFY)
 
-No paper/live flag exists today (finding #4). Introduce one explicit declaration in `paperbot`
-config — a set of account numbers that are **live** (default empty; populated only when
-prerequisite #4 stands up the live gateway + clientId + enrollment). `plan_accounts` derives
-`auto_clear_untracked = (account not in LIVE_ACCOUNTS)` per account. Until #4 lands this set is
-empty, so **nothing changes for paper** and the new code paths are dormant. This keeps the spec
-buildable now and inert until the live account actually exists.
+The earlier draft introduced a `LIVE_ACCOUNTS` set and derived a per-account
+`auto_clear_untracked` flag. Reviewer decision **Q1 = UNIFY removed both**: behavior is
+account-type-independent, so no paper/live distinction is needed at all. The only "scoping" is
+whether a `universe` is threaded into `build_plan`/`plan_accounts` — the S0 multi-account path
+passes it (via `strategy.universe()`), so paper and live get the identical review treatment; every
+other caller leaves it `None` and gets the byte-identical legacy `UNTRACKED` behavior. `config`
+gains only `SWEEP_WHITELIST` (default empty), not a `LIVE_ACCOUNTS` set.
 
 ### 3.E Surface alien holdings for human reconciliation
 
@@ -187,20 +198,34 @@ holding); DRIP fractional *trading* (we surface the stub, we don't try to trade 
 
 ---
 
-## 6. Open questions for the reviewer
+## 6. Reviewer decisions — RESOLVED (2026-07-20) and BUILT
 
-1. **Paper behavior — keep or unify?** Preserve paper's current auto-sweep of `UNTRACKED`/`ALIEN`
-   leftovers (default, least disruptive), or unify so paper *also* routes alien holdings to review?
-   (Recommend keep auto-sweep on paper: paper leftovers are genuinely disposable test positions,
-   and unifying would add review noise to the account family we use for everything.)
-2. **Universe source.** Read `config.ALL_TICKERS` directly, or add a `strategy.universe()` accessor
-   that unions every sleeve's selectable symbols across all regimes? (Recommend the accessor — a
-   future regime that adds a sleeve/ticker must not silently make a legitimately-held symbol read
-   as `ALIEN`. `ALL_TICKERS` is the correct value *today* but the accessor is the durable seam.)
-3. **Fractional stub disposition.** Beyond suppressing the false page, do we ever want to surface
-   fractional DRIP stubs for periodic manual cleanup, or stay fully silent on them? (Recommend a
-   quiet line in the reconciliation readout, no alert.)
-4. **Cash-sweep whitelist.** Confirm the live account's cash / money-market sweep symbol(s) so they
-   are whitelisted out of `ALIEN` from day one (otherwise the first live cycle pages on the sweep
-   balance). Andrew to name the exact symbol once the live account is known (ties to prerequisite
-   #4). `reconcile._investable.CASH_SYMBOL` is the existing anchor to extend.
+All four were resolved by the reviewer and are implemented on branch
+`thread/s0-live-reconciliation` (paperbot v0.18.0).
+
+1. **Paper behavior — UNIFY.** The alien-holding → review behavior applies on **both** paper and
+   live, identically. This *simplified* the design: there is **no** per-account
+   `auto_clear_untracked` flag and **no** `LIVE_ACCOUNTS` set (both were in the earlier draft of
+   §3.B/§3.D and are now removed). The universe-based split does all the work everywhere and is
+   account-type-independent — a symbol the strategy knows that the model dropped is `ROTATE_OUT`
+   (sell, on paper and live alike); a symbol it never knew is `ALIEN` (review, on paper and live
+   alike). Behavior is still scoped by whether a `universe` is passed at all: `universe=None`
+   (backtester and any caller that doesn't pass it) reproduces today's single `UNTRACKED` bucket
+   bit-for-bit, so nothing off the S0 multi-account path changes.
+2. **Universe source — the `strategy.universe()` accessor.** Added `universe()` on
+   `StrategyBase` (which refuses by default — a strategy must self-describe) and on
+   `AdaptiveAllWeather` / a module-level `strategies.all_weather.universe()`, returning
+   `set(config.ALL_TICKERS)`. Verified a superset of every sleeve's output (parts/sector.py →
+   `EQUITY_CORE + SECTORS`; parts/defensive.py + portfolio `_BUCKET_OF` → `DEFENSIVE_ASSETS`;
+   parts/real_assets.py → `REAL_ASSETS`; the best-tbill fallback `BENCHMARK_TBILL ∈ TBILLS`), so no
+   sleeve can emit a symbol outside it. paperbot reads it via the accessor, not a hardcoded
+   duplicate — the durable seam a future added sleeve/ticker updates in one place.
+3. **Fractional stub disposition — a quiet readout line.** `FRACTIONAL` stubs (held, model weight 0,
+   `int(shares)==0`, `shares!=0`) are suppressed from the breach/page path entirely and appear only
+   as a quiet line in `recon_report`'s read-only readout. They never alert or page.
+4. **Cash-sweep whitelist — mechanism built, default empty (discover-then-whitelist).**
+   `config.SWEEP_WHITELIST` (a `set[str]`, default **empty**) names symbols excluded from `ALIEN`,
+   **extending** the existing `reconcile._investable.CASH_SYMBOL` anchor (which is always excluded).
+   No sweep symbol is hardcoded — Andrew names the live account's exact sweep ticker(s) once the live
+   account is known (ties to prerequisite #4) and adds them here. A whitelisted symbol classifies
+   `SWEEP` (never `ALIEN`): no breach, no order, no page.

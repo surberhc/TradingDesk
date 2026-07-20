@@ -94,6 +94,20 @@ ENROLLMENT = {
 }
 REBALANCE_MASTER = False   # the DF...141 master is the advisor account; not traded.
 
+# --- Corp-action / sweep whitelist (discover-then-whitelist anchor) -------------
+# Symbols to EXCLUDE from the ALIEN (corp-action / manual-holding) classification even
+# though the strategy's universe does not contain them — a real cash / money-market
+# SWEEP fund the live account holds by design, not a corporate action to review. A
+# whitelisted symbol is classified SWEEP (never ALIEN): it does not breach the band, no
+# order is emitted against it, and no CORP-ACTION review alert pages on it.
+#
+# MECHANISM ONLY — DEFAULT EMPTY (discover-then-whitelist, reviewer decision Q4). Do NOT
+# pre-hardcode any sweep symbol: the live account's exact sweep ticker(s) are named by
+# Andrew once the live account is known (prereq #4), then added here. Until then this is
+# empty and dormant. The cash bucket anchor (investable.CASH_SYMBOL) is ALWAYS excluded
+# from ALIEN in addition to this set; this set EXTENDS that single anchor.
+SWEEP_WHITELIST: set[str] = set()
+
 # Drift band (no-trade band): an account is LEFT ALONE until some holding drifts beyond
 # this fraction of NAV from its model weight. Once any holding breaches it, the account
 # is rebalanced fully back to target. Applied identically to every account so there is

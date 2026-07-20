@@ -13,6 +13,23 @@ Per-ticker status:
   DRIFTED   — held, but off target by more than tolerance (a rebalance would correct it)
   MISSING   — wanted by the strategy but not held (e.g. before the first fill)
   UNTRACKED — held but NOT in the target (manual position / leftover -> investigate)
+
+Universe-aware refinement (S0 live-account corp-action guard, 2026-07-20)
+------------------------------------------------------------------------
+Passing `universe` (the strategy's tradeable symbols, from strategy.universe()) SPLITS
+the single UNTRACKED bucket — which conflated two economically opposite cases — into
+three precise ones so the engine can auto-trade a legitimate model rotation-out while
+NEVER auto-liquidating an alien / corporate-action holding:
+  ROTATE_OUT — held, weight 0, symbol ∈ universe, int(shares) >= 1
+               (model dropped a KNOWN ticker -> should SELL: normal rebalancing)
+  ALIEN      — held, weight 0, symbol ∉ universe, ∉ whitelist, ≠ cash symbol, int(shares)>=1
+               (spinoff / rename / manual position -> REVIEW; the bot never auto-trades it)
+  FRACTIONAL — held, weight 0, int(shares) == 0 but shares != 0
+               (DRIP sub-share stub -> record, do not action; suppressed from the band)
+  SWEEP      — held, weight 0, symbol is the cash symbol or in config.SWEEP_WHITELIST
+               (a money-market sweep held by design -> not ALIEN, no order, no page)
+When `universe is None` (backtester / paper callers that don't pass it) the classification
+is IDENTICAL to before: all of the above collapse back to UNTRACKED. Behavior-preserving.
 """
 from __future__ import annotations
 
@@ -23,6 +40,51 @@ import config
 import investable as _investable
 import strategy_target
 from connections import clientids, ibkr_paper
+
+
+# Refined statuses that a held, model-weight-0 symbol can take when a `universe` is given.
+# UNTRACKED is the universe=None (behavior-preserving) collapse of all four.
+ROTATE_OUT = "ROTATE_OUT"
+ALIEN = "ALIEN"
+FRACTIONAL = "FRACTIONAL"
+SWEEP = "SWEEP"
+
+
+def classify_untracked(symbol: str, actual_shares: float,
+                       universe: set[str] | None,
+                       whitelist: set[str] | None = None) -> str:
+    """Refine a held symbol the model weights at 0 (actual_shares != 0 assumed by callers).
+
+    Single source of truth for the split so reconcile() and alien_holdings() can never
+    disagree. `universe is None` preserves the legacy single bucket exactly."""
+    if universe is None:
+        return "UNTRACKED"
+    if symbol == _investable.CASH_SYMBOL or symbol in (whitelist or set()):
+        return SWEEP
+    if int(actual_shares) == 0:            # sub-1-share DRIP stub (truncation seam)
+        return FRACTIONAL
+    if symbol in universe:                 # a KNOWN ticker the model dropped this cycle
+        return ROTATE_OUT
+    return ALIEN                           # corp-action / manual holding -> human review
+
+
+def alien_holdings(positions: dict, universe: set[str] | None,
+                   whitelist: set[str] | None = None) -> list[tuple[str, float]]:
+    """Held symbols that classify ALIEN (∉ universe, ∉ whitelist, ≠ cash, int(shares)>=1).
+
+    A pure convenience for callers that have positions but no model Target in hand (the
+    morning executor). Uses the SAME classify_untracked() predicate reconcile() does, so
+    the two paths cannot drift. Returns [(symbol, shares), ...]."""
+    out: list[tuple[str, float]] = []
+    if universe is None:
+        return out
+    for sym, sh in positions.items():
+        sh = float(sh)
+        if sh == 0:
+            continue
+        if classify_untracked(sym, sh, universe, whitelist) == ALIEN:
+            out.append((sym, sh))
+    return out
 
 
 @dataclass
@@ -38,13 +100,23 @@ class Line:
 
 def reconcile(target: strategy_target.Target, nav: float, positions: dict,
               prices: dict | None = None, tolerance_w: float = 0.01,
-              investable: float | None = None) -> list[Line]:
+              investable: float | None = None,
+              universe: set[str] | None = None,
+              whitelist: set[str] | None = None) -> list[Line]:
     """Compare the strategy's target book against actual positions. `prices` (symbol->
     price) overrides the strategy-data close for valuation (e.g. live quotes).
 
     `investable` overrides the capital sized against (default NAV*(1-cash_reserve)).
     The multi-account engine passes (NAV - distribution_reserve)*(1-cash_reserve) so a
-    client's upcoming distribution is carved out before any buy is sized."""
+    client's upcoming distribution is carved out before any buy is sized.
+
+    `universe` (the strategy's tradeable symbols) OPT-IN refines the single UNTRACKED
+    status into ROTATE_OUT / ALIEN / FRACTIONAL / SWEEP (see module docstring). When
+    None (the default — backtester and every existing caller), classification is
+    byte-identical to before: UNTRACKED. `whitelist` (default config.SWEEP_WHITELIST when
+    a universe is given) names sweep symbols excluded from ALIEN."""
+    if universe is not None and whitelist is None:
+        whitelist = set(getattr(config, "SWEEP_WHITELIST", set()))
     if investable is None:
         # Shared formula (investable module) with no distribution reserve carved out —
         # behavior-identical to the previous inline nav*(1-cash_reserve_pct).
@@ -63,7 +135,8 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
         if weight > 0 and actual_shares == 0:
             status = "MISSING"
         elif weight == 0 and actual_shares != 0:
-            status = "UNTRACKED"
+            # universe=None -> "UNTRACKED" (legacy); otherwise the refined split.
+            status = classify_untracked(sym, actual_shares, universe, whitelist)
         elif abs(drift_w) <= tolerance_w:
             status = "MATCHED"
         else:

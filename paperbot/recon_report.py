@@ -46,6 +46,9 @@ class AccountPlan:
     lines: list            # reconcile.Line per symbol
     needs_rebalance: bool
     orders: dict           # symbol -> signed share delta (target - actual); empty if in-band
+    alien_lines: list = field(default_factory=list)   # reconcile.Line's classified ALIEN
+                          # (corp-action / manual holdings): surfaced for human review,
+                          # NEVER auto-traded. Empty unless a universe was supplied.
 
 
 @dataclass
@@ -59,6 +62,24 @@ class BlockOrder:
     reason: str = "REBALANCE_TO_MODEL"
 
 
+# NO-autotrade / always-breach status sets — kept byte-identical to
+# rebalance_engine's so this readout's REBALANCE/in-band labels match the engine's
+# actual decisions. (Replicated, not imported: rebalance_engine imports AccountPlan
+# FROM this module, so importing it back would be circular.)
+_NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP"})
+_ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT"})
+
+
+def _strategy_universe() -> set[str] | None:
+    """S0's tradeable universe via the strategy's own universe() accessor; None on failure
+    (readout then falls back to legacy UNTRACKED labels — it places no orders regardless)."""
+    try:
+        from strategies.all_weather import universe as s0_universe
+        return s0_universe()
+    except Exception:
+        return None
+
+
 def _targets_by_version() -> dict:
     """Run the validated engine once per DISTINCT enrolled version (compliance: the
     model per risk tier, not a per-client guess)."""
@@ -69,22 +90,27 @@ def _targets_by_version() -> dict:
 
 
 def plan_account(account: str, version: str, net_liq: float, positions: dict,
-                 target: strategy_target.Target) -> AccountPlan:
-    """Reconcile one account against its tier model, reserving its distribution cash."""
+                 target: strategy_target.Target,
+                 universe: set[str] | None = None) -> AccountPlan:
+    """Reconcile one account against its tier model, reserving its distribution cash.
+
+    `universe` (the strategy's tradeable symbols) refines a held, model-weight-0 symbol
+    into ROTATE_OUT (sell) / ALIEN (review) / FRACTIONAL / SWEEP so the readout shows the
+    corp-action guard's classification. None -> legacy UNTRACKED (readout unchanged)."""
     reserve = cashflows.reserve_for(account, net_liq)
     investable = _investable.compute_investable(net_liq, reserve)
     lines = reconcile.reconcile(target, net_liq, positions,
                                 tolerance_w=config.REBALANCE_BAND_PCT,
-                                investable=investable)
+                                investable=investable, universe=universe)
     # NO-TRADE BAND — ACCOUNT-LEVEL, all-or-nothing. Mirrors rebalance_engine.plan_account
     # exactly so this readout's REBALANCE/in-band labels match what the engine actually does.
     # The breach test keys on the SIZE OF THE TRADE the rebalance would make
     # (|target_shares - actual_shares| valued vs NetLiq), NOT raw weight-vs-model drift:
     # the cash reserve means a fully-invested account sits ~reserve% under its raw model
     # weight by construction, so the old status-based test falsely flagged correctly-invested
-    # accounts and defeated the band on any holding over ~60% weight. A stray UNTRACKED
-    # position always breaches (it must be cleared regardless of size). (Replicated here, not
-    # imported: rebalance_engine imports AccountPlan/BlockOrder FROM this module.)
+    # accounts and defeated the band on any holding over ~60% weight. A KNOWN dropped ticker
+    # (UNTRACKED/ROTATE_OUT) always breaches; an ALIEN/FRACTIONAL/SWEEP line never does and
+    # is never auto-traded (corp-action guard).
     band_pct = config.REBALANCE_BAND_PCT
 
     def _trade_weight(ln) -> float:
@@ -94,16 +120,20 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
             return 0.0
         return abs(ln.target_shares - int(ln.actual_shares)) * price / net_liq
 
-    breached = (any(ln.status == "UNTRACKED" for ln in lines)
-                or any(_trade_weight(ln) > band_pct for ln in lines))
+    breached = (any(ln.status in _ALWAYS_BREACH_STATUSES for ln in lines)
+                or any(_trade_weight(ln) > band_pct for ln in lines
+                       if ln.status not in _NO_AUTOTRADE_STATUSES))
     orders: dict = {}
     if breached:
         for ln in lines:
+            if ln.status in _NO_AUTOTRADE_STATUSES:
+                continue
             delta = ln.target_shares - int(ln.actual_shares)
             if abs(delta) >= 1:
                 orders[ln.symbol] = delta
+    alien_lines = [ln for ln in lines if ln.status == "ALIEN"]
     return AccountPlan(account, version, net_liq, reserve, investable,
-                       lines, breached, orders)
+                       lines, breached, orders, alien_lines)
 
 
 def aggregate_blocks(plans: list[AccountPlan]) -> list[BlockOrder]:
@@ -154,12 +184,14 @@ def main() -> int:
                     print("\nNo enrolled + funded client accounts to reconcile.")
                     return 0
 
+                strat_universe = _strategy_universe()
                 plans: list[AccountPlan] = []
                 for info in sorted(clients, key=lambda x: x.number):
                     positions = {p.contract.symbol: p.position
                                  for p in ib.positions(info.number) if p.position != 0}
                     plans.append(plan_account(info.number, info.version, info.net_liq,
-                                              positions, targets[info.version]))
+                                              positions, targets[info.version],
+                                              universe=strat_universe))
 
                 # --- Section A: per-account reconciliation ---
                 print(f"\n{'ACCOUNT':12s} {'TIER':13s} {'NETLIQ':>14s} {'RESERVE':>10s} "
@@ -167,7 +199,8 @@ def main() -> int:
                 print("-" * 92)
                 for p in plans:
                     n_drift = sum(1 for ln in p.lines
-                                  if ln.status in ("DRIFTED", "MISSING", "UNTRACKED"))
+                                  if ln.status in ("DRIFTED", "MISSING", "UNTRACKED",
+                                                   "ROTATE_OUT"))
                     action = "REBALANCE" if p.needs_rebalance else "in-band"
                     print(f"{p.account:12s} {p.version:13s} {p.net_liq:>14,.0f} {p.reserve:>10,.0f} "
                           f"{p.investable:>14,.0f} {n_drift:>7d}  {action:9s}  "
@@ -189,6 +222,31 @@ def main() -> int:
                         print(f"    {ln.status:9s} {ln.symbol:6s} {ln.target_weight*100:>6.2f}% "
                               f"{ln.actual_weight*100:>6.2f}% {ln.drift_weight*100:>+6.2f}%")
                 print()
+
+                # --- Section A.2: corp-action guard readout (universe-aware) ---
+                # ALIEN holdings are surfaced for HUMAN REVIEW and never auto-traded; the
+                # quiet FRACTIONAL/SWEEP lines are recorded (a DRIP stub / whitelisted sweep)
+                # but never breach the band or page. All read-only — this places no order.
+                alien_any = any(getattr(p, "alien_lines", None) for p in plans)
+                fractional_any = any(ln.status in ("FRACTIONAL", "SWEEP")
+                                     for p in plans for ln in p.lines)
+                if alien_any:
+                    print("CORP-ACTION / UNTRACKED REVIEW — alien holdings (NOT in the "
+                          "strategy universe; never auto-traded, human review required):")
+                    for p in plans:
+                        for ln in getattr(p, "alien_lines", None) or []:
+                            print(f"    {p.account}  ALIEN {ln.symbol:6s} "
+                                  f"qty={ln.actual_shares:,.4f}  act_w={ln.actual_weight*100:>6.2f}%")
+                    print()
+                if fractional_any:
+                    print("quiet: fractional DRIP stubs / whitelisted sweeps (recorded, not "
+                          "actioned):")
+                    for p in plans:
+                        for ln in p.lines:
+                            if ln.status in ("FRACTIONAL", "SWEEP"):
+                                print(f"    {p.account}  {ln.status:10s} {ln.symbol:6s} "
+                                      f"qty={ln.actual_shares:,.4f}")
+                    print()
 
                 # --- Section B: aggregated block orders (fair single-price execution) ---
                 blocks = aggregate_blocks(plans)

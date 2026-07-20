@@ -77,3 +77,18 @@ class StrategyBase(ABC):
         """Hook for paper fills. Allocation strategies carry no per-fill state, so the
         default is a no-op; override if a strategy must react to partial fills."""
         return None
+
+    def universe(self) -> set[str]:
+        """The full set of symbols this strategy can EVER hold — the union across every
+        sleeve and every regime it can select. This is the durable seam the paperbot
+        reconciler uses to tell a legitimate model rotation-out (a symbol the strategy
+        knows, dropped to 0% this cycle) apart from an alien/corporate-action holding
+        (a symbol the strategy has never known). It is READ-ONLY — it describes what the
+        strategy can trade, it decides nothing.
+
+        No default is safe: a strategy that does not declare its universe would make the
+        reconciler read EVERY held symbol as alien. So the base refuses rather than guess;
+        each concrete strategy must self-describe."""
+        raise NotImplementedError(
+            f"{type(self).__name__} must declare universe() — the set of symbols it can "
+            f"ever hold (union across sleeves/regimes).")

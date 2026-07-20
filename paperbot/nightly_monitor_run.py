@@ -94,6 +94,7 @@ import account_monitor_run as amr
 import config
 import live_quotes
 import rebalance_guard
+import reconcile
 import strategy_target
 import version
 from connections import clientids, ibkr_paper
@@ -117,6 +118,49 @@ CONNECT_RETRY_BACKOFF_SECS = 90        # ~3 attempts * (up to ~120s each + 90s b
                                        # worst case is comfortably under 10 minutes total
 
 PENDING_TRADES_DIR = r"C:\TradingDesk-Local\pending_trades"
+
+
+def _strategy_universe() -> set[str] | None:
+    """The S0 strategy's tradeable universe (union across sleeves/regimes), via the
+    strategy's own universe() accessor — the durable seam for telling a legitimate model
+    rotation-out apart from an alien corp-action holding. Returns None on any failure so
+    the plan path falls back to legacy UNTRACKED classification (the rebalance_guard
+    ticker allow-list still backstops any unknown symbol) rather than crashing the run."""
+    try:
+        from strategies.all_weather import universe as s0_universe
+        return s0_universe()
+    except Exception as exc:
+        print(f"    ! could not resolve strategy universe ({exc}); "
+              f"falling back to legacy UNTRACKED classification.")
+        return None
+
+
+def _corp_action_alert_lines(plans: list, prices_by_symbol: dict) -> list[str]:
+    """Build the human-readable CORP-ACTION / UNTRACKED REVIEW alert body from any ALIEN
+    holdings across the planned accounts. Empty list if there are none."""
+    lines: list[str] = []
+    for p in sorted(plans, key=lambda x: getattr(x, "account", "")):
+        aliens = getattr(p, "alien_lines", None) or []
+        if not aliens:
+            continue
+        lines.append(f"  account {p.account}:")
+        for ln in aliens:
+            px = prices_by_symbol.get(ln.symbol, float("nan"))
+            est = (ln.actual_shares * px) if (px == px) else float("nan")
+            lines.append(f"    {ln.symbol:6s} qty={ln.actual_shares:,.4f}  "
+                         f"est_value~{est:,.0f}")
+    if lines:
+        lines = [
+            "CORP-ACTION / UNTRACKED REVIEW — a held symbol the strategy does NOT know "
+            "(spinoff / ticker-rename / manual position / un-whitelisted sweep) was found. "
+            "The bot transmits NOTHING against it (fail-closed). A human must choose one of:",
+            "  (a) manually sell it via  rebalance_execute.py --arm-i-understand",
+            "  (b) update ENROLLMENT / the model if it belongs, or",
+            "  (c) accept + whitelist it (paperbot/config.py SWEEP_WHITELIST).",
+            "",
+            "Alien holdings:",
+        ] + lines
+    return lines
 
 
 def _write_status(st: str, metrics: dict | None = None, message: str = "") -> None:
@@ -286,13 +330,28 @@ def _do_work(ib, today: date) -> int:
         account_inputs.append({"account": info.number, "version": info.version,
                               "net_liq": info.net_liq, "positions": positions, "prices": prices})
 
-    out = build_plan(account_inputs, targets)
+    strat_universe = _strategy_universe()
+    out = build_plan(account_inputs, targets, universe=strat_universe)
     plans = out["plans"]
+
+    # CORP-ACTION / UNTRACKED REVIEW — surface any ALIEN (corp-action / manual) holdings
+    # BEFORE the rebalance decision, so an alien-only cycle is flagged "needs review" even
+    # when no account breaches the band. This alert never blocks the legitimate
+    # ROTATE_OUT/DRIFTED/MISSING rebalancing below — it is informational and additive.
+    prices_by_symbol_all = {sym: px for ai in account_inputs
+                            for sym, px in ai.get("prices", {}).items()}
+    alien_lines = _corp_action_alert_lines(plans, prices_by_symbol_all)
+    if alien_lines:
+        print("\n    " + "\n    ".join(alien_lines))
+        _alert_email("CORP-ACTION / UNTRACKED REVIEW (alien holding found)", alien_lines)
+
     needing = [p.account for p in plans if p.needs_rebalance]
     if not needing:
+        msg = ("alien holding(s) flagged for review; no account breaches the band"
+               if alien_lines else "in-band; nothing staged")
         print("    every enrolled account is within the drift band — not a rebalance "
               "night. Nothing staged.")
-        _write_status("ok", message="in-band; nothing staged")
+        _write_status("ok", message=msg)
         return 0
 
     print(f"    {len(needing)} account(s) need rebalancing: {needing}")
@@ -309,11 +368,12 @@ def _do_work(ib, today: date) -> int:
         _alert_email("nightly monitor: FA group resolution FAILED", [msg])
         _write_status("fail", message=msg)
         return 1
-    out = build_plan(account_inputs, targets, tier_groups=tier_groups)
+    out = build_plan(account_inputs, targets, tier_groups=tier_groups,
+                     universe=strat_universe)
     routes = out["routes"]
     if not routes:
         print("    band test flagged accounts but no routes were built (e.g. all "
-              "UNTRACKED-only) — nothing to stage.")
+              "ALIEN/FRACTIONAL-only) — nothing to stage.")
         _write_status("ok", message="no routes built despite band breach")
         return 0
 
