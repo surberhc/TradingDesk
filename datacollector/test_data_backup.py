@@ -87,11 +87,17 @@ def _run(tmp_path, monkeypatch, **over):
         "status_fn": over.get("status_fn", Recorder(None)),
         "heartbeat_fn": over.get("heartbeat_fn", Recorder(None)),
         "log_fn": over.get("log_fn", Recorder(None)),
+        # Faked so the suite never reads the REAL status file off disk. Returning None
+        # ("never deep-verified") means auto-mode resolves to DEEP — which is also what
+        # NOW (a Friday) would give, so every pre-existing test below is a DEEP run.
+        "last_deep_fn": over.get("last_deep_fn", Recorder(None)),
     }
     extra = {}
-    if "mtime_fn" in over:
-        extra["mtime_fn"] = over["mtime_fn"]
-    st = db.run_backup(now=NOW, dry_run=over.get("dry_run", False), **fakes, **extra)
+    for opt in ("mtime_fn", "verify_list_fn", "copied_fn"):
+        if opt in over:
+            extra[opt] = over[opt]
+    st = db.run_backup(now=NOW, dry_run=over.get("dry_run", False),
+                       mode=over.get("mode", "auto"), **fakes, **extra)
     return st, fakes
 
 
@@ -703,3 +709,397 @@ def test_data_backup_alarm_fires_when_heartbeat_never_existed(tmp_path):
     a = hba.assess(job, now)
     assert a["status"] == "missing"
     assert a["alert"] is True
+
+
+# --------------------------------------------------------------------------- #
+# TWO CADENCES (2026-07-20) — deep (full re-hash) vs incremental (verify what we copied)
+#
+# The old job re-hashed ~99 GB EVERY night (copy --checksum + a full unscoped check =
+# ~200 GB of local reads) while the uploads were already incremental. These tests pin the
+# split AND, more importantly, pin the honesty of the smaller claim: an incremental run
+# must never say the whole warehouse is verified, because it isn't.
+# --------------------------------------------------------------------------- #
+def test_NOW_is_a_friday_so_the_existing_suite_runs_in_deep_mode():
+    """Load-bearing for every test above: NOW is DEEP_WEEKDAY, so auto-mode picks deep and
+    the pre-existing expectations (full check, PROVES_VERIFIED*) still hold unchanged."""
+    assert NOW.weekday() == db.DEEP_WEEKDAY == 4        # Friday
+    st, _ = _run(None, None)
+    assert st["mode"] == "deep"
+
+
+# --- choose_mode: all five rules --------------------------------------------------- #
+FRIDAY = dt.datetime(2026, 7, 17, 21, 0, 0)
+MONDAY = dt.datetime(2026, 7, 20, 21, 0, 0)
+
+
+def test_choose_mode_explicit_request_wins_over_every_other_rule():
+    """Rule 1. An operator override is honoured verbatim — including asking for the CHEAP
+    pass on a Friday, and the EXPENSIVE pass on a Monday."""
+    mode, why = db.choose_mode(FRIDAY, "2026-07-17T21:00:00", requested="incremental")
+    assert mode == "incremental"
+    assert "explicitly requested" in why
+    mode, why = db.choose_mode(MONDAY, "2026-07-20T21:00:00", requested="deep")
+    assert mode == "deep"
+    assert "explicitly requested" in why
+
+
+def test_choose_mode_never_deep_verified_goes_deep():
+    """Rule 2. With no verified baseline there is nothing to be incremental against."""
+    mode, why = db.choose_mode(MONDAY, None)
+    assert mode == "deep"
+    assert "no usable record" in why
+
+
+def test_choose_mode_stale_last_deep_self_heals_to_deep():
+    """Rule 3. A missed Friday must not become 'we quietly never deep-verified again'."""
+    stale = (MONDAY - dt.timedelta(days=db.DEEP_MAX_AGE_DAYS + 2)).isoformat()
+    mode, why = db.choose_mode(MONDAY, stale)
+    assert mode == "deep"
+    assert "self-heal" in why
+    assert "days ago" in why
+
+
+def test_choose_mode_on_the_deep_weekday_goes_deep():
+    """Rule 4. The scheduled full pass."""
+    mode, why = db.choose_mode(FRIDAY, (FRIDAY - dt.timedelta(days=7)).isoformat())
+    assert mode == "deep"
+    assert "Friday" in why
+
+
+def test_choose_mode_otherwise_is_incremental_and_names_the_last_deep():
+    """Rule 5. The normal weeknight."""
+    mode, why = db.choose_mode(MONDAY, "2026-07-17T21:00:00")
+    assert mode == "incremental"
+    assert "2026-07-17" in why
+
+
+def test_choose_mode_accepts_a_datetime_as_well_as_a_string():
+    mode, _ = db.choose_mode(MONDAY, dt.datetime(2026, 7, 17, 21, 0, 0))
+    assert mode == "incremental"
+
+
+def test_choose_mode_unparseable_last_deep_fails_TOWARD_deep():
+    """An unreadable timestamp means we cannot prove when the last full verification was.
+    Unknown must resolve to the MORE thorough pass — the cost of a needless deep run is
+    disk time; the cost of a wrongly-skipped one is unverified data."""
+    mode, why = db.choose_mode(MONDAY, "not a timestamp at all")
+    assert mode == "deep"
+    assert "no usable record" in why
+
+
+# --- argv --------------------------------------------------------------------------- #
+def test_incremental_copy_argv_drops_checksum_and_adds_verbose():
+    """The whole saving: no --checksum means rclone hashes NOTHING locally and decides
+    from size+modtime. -v is what makes the copied paths visible to parse."""
+    argv = db.copy_argv(r"C:\fake\rclone.exe", deep=False)
+    assert "--checksum" not in argv
+    assert "-v" in argv
+    assert "--drive-use-trash=false" in argv
+    assert argv[1] == "copy"
+
+
+def test_deep_copy_argv_is_unchanged_and_is_the_DEFAULT():
+    argv = db.copy_argv(r"C:\fake\rclone.exe")
+    assert "--checksum" in argv
+    assert "-v" not in argv
+    assert db.copy_argv(r"C:\fake\rclone.exe", deep=True) == argv
+
+
+def test_check_argv_scopes_to_files_from_when_given_one():
+    argv = db.check_argv(r"C:\fake\rclone.exe", files_from=r"C:\tmp\list.txt")
+    assert "--files-from" in argv
+    assert argv[argv.index("--files-from") + 1] == r"C:\tmp\list.txt"
+
+
+def test_check_argv_without_files_from_is_the_full_unscoped_pass():
+    assert "--files-from" not in db.check_argv(r"C:\fake\rclone.exe")
+
+
+# --- parse_copied_paths ------------------------------------------------------------- #
+COPY_INCREMENTAL = (
+    "2026/07/20 21:00:31 INFO  : warehouse/raw/options/SPY/2026-07-20.parquet: "
+    "Copied (new)\n"
+    "2026/07/20 21:00:31 INFO  : state/paperbot/runs.jsonl: Copied (replaced existing)\n"
+    "Transferred:   \t   1.234 GiB / 1.234 GiB, 100%, 10.5 MiB/s, ETA 0s\n"
+    "Transferred:            2 / 2, 100%\n")
+COPY_NOTHING_NEW = (
+    "2026/07/20 21:00:31 INFO  : There was nothing to transfer\n"
+    "Transferred:   \t   0 B / 0 B, -, 0 B/s, ETA -\n"
+    "Checks:              499539 / 499539, 100%\n"
+    "Elapsed time:         4m1.2s\n")
+
+
+def test_parse_copied_paths_handles_both_copied_wordings():
+    got = db.parse_copied_paths(COPY_INCREMENTAL)
+    assert got == ["warehouse/raw/options/SPY/2026-07-20.parquet",
+                   "state/paperbot/runs.jsonl"]
+
+
+def test_parse_copied_paths_PRESERVES_CASE():
+    """rclone check --files-from matches case-SENSITIVELY. Lower-casing the list (as
+    normalise_path does) would silently match nothing, and a check that verifies nothing
+    while exiting clean is precisely the silent green light this job exists to prevent."""
+    got = db.parse_copied_paths(
+        "2026/07/20 21:00:31 INFO  : Warehouse/RAW/SPY/Xyz.PARQUET: Copied (new)\n")
+    assert got == ["Warehouse/RAW/SPY/Xyz.PARQUET"]
+
+
+def test_parse_copied_paths_dedups_but_preserves_order():
+    txt = ("INFO  : b/second.txt: Copied (new)\n"
+           "INFO  : a/first.txt: Copied (new)\n"
+           "INFO  : b/second.txt: Copied (replaced existing)\n")
+    assert db.parse_copied_paths(txt) == ["b/second.txt", "a/first.txt"]
+
+
+def test_parse_copied_paths_ignores_everything_that_is_not_a_copy():
+    txt = ("INFO  : old/thing.txt: Deleted\n"
+           "INFO  : other/thing.txt: Updated modification time\n"
+           "INFO  : There was nothing to transfer\n"
+           "Transferred:   \t   0 B / 0 B, -, 0 B/s, ETA -\n"
+           "NOTICE: Google drive root 'X': 0 differences found\n")
+    assert db.parse_copied_paths(txt) == []
+    assert db.parse_copied_paths(COPY_NOTHING_NEW) == []
+
+
+def test_parse_copied_paths_normalises_windows_separators():
+    got = db.parse_copied_paths(r"INFO  : .\warehouse\raw\x.parquet: Copied (new)" + "\n")
+    assert got == ["warehouse/raw/x.parquet"]
+
+
+def test_parse_copied_paths_empty_input():
+    assert db.parse_copied_paths("") == []
+    assert db.parse_copied_paths(None) == []
+
+
+# --- write_verify_list -------------------------------------------------------------- #
+def test_write_verify_list_writes_one_path_per_line(tmp_path):
+    target = tmp_path / "list.txt"
+    out = db.write_verify_list(["a/b.parquet", "C/D.jsonl"], path=target)
+    assert Path(out) == target
+    assert target.read_text(encoding="utf-8") == "a/b.parquet\nC/D.jsonl\n"
+
+
+def test_verify_list_lives_under_an_EXCLUDED_dir_so_it_is_never_backed_up():
+    """If the scoping list were itself inside the backup scope it would show up as a
+    difference in the very check it scopes."""
+    assert str(db.BACKUP_DIR).lower() in str(db.VERIFY_LIST_FILE).lower()
+    assert "backups/**" in db.EXCLUDES
+
+
+# --- read_last_deep ----------------------------------------------------------------- #
+def test_read_last_deep_reads_the_field(tmp_path):
+    p = tmp_path / "status.json"
+    p.write_text('{"last_deep_verified": "2026-07-17T21:00:00"}', encoding="utf-8")
+    assert db.read_last_deep(status_file=p) == "2026-07-17T21:00:00"
+
+
+@pytest.mark.parametrize("body", [None, "{ not json at all", "[]", '{"ok": true}'])
+def test_read_last_deep_never_raises_and_returns_none_when_unknown(tmp_path, body):
+    """Missing file, malformed file, wrong shape, or missing key — all mean 'unknown',
+    which resolves to a DEEP run upstream. It must never crash the backup job."""
+    p = tmp_path / "status.json"
+    if body is not None:
+        p.write_text(body, encoding="utf-8")
+    assert db.read_last_deep(status_file=p) is None
+
+
+# --- incremental runs --------------------------------------------------------------- #
+def _incremental(tmp_path, *, copy_out=COPY_INCREMENTAL, check_fn=None, last_deep=None,
+                 mtime_fn=None):
+    over = {
+        "mode": "incremental",
+        "copy_fn": Recorder(_proc(0, stderr=copy_out)),
+        "verify_list_fn": Recorder(tmp_path / "verify_list.txt"),
+        "last_deep_fn": Recorder(last_deep),
+    }
+    if check_fn is not None:
+        over["check_fn"] = check_fn
+    if mtime_fn is not None:
+        over["mtime_fn"] = mtime_fn
+    return _run(tmp_path, None, **over)
+
+
+def test_incremental_run_scopes_the_check_to_the_copied_files(tmp_path):
+    st, f = _incremental(tmp_path, last_deep="2026-07-10T21:00:00")
+    assert st["mode"] == "incremental"
+    assert st["copied_count"] == 2
+    assert f["check_fn"].calls == 1
+    assert f["check_fn"].args[0][1]["files_from"] == str(tmp_path / "verify_list.txt")
+    assert f["heartbeat_fn"].calls == 1
+    assert st["ok"] is True
+    # The copy ran WITHOUT --checksum: deep=False threaded through as a keyword.
+    assert f["copy_fn"].args[0][1]["deep"] is False
+
+
+def test_incremental_proves_string_never_claims_the_whole_warehouse(tmp_path):
+    """THE HONESTY ASSERTION for the cheap pass. It proved 2 files. It must say 2 files,
+    and it must name when everything else was last actually proven."""
+    st, _ = _incremental(tmp_path, last_deep="2026-07-10T21:00:00")
+    assert st["proves"] == db.PROVES_VERIFIED_INCREMENTAL.format(
+        n=2, src=db.DATA_SOURCE, remote=db.RCLONE_REMOTE, last_deep="2026-07-10T21:00:00")
+    assert "everything else IS proven byte-identical" not in st["proves"]
+    assert "NOT re-verified by this run" in st["proves"]
+    assert "2026-07-10T21:00:00" in st["proves"]
+
+
+def test_incremental_with_no_prior_deep_renders_never_not_None(tmp_path):
+    st, _ = _incremental(tmp_path, last_deep=None)
+    assert "never" in st["proves"]
+    assert "None" not in st["proves"]
+
+
+def test_incremental_with_benign_churn_uses_the_benign_incremental_wording(tmp_path):
+    out = (_err("conductor/conductor.db", "sizes differ") +
+           _summary(differences=1, matching=2))
+    st, f = _incremental(tmp_path, check_fn=Recorder(_proc(1, stderr=out)),
+                         last_deep="2026-07-10T21:00:00",
+                         mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is True
+    assert f["heartbeat_fn"].calls == 1
+    assert st["proves"] == db.PROVES_VERIFIED_INCREMENTAL_WITH_BENIGN.format(
+        n=2, m=1, v=1, c=0, src=db.DATA_SOURCE, remote=db.RCLONE_REMOTE,
+        last_deep="2026-07-10T21:00:00")
+    assert "everything else IS proven byte-identical" not in st["proves"]
+
+
+def test_incremental_with_nothing_copied_skips_the_check_entirely(tmp_path):
+    """Nothing changed, so nothing needs verifying — and that IS a verified state: the
+    backup is exactly as current as it was. Running a check here would burn hours to
+    re-prove bytes nobody touched."""
+    st, f = _incremental(tmp_path, copy_out=COPY_NOTHING_NEW,
+                         last_deep="2026-07-10T21:00:00")
+    assert st["copied_count"] == 0
+    assert f["check_fn"].calls == 0              # the whole point
+    assert st["ok"] is True
+    assert f["heartbeat_fn"].calls == 1
+    assert st["proves"] == db.PROVES_VERIFIED_NOTHING_NEW.format(
+        remote=db.RCLONE_REMOTE, last_deep="2026-07-10T21:00:00")
+    assert "nothing new to copy" in st["proves"]
+    assert "verified byte-identical" not in st["proves"]   # nothing was checked; say so
+
+
+def test_incremental_heartbeat_text_names_the_mode(tmp_path):
+    st, f = _incremental(tmp_path, last_deep="2026-07-10T21:00:00")
+    text = f["heartbeat_fn"].args[0][0][0]
+    assert "mode=incremental" in text
+    assert "copied=2" in text
+    assert "COMPLETE" not in text.upper()
+
+
+def test_incremental_TIER1_failure_still_fails_closed(tmp_path):
+    """The cheap pass must not become a cheap EXCUSE. A corrupt parquet inside the scoped
+    check pages exactly as it does in a deep run."""
+    out = (_err("warehouse/raw/options/spy/2024-01-02.parquet", "md5 differ") +
+           _summary(differences=1, matching=1))
+    st, f = _incremental(tmp_path, check_fn=Recorder(_proc(1, stderr=out)),
+                         last_deep="2026-07-10T21:00:00",
+                         mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0          # cold heartbeat -> it pages
+    assert "TIER-1" in st["proves"]
+    assert "2024-01-02.parquet" in st["proves"]
+
+
+# --- the last_deep_verified clock --------------------------------------------------- #
+def test_only_a_successful_deep_run_advances_last_deep_verified(tmp_path, monkeypatch):
+    st, _ = _run(tmp_path, monkeypatch, last_deep_fn=Recorder("2026-07-10T21:00:00"))
+    assert st["mode"] == "deep"
+    assert st["last_deep_verified"] == NOW.isoformat(timespec="seconds")
+
+
+def test_a_successful_incremental_run_carries_last_deep_verified_FORWARD(tmp_path):
+    """It must not be clobbered to None by the cheap pass — the whole self-heal and the
+    honesty of `proves` both hang off this value surviving."""
+    st, _ = _incremental(tmp_path, last_deep="2026-07-10T21:00:00")
+    assert st["ok"] is True
+    assert st["last_deep_verified"] == "2026-07-10T21:00:00"
+
+
+def test_a_FAILED_deep_run_does_not_advance_last_deep_verified(tmp_path, monkeypatch):
+    st, f = _run(tmp_path, monkeypatch, last_deep_fn=Recorder("2026-07-10T21:00:00"),
+                 check_fn=Recorder(_proc(1, stderr=CHECK_DIFF)),
+                 mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert st["last_deep_verified"] == "2026-07-10T21:00:00"
+
+
+# --- the parse-failure guard -------------------------------------------------------- #
+# An empty copied-path list is read as "nothing new to copy" — a verified success that
+# refreshes the heartbeat. It is ALSO what a BROKEN parse_copied_paths produces. These
+# pin the cross-check against rclone's own transfer stats: bytes/files moved + zero
+# parsed paths = a contradiction, and a contradiction fails CLOSED.
+COPY_MOVED_BUT_UNPARSEABLE = (
+    # Same run as COPY_INCREMENTAL, but with the INFO lines in a wording our regex does
+    # not match — i.e. exactly what a future rclone -v format change looks like here.
+    "2026/07/20 21:00:31 INFO  : warehouse/raw/options/SPY/2026-07-20.parquet "
+    "-> transferred (new)\n"
+    "Transferred:   \t   1.234 GiB / 1.234 GiB, 100%, 10.5 MiB/s, ETA 0s\n"
+    "Transferred:            2 / 2, 100%\n")
+
+
+def test_incremental_zero_parsed_paths_but_bytes_moved_FAILS_CLOSED(tmp_path):
+    st, f = _incremental(tmp_path, copy_out=COPY_MOVED_BUT_UNPARSEABLE,
+                         last_deep="2026-07-10T21:00:00")
+    assert st["copied_count"] == 0
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0          # cold heartbeat -> it pages
+    assert f["check_fn"].calls == 0              # nothing could be scoped to verify
+    blob = " ".join(st["errors"])
+    assert "CONTRADICTION" in blob
+    assert "parse_copied_paths" in blob
+    assert "-v" in blob                          # names the likely cause
+    assert st["proves"] == db.PROVES_FAILED_PARSE_CONTRADICTION.format(
+        moved=f"{st['bytes']} byte(s) and 2 file(s)")
+    assert st["bytes"] > 0
+
+
+def test_the_contradiction_proves_string_claims_nothing_was_verified(tmp_path):
+    st, _ = _incremental(tmp_path, copy_out=COPY_MOVED_BUT_UNPARSEABLE,
+                         last_deep="2026-07-10T21:00:00")
+    assert st["proves"].startswith("nothing")
+    assert "verified byte-identical" not in st["proves"]
+    assert "nothing new to copy" not in st["proves"]
+    assert "parse_copied_paths" in st["proves"]
+
+
+def test_incremental_zero_parsed_paths_and_nothing_transferred_is_still_a_success(
+        tmp_path):
+    """The symmetric half: rclone's stats AGREE that nothing moved, so the existing
+    'nothing new' success path is untouched."""
+    st, f = _incremental(tmp_path, copy_out=COPY_NOTHING_NEW,
+                         last_deep="2026-07-10T21:00:00")
+    assert st["copied_count"] == 0
+    assert st["ok"] is True
+    assert f["heartbeat_fn"].calls == 1
+    assert f["check_fn"].calls == 0
+    assert st["proves"] == db.PROVES_VERIFIED_NOTHING_NEW.format(
+        remote=db.RCLONE_REMOTE, last_deep="2026-07-10T21:00:00")
+
+
+def test_contradiction_also_trips_on_a_transferred_FILE_COUNT_alone(tmp_path):
+    """Bytes unparseable (or absent) but the file count says 2 — still a contradiction."""
+    out = ("INFO  : some/path.parquet -> transferred (new)\n"
+           "Transferred:            2 / 2, 100%\n")
+    st, f = _incremental(tmp_path, copy_out=out, last_deep="2026-07-10T21:00:00")
+    assert st["bytes"] is None
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert st["proves"] == db.PROVES_FAILED_PARSE_CONTRADICTION.format(moved="2 file(s)")
+
+
+def test_parse_transferred_files_reads_the_count_line_not_the_byte_line():
+    assert db.parse_transferred_files(COPY_OK) == 5
+    assert db.parse_transferred_files(COPY_INCREMENTAL) == 2
+    # "0 B / 0 B" carries a size unit, so it is the BYTE line and is correctly not read
+    # as a count. Unparseable -> None, which never manufactures a contradiction.
+    assert db.parse_transferred_files(COPY_NOTHING_NEW) is None
+    assert db.parse_transferred_files("Transferred:            0 / 0, 100%\n") == 0
+    assert db.parse_transferred_files("") is None
+    assert db.parse_transferred_files("Elapsed time: 1s\n") is None
+
+
+def test_status_records_the_mode_and_why(tmp_path):
+    st, _ = _incremental(tmp_path, last_deep="2026-07-10T21:00:00")
+    assert st["mode"] == "incremental"
+    assert "explicitly requested" in st["mode_why"]

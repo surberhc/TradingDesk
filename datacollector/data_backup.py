@@ -102,6 +102,64 @@ Tier 2/3 items are recorded in the status JSON under `benign_differences` (count
 capped sample of paths) so a human can audit WHY anything was called benign, and the
 `proves` string NAMES them rather than implying a clean 100%.
 
+TWO CADENCES — WHY THIS JOB NO LONGER RE-HASHES 99 GB EVERY NIGHT (added 2026-07-20)
+------------------------------------------------------------------------------------
+The as-built job did the full thing every single night: `rclone copy --checksum` followed
+by a full, unscoped `rclone check`. BOTH of those recompute the md5 of EVERY local file —
+~499k files / ~99 GB each — so one night cost roughly 200 GB of reads off the local disk.
+The UPLOADS were always tiny and incremental (almost nothing changes day to day); it was
+the VERIFICATION that was full-scope. That much disk churn runs for hours and competes
+directly with the data collectors and a live S8 session for the same spindle. Paying it
+nightly bought very little: the same bytes were re-proven over and over.
+
+So the job now runs in one of two MODES, chosen by itself from the calendar (nothing in
+the scheduled task changed — see choose_mode()):
+
+  INCREMENTAL (most nights). `rclone copy` WITHOUT --checksum, so rclone decides what to
+  upload from size+modtime against the remote's metadata listing — no local hashing at
+  all. `-v` is added so rclone logs one INFO line per copied path; we parse those paths
+  (parse_copied_paths) and write them to a file, then run `rclone check --files-from
+  <that file>` so the checksum verification covers EXACTLY the files this run touched.
+  If nothing was copied, the check is SKIPPED entirely — there is nothing new to prove,
+  and the backup is still exactly as verified as it was yesterday.
+
+  DEEP (Fridays, plus the self-heal below). Unchanged from the original job: full
+  `copy --checksum` and a full unscoped `check`. Every file, both ends, re-hashed. This
+  is the pass that can actually catch bit-rot in a file that was backed up long ago.
+
+  WHY FRIDAY: the deep pass is the long one, and Friday night lets it run into a weekend
+  when the desk is quiet — and lets the machine be turned off Saturday/Sunday without
+  skipping it. If a Friday IS missed (machine off, job failed), DEEP_MAX_AGE_DAYS forces
+  the next run to go deep once the last deep verification is older than that window, so a
+  missed deep night self-heals instead of silently never happening again.
+
+  WHAT INCREMENTAL GIVES UP — say it plainly, because the whole point of this file is
+  that a backup must not claim more than it proved:
+    (a) size+modtime can MISS a content change that preserves both. A file rewritten with
+        identical length and a restored mtime would not be re-uploaded, and incremental
+        would never notice. --checksum (deep) is what catches that.
+    (b) Bit-rot / silent divergence in a file that was already backed up is OUT OF SCOPE
+        of an incremental run — it verifies only what it just copied. Worst case, such a
+        divergence goes unnoticed for one DEEP INTERVAL (a week, bounded by
+        DEEP_MAX_AGE_DAYS) rather than one night. That is the trade we are making, with
+        eyes open: a week of exposure to a rare failure, against hours of nightly disk
+        contention that was itself an operational risk.
+    (c) The copied-path PARSE is the one place in this design where a FAILURE could read
+        as SUCCESS: if rclone's -v INFO wording ever changes, parse_copied_paths returns
+        an empty list, and an empty list is indistinguishable from "nothing new to copy" —
+        a verified success that refreshes the heartbeat while verifying nothing. So the
+        empty case is cross-checked against an INDEPENDENT signal, rclone's own end-of-run
+        stats (parse_transferred_bytes / parse_transferred_files): if rclone says it moved
+        bytes or files while we could not name a single copied path, the two contradict
+        each other, nothing can be scoped for verification, and the run fails CLOSED with
+        PROVES_FAILED_PARSE_CONTRADICTION — a broken parser PAGES instead of silently
+        under-verifying. Zero paths AND zero transferred is the only "nothing new" that
+        still counts as a success.
+    (d) Therefore an incremental run's `proves` string NEVER claims the whole warehouse is
+        verified. It states what it actually proved — the N files it copied this run — and
+        names the date of the last FULL verification for everything else. An honest,
+        smaller claim is the entire design (see PROVES_VERIFIED_INCREMENTAL).
+
 SECRETS
 -------
 The rclone remote token lives in the rclone config file (RCLONE_CONFIG, under the
@@ -110,7 +168,11 @@ can authenticate, but it NEVER reads, prints, echoes, or logs the file's CONTENT
 Nothing here surfaces a token, and rclone's own output does not carry it.
 
 Run:
-    <venv python> data_backup.py            # real run (the DataBackupDaily path)
+    <venv python> data_backup.py            # real run (the DataBackupDaily path); --mode
+                                            #   defaults to auto -> deep on Friday (or if
+                                            #   the last deep is stale), else incremental
+    <venv python> data_backup.py --mode deep         # force the full re-hash pass
+    <venv python> data_backup.py --mode incremental  # force the scoped pass
     <venv python> data_backup.py --dry-run  # rclone --dry-run: transfer nothing, do
                                             #   NOT verify, do NOT refresh the heartbeat
 
@@ -162,6 +224,22 @@ HEARTBEAT_FILE = Path(os.environ.get(
 LOG_FILE = Path(os.environ.get(
     "TRADINGDESK_DATA_BACKUP_LOG", str(BACKUP_DIR / "data_backup.log")))
 
+# The scoped file list an INCREMENTAL run hands to `rclone check --files-from`. It lives
+# under BACKUP_DIR, which is in EXCLUDES below, so this file is NEVER itself backed up
+# (and can never provoke a difference in the very check it scopes).
+VERIFY_LIST_FILE = Path(os.environ.get(
+    "TRADINGDESK_DATA_BACKUP_VERIFY_LIST",
+    str(BACKUP_DIR / "data_backup_verify_list.txt")))
+
+# Which weekday gets the full, everything-re-hashed DEEP pass. Mon=0 … Sun=6; 4 = FRIDAY,
+# so the long pass runs into a quiet weekend and the machine can then be off Sat/Sun.
+DEEP_WEEKDAY = int(os.environ.get("TRADINGDESK_DATA_BACKUP_DEEP_WEEKDAY", 4))
+
+# The self-heal. If the last successful deep verification is older than this many days,
+# the NEXT run goes deep regardless of weekday — so a missed Friday (machine off, job
+# failed) cannot turn into "we quietly never deep-verified again".
+DEEP_MAX_AGE_DAYS = float(os.environ.get("TRADINGDESK_DATA_BACKUP_DEEP_MAX_AGE_DAYS", 8))
+
 # Paths NOT backed up. venv/ is reproducible; backups/ is this job's own bookkeeping
 # (and would recurse); secrets/ must NEVER leave the machine. These MUST match the
 # excludes the first full sync used, or `check` would compare against a differently
@@ -201,6 +279,32 @@ PROVES_VERIFIED_WITH_BENIGN = (
     "created after the run began) — 0 mismatches in the immutable warehouse/raw data. "
     "Those {m} files are NOT proven current in the backup and will be re-copied next "
     "run; everything else IS proven byte-identical")
+# --- INCREMENTAL variants. These must claim LESS, and say so out loud: an incremental
+# run verified only the files it copied, and it says when everything else was last
+# actually proven. Never let one of these grow a sentence about the whole warehouse.
+PROVES_VERIFIED_INCREMENTAL = (
+    "the {n} file(s) newly copied by this run were verified byte-identical (md5) between "
+    "{src} and {remote} — rclone check was scoped to exactly those files (--files-from) "
+    "and reported 0 differences and 0 errors. The REST of the backup was NOT re-verified "
+    "by this run; its last full byte-for-byte verification was {last_deep}")
+PROVES_VERIFIED_INCREMENTAL_WITH_BENIGN = (
+    "the {n} file(s) newly copied by this run were verified byte-identical (md5) between "
+    "{src} and {remote}; {m} benign differences ({v} known-volatile live files that "
+    "changed during the run, {c} files created after the run began) — 0 mismatches in the "
+    "immutable warehouse/raw data. Those {m} files are NOT proven current in the backup "
+    "and will be re-copied next run. The REST of the backup was NOT re-verified by this "
+    "run; its last full byte-for-byte verification was {last_deep}")
+PROVES_VERIFIED_NOTHING_NEW = (
+    "rclone found nothing new to copy, so NO files needed verification this run and none "
+    "was performed — the backup at {remote} is unchanged since the last run, and its last "
+    "full byte-for-byte verification was {last_deep}")
+PROVES_FAILED_PARSE_CONTRADICTION = (
+    "nothing — rclone's own end-of-run stats say this run TRANSFERRED data ({moved}), yet "
+    "not a single copied path could be parsed out of its -v output, so there was nothing "
+    "to hand `rclone check --files-from` and NO file was verified. The most likely cause "
+    "is that rclone's -v INFO line format changed and parse_copied_paths no longer "
+    "matches it; until that parser is updated an incremental run cannot scope its "
+    "verification, so this run is failed CLOSED rather than reported as 'nothing new'")
 PROVES_FAILED = (
     "nothing — this run did not complete a verified data backup; read `errors` for the "
     "failure (rclone copy and rclone check did not BOTH fully succeed), so an "
@@ -299,37 +403,191 @@ def _base_flags() -> list[str]:
     return flags
 
 
-def copy_argv(rclone_path: str, dry_run: bool = False) -> list[str]:
+def copy_argv(rclone_path: str, dry_run: bool = False, deep: bool = True) -> list[str]:
     """`rclone copy SRC REMOTE` — additive, never deletes on the remote (see the
-    COPY-NOT-SYNC note in the module docstring). --checksum forces content comparison
-    on the copy itself; --drive-use-trash=false so an overwrite frees space instead of
-    filling Drive's trash."""
+    COPY-NOT-SYNC note in the module docstring). --drive-use-trash=false so an overwrite
+    frees space instead of filling Drive's trash.
+
+    deep=True (the DEFAULT, so every pre-existing caller keeps the original behaviour):
+        --checksum forces rclone to hash every local file to decide what to upload. This
+        is the expensive pass — ~99 GB of local reads — and it is why it is now weekly.
+    deep=False (incremental): NO --checksum, so rclone decides from size+modtime against
+        the remote's metadata listing and hashes nothing locally. -v is added so rclone
+        logs one INFO line per copied path; parse_copied_paths() turns those lines into
+        the scoped file list the follow-up check verifies.
+    """
     argv = [rclone_path, "copy", str(DATA_SOURCE), RCLONE_REMOTE]
     argv += _base_flags()
-    argv += ["--checksum", "--drive-use-trash=false"]
+    if deep:
+        argv += ["--checksum", "--drive-use-trash=false"]
+    else:
+        argv += ["-v", "--drive-use-trash=false"]
     if dry_run:
         argv += ["--dry-run"]
     return argv
 
 
-def check_argv(rclone_path: str) -> list[str]:
+def check_argv(rclone_path: str, files_from: str | None = None) -> list[str]:
     """`rclone check SRC REMOTE` — recompute + compare hashes (md5) local vs remote.
     This is the integrity proof. rclone check compares by hash by default when both
     ends support it (Google Drive does), so no extra flag is needed to make it a
-    checksum comparison."""
+    checksum comparison.
+
+    files_from (incremental mode only) scopes the check to exactly the paths listed in
+    that file — the ones this run actually copied. With no files_from the check is the
+    original full-scope pass over everything.
+    """
     argv = [rclone_path, "check", str(DATA_SOURCE), RCLONE_REMOTE]
     argv += _base_flags()
+    if files_from:
+        argv += ["--files-from", str(files_from)]
     return argv
 
 
-def _run_copy(rclone_path: str, dry_run: bool):
-    return subprocess.run(copy_argv(rclone_path, dry_run), capture_output=True,
+def _run_copy(rclone_path: str, dry_run: bool, deep: bool = True):
+    return subprocess.run(copy_argv(rclone_path, dry_run, deep=deep), capture_output=True,
                           text=True, timeout=RCLONE_TIMEOUT, check=False)
 
 
-def _run_check(rclone_path: str):
-    return subprocess.run(check_argv(rclone_path), capture_output=True,
-                          text=True, timeout=RCLONE_TIMEOUT, check=False)
+def _run_check(rclone_path: str, files_from: str | None = None):
+    return subprocess.run(check_argv(rclone_path, files_from=files_from),
+                          capture_output=True, text=True, timeout=RCLONE_TIMEOUT,
+                          check=False)
+
+
+# --------------------------------------------------------------------------- #
+# Mode selection — deep (full re-hash) vs incremental (verify only what we copied)
+# --------------------------------------------------------------------------- #
+_WEEKDAY_NAMES = ("Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday",
+                  "Sunday")
+
+
+def _coerce_dt(value) -> dt.datetime | None:
+    """datetime | ISO string | None -> datetime | None. An UNPARSEABLE string comes back
+    as None ON PURPOSE: None means "we cannot prove when the last deep pass was", and the
+    caller then chooses DEEP. Failing toward the more thorough pass is the safe direction;
+    the cost of a needless deep run is disk time, the cost of a needlessly skipped one is
+    unverified data."""
+    if isinstance(value, dt.datetime):
+        return value
+    if isinstance(value, str):
+        try:
+            return dt.datetime.fromisoformat(value.strip())
+        except (ValueError, TypeError):
+            return None
+    return None
+
+
+def choose_mode(now, last_deep, requested: str = "auto") -> tuple[str, str]:
+    """-> (mode, why). mode is "deep" or "incremental"; why is a human sentence recorded
+    in the status file so a reader can always see WHY this run was scoped the way it was.
+
+    The rules, in order:
+      1. An explicit --mode wins, verbatim. The operator is allowed to override.
+      2. Never deep-verified -> deep. There is no baseline to be incremental against.
+      3. Last deep older than DEEP_MAX_AGE_DAYS -> deep. This is the self-heal for a
+         missed deep night.
+      4. It is DEEP_WEEKDAY (Friday) -> deep. The scheduled full pass.
+      5. Otherwise incremental.
+    """
+    if requested in ("deep", "incremental"):
+        return requested, (f"mode '{requested}' was explicitly requested via --mode, so "
+                           f"the weekday/age rules were not consulted")
+
+    parsed = _coerce_dt(last_deep)
+    if parsed is not None and parsed.tzinfo is not None and now.tzinfo is None:
+        parsed = parsed.replace(tzinfo=None)
+
+    if parsed is None:
+        return "deep", ("no usable record of a previous successful deep verification "
+                        "(last_deep_verified is absent or unreadable), so this run does "
+                        "the FULL pass — there is no verified baseline to be incremental "
+                        "against")
+
+    age_days = (now - parsed).total_seconds() / 86400.0
+    if age_days > DEEP_MAX_AGE_DAYS:
+        return "deep", (f"the last full verification was {parsed:%Y-%m-%d %H:%M:%S} "
+                        f"({age_days:.1f} days ago), older than DEEP_MAX_AGE_DAYS="
+                        f"{DEEP_MAX_AGE_DAYS} — this is the self-heal, so a missed deep "
+                        f"night is picked up on the next run instead of never happening")
+    if now.weekday() == DEEP_WEEKDAY:
+        return "deep", (f"today is {_WEEKDAY_NAMES[DEEP_WEEKDAY]}, the scheduled deep "
+                        f"verification night (DEEP_WEEKDAY={DEEP_WEEKDAY})")
+    return "incremental", (f"not {_WEEKDAY_NAMES[DEEP_WEEKDAY]} and the last full "
+                           f"verification ({parsed:%Y-%m-%d %H:%M:%S}, {age_days:.1f} "
+                           f"days ago) is still within DEEP_MAX_AGE_DAYS="
+                           f"{DEEP_MAX_AGE_DAYS}, so only the files copied this run are "
+                           f"verified")
+
+
+def read_last_deep(status_file=None) -> str | None:
+    """The previous run's `last_deep_verified` out of the status JSON, or None.
+
+    NEVER raises: a missing, unreadable, or malformed status file simply means "unknown",
+    and unknown resolves to a DEEP run upstream — the safe direction.
+    """
+    try:
+        raw = Path(status_file or STATUS_FILE).read_text(encoding="utf-8")
+        data = json.loads(raw)
+    except Exception:  # noqa: BLE001 — any failure here means "unknown", never a crash
+        return None
+    if not isinstance(data, dict):
+        return None
+    value = data.get("last_deep_verified")
+    return value if isinstance(value, str) else None
+
+
+# --------------------------------------------------------------------------- #
+# Incremental mode: what did the copy actually copy?
+# --------------------------------------------------------------------------- #
+# rclone at -v logs one INFO line per transferred object, e.g.
+#   2026/07/20 21:00:31 INFO  : warehouse/raw/options/spy/2026-07-20.parquet: Copied (new)
+#   2026/07/20 21:00:31 INFO  : state/paperbot/runs.jsonl: Copied (replaced existing)
+# The path itself may contain colons, so the path group is non-greedy and the reason must
+# START with "Copied" — that anchors the split at the right colon. Non-"Copied" INFO lines
+# (Deleted, Updated, "There was nothing to transfer", stat blocks) are deliberately not
+# matched: only bytes we actually pushed this run need verifying.
+_COPIED_RE = re.compile(r"INFO\s*:\s*(?P<path>.+?)\s*:\s*(?P<reason>Copied\b.*?)\s*$")
+
+
+def parse_copied_paths(text: str) -> list[str]:
+    """rclone -v copy output -> the de-duplicated, ORDER-PRESERVED list of copied paths.
+
+    Forward-slashed and leading './' stripped, but CASE IS PRESERVED — deliberately NOT
+    normalise_path(), which lower-cases. `rclone check --files-from` matches paths
+    case-sensitively, so a lower-cased list would silently fail to match real files and
+    the check would verify nothing while looking clean. That would be exactly the silent
+    green light this job exists to prevent.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+    for line in (text or "").splitlines():
+        m = _COPIED_RE.search(line)
+        if not m:
+            continue
+        p = m.group("path").strip().strip('"').replace("\\", "/")
+        while p.startswith("./"):
+            p = p[2:]
+        p = p.lstrip("/")
+        if not p or p in seen:
+            continue
+        seen.add(p)
+        out.append(p)
+    return out
+
+
+def write_verify_list(paths, path=None) -> Path:
+    """Write the scoped file list for `rclone check --files-from`, one path per line.
+
+    Lands in BACKUP_DIR, which is in EXCLUDES, so this file is never itself backed up and
+    can never show up as a difference in the very check it scopes.
+    """
+    target = Path(path or VERIFY_LIST_FILE)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    with open(target, "w", encoding="utf-8", newline="\n") as f:
+        for p in paths:
+            f.write(f"{p}\n")
+    return target
 
 
 # --------------------------------------------------------------------------- #
@@ -616,6 +874,28 @@ def parse_transferred_bytes(text: str) -> int | None:
     return int(value * mult)
 
 
+# The OTHER 'Transferred:' line — the FILE COUNT, e.g. "Transferred:  5 / 5, 100%".
+# It is distinguishable from the byte line because the byte line always carries a size
+# unit before the '/', so a bare integer immediately followed by '/' can only be the
+# count. Best-effort in the SAFE direction: an unparseable value is None, and None never
+# manufactures a failure — this figure is only ever used to CONTRADICT a claim that
+# nothing was copied.
+_TRANSFERRED_FILES_RE = re.compile(r"Transferred:\s*(\d+)\s*/\s*\d+", re.IGNORECASE)
+
+
+def parse_transferred_files(text: str) -> int | None:
+    """Best-effort file COUNT from rclone copy's end-of-run stats. -> int|None."""
+    if not text:
+        return None
+    m = _TRANSFERRED_FILES_RE.search(text)
+    if not m:
+        return None
+    try:
+        return int(m.group(1))
+    except ValueError:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Status / heartbeat — heartbeat refreshed ONLY on verified success
 # --------------------------------------------------------------------------- #
@@ -657,10 +937,11 @@ def touch_heartbeat(text: str, *, heartbeat_file=None) -> None:
 # --------------------------------------------------------------------------- #
 # The job — injectable so tests drive it offline (no real rclone, no transfers)
 # --------------------------------------------------------------------------- #
-def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, copy_fn=None,
-               check_fn=None, parse_fn=None, bytes_fn=None, status_fn=None,
+def run_backup(*, now=None, dry_run: bool = False, mode: str = "auto", resolve_fn=None,
+               copy_fn=None, check_fn=None, parse_fn=None, bytes_fn=None, status_fn=None,
                heartbeat_fn=None, log_fn=None, errors_fn=None, mtime_fn=None,
-               run_start=None) -> dict:
+               run_start=None, last_deep_fn=None, copied_fn=None,
+               verify_list_fn=None) -> dict:
     """One data-backup run. Returns the status dict. Never raises for policy reasons.
 
     THE INVARIANT, stated once so it cannot be lost in a refactor:
@@ -679,6 +960,13 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, copy_fn=None
 
     A --dry-run passes rclone --dry-run to copy, runs NO check, and is NEVER a success
     (ok stays False, heartbeat untouched) — the same contract repo_backup.py uses.
+
+    MODE ("auto" | "deep" | "incremental"; see choose_mode and the TWO CADENCES section of
+    the module docstring). Deep behaves exactly as this job always has. Incremental scopes
+    the verification to the files this run copied, and its `proves` string claims only
+    those — it NEVER claims the whole warehouse. The tier classification, the accounting
+    gates, and the heartbeat invariant above are IDENTICAL in both modes; only the SCOPE
+    of what was verified differs, and the scope is stated honestly in `proves`.
     """
     log_fn = log_fn or log
     resolve_fn = resolve_fn or resolve_rclone
@@ -689,11 +977,23 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, copy_fn=None
     status_fn = status_fn or write_status
     heartbeat_fn = heartbeat_fn or touch_heartbeat
     errors_fn = errors_fn or parse_check_errors
+    last_deep_fn = last_deep_fn or read_last_deep
+    copied_fn = copied_fn or parse_copied_paths
+    verify_list_fn = verify_list_fn or write_verify_list
 
     now = now or dt.datetime.now()
     # Captured BEFORE rclone is launched. Tier 3 ("created during the run") is decided
     # against this instant, so it must be the earliest possible moment of the run.
     run_start = run_start if run_start is not None else now.timestamp()
+
+    # Resolve the mode FIRST: it decides the copy flags, so nothing may run before it.
+    prev_deep = last_deep_fn()
+    mode, mode_why = choose_mode(now, prev_deep, mode)
+    # Normalised to a string for the status file, and carried forward on EVERY run so a
+    # run that is not deep can never erase the record of when the last deep pass was.
+    carried_deep = _coerce_dt(prev_deep)
+    carried_deep = carried_deep.isoformat(timespec="seconds") if carried_deep else None
+    last_deep_display = carried_deep or "never"
 
     st: dict = {
         "job": "data_backup",
@@ -703,6 +1003,14 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, copy_fn=None
         "remote": RCLONE_REMOTE,
         "rclone_path": None,
         "rclone_note": None,
+        # Which cadence this run used, and WHY — recorded so a reader of the status file
+        # never has to guess how much this run actually verified.
+        "mode": mode,
+        "mode_why": mode_why,
+        # Carried forward on every run; only a SUCCESSFUL DEEP run advances it.
+        "last_deep_verified": carried_deep,
+        # Incremental only: how many paths rclone reported copying (None in deep mode).
+        "copied_count": None,
         "copy_returncode": None,
         "check_returncode": None,
         "files_checked": None,
@@ -738,10 +1046,13 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, copy_fn=None
     if not rclone_path:
         return _fail(rnote)
     log_fn(f"rclone {rnote}")
+    log_fn(f"mode={mode} ({mode_why}); last full verification: {last_deep_display}")
 
     # 2. Copy (additive; never deletes on the remote). --dry-run passes through.
+    #    `deep` goes by KEYWORD so the positional (rclone_path, dry_run) contract that
+    #    existing callers and test doubles rely on is untouched.
     try:
-        proc = copy_fn(rclone_path, dry_run)
+        proc = copy_fn(rclone_path, dry_run, deep=(mode == "deep"))
     except subprocess.TimeoutExpired as e:
         return _fail(f"rclone copy TIMED OUT after {RCLONE_TIMEOUT}s ({e!r})")
     except Exception as e:  # noqa: BLE001
@@ -768,8 +1079,66 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, copy_fn=None
     # 4. VERIFY. The copy exiting 0 says rclone THINKS it wrote the bytes; it is not
     #    proof the remote holds the same bytes. `rclone check` recomputes and compares
     #    checksums (md5) local vs remote — THIS is the integrity proof, not step 2.
+    #
+    #    DEEP verifies everything (files_from stays None). INCREMENTAL verifies exactly
+    #    the paths this run copied, and if it copied NOTHING there is nothing to verify:
+    #    that is a legitimate verified state (the backup is unchanged and therefore still
+    #    as current as it was), not a skipped check — and `proves` says so precisely.
+    files_from = None
+    if mode != "deep":
+        copied = copied_fn(combined)
+        st["copied_count"] = len(copied)
+        log_fn(f"incremental: rclone reported {len(copied)} copied path(s)")
+        if not copied:
+            # THE PARSE-FAILURE GUARD. An empty copied-path list is read as "nothing new
+            # to copy" — a legitimate verified success. But it is ALSO exactly what a
+            # BROKEN PARSER produces, and a parse failure that reads as good news is the
+            # silent green light this whole file exists to prevent. So cross-check it
+            # against an INDEPENDENT signal: rclone's own end-of-run stats. If rclone says
+            # it moved bytes (or files) while we could not name a single copied path, the
+            # two disagree, nothing can be scoped for verification, and we fail CLOSED.
+            moved = []
+            if isinstance(st["bytes"], int) and st["bytes"] > 0:
+                moved.append(f"{st['bytes']} byte(s)")
+            n_files = parse_transferred_files(combined)
+            if isinstance(n_files, int) and n_files > 0:
+                moved.append(f"{n_files} file(s)")
+            if moved:
+                st["proves"] = PROVES_FAILED_PARSE_CONTRADICTION.format(
+                    moved=" and ".join(moved))
+                msg = (f"CONTRADICTION: rclone's copy stats report {' and '.join(moved)} "
+                       f"transferred, but parse_copied_paths found ZERO copied paths in "
+                       f"its -v output — so nothing could be handed to `rclone check "
+                       f"--files-from` and NOTHING was verified. Most likely rclone's -v "
+                       f"INFO line wording changed and parse_copied_paths no longer "
+                       f"matches; the parser needs updating. Refusing to report 'nothing "
+                       f"new to copy' — failing closed, heartbeat NOT refreshed.")
+                st["errors"].append(msg)
+                st["ok"] = False
+                log_fn(f"FAIL: {msg}")
+                status_fn(st)
+                return st
+            st["ok"] = True
+            st["proves"] = PROVES_VERIFIED_NOTHING_NEW.format(
+                remote=RCLONE_REMOTE, last_deep=last_deep_display)
+            status_fn(st)
+            heartbeat_fn(
+                f"{now:%Y-%m-%d %H:%M:%S}  data backup verified  source={DATA_SOURCE} "
+                f"remote={RCLONE_REMOTE} files_checked=0 bytes_this_run={st['bytes']} "
+                f"check=nothing-new-to-verify mode={mode} copied=0 "
+                f"benign_differences=0")
+            log_fn(f"SUCCESS: nothing new to copy, so nothing needed verification "
+                   f"(mode={mode}) -> {RCLONE_REMOTE}")
+            return st
+        try:
+            files_from = str(verify_list_fn(copied))
+        except Exception as e:  # noqa: BLE001 — no list means no scoped proof; fail closed
+            return _fail(f"could not write the scoped verify list ({e!r}) — refusing to "
+                         f"run an unscoped or unverified check")
+
     try:
-        cproc = check_fn(rclone_path)
+        cproc = check_fn(rclone_path) if files_from is None else check_fn(
+            rclone_path, files_from=files_from)
     except subprocess.TimeoutExpired as e:
         return _fail(f"rclone check TIMED OUT after {RCLONE_TIMEOUT}s ({e!r})")
     except Exception as e:  # noqa: BLE001
@@ -842,21 +1211,39 @@ def run_backup(*, now=None, dry_run: bool = False, resolve_fn=None, copy_fn=None
     st["ok"] = True
     n = st["files_checked"]
     benign = len(tier2) + len(tier3)
-    if benign:
-        st["proves"] = PROVES_VERIFIED_WITH_BENIGN.format(
-            n=n if isinstance(n, int) else "an unparseable number of",
-            m=benign, v=len(tier2), c=len(tier3),
-            src=DATA_SOURCE, remote=RCLONE_REMOTE)
-    elif isinstance(n, int):
-        st["proves"] = PROVES_VERIFIED.format(n=n, src=DATA_SOURCE, remote=RCLONE_REMOTE)
+    if mode == "deep":
+        # A clean deep pass is the ONLY thing that advances this clock — it is the only
+        # run that actually re-proved the whole warehouse.
+        st["last_deep_verified"] = now.isoformat(timespec="seconds")
+        if benign:
+            st["proves"] = PROVES_VERIFIED_WITH_BENIGN.format(
+                n=n if isinstance(n, int) else "an unparseable number of",
+                m=benign, v=len(tier2), c=len(tier3),
+                src=DATA_SOURCE, remote=RCLONE_REMOTE)
+        elif isinstance(n, int):
+            st["proves"] = PROVES_VERIFIED.format(n=n, src=DATA_SOURCE,
+                                                  remote=RCLONE_REMOTE)
+        else:
+            st["proves"] = PROVES_VERIFIED_NO_COUNT.format(src=DATA_SOURCE,
+                                                           remote=RCLONE_REMOTE)
     else:
-        st["proves"] = PROVES_VERIFIED_NO_COUNT.format(src=DATA_SOURCE,
-                                                       remote=RCLONE_REMOTE)
+        # Incremental claims ONLY the files it copied, and names when everything else was
+        # last actually proven.
+        copied_n = st["copied_count"]
+        if benign:
+            st["proves"] = PROVES_VERIFIED_INCREMENTAL_WITH_BENIGN.format(
+                n=copied_n, m=benign, v=len(tier2), c=len(tier3),
+                src=DATA_SOURCE, remote=RCLONE_REMOTE, last_deep=last_deep_display)
+        else:
+            st["proves"] = PROVES_VERIFIED_INCREMENTAL.format(
+                n=copied_n, src=DATA_SOURCE, remote=RCLONE_REMOTE,
+                last_deep=last_deep_display)
     status_fn(st)
     heartbeat_fn(
         f"{now:%Y-%m-%d %H:%M:%S}  data backup verified  source={DATA_SOURCE} "
         f"remote={RCLONE_REMOTE} files_checked={n} bytes_this_run={st['bytes']} "
-        f"check=0-tier1-failures benign_differences={benign}")
+        f"check=0-tier1-failures mode={mode} copied={st['copied_count']} "
+        f"benign_differences={benign}")
     for d in tier2 + tier3:
         log_fn(f"benign (tier {d['tier']}): {d['path']} [{d['reason']}] — {d['why']}")
     log_fn(f"SUCCESS: verified data backup ({st['check_result']}; "
@@ -870,10 +1257,15 @@ def main() -> int:
     ap.add_argument("--dry-run", action="store_true",
                     help="pass rclone --dry-run to copy: transfer nothing, run NO "
                          "checksum verification, and never refresh the heartbeat.")
+    ap.add_argument("--mode", choices=("auto", "incremental", "deep"), default="auto",
+                    help="auto (default): DEEP on DEEP_WEEKDAY (Friday) or if the last "
+                         "deep verification is older than DEEP_MAX_AGE_DAYS, else "
+                         "INCREMENTAL. deep: full re-hash of everything. incremental: "
+                         "verify only the files this run copied.")
     args = ap.parse_args()
 
     try:
-        st = run_backup(dry_run=args.dry_run)
+        st = run_backup(dry_run=args.dry_run, mode=args.mode)
     except Exception as e:  # noqa: BLE001 — an unexpected error is still a FAILED backup
         log(f"UNEXPECTED ERROR (reporting failure, NOT success): {e!r}")
         return 2
