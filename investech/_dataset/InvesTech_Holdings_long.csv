@@ -1,0 +1,401 @@
+Issue Date,Symbol,Fund,Weight %
+2023-01-20,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,50
+2023-01-20,XLV,Health Care Select Sector SPDR,12
+2023-01-20,XLP,Consumer Staples Select Sector SPDR,7
+2023-01-20,XLE,Energy Select Sector SPDR,6
+2023-01-20,XLI,Industrial Select Sector SPDR,6
+2023-01-20,XLU,Utilities Select Sector SPDR,2
+2023-01-20,RYT,Invesco S&P 500 Equal Weight Technology (old ticker),6
+2023-01-20,FSTCX,Fidelity Select Communication Services,3
+2023-01-20,XLF,Financial Select Sector SPDR,3
+2023-01-20,GDX,VanEck Gold Miners ETF,5
+2023-02-17,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,47
+2023-02-17,XLV,Health Care Select Sector SPDR,12
+2023-02-17,XLP,Consumer Staples Select Sector SPDR,7
+2023-02-17,XLE,Energy Select Sector SPDR,6
+2023-02-17,XLI,Industrial Select Sector SPDR,8
+2023-02-17,XLU,Utilities Select Sector SPDR,2
+2023-02-17,RYT,Invesco S&P 500 Equal Weight Technology (old ticker),6
+2023-02-17,FSTCX,Fidelity Select Communication Services,3
+2023-02-17,XLF,Financial Select Sector SPDR,3
+2023-02-17,GDX,VanEck Gold Miners ETF,6
+2023-03-17,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,47
+2023-03-17,XLV,Health Care Select Sector SPDR,12
+2023-03-17,XLP,Consumer Staples Select Sector SPDR,7
+2023-03-17,XLE,Energy Select Sector SPDR,6
+2023-03-17,XLI,Industrial Select Sector SPDR,8
+2023-03-17,XLU,Utilities Select Sector SPDR,2
+2023-03-17,RYT,Invesco S&P 500 Equal Weight Technology (old ticker),6
+2023-03-17,FSTCX,Fidelity Select Communication Services,3
+2023-03-17,XLF,Financial Select Sector SPDR,3
+2023-03-17,GDX,VanEck Gold Miners ETF,6
+2023-04-21,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,52
+2023-04-21,XLV,Health Care Select Sector SPDR,12
+2023-04-21,XLP,Consumer Staples Select Sector SPDR,7
+2023-04-21,XLE,Energy Select Sector SPDR,4
+2023-04-21,XLI,Industrial Select Sector SPDR,8
+2023-04-21,XLU,Utilities Select Sector SPDR,2
+2023-04-21,RYT,Invesco S&P 500 Equal Weight Technology (old ticker),6
+2023-04-21,FSTCX,Fidelity Select Communication Services,3
+2023-04-21,GDX,VanEck Gold Miners ETF,6
+2023-05-19,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,52
+2023-05-19,XLV,Health Care Select Sector SPDR,12
+2023-05-19,XLP,Consumer Staples Select Sector SPDR,7
+2023-05-19,XLE,Energy Select Sector SPDR,4
+2023-05-19,XLI,Industrial Select Sector SPDR,8
+2023-05-19,XLU,Utilities Select Sector SPDR,2
+2023-05-19,RYT,Invesco S&P 500 Equal Weight Technology (old ticker),6
+2023-05-19,FSTCX,Fidelity Select Communication Services,3
+2023-05-19,GDX,VanEck Gold Miners ETF,6
+2023-06-16,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,52
+2023-06-16,XLV,Health Care Select Sector SPDR,12
+2023-06-16,XLP,Consumer Staples Select Sector SPDR,7
+2023-06-16,XLE,Energy Select Sector SPDR,4
+2023-06-16,XLI,Industrial Select Sector SPDR,8
+2023-06-16,XLU,Utilities Select Sector SPDR,2
+2023-06-16,RSPT,Invesco S&P 500 Equal Weight Technology,6
+2023-06-16,FSTCX,Fidelity Select Communication Services,3
+2023-06-16,GDX,VanEck Gold Miners ETF,6
+2023-07-21,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,49
+2023-07-21,XLV,Health Care Select Sector SPDR,12
+2023-07-21,NOBL,ProShares S&P 500 Dividend Aristocrats,8
+2023-07-21,XLP,Consumer Staples Select Sector SPDR,7
+2023-07-21,XLE,Energy Select Sector SPDR,4
+2023-07-21,XLI,Industrial Select Sector SPDR,8
+2023-07-21,XLU,Utilities Select Sector SPDR,2
+2023-07-21,RSPT,Invesco S&P 500 Equal Weight Technology,4
+2023-07-21,GDX,VanEck Gold Miners ETF,6
+2023-08-18,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,49
+2023-08-18,XLV,Health Care Select Sector SPDR,12
+2023-08-18,NOBL,ProShares S&P 500 Dividend Aristocrats,8
+2023-08-18,XLP,Consumer Staples Select Sector SPDR,7
+2023-08-18,XLE,Energy Select Sector SPDR,4
+2023-08-18,XLI,Industrial Select Sector SPDR,8
+2023-08-18,XLU,Utilities Select Sector SPDR,2
+2023-08-18,RSPT,Invesco S&P 500 Equal Weight Technology,4
+2023-08-18,GDX,VanEck Gold Miners ETF,6
+2023-09-15,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,49
+2023-09-15,XLV,Health Care Select Sector SPDR,12
+2023-09-15,NOBL,ProShares S&P 500 Dividend Aristocrats,8
+2023-09-15,XLP,Consumer Staples Select Sector SPDR,7
+2023-09-15,XLE,Energy Select Sector SPDR,4
+2023-09-15,XLI,Industrial Select Sector SPDR,8
+2023-09-15,XLU,Utilities Select Sector SPDR,2
+2023-09-15,RSPT,Invesco S&P 500 Equal Weight Technology,4
+2023-09-15,GDX,VanEck Gold Miners ETF,6
+2023-10-20,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,55
+2023-10-20,XLV,Health Care Select Sector SPDR,12
+2023-10-20,NOBL,ProShares S&P 500 Dividend Aristocrats,8
+2023-10-20,XLP,Consumer Staples Select Sector SPDR,7
+2023-10-20,XLE,Energy Select Sector SPDR,4
+2023-10-20,XLI,Industrial Select Sector SPDR,5
+2023-10-20,XLU,Utilities Select Sector SPDR,2
+2023-10-20,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2023-10-20,GDX,VanEck Gold Miners ETF,4
+2023-11-17,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,51
+2023-11-17,XLV,Health Care Select Sector SPDR,12
+2023-11-17,NOBL,ProShares S&P 500 Dividend Aristocrats,12
+2023-11-17,XLP,Consumer Staples Select Sector SPDR,7
+2023-11-17,XLE,Energy Select Sector SPDR,4
+2023-11-17,XLI,Industrial Select Sector SPDR,5
+2023-11-17,XLU,Utilities Select Sector SPDR,2
+2023-11-17,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2023-11-17,GDX,VanEck Gold Miners ETF,4
+2023-12-15,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,51
+2023-12-15,XLV,Health Care Select Sector SPDR,12
+2023-12-15,NOBL,ProShares S&P 500 Dividend Aristocrats,12
+2023-12-15,XLP,Consumer Staples Select Sector SPDR,7
+2023-12-15,XLE,Energy Select Sector SPDR,4
+2023-12-15,XLI,Industrial Select Sector SPDR,5
+2023-12-15,XLU,Utilities Select Sector SPDR,2
+2023-12-15,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2023-12-15,GDX,VanEck Gold Miners ETF,4
+2024-01-19,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,51
+2024-01-19,XLV,Health Care Select Sector SPDR,12
+2024-01-19,NOBL,ProShares S&P 500 Dividend Aristocrats,12
+2024-01-19,XLP,Consumer Staples Select Sector SPDR,7
+2024-01-19,XLE,Energy Select Sector SPDR,4
+2024-01-19,XLI,Industrial Select Sector SPDR,5
+2024-01-19,XLU,Utilities Select Sector SPDR,2
+2024-01-19,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-01-19,GDX,VanEck Gold Miners ETF,4
+2024-02-16,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,51
+2024-02-16,XLV,Health Care Select Sector SPDR,12
+2024-02-16,NOBL,ProShares S&P 500 Dividend Aristocrats,12
+2024-02-16,XLP,Consumer Staples Select Sector SPDR,7
+2024-02-16,XLE,Energy Select Sector SPDR,4
+2024-02-16,XLI,Industrial Select Sector SPDR,5
+2024-02-16,XLU,Utilities Select Sector SPDR,2
+2024-02-16,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-02-16,GDX,VanEck Gold Miners ETF,4
+2024-03-15,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,47
+2024-03-15,XLV,Health Care Select Sector SPDR,12
+2024-03-15,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-03-15,XLP,Consumer Staples Select Sector SPDR,7
+2024-03-15,XLE,Energy Select Sector SPDR,4
+2024-03-15,XLI,Industrial Select Sector SPDR,5
+2024-03-15,XLU,Utilities Select Sector SPDR,2
+2024-03-15,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-03-15,GDX,VanEck Gold Miners ETF,4
+2024-04-19,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,42
+2024-04-19,XLV,Health Care Select Sector SPDR,12
+2024-04-19,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-04-19,XLP,Consumer Staples Select Sector SPDR,7
+2024-04-19,XLE,Energy Select Sector SPDR,6
+2024-04-19,XLI,Industrial Select Sector SPDR,5
+2024-04-19,XLU,Utilities Select Sector SPDR,2
+2024-04-19,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-04-19,IWM,iShares Russell 2000 ETF,3
+2024-04-19,GDX,VanEck Gold Miners ETF,4
+2024-05-17,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,42
+2024-05-17,XLV,Health Care Select Sector SPDR,12
+2024-05-17,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-05-17,XLP,Consumer Staples Select Sector SPDR,7
+2024-05-17,XLE,Energy Select Sector SPDR,6
+2024-05-17,XLI,Industrial Select Sector SPDR,5
+2024-05-17,XLU,Utilities Select Sector SPDR,2
+2024-05-17,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-05-17,IWM,iShares Russell 2000 ETF,3
+2024-05-17,GDX,VanEck Gold Miners ETF,4
+2024-06-21,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,42
+2024-06-21,XLV,Health Care Select Sector SPDR,12
+2024-06-21,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-06-21,XLP,Consumer Staples Select Sector SPDR,7
+2024-06-21,XLE,Energy Select Sector SPDR,6
+2024-06-21,XLI,Industrial Select Sector SPDR,5
+2024-06-21,XLU,Utilities Select Sector SPDR,2
+2024-06-21,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-06-21,IWM,iShares Russell 2000 ETF,3
+2024-06-21,GDX,VanEck Gold Miners ETF,4
+2024-07-19,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,42
+2024-07-19,XLV,Health Care Select Sector SPDR,12
+2024-07-19,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-07-19,XLP,Consumer Staples Select Sector SPDR,7
+2024-07-19,XLE,Energy Select Sector SPDR,6
+2024-07-19,XLI,Industrial Select Sector SPDR,5
+2024-07-19,XLU,Utilities Select Sector SPDR,2
+2024-07-19,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-07-19,IWM,iShares Russell 2000 ETF,3
+2024-07-19,GDX,VanEck Gold Miners ETF,4
+2024-08-16,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,45
+2024-08-16,XLV,Health Care Select Sector SPDR,12
+2024-08-16,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-08-16,XLP,Consumer Staples Select Sector SPDR,7
+2024-08-16,XLE,Energy Select Sector SPDR,6
+2024-08-16,XLI,Industrial Select Sector SPDR,5
+2024-08-16,XLU,Utilities Select Sector SPDR,2
+2024-08-16,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-08-16,GDX,VanEck Gold Miners ETF,4
+2024-09-20,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,45
+2024-09-20,XLV,Health Care Select Sector SPDR,12
+2024-09-20,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-09-20,XLP,Consumer Staples Select Sector SPDR,7
+2024-09-20,XLE,Energy Select Sector SPDR,6
+2024-09-20,XLI,Industrial Select Sector SPDR,5
+2024-09-20,XLU,Utilities Select Sector SPDR,2
+2024-09-20,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-09-20,GDX,VanEck Gold Miners ETF,4
+2024-10-18,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,45
+2024-10-18,XLV,Health Care Select Sector SPDR,12
+2024-10-18,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-10-18,XLP,Consumer Staples Select Sector SPDR,7
+2024-10-18,XLE,Energy Select Sector SPDR,6
+2024-10-18,XLI,Industrial Select Sector SPDR,5
+2024-10-18,XLU,Utilities Select Sector SPDR,2
+2024-10-18,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-10-18,GDX,VanEck Gold Miners ETF,4
+2024-11-15,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,43
+2024-11-15,XLV,Health Care Select Sector SPDR,12
+2024-11-15,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-11-15,XLP,Consumer Staples Select Sector SPDR,7
+2024-11-15,XLE,Energy Select Sector SPDR,6
+2024-11-15,XLI,Industrial Select Sector SPDR,6
+2024-11-15,XLU,Utilities Select Sector SPDR,2
+2024-11-15,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-11-15,GDX,VanEck Gold Miners ETF,5
+2024-12-20,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,39
+2024-12-20,XLV,Health Care Select Sector SPDR,12
+2024-12-20,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2024-12-20,XLP,Consumer Staples Select Sector SPDR,7
+2024-12-20,XLE,Energy Select Sector SPDR,6
+2024-12-20,XLI,Industrial Select Sector SPDR,8
+2024-12-20,XLU,Utilities Select Sector SPDR,4
+2024-12-20,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2024-12-20,GDX,VanEck Gold Miners ETF,5
+2025-01-17,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,36
+2025-01-17,XLV,Health Care Select Sector SPDR,12
+2025-01-17,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-01-17,XLP,Consumer Staples Select Sector SPDR,7
+2025-01-17,XLE,Energy Select Sector SPDR,6
+2025-01-17,XLI,Industrial Select Sector SPDR,8
+2025-01-17,XLU,Utilities Select Sector SPDR,4
+2025-01-17,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2025-01-17,GDX,VanEck Gold Miners ETF,5
+2025-01-17,SPDN,Direxion Daily S&P 500 Bear 1X ETF,3
+2025-02-21,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,36
+2025-02-21,XLV,Health Care Select Sector SPDR,12
+2025-02-21,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-02-21,XLP,Consumer Staples Select Sector SPDR,7
+2025-02-21,XLE,Energy Select Sector SPDR,6
+2025-02-21,XLI,Industrial Select Sector SPDR,8
+2025-02-21,XLU,Utilities Select Sector SPDR,4
+2025-02-21,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2025-02-21,GDX,VanEck Gold Miners ETF,5
+2025-02-21,SPDN,Direxion Daily S&P 500 Bear 1X ETF,3
+2025-03-21,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,36
+2025-03-21,XLV,Health Care Select Sector SPDR,12
+2025-03-21,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-03-21,XLP,Consumer Staples Select Sector SPDR,7
+2025-03-21,XLE,Energy Select Sector SPDR,6
+2025-03-21,XLI,Industrial Select Sector SPDR,8
+2025-03-21,XLU,Utilities Select Sector SPDR,4
+2025-03-21,RSPT,Invesco S&P 500 Equal Weight Technology,3
+2025-03-21,GDX,VanEck Gold Miners ETF,5
+2025-03-21,SPDN,Direxion Daily S&P 500 Bear 1X ETF,3
+2025-04-18,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,40
+2025-04-18,XLV,Health Care Select Sector SPDR,12
+2025-04-18,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-04-18,XLP,Consumer Staples Select Sector SPDR,7
+2025-04-18,XLE,Energy Select Sector SPDR,6
+2025-04-18,XLI,Industrial Select Sector SPDR,8
+2025-04-18,XLU,Utilities Select Sector SPDR,4
+2025-04-18,GDX,VanEck Gold Miners ETF,4
+2025-04-18,SPDN,Direxion Daily S&P 500 Bear 1X ETF,3
+2025-05-16,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,40
+2025-05-16,XLV,Health Care Select Sector SPDR,12
+2025-05-16,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-05-16,XLP,Consumer Staples Select Sector SPDR,7
+2025-05-16,XLE,Energy Select Sector SPDR,6
+2025-05-16,XLI,Industrial Select Sector SPDR,8
+2025-05-16,XLU,Utilities Select Sector SPDR,4
+2025-05-16,GDX,VanEck Gold Miners ETF,4
+2025-05-16,SPDN,Direxion Daily S&P 500 Bear 1X ETF,3
+2025-06-20,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,43
+2025-06-20,XLV,Health Care Select Sector SPDR,12
+2025-06-20,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-06-20,XLP,Consumer Staples Select Sector SPDR,7
+2025-06-20,XLE,Energy Select Sector SPDR,6
+2025-06-20,XLI,Industrial Select Sector SPDR,8
+2025-06-20,XLU,Utilities Select Sector SPDR,4
+2025-06-20,GDX,VanEck Gold Miners ETF,4
+2025-07-18,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,43
+2025-07-18,XLV,Health Care Select Sector SPDR,12
+2025-07-18,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-07-18,XLP,Consumer Staples Select Sector SPDR,7
+2025-07-18,XLE,Energy Select Sector SPDR,6
+2025-07-18,XLI,Industrial Select Sector SPDR,8
+2025-07-18,XLU,Utilities Select Sector SPDR,4
+2025-07-18,GDX,VanEck Gold Miners ETF,4
+2025-08-15,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,43
+2025-08-15,XLV,Health Care Select Sector SPDR,12
+2025-08-15,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-08-15,XLP,Consumer Staples Select Sector SPDR,7
+2025-08-15,XLE,Energy Select Sector SPDR,6
+2025-08-15,XLI,Industrial Select Sector SPDR,8
+2025-08-15,XLU,Utilities Select Sector SPDR,4
+2025-08-15,GDX,VanEck Gold Miners ETF,4
+2025-09-19,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,38
+2025-09-19,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2025-09-19,XLV,Health Care Select Sector SPDR,12
+2025-09-19,NOBL,ProShares S&P 500 Dividend Aristocrats,16
+2025-09-19,XLP,Consumer Staples Select Sector SPDR,7
+2025-09-19,XLE,Energy Select Sector SPDR,6
+2025-09-19,XLI,Industrial Select Sector SPDR,8
+2025-09-19,XLU,Utilities Select Sector SPDR,4
+2025-09-19,GDX,VanEck Gold Miners ETF,4
+2025-10-17,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,38
+2025-10-17,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2025-10-17,XLV,Health Care Select Sector SPDR,12
+2025-10-17,NOBL,ProShares S&P 500 Dividend Aristocrats,15
+2025-10-17,XLP,Consumer Staples Select Sector SPDR,6
+2025-10-17,XLE,Energy Select Sector SPDR,5
+2025-10-17,XLI,Industrial Select Sector SPDR,8
+2025-10-17,XLU,Utilities Select Sector SPDR,4
+2025-10-17,GDX,VanEck Gold Miners ETF,7
+2025-11-21,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,35
+2025-11-21,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2025-11-21,XLV,Health Care Select Sector SPDR,12
+2025-11-21,NOBL,ProShares S&P 500 Dividend Aristocrats,15
+2025-11-21,XLP,Consumer Staples Select Sector SPDR,6
+2025-11-21,XLE,Energy Select Sector SPDR,5
+2025-11-21,XLI,Industrial Select Sector SPDR,8
+2025-11-21,XLU,Utilities Select Sector SPDR,4
+2025-11-21,GDX,VanEck Gold Miners ETF,5
+2025-11-21,SPDN,Direxion Daily S&P 500 Bear 1X ETF,5
+2025-12-19,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,32
+2025-12-19,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2025-12-19,TRMCX,T. Rowe Price Mid-Cap Value Fund,5
+2025-12-19,XLV,Health Care Select Sector SPDR,12
+2025-12-19,NOBL,ProShares S&P 500 Dividend Aristocrats,13
+2025-12-19,XLP,Consumer Staples Select Sector SPDR,6
+2025-12-19,XLE,Energy Select Sector SPDR,5
+2025-12-19,XLI,Industrial Select Sector SPDR,8
+2025-12-19,XLU,Utilities Select Sector SPDR,4
+2025-12-19,GDX,VanEck Gold Miners ETF,5
+2025-12-19,SPDN,Direxion Daily S&P 500 Bear 1X ETF,5
+2026-01-16,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,30
+2026-01-16,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2026-01-16,TRMCX,T. Rowe Price Mid-Cap Value Fund,7
+2026-01-16,XLV,Health Care Select Sector SPDR,12
+2026-01-16,NOBL,ProShares S&P 500 Dividend Aristocrats,13
+2026-01-16,XLP,Consumer Staples Select Sector SPDR,6
+2026-01-16,XLE,Energy Select Sector SPDR,5
+2026-01-16,XLI,Industrial Select Sector SPDR,8
+2026-01-16,XLU,Utilities Select Sector SPDR,4
+2026-01-16,GDX,VanEck Gold Miners ETF,5
+2026-01-16,SPDN,Direxion Daily S&P 500 Bear 1X ETF,5
+2026-02-20,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,30
+2026-02-20,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2026-02-20,TRMCX,T. Rowe Price Mid-Cap Value Fund,7
+2026-02-20,XLV,Health Care Select Sector SPDR,12
+2026-02-20,NOBL,ProShares S&P 500 Dividend Aristocrats,13
+2026-02-20,XLP,Consumer Staples Select Sector SPDR,6
+2026-02-20,XLE,Energy Select Sector SPDR,5
+2026-02-20,XLI,Industrial Select Sector SPDR,8
+2026-02-20,XLU,Utilities Select Sector SPDR,4
+2026-02-20,GDX,VanEck Gold Miners ETF,3
+2026-02-20,SPDN,Direxion Daily S&P 500 Bear 1X ETF,7
+2026-03-20,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,30
+2026-03-20,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2026-03-20,TRMCX,T. Rowe Price Mid-Cap Value Fund,7
+2026-03-20,XLV,Health Care Select Sector SPDR,12
+2026-03-20,NOBL,ProShares S&P 500 Dividend Aristocrats,13
+2026-03-20,XLP,Consumer Staples Select Sector SPDR,6
+2026-03-20,XLE,Energy Select Sector SPDR,5
+2026-03-20,XLI,Industrial Select Sector SPDR,8
+2026-03-20,XLU,Utilities Select Sector SPDR,4
+2026-03-20,GDX,VanEck Gold Miners ETF,3
+2026-03-20,SPDN,Direxion Daily S&P 500 Bear 1X ETF,7
+2026-04-17,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,32
+2026-04-17,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2026-04-17,TRMCX,T. Rowe Price Mid-Cap Value Fund,7
+2026-04-17,XLV,Health Care Select Sector SPDR,12
+2026-04-17,NOBL,ProShares S&P 500 Dividend Aristocrats,13
+2026-04-17,XLP,Consumer Staples Select Sector SPDR,6
+2026-04-17,XLE,Energy Select Sector SPDR,5
+2026-04-17,XLI,Industrial Select Sector SPDR,8
+2026-04-17,XLU,Utilities Select Sector SPDR,4
+2026-04-17,GDX,VanEck Gold Miners ETF,3
+2026-04-17,SPDN,Direxion Daily S&P 500 Bear 1X ETF,5
+2026-05-15,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,32
+2026-05-15,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2026-05-15,TRMCX,T. Rowe Price Mid-Cap Value Fund,7
+2026-05-15,XLV,Health Care Select Sector SPDR,12
+2026-05-15,NOBL,ProShares S&P 500 Dividend Aristocrats,13
+2026-05-15,XLP,Consumer Staples Select Sector SPDR,6
+2026-05-15,XLE,Energy Select Sector SPDR,5
+2026-05-15,XLI,Industrial Select Sector SPDR,8
+2026-05-15,XLU,Utilities Select Sector SPDR,4
+2026-05-15,GDX,VanEck Gold Miners ETF,3
+2026-05-15,SPDN,Direxion Daily S&P 500 Bear 1X ETF,5
+2026-06-19,Cash/T-Bills/MMF,T-Bills / Cash / Money Market,33.5
+2026-06-19,IBTM,iShares iBonds Dec 2032 Term Treasury ETF,5
+2026-06-19,TRMCX,T. Rowe Price Mid-Cap Value Fund,7
+2026-06-19,XLV,Health Care Select Sector SPDR,12
+2026-06-19,NOBL,ProShares S&P 500 Dividend Aristocrats,13
+2026-06-19,XLP,Consumer Staples Select Sector SPDR,6
+2026-06-19,XLE,Energy Select Sector SPDR,5
+2026-06-19,XLI,Industrial Select Sector SPDR,8
+2026-06-19,XLU,Utilities Select Sector SPDR,4
+2026-06-19,GDX,VanEck Gold Miners ETF,1.5
+2026-06-19,SPDN,Direxion Daily S&P 500 Bear 1X ETF,5

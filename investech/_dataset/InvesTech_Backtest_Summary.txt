@@ -1,0 +1,27 @@
+InvesTech Signal Backtest — Summary
+Rows: 42 monthly issues (2023-01-20 to 2026-06-19)
+
+Forward S&P return correlations (Pearson r):
+  Net Equity% vs fwd 1m: r=-0.217 (n=41)
+  Net Equity% vs fwd 3m: r=-0.341 (n=39)
+  Net Equity% vs fwd 6m: r=-0.318 (n=36)
+  NLC Value vs fwd 1m: r=-0.345 (n=28)
+  NLC Value vs fwd 3m: r=-0.522 (n=27)
+  NLC Value vs fwd 6m: r=-0.636 (n=25)
+  dNetEquity vs fwd 3m: r=-0.201 (n=38)
+
+Forward 3-month S&P return by NLC Regime:
+  Distribution (bearish): mean=6.01% (n=20)
+  Selling Vacuum / Neutral: mean=3.61% (n=19)
+  Difference: 2.4 pts
+
+Drawdown episodes (>=5% off peak, issue-date sampled) and net-equity changes prior:
+  2023-03-17: dd=-5.6%, NetEq=53.0, dNetEq(-1mo)=3.0, dNetEq(-2mo)=None
+  2025-03-21: dd=-7.8%, NetEq=58.0, dNetEq(-1mo)=0.0, dNetEq(-2mo)=-3.0
+  2025-04-18: dd=-12.3%, NetEq=54.0, dNetEq(-1mo)=0.0, dNetEq(-2mo)=0.0
+  2025-05-16: dd=-7.4%, NetEq=54.0, dNetEq(-1mo)=-4.0, dNetEq(-2mo)=0.0
+
+CAVEAT: Only 42 monthly observations across a single, predominantly bull-market
+regime. Forward-return windows overlap (autocorrelated), so effective sample size
+is far below 42. Correlations are descriptive only — low statistical power, none
+should be treated as significant.

@@ -1,0 +1,15 @@
+# Phase-1 feed runs almost entirely on the Python 3.x standard library
+# (urllib, csv, json, re). The ONE third-party package it uses is openpyxl,
+# to read State Street's SPY holdings .xlsx for the top-10 concentration metric.
+# If openpyxl is missing, that fetcher falls back to the iShares IVV CSV and
+# the rest of the run is unaffected.
+
+openpyxl>=3.1
+
+# Optional upgrades (uncomment if you wire them in):
+#
+# requests      # nicer HTTP than urllib; swap into fetchers._http_get if desired
+# xlrd==1.2.0   # ONLY needed to read Robert Shiller's legacy ie_data.xls
+#               # directly (CAPE). The default code path scrapes multpl.com
+#               # instead and needs none of this. NOTE: xlrd>=2.0 dropped .xls
+#               # support, so 1.2.0 is required for the legacy format.

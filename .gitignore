@@ -35,6 +35,13 @@ backtester/output/
 # (small static reference data / compliance data trail).
 !canslim/source/*.xlsx
 
+# Exception: investech/_dataset is small derived reference data (~50 KB) that the
+# phase2_feed code loads by path (config.py -> NLC_REFERENCE_CSV), so it has to
+# travel with the code. The bulk newsletter PDFs do NOT -- see
+# investech/SOURCE_PDFS_MOVED.md.
+!investech/_dataset/*.csv
+!investech/_dataset/*.xlsx
+
 # --- Local tooling / editor ---
 .claude/
 .vscode/

@@ -1,0 +1,10 @@
+# Phase-2 breadth feed runs on the Python 3.x standard library ONLY
+# (urllib, csv, json, time, datetime). No third-party package is required to
+# run main.py -- this mirrors Phase 1's "stdlib-first" design.
+#
+# `requests` is listed as an OPTIONAL convenience only. The code path uses
+# urllib; if you prefer requests, you can swap it into fetchers/breadth.py's
+# _http_get_text. Nothing else depends on it.
+
+# Optional (not imported by default):
+# requests>=2.31
