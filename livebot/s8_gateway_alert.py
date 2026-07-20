@@ -214,6 +214,82 @@ def gateway_process_alive(
     return bool(parsed.get("found"))
 
 
+# --------------------------------------------------------------------------- #
+# DISCONNECT DETAIL RECORDER — where "the exact error observed" actually comes from
+#
+# WHY THIS EXISTS. The pilot loops do NOT learn about a mid-session drop by catching an
+# exception: they poll ``ib.isConnected()``. By the time that poll returns False the only
+# party that ever saw a reason is the IB API client itself, which logs it ("Peer closed
+# connection.") and emits it on ``ib.client.apiError``. Nothing was catching that emit, so
+# ``handle_gateway_down`` was called with ``error=None`` and the single most useful field in
+# the email rendered "UNKNOWN (could not be determined)" — even though the process knew the
+# reason. This recorder subscribes to that event so the real string is available at alert
+# time.
+# --------------------------------------------------------------------------- #
+
+# Named so the email can say WHICH source was consulted rather than a bare "UNKNOWN".
+DISCONNECT_DETAIL_SOURCE = "the IB API client's own apiError/disconnect message"
+
+
+class DisconnectDetailRecorder:
+    """Remembers the LAST message the IB API itself reported. Best-effort, never raises.
+
+    Callable so it can be used directly as an ``ib.client.apiError`` handler. ``reset()`` is
+    called on a successful (re)connect so a stale message from an EARLIER outage can never
+    be presented as this outage's reason.
+    """
+
+    def __init__(self, now: Callable[[], float] = time.time) -> None:
+        self._now = now
+        self.message: Optional[str] = None
+        self.recorded_at: Optional[float] = None
+        self.attach_error: Optional[str] = None
+
+    def __call__(self, msg=None, *_a, **_k) -> None:
+        try:
+            text = str(msg).strip() if msg is not None else ""
+            if not text:
+                return
+            self.message = text
+            self.recorded_at = float(self._now())
+        except Exception:  # noqa: BLE001 — a recorder must never disturb the API loop
+            pass
+
+    def reset(self) -> None:
+        self.message = None
+        self.recorded_at = None
+
+    def detail_source(self) -> str:
+        """What was consulted for the error string — named either way, so a missing detail
+        is an HONEST "checked X, it had nothing", never a bare UNKNOWN."""
+        if self.attach_error:
+            return (f"{DISCONNECT_DETAIL_SOURCE} could not be subscribed to "
+                    f"({self.attach_error})")
+        if self.message:
+            return DISCONNECT_DETAIL_SOURCE
+        return (f"{DISCONNECT_DETAIL_SOURCE} was checked and reported nothing; the drop was "
+                f"detected by polling ib.isConnected(), which raises no exception")
+
+
+def attach_disconnect_recorder(ib, *, recorder: Optional[DisconnectDetailRecorder] = None,
+                               now: Callable[[], float] = time.time,
+                               log: Callable[[str], Any] = print) -> DisconnectDetailRecorder:
+    """Subscribe a recorder to ``ib.client.apiError``. Never raises — on failure the
+    returned recorder reports (honestly) that it could not be attached."""
+    rec = recorder if recorder is not None else DisconnectDetailRecorder(now=now)
+    try:
+        ib.client.apiError += rec
+        rec.attach_error = None
+    except Exception as exc:  # noqa: BLE001
+        rec.attach_error = f"{type(exc).__name__}: {exc}"
+        try:
+            log(f"s8_gateway_alert: could not subscribe to ib.client.apiError "
+                f"({rec.attach_error}); the alert will say so rather than claim UNKNOWN.")
+        except Exception:  # noqa: BLE001
+            pass
+    return rec
+
+
 def _default_mailer():
     """The EXISTING dailyreport mailer — the same module/path ``s8_runner._alert_email``
     uses. Imported lazily (with the repo-derived sys.path shim the other livebot modules
@@ -264,6 +340,8 @@ def capture_diagnostics(
     *,
     source: str = "s8",
     error: Optional[BaseException] = None,
+    detail: Optional[str] = None,
+    detail_source: Optional[str] = None,
     last_connect_ok_ts: Optional[float] = None,
     port: int = LIVE_TRADE_PORT,
     now: Callable[[], float] = time.time,
@@ -287,7 +365,16 @@ def capture_diagnostics(
                                     listening port / install dir, not just "some java"?
                                     (None = unknown)
       ``error_type`` / ``error``    the exact exception type + message observed, or None
+      ``error_detail_source``       WHAT was consulted for that string — so a missing error
+                                    is "checked X, it had nothing", never a bare UNKNOWN
       ``seconds_since_last_connect``  seconds since the last known-good connect, or None
+
+    Two independent ways the error string can arrive, because the two detection paths
+    differ: ``error`` is an exception actually caught at the detection point, while
+    ``detail`` is a plain string the IB API itself reported (e.g. "Peer closed connection.",
+    captured by ``DisconnectDetailRecorder``). The mid-session loops poll
+    ``ib.isConnected()`` and therefore have NO exception — ``detail`` is the only path that
+    can carry the real reason for them.
     """
     ct = None
     try:
@@ -317,6 +404,28 @@ def capture_diagnostics(
         except (TypeError, ValueError):
             since = None
 
+    # The error string, from whichever source actually had it. An exception caught at the
+    # detection point wins; otherwise the IB API's own reported message; otherwise NEITHER,
+    # and we name what was consulted instead of printing a bare "UNKNOWN".
+    err_type: Optional[str] = None
+    err_text: Optional[str] = None
+    if error is not None:
+        err_type = type(error).__name__
+        err_text = f"{error}"
+        src = detail_source or "an exception caught at the detection point"
+    else:
+        try:
+            txt = str(detail).strip() if detail is not None else ""
+        except Exception:  # noqa: BLE001
+            txt = ""
+        if txt:
+            err_text = txt
+            src = detail_source or DISCONNECT_DETAIL_SOURCE
+        else:
+            src = detail_source or (
+                "no exception was raised (the drop is detected by polling "
+                "ib.isConnected()) and no IB API disconnect message was recorded")
+
     return {
         "source": str(source),
         "observations_only": True,
@@ -326,9 +435,94 @@ def capture_diagnostics(
         "port": int(port),
         "port_listening": listening,
         "gateway_process_alive": proc,
-        "error_type": (type(error).__name__ if error is not None else None),
-        "error": (f"{error}" if error is not None else None),
+        "error_type": err_type,
+        "error": err_text,
+        "error_detail_source": src,
         "seconds_since_last_connect": since,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# STATE CLASSIFICATION — say plainly WHAT dropped, derived only from the two probes
+#
+# The old body said the gateway "dropped" while the same email reported "JVM alive YES /
+# port 4003 YES", which reads as a contradiction. It is not one: it is the ordinary case of
+# the API SESSION being lost while the Gateway PROCESS keeps running. That distinction is
+# fully derivable from the two probes already collected, so it is stated outright. No cause
+# is inferred — only which of the two things went away.
+# --------------------------------------------------------------------------- #
+
+STATE_SESSION_DROPPED = "API_SESSION_DROPPED_PROCESS_ALIVE"
+STATE_PROCESS_GONE = "GATEWAY_PROCESS_GONE"
+STATE_PROCESS_UP_PORT_CLOSED = "PROCESS_ALIVE_PORT_CLOSED"
+STATE_PORT_OPEN_PROCESS_NOT_FOUND = "PORT_OPEN_PROCESS_NOT_FOUND"
+STATE_UNDETERMINED = "UNDETERMINED"
+
+
+def classify_gateway_state(diagnostics: Dict[str, Any]) -> Dict[str, str]:
+    """Turn the JVM-alive + port probes into ONE unambiguous sentence about what was lost.
+
+    Returns ``{"key", "headline", "explanation"}``. Purely mechanical: it restates the two
+    observations, it never guesses WHY either of them is what it is.
+    """
+    d = diagnostics or {}
+    proc = d.get("gateway_process_alive")
+    listening = d.get("port_listening")
+    port = d.get("port", LIVE_TRADE_PORT)
+
+    if proc is None or listening is None:
+        unknown = []
+        if proc is None:
+            unknown.append("whether this Gateway's JVM is alive")
+        if listening is None:
+            unknown.append(f"whether port {port} is accepting TCP")
+        return {
+            "key": STATE_UNDETERMINED,
+            "headline": "THE API SESSION WAS LOST. Whether the gateway PROCESS is still up "
+                        "could not be determined.",
+            "explanation": ("The pilot's API connection to the gateway went away — that much "
+                            "is certain, it is what triggered this email. But the probe(s) "
+                            "for " + " and ".join(unknown) + " could not answer, so this "
+                            "email cannot tell you whether the Gateway process itself is "
+                            "still running."),
+        }
+    if proc and listening:
+        return {
+            "key": STATE_SESSION_DROPPED,
+            "headline": "THE API SESSION DROPPED — THE GATEWAY PROCESS IS STILL UP.",
+            "explanation": (f"This Gateway's JVM is still running and port {port} is still "
+                            f"accepting TCP connections, but the pilot's API session to it "
+                            f"was lost. So what went away is the API CONNECTION, not the "
+                            f"Gateway program. Reconnecting may or may not need a fresh "
+                            f"login — that is why a relaunch (and possibly a 2FA push) can "
+                            f"still follow even though the process never died."),
+        }
+    if proc and not listening:
+        return {
+            "key": STATE_PROCESS_UP_PORT_CLOSED,
+            "headline": f"THE GATEWAY PROCESS IS STILL UP BUT PORT {port} IS NOT ACCEPTING "
+                        f"CONNECTIONS.",
+            "explanation": (f"This Gateway's JVM is still running, but nothing is answering "
+                            f"on port {port}, so the pilot cannot reach the API. The process "
+                            f"is alive and NOT serving."),
+        }
+    if (not proc) and listening:
+        return {
+            "key": STATE_PORT_OPEN_PROCESS_NOT_FOUND,
+            "headline": f"PORT {port} IS ACCEPTING CONNECTIONS BUT THIS GATEWAY'S JVM WAS "
+                        f"NOT FOUND.",
+            "explanation": (f"The two probes disagree: something is listening on port {port} "
+                            f"while the process scan did not match this Gateway's JVM. Both "
+                            f"observations are reported as seen; no attempt is made here to "
+                            f"reconcile them."),
+        }
+    return {
+        "key": STATE_PROCESS_GONE,
+        "headline": "THE GATEWAY PROCESS IS GONE — THE JVM IS NOT RUNNING AND THE PORT IS "
+                    "CLOSED.",
+        "explanation": (f"This Gateway's JVM was not found and port {port} is refusing "
+                        f"connections. The Gateway program itself is down, not just the API "
+                        f"session."),
     }
 
 
@@ -343,18 +537,44 @@ def _fmt(value: Any) -> str:
     return str(value)
 
 
+def _format_error_line(diagnostics: Dict[str, Any]) -> str:
+    """The "exact error observed" line.
+
+    An exception renders as ``Type: message``; an IB-API-reported string renders on its own
+    (there is no exception type for it, and inventing one would be a fabrication). When
+    NEITHER source had anything, the line names the source that was consulted and came up
+    empty — an honest "checked X, nothing there" instead of a bare UNKNOWN.
+    """
+    d = diagnostics or {}
+    text = d.get("error")
+    etype = d.get("error_type")
+    src = d.get("error_detail_source")
+    if text and etype:
+        line = f"{etype}: {text}"
+    elif text:
+        line = str(text)
+    else:
+        return ("NONE RECORDED — " + (str(src) if src
+                                      else "no error source was consulted"))
+    return line + (f"   [source: {src}]" if src else "")
+
+
 def format_diagnostics_lines(diagnostics: Dict[str, Any]) -> list:
     """The OBSERVED-FACTS block shared by every email this module sends."""
     d = diagnostics or {}
+    state = classify_gateway_state(d)
     return [
+        "WHAT HAPPENED (stated from the two probes below, nothing else):",
+        f"  {state['headline']}",
+        f"  {state['explanation']}",
+        "",
         "OBSERVED (facts only — no cause is inferred):",
         f"  detected by ............... {d.get('source')}",
         f"  time (CT) ................. {_fmt(d.get('observed_at_ct'))}",
         f"  THIS gateway's JVM alive? . {_fmt(d.get('gateway_process_alive'))}",
         f"  port {d.get('port', LIVE_TRADE_PORT)} accepting TCP? ..... "
         f"{_fmt(d.get('port_listening'))}",
-        f"  exact error observed ...... {_fmt(d.get('error_type'))}: "
-        f"{_fmt(d.get('error'))}",
+        f"  exact error observed ...... {_format_error_line(d)}",
         f"  seconds since last good connect: "
         f"{_fmt(d.get('seconds_since_last_connect'))}",
         "",
@@ -460,21 +680,32 @@ def send_gateway_down_alert(diagnostics: Dict[str, Any], relaunching: bool,
 
     This is the message whose PRESENCE authorises the 2FA push Andrew is about to receive.
     """
+    d = diagnostics or {}
+    port = d.get("port", LIVE_TRADE_PORT)
+    state = classify_gateway_state(d)
+    # Lead with WHAT was lost. "dropped" alone alongside "JVM alive YES / port YES" reads as
+    # a contradiction; the classification says which of the two actually went away.
+    opening = (f"The S8 live pilot LOST ITS CONNECTION to the live-trading gateway "
+               f"(port {port}) MID-SESSION.")
     if relaunching:
         subject = "GATEWAY DOWN - relaunching, approve the 2FA"
         head = [
-            "The S8 live-pilot gateway (port "
-            f"{(diagnostics or {}).get('port', LIVE_TRADE_PORT)}) dropped MID-SESSION and "
-            "THE DESK IS RELAUNCHING IT NOW.",
+            opening,
             "",
-            "THIS RELAUNCH WAS INITIATED BY THE DESK. Expect an IBKR Mobile 2FA push "
-            "within about a minute — it is ours, and you can approve it.",
+            state["headline"],
+            state["explanation"],
+            "",
+            "THE DESK IS RELAUNCHING THE GATEWAY NOW. THIS RELAUNCH WAS INITIATED BY THE "
+            "DESK. Expect an IBKR Mobile 2FA push within about a minute — it is ours, and "
+            "you can approve it.",
         ]
     else:
         subject = "GATEWAY DOWN - no relaunch attempted"
         head = [
-            "The S8 live-pilot gateway (port "
-            f"{(diagnostics or {}).get('port', LIVE_TRADE_PORT)}) dropped MID-SESSION.",
+            opening,
+            "",
+            state["headline"],
+            state["explanation"],
             "",
             "NO relaunch was attempted by the desk, so you should NOT expect a 2FA push.",
         ]
@@ -547,6 +778,9 @@ def handle_gateway_down(
     source: str,
     *,
     error: Optional[BaseException] = None,
+    detail: Optional[str] = None,
+    detail_source: Optional[str] = None,
+    recorder: Optional["DisconnectDetailRecorder"] = None,
     last_connect_ok_ts: Optional[float] = None,
     port: int = LIVE_TRADE_PORT,
     mailer=None,
@@ -578,8 +812,20 @@ def handle_gateway_down(
         "seconds_down": None, "diagnostics": None, "error": None,
     }
     try:
+        # A ``recorder`` (subscribed to the IB API's own apiError/disconnect message) is the
+        # ONLY thing that knows the reason on the polling detection path, where no exception
+        # is ever raised. Explicit detail/detail_source still win if a caller passes them.
+        if recorder is not None:
+            try:
+                if detail is None:
+                    detail = recorder.message
+                if detail_source is None:
+                    detail_source = recorder.detail_source()
+            except Exception:  # noqa: BLE001 — a bad recorder must not break alerting
+                pass
         diag = capture_diagnostics(
-            source=source, error=error, last_connect_ok_ts=last_connect_ok_ts,
+            source=source, error=error, detail=detail, detail_source=detail_source,
+            last_connect_ok_ts=last_connect_ok_ts,
             port=port, now=clock, probe_port=probe_port, probe_process=probe_process,
         )
         result["diagnostics"] = diag

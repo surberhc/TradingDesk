@@ -218,6 +218,88 @@ def _todays_expiration(exps: list[str]) -> str:
     return today
 
 
+# ---------------------------------------------------------------------------
+# PER-EXPIRY LISTED-STRIKE RESOLUTION (fixes the Error-200 noise, 2026-07-20)
+# ---------------------------------------------------------------------------
+# reqSecDefOptParams returns the UNION of strikes across ALL of a root's expirations;
+# it does NOT say which strikes are listed for one specific expiry. SPXW's 0DTE listing
+# is dense (5 pt) near the money and sparser further out, so a band taken off the union
+# grid can contain strikes that simply do not exist for TODAY — e.g. on 2026-07-20 with
+# spot ~7508 the +60-strike band edge asked for 7805, which is in the union grid but not
+# in the 0DTE listing, and IBKR answered with
+#     Error 200 ... No security definition has been found for the request
+# once per entry evaluation, all session (see C:\TradingDesk-Local\s8_pilot\logs\
+# s8_service_20260720.log). qualifyContracts already DROPPED those contracts, so the
+# resulting chain was correct — the cost was pure log noise. These helpers let a caller
+# ask ONCE per expiry which strikes actually exist and intersect its band with them, so
+# the bad request is never made in the first place.
+_LISTED_STRIKE_TOL = 1e-6
+_listed_strike_cache: dict[tuple[str, str, str], frozenset[float]] = {}
+# Expirations whose "strikes excluded" line has already been printed (log once, not once
+# per entry evaluation — the whole point of this change is to REMOVE repeated noise).
+_filter_logged: set[str] = set()
+
+
+def _skey(x) -> float:
+    """Rounded strike key — IBKR strikes are exact-ish floats; round for set membership."""
+    return round(float(x), 4)
+
+
+def filter_to_listed(strikes, listed) -> list[float]:
+    """PURE. Keep only ``strikes`` that appear in ``listed``. No IBKR, no network.
+
+    ``listed`` is the set of strikes genuinely listed for one expiry (see
+    ``listed_strikes_for_expiry``). A falsy/empty ``listed`` means "unknown" and the input
+    passes through UNCHANGED — the filter degrades to today's behaviour rather than
+    silently emptying a band. Order is preserved; membership is float-tolerant.
+    """
+    if not listed:
+        return [float(s) for s in strikes]
+    keys = {_skey(x) for x in listed}
+    return [float(s) for s in strikes if _skey(s) in keys]
+
+
+def listed_strikes_for_expiry(
+    ib: IB,
+    exp: str,
+    *,
+    symbol: str = "SPX",
+    trading_class: str = _SPXW_TRADING_CLASS,
+    exchange: str = "SMART",
+    currency: str = "USD",
+    use_cache: bool = True,
+) -> frozenset[float] | None:
+    """Strikes ACTUALLY listed for one expiry, via a single reqContractDetails round-trip.
+
+    Read-only (a contract-definition lookup — no market data, no order path). Cached per
+    (symbol, tradingClass, expiration) for the life of the process: an expiry's listing does
+    not change intraday, and the key contains the date so it self-invalidates tomorrow.
+
+    Returns ``None`` — never raises — when the lookup fails or comes back empty, which the
+    callers read as "unknown, don't filter". A definition lookup is a convenience here, not
+    a correctness dependency: qualifyContracts remains the authority on what exists.
+    """
+    key = (str(symbol), str(trading_class), str(exp))
+    if use_cache and key in _listed_strike_cache:
+        return _listed_strike_cache[key]
+    try:
+        tmpl = Option(symbol=symbol, lastTradeDateOrContractMonth=str(exp),
+                      exchange=exchange, currency=currency, tradingClass=trading_class)
+        details = ib.reqContractDetails(tmpl) or []
+        strikes = frozenset(
+            float(d.contract.strike)
+            for d in details
+            if getattr(d, "contract", None) is not None and d.contract.strike
+        )
+    except Exception:  # noqa: BLE001 — advisory lookup; never break the caller
+        return None
+    if not strikes:
+        return None
+    if use_cache:
+        _listed_strike_cache[key] = strikes
+    return strikes
+
+
 def _qualify(ib: IB, candidates: list[Option]) -> list[Option]:
     """Qualify in pacing-friendly chunks; keep only contracts IBKR resolved.
 
@@ -263,6 +345,24 @@ def build_0dte_chain(
 
     atm = min(range(len(strikes)), key=lambda i: abs(strikes[i] - spot))
     band_strikes = strikes[max(0, atm - strikes_each_side): atm + strikes_each_side + 1]
+
+    # Drop band strikes that are not listed for THIS expiry before asking IBKR about them.
+    # Deliberately applied AFTER the band is computed (not to the grid the band indexes
+    # into), so the band's width in strikes/points is byte-for-byte what it was before —
+    # the ONLY contracts removed are ones qualifyContracts already dropped as unknown.
+    # Behaviour-preserving noise removal, not a change to what the entry path can see.
+    listed = listed_strikes_for_expiry(ib, exp, symbol=c.symbol)
+    if listed:
+        kept = filter_to_listed(band_strikes, listed)
+        if kept and len(kept) != len(band_strikes):
+            if exp not in _filter_logged:
+                _filter_logged.add(exp)
+                missing = [k for k in band_strikes if k not in set(kept)]
+                print(f"s8_chain: {len(missing)} band strike(s) not listed for exp={exp} "
+                      f"({', '.join(f'{m:g}' for m in missing[:8])}"
+                      f"{'...' if len(missing) > 8 else ''}) — excluded from the request "
+                      f"(prevents IBKR Error 200 noise; logged once per expiry)")
+            band_strikes = kept
 
     candidates = [
         Option(c.symbol, exp, k, r, "SMART", tradingClass=_SPXW_TRADING_CLASS, currency="USD")

@@ -224,7 +224,7 @@ def test_build_entry_trade_record_wellformed_open_record():
 
     rec = s8_capture.build_entry_trade_record(
         pick=pick, template_cfg=cfg, account="U14438624", qty=1,
-        entry_ts="2026-07-17T13:30:45.123-05:00",
+        entry_ts="2026-07-17T13:30:45.123-05:00", slot="13:30",
         entry_spot=7500.0, entry_vix=14.2, entry_realized_vol=None,
         short_leg=short_leg, long_leg=long_leg, stop_price=7.3,
         paperbot_version="0.16.0", pilot_mode=True,
@@ -237,7 +237,7 @@ def test_build_entry_trade_record_wellformed_open_record():
     assert rec.template == "Puts-80-$4"
     assert rec.side == "PUT"
     assert rec.qty == 1
-    # date/slot derived from the CT entry timestamp.
+    # date derived from the CT entry timestamp; slot is the GRID label passed in.
     assert rec.date == "20260717"
     assert rec.slot == "13:30"
     assert rec.trade_id == "20260717:Puts-80-$4:13:30:7480:7445"
@@ -266,7 +266,7 @@ def test_build_entry_trade_record_greeks_complete_false_if_a_leg_incomplete():
 
     rec = s8_capture.build_entry_trade_record(
         pick=pick, template_cfg=cfg, account="U14438624", qty=1,
-        entry_ts="2026-07-17T13:30:45.123-05:00",
+        entry_ts="2026-07-17T13:30:45.123-05:00", slot="13:30",
         entry_spot=7500.0, entry_vix=None, entry_realized_vol=None,
         short_leg=short_leg, long_leg=long_leg, stop_price=7.3,
         paperbot_version="0.16.0", pilot_mode=True,
@@ -274,6 +274,59 @@ def test_build_entry_trade_record_greeks_complete_false_if_a_leg_incomplete():
 
     assert rec.entry.greeks_complete is False
     assert rec.status == "open"
+
+
+# --------------------------------------------------------------------------- #
+# GRID SLOT vs WALL CLOCK (conductor #36 — the duplicate-entry root cause)
+# --------------------------------------------------------------------------- #
+def test_record_slot_is_the_grid_label_while_entry_ts_keeps_the_wall_clock():
+    """The persisted idempotency key is the ENTRY_GRID_CT label; the true wall-clock entry
+    instant is NOT lost — it stays verbatim on EntryInfo.entry_ts.
+
+    This is the exact shape of the live 2026-07-20 incident: the cycle ran at 08:43:07 for
+    the 08:45 grid slot. Before the fix the record was stored under slot "08:43", which
+    s8_service.slot_already_entered (which queries "08:45") could never match.
+    """
+    pick = _FakePick()
+    cfg = {"stop_multiple": 3.3}
+
+    rec = s8_capture.build_entry_trade_record(
+        pick=pick, template_cfg=cfg, account="U14438624", qty=1,
+        entry_ts="2026-07-20T08:43:07.412-05:00", slot="08:45",
+        entry_spot=7500.0, entry_vix=14.2, entry_realized_vol=None,
+        short_leg=_complete_leg("P", 7480.0, -0.24),
+        long_leg=_complete_leg("P", 7445.0, -0.16),
+        stop_price=7.3, paperbot_version="0.16.0", pilot_mode=True,
+    )
+
+    # Identity keys carry the GRID slot...
+    assert rec.slot == "08:45"
+    assert rec.trade_id == "20260720:Puts-80-$4:08:45:7480:7445"
+    # ...the date still comes off the timestamp...
+    assert rec.date == "20260720"
+    # ...and the true wall-clock entry instant is preserved EXACTLY as captured.
+    assert rec.entry.entry_ts == "2026-07-20T08:43:07.412-05:00"
+
+
+def test_missing_grid_slot_falls_back_to_wall_clock_with_a_loud_warning(capsys):
+    """The fallback is deliberate and NEVER silent: no grid slot -> wall-clock minute plus a
+    loud printed warning that the idempotency key is degraded."""
+    pick = _FakePick()
+    cfg = {"stop_multiple": 3.3}
+
+    rec = s8_capture.build_entry_trade_record(
+        pick=pick, template_cfg=cfg, account="U14438624", qty=1,
+        entry_ts="2026-07-20T08:43:07.412-05:00", slot=None,
+        entry_spot=7500.0, entry_vix=None, entry_realized_vol=None,
+        short_leg=_complete_leg("P", 7480.0, -0.24),
+        long_leg=_complete_leg("P", 7445.0, -0.16),
+        stop_price=7.3, paperbot_version="0.16.0", pilot_mode=True,
+    )
+
+    assert rec.slot == "08:43"                       # degraded, wall-clock key
+    out = capsys.readouterr().out
+    assert "NO GRID SLOT PASSED" in out
+    assert "IDEMPOTENCY KEY IS DEGRADED" in out
 
 
 # --------------------------------------------------------------------------- #
@@ -288,7 +341,7 @@ def test_trade_record_round_trips_through_store(tmp_path, monkeypatch):
     cfg = {"stop_multiple": 3.3}
     rec = s8_capture.build_entry_trade_record(
         pick=pick, template_cfg=cfg, account="U14438624", qty=1,
-        entry_ts="2026-07-17T13:30:45.123-05:00",
+        entry_ts="2026-07-17T13:30:45.123-05:00", slot="13:30",
         entry_spot=7500.0, entry_vix=14.2, entry_realized_vol=None,
         short_leg=_complete_leg("P", 7480.0, -0.24),
         long_leg=_complete_leg("P", 7445.0, -0.16),

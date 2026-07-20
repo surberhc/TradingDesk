@@ -382,6 +382,11 @@ class S8Collector:
         self._vix_contract = None
         self._expiration: Optional[str] = None
         self._max_strikes = DEFAULT_MAX_STRIKES
+        # Strikes observed NOT to exist for a given expiry (exp -> set of rounded strikes).
+        # Populated when a qualify comes back short; excluded from every later band build so
+        # a reconnect/resubscribe never re-asks IBKR for a contract it already said is
+        # unknown (that repetition was the Error-200 log noise seen on 2026-07-20).
+        self._unlisted: dict = {}
 
     # ------------------------------------------------------------------ #
     # Chain resolution (mirrors s8_chain's underlying + params steps)
@@ -405,6 +410,44 @@ class S8Collector:
         strikes = sorted({s for p in spxw for s in p.strikes})
         exp = s8_chain._todays_expiration(exps)
         return c, float(spot), exp, strikes
+
+    # ------------------------------------------------------------------ #
+    # Strike-existence filtering (Error-200 prevention — see item #37)
+    # ------------------------------------------------------------------ #
+    def listed_grid(self, strikes: Sequence[float], exp: str) -> List[float]:
+        """Reduce the union strike grid to strikes that ACTUALLY exist for ``exp``.
+
+        ``_resolve_chain`` returns reqSecDefOptParams' UNION of strikes across all of SPX's
+        expirations — some of which are not listed for today's 0DTE. Requesting one of those
+        earns an IBKR ``Error 200 No security definition has been found`` (observed live
+        2026-07-20: strike 7805 with spot ~7508). Two independent filters, both graceful:
+
+          1. the per-expiry listing from ``s8_chain.listed_strikes_for_expiry`` (one cached
+             reqContractDetails round-trip; ``None`` = unknown -> no filtering), and
+          2. ``self._unlisted[exp]`` — strikes THIS session already saw fail to qualify.
+
+        Because the grid is narrowed BEFORE ``compute_atm_band`` runs, the band still ends up
+        ``max_strikes`` wide — it is centred on ATM over real strikes instead of losing its
+        edges. Never raises and never returns empty: if filtering would wipe the grid out
+        (a bad/partial listing lookup), the original grid is returned unchanged.
+        """
+        import s8_chain
+
+        grid = [float(s) for s in strikes]
+        listed = s8_chain.listed_strikes_for_expiry(self._ib, exp)
+        kept = s8_chain.filter_to_listed(grid, listed) if listed else list(grid)
+        bad = self._unlisted.get(exp) or set()
+        if bad:
+            kept = [k for k in kept if s8_chain._skey(k) not in bad]
+        if not kept:
+            print(f"s8_collector: listed-strike filter would empty the grid for exp={exp}; "
+                  f"falling back to the unfiltered grid")
+            return grid
+        if len(kept) != len(grid):
+            print(f"s8_collector: strike grid for exp={exp} narrowed {len(grid)} -> "
+                  f"{len(kept)} to strikes listed for that expiry "
+                  f"(prevents IBKR Error 200 requests)")
+        return kept
 
     # ------------------------------------------------------------------ #
     # Subscribe / cancel the band (line-budget aware, degrades gracefully)
@@ -475,6 +518,21 @@ class S8Collector:
             for k in band for r in ("P", "C")
         ]
         qualified = s8_chain._qualify(self._ib, candidates)
+
+        # RESIDUAL Error-200 handling — quiet and self-silencing. The per-expiry listing
+        # lookup is advisory (it can be unavailable, or a listing can change), so a strike
+        # can still fail to qualify. Record every such strike against this expiry and log
+        # ONE summary line: the next band build excludes them (see listed_grid), so the
+        # failing request is never repeated and neither is the log line.
+        got = {s8_chain._skey(o.strike) for o in qualified}
+        missing = [float(k) for k in band if s8_chain._skey(k) not in got]
+        if missing:
+            self._unlisted.setdefault(exp, set()).update(s8_chain._skey(k) for k in missing)
+            print(f"s8_collector: {len(missing)} band strike(s) not listed for exp={exp} "
+                  f"({', '.join(f'{m:g}' for m in missing[:8])}"
+                  f"{'...' if len(missing) > 8 else ''}) — dropped and suppressed for the "
+                  f"rest of the session")
+
         specs: List[Tuple[Any, str, float]] = []
         contracts: List[Any] = []
         for o in qualified:
@@ -589,6 +647,10 @@ class S8Collector:
                   f"startup); relaunch once the gateway is up.")
             raise SystemExit(3)
         self._ib = ib
+        # Capture the IB API's OWN disconnect message ("Peer closed connection.") — the drop
+        # is detected by polling ib.isConnected(), which raises nothing, so this event is the
+        # only place the real reason exists at alert time. Best-effort; never raises.
+        self._disconnect_recorder = s8_gateway_alert.attach_disconnect_recorder(ib)
         try:
             try:
                 # Startup is bounded-retry: waits for live SPX data rather than crashing on
@@ -627,11 +689,19 @@ class S8Collector:
                     # ensure_gateway()'s existing launch mutex + cooldown. The alerter dedups
                     # against the service's simultaneous detection of the SAME drop, so this
                     # yields ONE email, not two — and it never raises in here.
+                    # The recorder carries the IB API's own disconnect message (e.g. "Peer
+                    # closed connection.") so the email reports the REAL reason instead of
+                    # UNKNOWN; if it has nothing it says which source came up empty.
                     s8_gateway_alert.handle_gateway_down(
-                        "s8_collector", last_connect_ok_ts=last_connect_ok_ts)
+                        "s8_collector", last_connect_ok_ts=last_connect_ok_ts,
+                        recorder=getattr(self, "_disconnect_recorder", None))
                     try:
                         ib = ibkr_live_trade.connect(consumer, launch=False, readonly=True)
                         self._ib = ib
+                        # Re-subscribe the recorder to the NEW connection and clear the old
+                        # message, so a later outage is never reported with this one's reason.
+                        self._disconnect_recorder = (
+                            s8_gateway_alert.attach_disconnect_recorder(ib))
                         self._build_and_subscribe()
                         if settle_secs:
                             ib.sleep(settle_secs)
@@ -678,6 +748,11 @@ class S8Collector:
             # Blocks until a valid live spot is seen, or raises StartupDataTimeout on giving up.
             wait_for_live_spot(_resolve_spot)
         _c, spot, exp, strikes = self._resolve_chain()
+        # Narrow the union grid to strikes that genuinely exist for today's expiry BEFORE
+        # the ATM band is cut from it, so the band is max_strikes wide AND every strike in
+        # it resolves (no Error-200 requests). Degrades to the unfiltered grid if the
+        # per-expiry listing can't be resolved.
+        strikes = self.listed_grid(strikes, exp)
         self._subscribe_band(spot, strikes, exp)
 
     def _after_close(self) -> bool:

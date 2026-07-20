@@ -154,10 +154,25 @@ def leg_grab_from_ticker(ticker: Any, right: Any, strike: Any) -> s8_schema.LegG
 # PURE: SpreadPick + LegGrabs + context -> open TradeRecord
 # --------------------------------------------------------------------------- #
 def _date_slot_from_ts(entry_ts: Any) -> tuple[Optional[str], Optional[str]]:
-    """Derive (YYYYMMDD date, HH:MM slot) from an ISO entry timestamp string.
+    """Derive (YYYYMMDD date, HH:MM WALL-CLOCK MINUTE) from an ISO entry timestamp string.
 
-    entry_ts is captured in CT (see capture_and_persist_entry), so the HH:MM slot lines up
-    with s8_config.ENTRY_GRID_CT's CT grid. Returns (None, None) if entry_ts is unusable.
+    WARNING — the second return value is the WALL-CLOCK MINUTE, **not** the ENTRY_GRID_CT
+    slot. They are different things and must never be conflated:
+
+      * the GRID SLOT is the schedule label (e.g. "08:45") that s8_runner.due_templates
+        returns for any cycle within DUE_TOLERANCE_MINUTES (+/-2 min) of it;
+      * the WALL-CLOCK MINUTE is whenever the capture actually ran (08:43, 08:44, 08:45...).
+
+    Conflating them broke the store-backed idempotency guard: s8_service.slot_already_entered
+    searches the store for the GRID slot, but the persisted TradeRecord.slot held the
+    wall-clock minute, so the guard never matched and the SAME grid slot was re-entered on
+    every ~30s entry cycle for the whole +/-2min tolerance window (observed live 2026-07-20:
+    grid slots 08:45 and 08:50 each produced four entry batches). The GRID SLOT must be
+    PASSED IN (build_entry_trade_record's `slot` parameter, threaded from
+    s8_runner.evaluate_and_capture_due_template) — never re-derived from a timestamp.
+
+    Only the DATE half of this function's output is used on the normal path. Returns
+    (None, None) if entry_ts is unusable.
     """
     if not entry_ts or not isinstance(entry_ts, str) or len(entry_ts) < 16:
         return None, None
@@ -175,6 +190,7 @@ def build_entry_trade_record(
     account: Optional[str],
     qty: Optional[int],
     entry_ts: Optional[str],
+    slot: Optional[str],
     entry_spot: Optional[float],
     entry_vix: Optional[float],
     entry_realized_vol: Optional[float],
@@ -188,10 +204,30 @@ def build_entry_trade_record(
 
     Fills the entry group from the frozen SpreadPick + the two live LegGrabs + entry-time
     context; exit stays None (Phase 2's shadow-monitor fills it). ``greeks_complete`` is the
-    conjunction of both legs' ``complete`` flags. ``trade_id`` is s8_schema.make_trade_id over
-    (date, template, slot, short_strike, long_strike) with date/slot derived from entry_ts.
+    conjunction of both legs' ``complete`` flags.
+
+    ``slot`` MUST be the ENTRY_GRID_CT schedule label (e.g. "08:45") for the slot being
+    entered — the SAME key ``s8_service.slot_already_entered`` looks up in the store. It is
+    threaded down from ``s8_runner.evaluate_and_capture_due_template``. It is used for both
+    ``TradeRecord.slot`` and the ``trade_id``, so the idempotency key stored and the
+    idempotency key queried are one and the same thing (see _date_slot_from_ts's warning for
+    the bug this prevents). ``date`` is still derived from entry_ts, and ``entry_ts`` itself
+    keeps the TRUE wall-clock entry instant on ``EntryInfo.entry_ts`` — the grid label never
+    overwrites it.
+
+    FALLBACK: if `slot` is None/empty this falls back to the wall-clock minute derived from
+    entry_ts AND prints a loud warning — the degraded key is never silent.
     """
-    date, slot = _date_slot_from_ts(entry_ts)
+    date, ts_slot = _date_slot_from_ts(entry_ts)
+    if slot:
+        slot_key = slot
+    else:
+        slot_key = ts_slot
+        print(f"    !! s8_capture: NO GRID SLOT PASSED to build_entry_trade_record — falling "
+              f"back to the WALL-CLOCK minute {ts_slot!r} for TradeRecord.slot/trade_id. "
+              f"THE IDEMPOTENCY KEY IS DEGRADED: s8_service.slot_already_entered looks up the "
+              f"ENTRY_GRID_CT label, so this record may not match and the slot could be "
+              f"re-entered. Fix the caller to pass the grid slot.")
     greeks_complete = bool(short_leg.complete and long_leg.complete)
 
     entry = s8_schema.EntryInfo(
@@ -211,7 +247,7 @@ def build_entry_trade_record(
     )
 
     trade_id = s8_schema.make_trade_id(
-        date, pick.template_name, slot, pick.short_strike, pick.long_strike
+        date, pick.template_name, slot_key, pick.short_strike, pick.long_strike
     )
 
     return s8_schema.TradeRecord(
@@ -219,7 +255,7 @@ def build_entry_trade_record(
         date=date,
         account=account,
         template=pick.template_name,
-        slot=slot,
+        slot=slot_key,
         side=pick.side,
         expiration=None,   # set by capture_and_persist_entry from the chain snapshot
         qty=qty,
@@ -358,9 +394,15 @@ def _pilot_mode() -> bool:
 
 
 def capture_and_persist_entry(ib, pick, template_cfg, account, qty, chain_snap,
-                              stop_price) -> Optional[str]:
+                              stop_price, slot: Optional[str] = None) -> Optional[str]:
     """Grab both legs live (quotes+greeks) + spot + VIX at entry, build an "open"
     TradeRecord, persist it via s8_store, and return its trade_id.
+
+    ``slot`` is the ENTRY_GRID_CT schedule label of the slot being entered (threaded down
+    from s8_runner.evaluate_and_capture_due_template, which has it as its own parameter). It
+    becomes TradeRecord.slot / the trade_id so the persisted idempotency key matches the one
+    s8_service.slot_already_entered queries. Omitting it degrades that key to the wall-clock
+    minute and prints a loud warning (see build_entry_trade_record).
 
     BEST-EFFORT by contract: this NEVER raises into the caller — any failure is caught,
     logged, and returns None so a capture problem can never break the pilot cycle. Never
@@ -406,6 +448,7 @@ def capture_and_persist_entry(ib, pick, template_cfg, account, qty, chain_snap,
             account=account,
             qty=qty,
             entry_ts=entry_ts,
+            slot=slot,
             entry_spot=entry_spot,
             entry_vix=entry_vix,
             entry_realized_vol=entry_realized_vol,

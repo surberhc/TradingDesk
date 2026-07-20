@@ -321,3 +321,203 @@ def test_wait_for_live_spot_rejects_nonpositive_and_nan_spots():
     assert s8_collector._spot_is_valid(float("nan")) is False
     assert s8_collector._spot_is_valid(0.0) is False
     assert s8_collector._spot_is_valid(-1.0) is False
+
+
+# =========================================================================== #
+# STRIKE-EXISTENCE FILTERING (conductor item #37) — offline, fully mocked.
+#
+# reqSecDefOptParams hands back the UNION of strikes across ALL expirations, so a band cut
+# from it can contain strikes that are not listed for TODAY's 0DTE expiry. Requesting one
+# earns an IBKR "Error 200 No security definition has been found for the request" — observed
+# live 2026-07-20 (strike 7805 with spot ~7508). These tests pin the two filters that stop
+# the request being made: the per-expiry listing intersection, and the session-scoped
+# suppression of any strike that still fails to qualify.
+# =========================================================================== #
+
+@pytest.fixture(autouse=True)
+def _clear_chain_caches():
+    """s8_chain's listing cache / log-once set are module-level — reset around each test."""
+    import s8_chain
+    s8_chain._listed_strike_cache.clear()
+    s8_chain._filter_logged.clear()
+    yield
+    s8_chain._listed_strike_cache.clear()
+    s8_chain._filter_logged.clear()
+
+
+class _FakeContract:
+    def __init__(self, strike, right="C"):
+        self.strike = strike
+        self.right = right
+
+
+class _FakeDetails:
+    def __init__(self, strike, right="C"):
+        self.contract = _FakeContract(strike, right)
+
+
+class _FakeIB:
+    """Minimal IB stand-in: records reqContractDetails/reqMktData calls. No network."""
+
+    def __init__(self, details=None, raise_details=False):
+        self._details = details
+        self._raise = raise_details
+        self.detail_calls = 0
+        self.mkt_data_calls = []
+
+    def reqContractDetails(self, contract):
+        self.detail_calls += 1
+        if self._raise:
+            raise RuntimeError("no connection")
+        return self._details
+
+    def reqMktData(self, contract, ticks, snapshot, regulatory):
+        self.mkt_data_calls.append(contract)
+        return _FakeTicker(bid=1.0, ask=1.2)
+
+
+# --- the pure filter ------------------------------------------------------- #
+
+def test_filter_to_listed_keeps_only_existing_strikes():
+    import s8_chain
+    listed = {7400.0, 7405.0, 7410.0}
+    assert s8_chain.filter_to_listed([7400.0, 7405.0, 7407.0, 7410.0, 7805.0],
+                                     listed) == [7400.0, 7405.0, 7410.0]
+
+
+def test_filter_to_listed_passes_through_when_listing_unknown():
+    import s8_chain
+    band = [7400.0, 7405.0, 7805.0]
+    # None / empty listing means "unknown" — degrade to today's behaviour, never empty out.
+    assert s8_chain.filter_to_listed(band, None) == band
+    assert s8_chain.filter_to_listed(band, set()) == band
+
+
+def test_filter_to_listed_is_float_tolerant_and_order_preserving():
+    import s8_chain
+    listed = {7400.0000000001, 7410.0}
+    assert s8_chain.filter_to_listed([7410.0, 7400.0, 7405.0], listed) == [7410.0, 7400.0]
+
+
+# --- the per-expiry listing lookup ----------------------------------------- #
+
+def test_listed_strikes_for_expiry_reads_and_caches_the_listing():
+    import s8_chain
+    ib = _FakeIB(details=[_FakeDetails(7400.0, "C"), _FakeDetails(7400.0, "P"),
+                          _FakeDetails(7405.0, "C")])
+    got = s8_chain.listed_strikes_for_expiry(ib, "20260720")
+    assert got == frozenset({7400.0, 7405.0})     # de-duplicated across both rights
+    assert ib.detail_calls == 1
+    # Cached per (symbol, tradingClass, expiry) — a second ask costs no round-trip.
+    assert s8_chain.listed_strikes_for_expiry(ib, "20260720") == got
+    assert ib.detail_calls == 1
+    # A different expiry is a different key.
+    s8_chain.listed_strikes_for_expiry(ib, "20260721")
+    assert ib.detail_calls == 2
+
+
+def test_listed_strikes_for_expiry_returns_none_on_failure_or_empty():
+    import s8_chain
+    assert s8_chain.listed_strikes_for_expiry(_FakeIB(raise_details=True), "20260720") is None
+    assert s8_chain.listed_strikes_for_expiry(_FakeIB(details=[]), "20260720") is None
+    assert s8_chain.listed_strikes_for_expiry(_FakeIB(details=None), "20260720") is None
+    # A failure is NOT cached, so a later successful lookup still works.
+    ib = _FakeIB(details=[_FakeDetails(7400.0)])
+    assert s8_chain.listed_strikes_for_expiry(ib, "20260720") == frozenset({7400.0})
+
+
+# --- the collector's grid narrowing ---------------------------------------- #
+
+def _collector_with(ib, listed, monkeypatch):
+    import s8_chain
+    col = s8_collector.S8Collector()
+    col._ib = ib
+    monkeypatch.setattr(s8_chain, "listed_strikes_for_expiry",
+                        lambda _ib, _exp, **kw: listed)
+    return col
+
+
+def test_listed_grid_drops_strikes_not_listed_for_the_expiry(monkeypatch):
+    # The real 2026-07-20 shape: a union grid containing 7805, which is NOT 0DTE-listed.
+    grid = GRID + [7805.0]
+    col = _collector_with(_FakeIB(), frozenset(GRID), monkeypatch)
+    kept = col.listed_grid(grid, "20260720")
+    assert 7805.0 not in kept
+    assert kept == GRID
+
+
+def test_listed_grid_passes_grid_through_when_listing_unknown(monkeypatch):
+    col = _collector_with(_FakeIB(), None, monkeypatch)
+    grid = GRID + [7805.0]
+    assert col.listed_grid(grid, "20260720") == grid   # unknown listing -> no filtering
+
+
+def test_listed_grid_also_drops_session_observed_unlisted_strikes(monkeypatch):
+    col = _collector_with(_FakeIB(), None, monkeypatch)
+    col._unlisted["20260720"] = {7805.0, 7400.0}
+    kept = col.listed_grid(GRID + [7805.0], "20260720")
+    assert 7805.0 not in kept and 7400.0 not in kept
+    assert 7405.0 in kept
+
+
+def test_listed_grid_falls_back_when_filtering_would_empty_the_grid(monkeypatch):
+    # A bogus/partial listing must never leave the collector with nothing to subscribe.
+    col = _collector_with(_FakeIB(), frozenset({1.0, 2.0}), monkeypatch)
+    assert col.listed_grid(GRID, "20260720") == GRID
+
+
+def test_band_from_narrowed_grid_is_full_width_and_all_listed(monkeypatch):
+    """The band is cut AFTER narrowing, so it stays max_strikes wide over REAL strikes."""
+    real = frozenset(GRID)
+    grid = sorted(GRID + [7802.5, 7805.0, 7807.5])   # union-only strikes near the top edge
+    col = _collector_with(_FakeIB(), real, monkeypatch)
+    narrowed = col.listed_grid(grid, "20260720")
+    band = compute_atm_band(7795.0, narrowed, max_strikes=24)
+    assert len(band) == 24                     # full width, not eroded at the edge
+    assert set(band).issubset(real)            # and every strike genuinely exists
+
+
+# --- residual Error-200 handling: quiet, and never repeated ---------------- #
+
+def test_subscribe_options_records_and_suppresses_unqualifiable_strikes(monkeypatch, capsys):
+    import s8_chain
+
+    band = [7400.0, 7405.0, 7805.0]
+
+    def _fake_qualify(_ib, candidates):
+        # IBKR resolves everything except 7805 (the live 2026-07-20 failure).
+        return [o for o in candidates if float(o.strike) != 7805.0]
+
+    monkeypatch.setattr(s8_chain, "_qualify", _fake_qualify)
+    ib = _FakeIB()
+    col = s8_collector.S8Collector()
+    col._ib = ib
+
+    col._subscribe_options(band, "20260720")
+
+    # Only the resolvable contracts got a market-data line (2 rights x 2 strikes).
+    assert len(col._band_specs) == 4
+    assert 7805.0 not in {s[2] for s in col._band_specs}
+    assert len(ib.mkt_data_calls) == 4
+    assert col._expiration == "20260720"
+
+    # The miss was recorded against the expiry and logged exactly once, as a summary.
+    assert col._unlisted["20260720"] == {7805.0}
+    out = capsys.readouterr().out
+    assert out.count("not listed for exp=20260720") == 1
+    assert "7805" in out
+
+    # And it is suppressed from every later band build — the failing request never repeats.
+    monkeypatch.setattr(s8_chain, "listed_strikes_for_expiry", lambda _ib, _exp, **kw: None)
+    assert 7805.0 not in col.listed_grid(band, "20260720")
+
+
+def test_subscribe_options_is_silent_when_every_strike_qualifies(monkeypatch, capsys):
+    import s8_chain
+    monkeypatch.setattr(s8_chain, "_qualify", lambda _ib, candidates: list(candidates))
+    col = s8_collector.S8Collector()
+    col._ib = _FakeIB()
+    col._subscribe_options([7400.0, 7405.0], "20260720")
+    assert col._unlisted == {}                       # nothing to suppress
+    assert "not listed" not in capsys.readouterr().out   # and no noise at all
+    assert len(col._band_specs) == 4

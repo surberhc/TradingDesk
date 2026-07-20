@@ -543,8 +543,14 @@ def evaluate_and_capture_due_template(ib, chain_snap, summary, template_name: st
     # over capture_and_persist_entry's own internal try/except): a capture failure
     # logs a warning and the cycle proceeds exactly as before.
     try:
+        # `slot` (this function's own parameter) is the ENTRY_GRID_CT label of the slot
+        # being entered. It MUST be passed through: it becomes TradeRecord.slot / the
+        # trade_id, and s8_service.slot_already_entered looks up exactly that label. When
+        # the capture derived the slot from its own wall clock instead, the guard never
+        # matched inside the +/-2min tolerance window and the same grid slot was re-entered
+        # every cycle (observed live 2026-07-20).
         trade_id = s8_capture.capture_and_persist_entry(
-            ib, pick, cfg, account, qty, chain_snap, group.stop_price)
+            ib, pick, cfg, account, qty, chain_snap, group.stop_price, slot=slot)
         outcome["trade_id"] = trade_id
     except Exception as exc:
         print(f"    [{template_name}@{slot}] ! entry capture raised "

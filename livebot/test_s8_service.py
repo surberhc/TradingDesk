@@ -66,6 +66,10 @@ def _isolated_root(tmp_path, monkeypatch):
 class _FakeClient:
     def __init__(self):
         self._next = 1000
+        # ib_async's real client exposes this; _bind_ib subscribes the gateway-alert
+        # disconnect recorder to it so the alert email can report the REAL disconnect
+        # message ("Peer closed connection.") instead of UNKNOWN.
+        self.apiError = _FakeEvent()
 
     def getReqId(self) -> int:
         self._next += 1
@@ -171,9 +175,12 @@ def _capture_double_factory(calls):
     trade_id. The live capture (greeks/quotes over the gateway) is covered by the s8_capture
     tests; here we only need a real persisted open record to drive the service orchestration.
     """
-    def _double(ib, pick, cfg, account, qty, chain_snap, stop_price):
-        calls.append((pick, stop_price))
-        trade_id = make_trade_id(DATE, TEMPLATE, SLOT, SHORT, LONG)
+    def _double(ib, pick, cfg, account, qty, chain_snap, stop_price, slot=None):
+        calls.append((pick, stop_price, slot))
+        # Honest about the fix: the record is keyed on the GRID slot handed down by the
+        # runner (never a wall clock), exactly as the real capture now does.
+        assert slot == SLOT, f"capture must receive the grid slot, got {slot!r}"
+        trade_id = make_trade_id(DATE, TEMPLATE, slot, SHORT, LONG)
         s8_store.upsert_trade_record(_canonical_open_record(trade_id))
         return trade_id
     return _double
@@ -283,6 +290,89 @@ def test_entry_idempotency_second_due_check_skips(monkeypatch):
     assert len(calls) == 1                                 # capture ran ONCE total
     assert _count_trade_lines() == 1                       # exactly one persisted entry
     assert list(_records_by_id().keys()) == [tid]
+
+
+# --------------------------------------------------------------------------- #
+# REGRESSION (conductor #36) — the REAL capture path inside the +/-2min tolerance
+# window must enter a grid slot exactly ONCE, not once per cycle.
+# --------------------------------------------------------------------------- #
+
+_INCIDENT_DATE = "20260720"
+_GRID_SLOT = "08:45"
+
+
+class _FakeCaptureClock:
+    """Stand-in for s8_capture's ``datetime`` module attribute: ``now(tz=...)`` returns the
+    caller-controlled wall-clock instant, so the capture can be run at 08:43 / 08:44 / 08:45
+    against a fixed 08:45 grid slot — the exact live 2026-07-20 shape."""
+
+    current = None
+
+    @classmethod
+    def now(cls, tz=None):
+        return cls.current if tz is None else cls.current.astimezone(tz)
+
+
+def _wire_real_capture(monkeypatch):
+    """Wire the REAL s8_capture.capture_and_persist_entry (not a double) offline: only its
+    gateway-facing leaves (leg grabs, VIX, realized vol) are stubbed, so the slot/trade_id
+    threading under test is the production code path."""
+    import s8_capture
+
+    monkeypatch.setattr(s8_service, "current_ct_date", lambda: _INCIDENT_DATE)
+    monkeypatch.setattr(s8_runner, "due_templates",
+                        lambda now: [(TEMPLATE, _GRID_SLOT)])
+    monkeypatch.setattr(s8_service.s8_chain, "snapshot_0dte_chain",
+                        lambda ib, *a, **k: _synthetic_chain_snapshot())
+    monkeypatch.setattr(s8_capture, "grab_leg_live",
+                        lambda ib, contract, right, strike, *a, **k: _leg(strike, right))
+    monkeypatch.setattr(s8_capture, "grab_vix_live", lambda ib, *a, **k: 14.0)
+    monkeypatch.setattr(s8_capture.s8_vol, "realized_vol_live", lambda ib, *a, **k: 0.12)
+    monkeypatch.setattr(s8_capture, "datetime", _FakeCaptureClock)
+    monkeypatch.setattr(s8_runner.order_router, "place", _boom_place)
+    monkeypatch.setattr(s8_runner.order_router, "place_laddered", _boom_place)
+
+
+def test_grid_slot_entered_once_across_the_whole_tolerance_window(monkeypatch):
+    """THE 2026-07-20 INCIDENT, reproduced: grid slot 08:45 stays due for the whole
+    +/-2min DUE_TOLERANCE window, so the ~30s entry cycle fires at 08:43, 08:44 and 08:45.
+
+    Before the fix the capture keyed the record on its own WALL-CLOCK minute (08:43, 08:44,
+    08:45) while ``slot_already_entered`` queried the GRID label "08:45" — the guard never
+    matched and every cycle re-entered, producing four entry batches per slot live. With the
+    grid slot threaded through, cycles 2 and 3 are idempotent no-ops.
+    """
+    from datetime import datetime as _dt
+    from zoneinfo import ZoneInfo as _ZI
+
+    _CT = _ZI("America/Chicago")
+    _wire_real_capture(monkeypatch)
+
+    ib = _FakeIB(_MARGIN_OK)
+    svc = s8_service.S8Service(account="U14438624")
+    svc._bind_ib(ib)
+
+    outcomes = []
+    for minute, second in ((43, 7), (44, 12), (45, 3)):
+        _FakeCaptureClock.current = _dt(2026, 7, 20, 8, minute, second,
+                                        412_000, tzinfo=_CT)
+        outcomes.append(svc.entry_cycle(ib))
+
+    # Cycle 1 entered; cycles 2 and 3 were idempotent no-ops.
+    assert len(outcomes[0]) == 1 and outcomes[0][0].get("trade_id")
+    assert outcomes[1] == []
+    assert outcomes[2] == []
+
+    # EXACTLY ONE persisted record for (date, template, grid slot).
+    recs = [r for r in s8_store.read_trade_records()
+            if r.date == _INCIDENT_DATE and r.template == TEMPLATE and r.slot == _GRID_SLOT]
+    assert len(recs) == 1, [r.trade_id for r in recs]
+    # ...and no record was ever written under a wall-clock minute instead.
+    assert {r.slot for r in s8_store.read_trade_records()} == {_GRID_SLOT}
+    assert _count_trade_lines() == 1
+
+    # The true wall-clock entry instant survived on EntryInfo.entry_ts (08:43:07, not 08:45).
+    assert recs[0].entry.entry_ts.startswith("2026-07-20T08:43:07")
 
 
 # --------------------------------------------------------------------------- #

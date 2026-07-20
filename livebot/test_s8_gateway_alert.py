@@ -404,3 +404,184 @@ def test_probe_returns_none_off_windows(monkeypatch):
 def test_unknown_probe_renders_as_unknown_in_the_email():
     lines = ga.format_diagnostics_lines({"gateway_process_alive": None, "port": 4003})
     assert any("UNKNOWN (could not be determined)" in ln for ln in lines)
+
+
+# --------------------------------------------------------------------------- #
+# REGRESSION (2026-07-20 real outage, conductor #38): "exact error observed" came out
+# "UNKNOWN (could not be determined)" TWICE even though the process HAD the reason —
+# ib_async had logged "Peer closed connection." The loops detect the drop by polling
+# ib.isConnected(), which raises nothing, so the exception path was always empty and the
+# IB API's own apiError message was never captured. These tests pin the fix.
+# --------------------------------------------------------------------------- #
+
+class _FakeEvent:
+    """Stand-in for ib_async's ``client.apiError`` Event (+= subscribes, call emits)."""
+
+    def __init__(self):
+        self.handlers = []
+
+    def __iadd__(self, handler):
+        self.handlers.append(handler)
+        return self
+
+    def emit(self, msg):
+        for h in self.handlers:
+            h(msg)
+
+
+class _FakeClient:
+    def __init__(self):
+        self.apiError = _FakeEvent()
+
+
+class _FakeIB:
+    def __init__(self):
+        self.client = _FakeClient()
+
+
+def test_the_real_ib_disconnect_message_reaches_the_email_body(tmp_path):
+    """THE regression: 'Peer closed connection.' must appear in the email, verbatim."""
+    ib = _FakeIB()
+    rec = ga.attach_disconnect_recorder(ib, log=lambda *_a, **_k: None)
+    ib.client.apiError.emit("Peer closed connection.")   # what ib_async actually emits
+
+    m, clock = FakeMailer(), FakeClock()
+    ga.handle_gateway_down("s8_service", recorder=rec,
+                           **_kwargs(tmp_path, m, clock, lambda: True))
+
+    down_body = m.sent[0][1]
+    assert "Peer closed connection." in down_body
+    assert "exact error observed ...... UNKNOWN" not in down_body
+
+
+def test_detail_string_flows_through_diagnostics_and_the_error_line():
+    d = ga.capture_diagnostics(source="s8_collector", detail="Peer closed connection.",
+                               **_probes())
+    assert d["error"] == "Peer closed connection."
+    assert d["error_type"] is None            # no exception type is invented for a string
+    assert d["error_detail_source"]
+    line = ga._format_error_line(d)
+    assert "Peer closed connection." in line
+    assert "UNKNOWN" not in line
+
+
+def test_an_exception_still_wins_over_a_recorded_detail():
+    d = ga.capture_diagnostics(
+        source="s8_service", error=ConnectionResetError("WinError 10054"),
+        detail="Peer closed connection.", **_probes())
+    assert d["error_type"] == "ConnectionResetError"
+    assert "10054" in d["error"]
+
+
+def test_no_error_anywhere_names_the_source_checked_instead_of_bare_unknown():
+    """Honesty requirement: when neither source had anything, say WHICH source was consulted
+    and came up empty — never a bare UNKNOWN for the single most useful field."""
+    d = ga.capture_diagnostics(source="s8_service", **_probes())
+    line = ga._format_error_line(d)
+    assert line.startswith("NONE RECORDED")
+    assert "ib.isConnected()" in line or "apiError" in line
+    assert "UNKNOWN (could not be determined)" not in line
+
+
+def test_recorder_reports_the_source_it_checked_when_empty_and_after_reset():
+    rec = ga.DisconnectDetailRecorder()
+    assert rec.message is None
+    assert "reported nothing" in rec.detail_source()
+    rec("Peer closed connection.")
+    assert rec.message == "Peer closed connection."
+    assert rec.detail_source() == ga.DISCONNECT_DETAIL_SOURCE
+    rec.reset()                                  # a fresh session must not inherit it
+    assert rec.message is None
+
+
+def test_recorder_attach_failure_is_honest_and_never_raises():
+    class _NoClient:
+        pass
+
+    rec = ga.attach_disconnect_recorder(_NoClient(), log=lambda *_a, **_k: None)
+    assert rec.attach_error                      # recorded, not swallowed silently
+    assert "could not be subscribed" in rec.detail_source()
+    d = ga.capture_diagnostics(source="s8_service", detail=rec.message,
+                               detail_source=rec.detail_source(), **_probes())
+    assert "could not be subscribed" in ga._format_error_line(d)
+
+
+def test_recorder_ignores_empty_messages_and_never_raises_into_the_api_loop():
+    rec = ga.DisconnectDetailRecorder()
+    rec(None)
+    rec("")
+    rec("   ")
+    assert rec.message is None
+
+
+# --------------------------------------------------------------------------- #
+# STATE CLASSIFICATION (conductor #38b): the body must not read as a contradiction —
+# "dropped" alongside "JVM alive YES / port 4003 YES" has to be spelled out as the API
+# SESSION dropping while the gateway PROCESS stayed up.
+# --------------------------------------------------------------------------- #
+
+def test_session_dropped_but_process_alive_is_stated_unambiguously(tmp_path):
+    m, clock = FakeMailer(), FakeClock()
+    ga.handle_gateway_down(
+        "s8_service", **_kwargs(tmp_path, m, clock, lambda: True,
+                                **_probes(port_listening=True, process_alive=True)))
+
+    body = m.sent[0][1]
+    assert "API SESSION DROPPED" in body
+    assert "GATEWAY PROCESS IS STILL UP" in body
+    # ...and the reader is told what that combination means, not left to reconcile it.
+    assert "not the Gateway program" in body
+    # The observations that drive it are still shown as observed.
+    assert "JVM alive? . YES" in body
+    assert "accepting TCP? ..... YES" in body
+    # No cause is claimed.
+    assert "NOT determinable" in body
+
+
+def test_process_gone_is_distinguished_from_a_dropped_session():
+    d = ga.capture_diagnostics(source="s8_service",
+                               **_probes(port_listening=False, process_alive=False))
+    state = ga.classify_gateway_state(d)
+    assert state["key"] == ga.STATE_PROCESS_GONE
+    assert "GATEWAY PROCESS IS GONE" in state["headline"]
+    assert "API SESSION DROPPED" not in state["headline"]
+
+
+def test_process_up_but_port_closed_is_its_own_state():
+    d = ga.capture_diagnostics(source="s8_service",
+                               **_probes(port_listening=False, process_alive=True))
+    state = ga.classify_gateway_state(d)
+    assert state["key"] == ga.STATE_PROCESS_UP_PORT_CLOSED
+    assert "NOT ACCEPTING" in state["headline"]
+
+
+def test_port_open_but_no_jvm_is_reported_as_the_disagreement_it_is():
+    d = ga.capture_diagnostics(source="s8_service",
+                               **_probes(port_listening=True, process_alive=False))
+    state = ga.classify_gateway_state(d)
+    assert state["key"] == ga.STATE_PORT_OPEN_PROCESS_NOT_FOUND
+    assert "disagree" in state["explanation"]
+
+
+def test_undeterminable_probes_do_not_claim_a_state():
+    d = ga.capture_diagnostics(source="s8_service",
+                               probe_port=lambda *a, **k: None, probe_process=lambda: None)
+    state = ga.classify_gateway_state(d)
+    assert state["key"] == ga.STATE_UNDETERMINED
+    # The one thing that IS certain (the API session went away) is still stated...
+    assert "API SESSION WAS LOST" in state["headline"]
+    # ...and the unknown part is admitted rather than guessed.
+    assert "could not be determined" in state["headline"]
+    assert "STILL UP" not in state["headline"]
+
+
+def test_every_email_carries_the_state_classification(tmp_path):
+    """Down, back-up and relaunch-failed all share the diagnostics block, so all three must
+    state what was lost."""
+    m, clock = FakeMailer(), FakeClock()
+    ga.handle_gateway_down(
+        "s8_service", **_kwargs(tmp_path, m, clock, lambda: True,
+                                **_probes(port_listening=True, process_alive=True)))
+    for _subject, body in m.sent:
+        assert "WHAT HAPPENED" in body
+        assert "API SESSION DROPPED" in body

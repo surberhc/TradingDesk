@@ -140,9 +140,17 @@ class S8Service:
     # Connection binding — keep the service and the composed monitor on ONE ib
     # ------------------------------------------------------------------ #
     def _bind_ib(self, ib) -> None:
-        """Point both this service and the composed monitor at the same connection."""
+        """Point both this service and the composed monitor at the same connection.
+
+        Also subscribes the gateway-alert DISCONNECT RECORDER to this connection's
+        ``client.apiError``. A mid-session drop is detected by polling ``ib.isConnected()``,
+        which raises nothing — the IB API's own message ("Peer closed connection.") is the
+        ONLY place the real reason exists, so it has to be captured here, at bind time, or
+        the alert email has nothing but "UNKNOWN" to report. Best-effort; never raises.
+        """
         self._ib = ib
         self.monitor._ib = ib
+        self._disconnect_recorder = s8_gateway_alert.attach_disconnect_recorder(ib)
 
     # ------------------------------------------------------------------ #
     # ENTRY SIDE — idempotency + shared decision + subscribe
@@ -362,8 +370,12 @@ class S8Service:
                     # can trust — and its ABSENCE stays the security signal (see
                     # s8_gateway_alert's docstring). Strictly best-effort: it dedups against
                     # the collector's simultaneous detection and never raises in here.
+                    # The recorder carries the IB API's own disconnect message (e.g. "Peer
+                    # closed connection.") so the email reports the REAL reason instead of
+                    # UNKNOWN; if it has nothing it says which source came up empty.
                     s8_gateway_alert.handle_gateway_down(
-                        "s8_service", last_connect_ok_ts=last_connect_ok_ts)
+                        "s8_service", last_connect_ok_ts=last_connect_ok_ts,
+                        recorder=getattr(self, "_disconnect_recorder", None))
                     try:
                         ib = ibkr_live_trade.connect(_CONSUMER, launch=False, readonly=True)
                         self._bind_ib(ib)
@@ -372,6 +384,8 @@ class S8Service:
                         self.monitor._ticker_owner.clear()
                         for trade_id in list(self.monitor._positions.keys()):
                             self.monitor._subscribe(trade_id)
+                        # (_bind_ib above re-attached a FRESH disconnect recorder to the new
+                        # connection, so this outage's message cannot leak into a later one.)
                         last_connect_ok_ts = time.time()
                     except Exception as exc:  # noqa: BLE001
                         print(f"s8_service.run: reconnect failed ({exc}); retrying...")
