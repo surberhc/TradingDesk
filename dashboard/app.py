@@ -27,12 +27,17 @@ Four sections (tabs):
                    vs target + the rebalance PLAN preview (build-only). NO controls
                    anywhere.
   4. S8          — intraday PILOT_MODE monitor for S8 (British IC + B2 long-leg
-                   auto-close): today's 11-template entry schedule, s8_runner.py's
-                   own ledger'd cycle log, a DISPLAY-ONLY live re-mark of today's
-                   still-open hypothetical picks against current quotes, the live
-                   account's own margin snapshot, and live-TRADING Gateway (port 4003)
-                   connection health. See render_s8() below for the read-only/
-                   never-feeds-back guarantees specific to this tab.
+                   auto-close), sourced from the S8 CAPTURE STORE (livebot/s8_store.py
+                   -> trades.jsonl), not the retired runner ledger: today's 11-template
+                   entry schedule, today's OPEN positions (entry snapshot), a live
+                   exit-monitor (per-position distance-to-stop + running P&L computed
+                   from the pilot's OWN RECORDED TICKS — zero Gateway contact), today's
+                   CLOSED round-trips with exit
+                   reasons + P&L + MAE + greeks-at-entry-vs-exit, the live account's own
+                   margin snapshot, and live-TRADING Gateway (port 4003) connection
+                   health. A date selector (default today) lets past sessions be viewed.
+                   See render_s8() below for the read-only/never-feeds-back guarantees
+                   specific to this tab.
 
 Launch (see run_dashboard.bat): binds 0.0.0.0 so a phone on the LAN can reach it.
 
@@ -45,9 +50,10 @@ Read-only guarantees in this file:
     the live-TRADING Gateway (port 4003), connected read-only/display-only — called
     with launch=False (this dashboard never boots the Gateway) and a short timeout;
     every connection opened here is disconnected before the fragment returns. It only
-    ever calls ib.accountSummary(), ib.qualifyContracts(), ib.reqMktData()/
-    cancelMktData(), and ib.reqTickers() (all reads) — no order object is ever built or
-    placed from this tab.
+    ever calls ib.accountSummary() (the account/margin snapshot) — no per-leg quote
+    request; no order object is ever built or placed from this tab. The live exit-monitor
+    overlay makes NO Gateway contact at all: it reads the pilot's own RECORDED tick
+    parquet (livebot/s8_monitor.py's capture), never a fresh quote.
 """
 from __future__ import annotations
 
@@ -67,7 +73,7 @@ import streamlit as st
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
 REPO = Path(__file__).resolve().parent.parent
-for sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport"):
+for sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport", "livebot"):
     p = REPO / sub
     if str(p) not in sys.path:
         sys.path.insert(0, str(p))
@@ -83,15 +89,17 @@ if str(_conn) not in sys.path:
 import status as dr_status
 
 # S8 tab: pure/data modules only at module scope (no IBKR import triggers a connection
-# at import time — s8_config is data-only, s8_strategy/s8_chain's own IBKR imports are
-# just class references (IB/Index/Option), never a connect() call, and ledger.py only
-# defines a path constant). connections.ibkr_live_trade itself (the thing that actually
-# opens a socket) stays a LAZY import inside _s8_connect_readonly_short(), same
-# convention render_accounts() already uses for `from connections import ibkr_paper`.
-import ledger
-import s8_chain
+# at import time — s8_config is data-only and the capture-store modules below are
+# pure/read-only over trades.jsonl + parquet). connections.ibkr_live_trade itself (the
+# thing that actually opens a socket) stays a LAZY import inside
+# _s8_connect_readonly_short(), same convention render_accounts() already uses for
+# `from connections import ibkr_paper`. These all live in livebot/ (S8 was relocated out
+# of paperbot/ into its own package, commit 321b5cf) — hence livebot on sys.path above.
 import s8_config
-import s8_strategy
+import s8_monitor_core
+import s8_report
+import s8_schema
+import s8_store
 
 # --- Local data locations (off-Drive, on C:) -----------------------------------
 # (WAREHOUSE/derived-GEX-parquet paths are no longer needed here — that's the
@@ -725,87 +733,108 @@ def render_accounts() -> None:
 
 # ================================== 4. S8 =====================================
 # S8 (British IC + B2 long-leg auto-close): SPX/SPXW 0DTE scheduled credit-spread pair
-# strategy, still in PILOT_MODE (paperbot/s8_runner.py hardcodes PILOT_MODE=True and
+# strategy, still in PILOT_MODE (livebot/s8_service.py hardcodes PILOT_MODE=True and
 # never calls order_router.place()/ib.placeOrder() — see that module's own docstring).
-# This tab is a pure MONITOR: it reads s8_runner.py's ledger records (paperbot/
-# ledger.py -> C:\TradingDesk-Local\state\paperbot\runs.jsonl, filtered on
-# mode == "s8_live_pilot" — the only tag ledger.record_run() actually carries; there
-# is no separate strategy/runner field, confirmed by reading both ledger.py and every
-# record_run() call site in s8_runner.py) and, for TODAY's still-open logged picks
-# only, layers on a live re-mark against CURRENT IBKR quotes PURELY FOR DISPLAY.
+# This tab is a pure MONITOR over the S8 CAPTURE STORE: it reads the durable trade
+# records via livebot/s8_store.read_trade_records() (append-only trades.jsonl under
+# C:\TradingDesk-Local\s8_pilot\, latest-wins by trade_id), NOT the retired runner
+# ledger. The live all-day service (s8_service.py) writes ONLY to this store — it no
+# longer writes ledger records — so the store is the single source of truth here.
+# For TODAY's still-open captured positions it layers on a live exit-monitor overlay
+# (per-position distance-to-stop + running P&L) computed from the pilot's OWN RECORDED
+# TICKS (livebot/s8_monitor.py's capture parquet — read-only, in-memory DuckDB, ZERO
+# Gateway contact) PURELY FOR DISPLAY, using the canonical frozen semantics in
+# livebot/s8_monitor_core.py (spread_close_value = short_ask - long_bid;
+# distance_to_stop = stop_price - spread_close_value).
 #
-# Until Andrew provides the S8 live-trading TEST account (s8_config.ACCOUNT is "TBD")
-# and brings the live-TRADING Gateway up, s8_runner.py refuses to run, so every ledger
-# read below WILL come back empty and every live read WILL degrade to "offline". That is
-# the expected, correctly-handled state for this tab, not a bug.
+# When the store is empty (no session captured yet), a past session is selected, or no
+# ticks have been recorded for a position yet, the overlay's live columns simply show
+# "—" (and a tick older than the freshness threshold is flagged stale rather than shown
+# as live). That is the expected, correctly-handled state for this tab, not a bug.
 CT_ZONE = ZoneInfo("America/Chicago")     # matches s8_config.ENTRY_GRID_CT's own convention
-_ET_ZONE = ZoneInfo("America/New_York")   # SPX/SPXW PM settlement is stated in ET
-_S8_SETTLEMENT_ET = dt_time(16, 0)        # 16:00 ET, same instant s5_harvest_engine.py uses
 
-# Pilot default: mirrors s8_runner.py's own QTY_PER_ENTRY (=1) for the dollar math
-# below. Duplicated as a small local constant rather than importing s8_runner.py itself
-# into the dashboard process — s8_runner.py is a scheduled-task ENTRY POINT (it reads
-# sys.argv-free module-level state and wires mailer/order_router/ledger at import time);
-# a monitor page has no business executing that script's import side effects merely to
-# read one integer. If S8's real position size ever becomes a genuine per-trade
-# variable (not a pilot constant), this line must be revisited alongside that change.
+# Pilot default: mirrors the service's own QTY_PER_ENTRY (=1) — used only as a fallback
+# when a captured record has no qty. The store records carry their own qty, so the live
+# P&L math prefers record.qty and falls back to this constant.
 S8_QTY_PER_ENTRY = 1
-S8_CONTRACT_MULTIPLIER = 100.0  # standard SPX/SPXW index-option multiplier
 
 
 @st.cache_data(ttl=20)
-def _s8_read_today_records() -> list[dict]:
-    """Today's S8 ledger records, read-only. ledger.py is append-only and this function
-    never writes to it. Cached 20s (short — this feeds the fast-refresh fragment)."""
-    path = ledger.RUNS_JSONL
-    if not os.path.exists(path):
-        return []
-    today_str = datetime.now().strftime("%Y-%m-%d")
-    out: list[dict] = []
+def _s8_store_records() -> list:
+    """All S8 capture-store trade records, read-only, latest-wins by trade_id.
+
+    Delegates to livebot/s8_store.read_trade_records() — the SAME read livebot/
+    s8_report.py uses — and never writes to the store. Returns a list of
+    s8_schema.TradeRecord (dataclasses; picklable, so st.cache_data can hold them).
+    Cached 20s (short — this feeds the fast-refresh fragment). Any read failure
+    degrades to an empty list rather than taking the tab down."""
     try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("mode") != "s8_live_pilot":
-                    continue
-                if not str(rec.get("ts", "")).startswith(today_str):
-                    continue
-                out.append(rec)
-    except OSError:
+        return s8_store.read_trade_records()
+    except Exception:
         return []
-    return out
 
 
-@st.cache_data(ttl=300)
-def _s8_read_all_records(max_rows: int = 2000) -> list[dict]:
-    """Every S8 ledger record ever written, oldest-first, capped to the most recent
-    max_rows so a long-lived ledger can't blow up dashboard memory. Cached 5 minutes —
-    history changes far less often than the live cycle log; read-only, never writes."""
-    path = ledger.RUNS_JSONL
-    if not os.path.exists(path):
-        return []
-    out: list[dict] = []
-    try:
-        with open(path, "r", encoding="utf-8") as fh:
-            for line in fh:
-                line = line.strip()
-                if not line:
-                    continue
-                try:
-                    rec = json.loads(line)
-                except json.JSONDecodeError:
-                    continue
-                if rec.get("mode") == "s8_live_pilot":
-                    out.append(rec)
-    except OSError:
-        return []
-    return out[-max_rows:]
+def _s8_available_dates(records: list) -> list[str]:
+    """Distinct captured session dates (bare YYYYMMDD), most-recent first. Pure."""
+    return sorted({r.date for r in records if r.date}, reverse=True)
+
+
+def _s8_records_for_date(records: list, date: str | None) -> list:
+    """Records for one session date, reusing s8_report.select_records (pure). A None
+    date means 'all captured records'."""
+    if date is None:
+        return list(records)
+    return s8_report.select_records(records, date=date)
+
+
+# --- 4.0b PURE distance-to-stop math (offline-testable; no st, no IBKR) ---------
+def _s8_monitor_position(rec):
+    """Build a livebot/s8_monitor_core.MonitorPosition from a stored TradeRecord.
+
+    PURE (no I/O). realized_credit and stop_price are taken VERBATIM from the frozen
+    entry (never recomputed here) — the monitor core only compares live prices against
+    that already-frozen level (rule #1 stays clean)."""
+    e = rec.entry
+    return s8_monitor_core.MonitorPosition(
+        trade_id=rec.trade_id,
+        side=rec.side,
+        short_strike=(e.short_strike if e else None),
+        long_strike=(e.long_strike if e else None),
+        qty=(rec.qty if rec.qty else S8_QTY_PER_ENTRY),
+        realized_credit=(e.realized_credit if e and e.realized_credit is not None else 0.0),
+        stop_price=(e.stop_price if e and e.stop_price is not None else 0.0),
+    )
+
+
+def s8_distance_to_stop(rec, short_ask, long_bid) -> dict:
+    """PURE. Given an open TradeRecord + the CURRENT short-leg ask and long-leg bid,
+    return the live exit-monitor row values using the CANONICAL frozen semantics from
+    livebot/s8_monitor_core (the corrected net-spread stop, commit e08568e):
+
+        spread_cost      = short_ask - long_bid                 (cost to close now)
+        distance_to_stop = stop_price - spread_cost             (points; <=0 == stopped)
+        running_pnl      = (realized_credit - spread_cost) * 100 * qty   (dollars)
+
+    Computed by delegating to s8_monitor_core.spread_close_value / pnl_at so this tab can
+    never drift from the monitor's own stop/P&L math. None-safe: a missing quote yields
+    None for whatever needs it (never a guess, never a crash). NO Streamlit or IBKR
+    dependency — this is the single computation the offline tests pin."""
+    pos = _s8_monitor_position(rec)
+    sample = s8_monitor_core.Sample(short_ask=short_ask, long_bid=long_bid)
+    spread_cost = s8_monitor_core.spread_close_value(sample)
+    running_pnl = s8_monitor_core.pnl_at(pos, sample)
+    stop_price = rec.entry.stop_price if rec.entry else None
+    distance = None
+    if spread_cost is not None and stop_price is not None:
+        distance = float(stop_price) - spread_cost
+    stopped = distance is not None and distance <= 0
+    return {
+        "spread_cost": spread_cost,
+        "stop_price": stop_price,
+        "distance_to_stop": distance,
+        "running_pnl": running_pnl,
+        "stopped": stopped,
+    }
 
 
 # --- 4.1 Today's schedule strip ------------------------------------------------
@@ -820,16 +849,15 @@ def _s8_next_slot_today(grid: list[str] | None, now_ct: dt_time) -> str:
     return "done for today"
 
 
-def _s8_last_fired(records: list[dict], template: str) -> str:
-    """Latest cycle ts where `template` appeared in that cycle's due_templates — the
-    only per-template timestamp granularity ledger.py actually stores (there is no
-    separate per-template log line, only a per-cycle record with a due_templates list
-    and a results list); records are read in file order so the last match is the most
-    recent."""
+def _s8_last_fired(records: list, template: str) -> str:
+    """Latest captured entry timestamp for `template` among the given (today's) store
+    records — the store now IS the per-entry log (one TradeRecord per would-be trade),
+    so a template 'fired today' iff it has a captured record today. Records are in
+    first-seen order, so the last match is the most recent. '—' if none captured."""
     latest = "—"
     for rec in records:
-        if template in (rec.get("due_templates") or []):
-            latest = rec.get("ts", latest)
+        if rec.template == template and rec.entry and rec.entry.entry_ts:
+            latest = rec.entry.entry_ts
     return latest
 
 
@@ -845,16 +873,18 @@ def _s8_first_slot_minutes(grid: list[str] | None) -> int | None:
     return h * 60 + m
 
 
-def render_s8_schedule() -> None:
+def render_s8_schedule(records: list) -> None:
     st.markdown("#### Today's schedule — all 11 templates")
     st.caption("Times are CT (US/Central), matching s8_config.ENTRY_GRID_CT's own "
                "convention. Sorted by each template's own first scheduled entry time "
                "(fixed all day — not reordered by the clock); the 5 templates flagged "
                "NO SCHEDULE DATA are real gaps in the real-fills MATCHED sample (too "
                "few observations to name a grid, per s8_config.py's own comment) and "
-               "are grouped at the bottom rather than interspersed.")
+               "are grouped at the bottom rather than interspersed. 'last fired' is now "
+               "store-sourced (a captured trade record for the template today).")
     now_ct = datetime.now(tz=CT_ZONE).time()
-    records = _s8_read_today_records()
+    today = datetime.now(tz=CT_ZONE).strftime("%Y%m%d")
+    records = _s8_records_for_date(records, today)
     templates_sorted = sorted(
         s8_config.TEMPLATES.items(),
         key=lambda kv: (
@@ -902,243 +932,281 @@ def render_s8_schedule() -> None:
     _badge_legend()
 
 
-# --- 4.2 Live cycle log ---------------------------------------------------------
-def _render_s8_cycle_log() -> None:
-    st.markdown("#### Live cycle log (today)")
-    records = _s8_read_today_records()
-    if not records:
-        st.info("No S8 runner cycles logged yet today — expected until the S8 "
-                 "live-trading TEST account is set (s8_config.ACCOUNT is 'TBD') and the "
-                 "scheduled task begins firing.")
+# --- 4.2 Today's open positions (STORE-sourced; works offline) ------------------
+def _render_s8_open_positions(open_recs: list) -> None:
+    st.markdown("#### Open positions — entry snapshot (store)")
+    st.caption("Store-sourced (livebot/s8_store.py -> trades.jsonl); works offline with "
+               "no Gateway. One row per still-open captured S8 credit spread for the "
+               "selected session: strikes, entry credit, frozen stop_price, short-leg "
+               "entry greeks, and entry spot/VIX.")
+    if not open_recs:
+        st.info("No open positions for the selected session.")
         return
-    lo, hi = s8_strategy._REAL_DELTA_BAND
+    fmt_n, fmt_k = s8_report._fmt_num, s8_report._fmt_strike
     rows = []
-    for rec in records:
-        ts = rec.get("ts", "—")
-        if rec.get("error"):
-            rows.append({
-                "cycle ts": ts, "template": ", ".join(rec.get("due_templates") or []),
-                "chain snapshot": "FAIL", "short/long": "—", "width": "—", "credit": "—",
-                "delta flag": "", "margin gate": "—", "would transmit": rec["error"],
-            })
-            continue
-        for item in rec.get("results", []):
-            pick = item.get("pick")
-            delta_flag = ""
-            if pick and pick.get("short_delta") is not None:
-                d = pick["short_delta"]
-                if not (lo <= d <= hi):
-                    delta_flag = f"FLAG ({d:.3f} outside [{lo:.2f},{hi:.2f}])"
-            preflight = item.get("preflight")
-            margin_gate = ("OK" if preflight and preflight.get("ok")
-                           else ("REFUSED: " + "; ".join(preflight.get("reasons", []))
-                                 if preflight else "—"))
-            rows.append({
-                "cycle ts": ts, "template": item.get("template"),
-                "chain snapshot": "ok",
-                "short/long": (f"{pick['short_strike']:g}/{pick['long_strike']:g}"
-                              if pick else "—"),
-                "width": f"{pick['width']:.0f}" if pick else "—",
-                "credit": f"{pick['realized_credit']:.2f}" if pick else "—",
-                "delta flag": delta_flag,
-                "margin gate": margin_gate,
-                "would transmit": (item.get("would_transmit") or item.get("reason")
-                                  or item.get("error") or "—"),
-            })
+    for r in open_recs:
+        e = r.entry
+        sl = e.short_leg if e else None
+        rows.append({
+            "template": r.template or "—", "slot": r.slot or "—", "side": r.side or "—",
+            "short/long": (f"{fmt_k(e.short_strike)}/{fmt_k(e.long_strike)}" if e else "—"),
+            "credit": fmt_n(e.realized_credit if e else None),
+            "stop px": fmt_n(e.stop_price if e else None),
+            "short Δ": fmt_n(sl.delta if sl else None, 3),
+            "short Γ": fmt_n(sl.gamma if sl else None, 4),
+            "short Θ": fmt_n(sl.theta if sl else None),
+            "short IV": fmt_n(sl.iv if sl else None, 3),
+            "entry spot": fmt_n(e.entry_spot if e else None),
+            "entry VIX": fmt_n(e.entry_vix if e else None),
+        })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
 
 
-# --- 4.3 Estimated P&L on hypothetical picks (LIVE re-mark; DISPLAY ONLY) -------
-def _s8_settlement_intrinsic(spot_settle: float, side: str, short_strike: float,
-                             width: float) -> float:
-    """Adapted from backtester/s5_harvest_engine.py::_settlement_intrinsic for S8's
-    single-sided vertical (puts OR calls, never a condor's both sides at once) with its
-    own PER-PICK width (S8's width varies pick to pick — NOT s5's fixed 5.0-point wing).
-    Cash-settled European intrinsic, clipped to the defined-risk wing width."""
-    if side == "PUT":
-        return min(max(short_strike - spot_settle, 0.0), width)
-    return min(max(spot_settle - short_strike, 0.0), width)   # CALL
+# --- 4.3 Live exit-monitor / distance-to-stop (RECORDED-TICK overlay; DISPLAY ONLY) ---
+# The overlay reads the pilot's OWN recorded ticks — it makes ZERO Gateway contact. This
+# removes the market-data-line perturbation the old per-leg quote pull risked and drops the
+# wait-for-close constraint: it works DURING the session and AFTER close (once capture
+# stops, the last recorded tick simply ages past the freshness threshold and is flagged
+# stale rather than presented as live).
+
+# A tick older than this (seconds) is shown as "stale" rather than as a live price. The
+# pilot samples every few seconds, so a gap this large means capture is not currently live
+# for that position (after the close, or a dropped subscription).
+S8_TICK_STALE_SECS = 90
+
+# The tick store writes a NEW ~50-row parquet part per buffer flush — tens of thousands
+# of tiny files per session (~82k / 1GB by mid-afternoon). Scanning the whole day every
+# 5 minutes takes long enough, so the overlay bounds its read to the recent TAIL of part files: the
+# latest tick per position always lives in the newest parts. The window is anchored to the
+# NEWEST part's mtime (not wall-clock) so it still captures each position's final tick
+# after the close (shown stale) instead of an empty set. Chosen comfortably above
+# S8_TICK_STALE_SECS so a position in the "stale but recent" band (90–240s) still appears
+# with its age; a position with no tick in this window shows "—". NOT a strategy knob.
+S8_TICK_SCAN_WINDOW_SECS = 240
 
 
-def _s8_pick_id(pick_row: dict) -> str:
-    return (f"{pick_row['cycle_ts']}|{pick_row['template']}|"
-            f"{pick_row['short_strike']}|{pick_row['long_strike']}")
+def _s8_num(value):
+    """None for None/NaN/blank; float otherwise. Local mirror of s8_chain._num so the
+    tick reader carries no IBKR dependency. PURE."""
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except (TypeError, ValueError):
+        pass
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
 
 
-def _s8_reprice_pick(pick_row: dict, cfg: dict, short_q, long_q,
-                     spot_settle: float | None, phase: str) -> dict:
-    """PURE DISPLAY MATH for one hypothetical S8 pick.
+def _s8_ticks_dataframe(session_date: str, trade_ids=None):
+    """Read the LATEST recorded tick per (trade_id, leg) for one session date into a
+    DataFrame, via an EPHEMERAL in-memory DuckDB view — the SAME read-only pattern
+    livebot/s8_report.tick_counts uses: the on-disk catalog.duckdb is NEVER opened, and
+    the running collector's parquet parts are only READ. Optionally restrict to
+    ``trade_ids``.
 
-    *** THIS FUNCTION CANNOT AFFECT ANY REAL DECISION. *** Its only caller is
-    _render_s8_pnl() below, its only output is a dict rendered on this page, it never
-    writes to ledger.py, and s8_runner.py / s8_strategy.py have no import of
-    dashboard/app.py anywhere — there is no code path by which this math could reach
-    the real PILOT_MODE decision loop. This whole function could be deleted with zero
-    effect on the actual strategy.
+    ZERO Gateway contact — that is the whole point of the recorded-tick overlay. Any
+    failure (no partition yet, missing duckdb, unreadable parts) degrades to an empty
+    frame, so the overlay fail-softs to '—' exactly as the old gateway-offline path did.
 
-    Stop check: reuses s8_strategy.stop_price(entry_credit, stop_multiple) (the frozen
-    formula) and compares it to the SHORT leg's own current cost-to-close (its live
-    ask) — the same honest-fill convention (sell short at bid, buy back at ask) already
-    established in s8_strategy.py/s8_runner.py. Once stopped, the P&L is FROZEN at
-    exactly (entry_credit - stop_price) — the constant-dollar stop's own definition —
-    rather than kept re-marking a hypothetically-closed position.
+    PERFORMANCE: the parts are tens of thousands of tiny files (see
+    S8_TICK_SCAN_WINDOW_SECS), and ~all rows belong to the day's open positions, so
+    neither a whole-day scan nor a plain ``WHERE trade_id IN (...)`` is cheap enough for a
+    5-minute fragment refresh. Two bounds are applied: (1) only the recent TAIL of part files (mtime
+    within S8_TICK_SCAN_WINDOW_SECS of the newest part) is handed to DuckDB; (2) the
+    latest-per-leg reduction is pushed DOWN into SQL (``QUALIFY row_number() … = 1``) so
+    DuckDB MATERIALIZES only ~2 rows per open position, not millions. The ``ORDER BY ts
+    DESC`` is lexical on the ISO-8601 ts, matching _s8_latest_tick_per_leg's own string
+    sort, so the SQL pre-trim returns exactly the row that pure selection would keep (it
+    stays the canonical semantics; SQL only avoids shipping the full session to pandas).
+    Empty ``trade_ids`` list -> empty frame."""
+    import os
 
-    Open mark: a FULL SPREAD mark (both legs), not just the short leg — current cost to
-    close the spread = short_ask_now - long_bid_now (buy back short at its ask, sell
-    long at its bid); P&L = entry realized_credit - that cost. This is algebraically
-    the same honest-fill convention applied to both legs
-    ((short_bid_entry - short_ask_now) + (long_bid_now - long_ask_entry)
-      == realized_credit - (short_ask_now - long_bid_now))
-    without needing the individual per-leg entry prices ledger.py doesn't separately
-    store (only the net realized_credit is logged).
+    ids = None if trade_ids is None else list(trade_ids)
+    if ids is not None and not ids:
+        return pd.DataFrame(columns=s8_schema.TICK_COLUMNS)
+    ticks_dir = s8_store.get_root() / "ticks" / f"date={session_date}"
+    try:
+        parts = [(e.path, e.stat().st_mtime) for e in os.scandir(ticks_dir)
+                 if e.name.endswith(".parquet")]
+    except (FileNotFoundError, NotADirectoryError, OSError):
+        return pd.DataFrame(columns=s8_schema.TICK_COLUMNS)
+    if not parts:
+        return pd.DataFrame(columns=s8_schema.TICK_COLUMNS)
+    # Recent tail only — bound the scan to the newest window of parts (the latest tick per
+    # position lives here), anchored to the newest part so it still works after the close.
+    cutoff = max(m for _, m in parts) - S8_TICK_SCAN_WINDOW_SECS
+    recent = [p for p, m in parts if m >= cutoff]
+    try:
+        import duckdb
 
-    Settlement mark: past today's 16:00 ET settlement instant, marks to intrinsic at
-    spot via _s8_settlement_intrinsic() above (adapted from
-    backtester/s5_harvest_engine.py's proven _settlement_intrinsic), then freezes.
-    """
-    side = "PUT" if cfg["side"] == "Puts" else "CALL"
-    stop_px = s8_strategy.stop_price(pick_row["realized_credit"], cfg["stop_multiple"])
-    qty = S8_QTY_PER_ENTRY
-
-    if phase == "past_settlement" and spot_settle is not None:
-        debit = _s8_settlement_intrinsic(spot_settle, side, pick_row["short_strike"],
-                                         pick_row["width"])
-        pnl_pts = pick_row["realized_credit"] - debit
-        return {"status": "settled", "pnl_points": pnl_pts,
-                "pnl_dollars": pnl_pts * S8_CONTRACT_MULTIPLIER * qty,
-                "note": f"marked to intrinsic @ spot {spot_settle:.2f}", "frozen": True}
-
-    short_bid, short_ask = short_q if short_q else (None, None)
-    if short_ask is not None and short_ask >= stop_px:
-        pnl_pts = pick_row["realized_credit"] - stop_px
-        return {"status": "stopped", "pnl_points": pnl_pts,
-                "pnl_dollars": pnl_pts * S8_CONTRACT_MULTIPLIER * qty,
-                "note": f"short ask {short_ask:.2f} >= stop {stop_px:.2f} (frozen)",
-                "frozen": True}
-
-    long_bid, long_ask = long_q if long_q else (None, None)
-    if short_ask is not None and long_bid is not None:
-        cost_to_close = short_ask - long_bid
-        pnl_pts = pick_row["realized_credit"] - cost_to_close
-        return {"status": "open", "pnl_points": pnl_pts,
-                "pnl_dollars": pnl_pts * S8_CONTRACT_MULTIPLIER * qty,
-                "note": f"live mark: short ask {short_ask:.2f}, long bid {long_bid:.2f}",
-                "frozen": False}
-
-    return {"status": "quote unavailable", "pnl_points": None, "pnl_dollars": None,
-            "note": "no live two-sided quote for this strike this cycle", "frozen": False}
+        con = duckdb.connect(":memory:")
+        try:
+            files_sql = ",".join(
+                "'" + p.replace("\\", "/").replace("'", "''") + "'" for p in recent
+            )
+            con.execute(
+                "CREATE VIEW mon_ticks AS "
+                f"SELECT * FROM read_parquet([{files_sql}], union_by_name=true)"
+            )
+            where = ""
+            params: list = []
+            if ids is not None:
+                where = " WHERE trade_id IN (" + ",".join(["?"] * len(ids)) + ")"
+                params = ids
+            df = con.execute(
+                "SELECT trade_id, ts, leg, bid, ask, last, delta, iv FROM mon_ticks"
+                + where
+                + " QUALIFY row_number() OVER "
+                "(PARTITION BY trade_id, leg ORDER BY ts DESC) = 1",
+                params,
+            ).fetchdf()
+        finally:
+            con.close()
+    except Exception:
+        return pd.DataFrame(columns=s8_schema.TICK_COLUMNS)
+    return df
 
 
-def _s8_targeted_quotes(ib, expiration: str, needs: list[tuple[str, float]]) -> dict:
-    """Lighter targeted quote pull for exactly the strikes today's live P&L re-mark
-    needs (2 legs per still-open pick), reusing s8_chain.py's own contract-construction
-    pattern (SPX/SPXW 0DTE Option, SMART exchange, tradingClass SPXW) rather than
-    inventing a new one. Deliberately NOT s8_chain.snapshot_0dte_chain()'s full
-    near-money sweep (up to ~250 contracts, ~18s, meant for a pre-entry decision) — a
-    30s auto-refresh fragment re-pricing a handful of open picks only needs the exact
-    strikes involved. Settle window shortened to 3s (vs snapshot_0dte_chain's 6s)
-    since this pulls a handful of lines, not up to 3 full LINE_LIMIT batches — a
-    judgment call for this lighter, narrower ask, not a re-tuning of the proven
-    snapshot's own pacing constants."""
-    from ib_async import Option
-    contracts = [
-        Option("SPX", expiration, strike, right, "SMART",
-              tradingClass=s8_chain._SPXW_TRADING_CLASS, currency="USD")
-        for right, strike in needs
-    ]
-    contracts = [c for c in (ib.qualifyContracts(*contracts) or []) if c and c.conId]
-    if not contracts:
-        return {}
-    tickers = [ib.reqMktData(c, "", False, False) for c in contracts]
-    ib.sleep(3)
-    out = {}
-    for c, t in zip(contracts, tickers):
-        out[(c.right, float(c.strike))] = (s8_chain._num(t.bid), s8_chain._num(t.ask))
-    for c in contracts:
-        ib.cancelMktData(c)
+def _s8_latest_tick_per_leg(df) -> dict:
+    """PURE. Collapse a tick DataFrame to the LATEST tick per (trade_id, leg) by ts,
+    returning {trade_id: {"short": {...}, "long": {...}}} where each inner dict carries
+    bid/ask/last/delta/iv/ts (numbers coerced, NaN -> None). Empty / None input -> {}.
+    No I/O — this is the selection the offline tests pin, mirroring the store's
+    latest-wins convention but on the tick series (recorded ts are ISO-8601 with a single
+    tz offset per session, so lexical order == chronological order)."""
+    out: dict = {}
+    if df is None or len(df) == 0:
+        return out
+    ordered = df.sort_values("ts")
+    for (tid, leg), grp in ordered.groupby(["trade_id", "leg"], sort=False):
+        row = grp.iloc[-1]
+        out.setdefault(str(tid), {})[str(leg)] = {
+            "bid": _s8_num(row.get("bid")),
+            "ask": _s8_num(row.get("ask")),
+            "last": _s8_num(row.get("last")),
+            "delta": _s8_num(row.get("delta")),
+            "iv": _s8_num(row.get("iv")),
+            "ts": row.get("ts"),
+        }
     return out
 
 
-def _render_s8_pnl(ib) -> None:
-    st.markdown("#### Estimated P&L on today's hypothetical picks (live re-mark)")
-    st.caption("DISPLAY ONLY — re-marks today's still-open LOGGED picks against "
-               "current quotes. This math lives entirely in dashboard/app.py and is "
-               "never written to the ledger and never fed back into s8_runner.py's "
-               "real PILOT_MODE decision loop — see _s8_reprice_pick()'s docstring for "
-               "exactly why that coupling is structurally impossible here.")
+def _s8_tick_age_secs(ts_iso, now=None):
+    """Seconds between ``now`` and an ISO-8601 tick timestamp; None if unparseable/blank.
+    PURE (now defaults to the tick's own tz so age is well-defined offline)."""
+    if not ts_iso:
+        return None
+    try:
+        t = datetime.fromisoformat(str(ts_iso))
+    except (TypeError, ValueError):
+        return None
+    ref = now or datetime.now(tz=t.tzinfo)
+    if t.tzinfo is not None and ref.tzinfo is None:
+        ref = ref.replace(tzinfo=t.tzinfo)
+    return (ref - t).total_seconds()
 
-    records = _s8_read_today_records()
-    picks = [
-        {"cycle_ts": rec.get("ts"), "template": item["template"], **item["pick"]}
-        for rec in records
-        for item in rec.get("results", [])
-        if item.get("pick") and item.get("would_transmit")
-    ]
-    if not picks:
-        st.info("No approved (would-have-transmitted) picks logged today yet.")
+
+def _s8_fmt_age(secs) -> str:
+    """Compact '4s ago' / '2m03s ago' / '1h05m ago' freshness label; '—' if unknown."""
+    if secs is None:
+        return "—"
+    s = int(round(secs))
+    if s < 0:
+        s = 0
+    if s < 60:
+        return f"{s}s ago"
+    m, s = divmod(s, 60)
+    if m < 60:
+        return f"{m}m{s:02d}s ago"
+    h, m = divmod(m, 60)
+    return f"{h}h{m:02d}m ago"
+
+
+def _render_s8_live_monitor(open_recs: list, is_today: bool, session_date=None) -> None:
+    st.markdown("#### Live exit-monitor — distance to stop (recorded ticks)")
+    st.caption("The 'watch it happen' view. For each open position: current cost to "
+               "close the spread (short ask − long bid) vs its frozen stop_price → "
+               "distance to stop + running P&L. The distance/P&L math is the CANONICAL "
+               "livebot/s8_monitor_core computation (s8_distance_to_stop); the prices come "
+               "from the pilot's OWN RECORDED TICKS (read-only parquet, in-memory DuckDB, "
+               "ZERO Gateway contact) — the latest tick per leg. Each row shows that "
+               f"tick's age; a tick older than {S8_TICK_STALE_SECS}s (e.g. after the "
+               "close, when capture stops) is flagged 'stale' and its live columns blanked "
+               "rather than presenting old data as live. Past session / no ticks yet → "
+               "'—'.")
+    if not open_recs:
+        st.info("No open positions to monitor for the selected session.")
         return
 
-    frozen: dict = st.session_state.setdefault("s8_frozen_pnl", {})
-    now_et = datetime.now(tz=_ET_ZONE)
-    phase = "past_settlement" if now_et.time() >= _S8_SETTLEMENT_ET else "intraday"
-
-    to_query = [p for p in picks if _s8_pick_id(p) not in frozen]
-    quotes: dict = {}
-    spot_settle = None
-    if ib is not None and to_query:
-        try:
-            expiration = to_query[0]["cycle_ts"][:10].replace("-", "")
-            needs = set()
-            for p in to_query:
-                side = "PUT" if s8_config.TEMPLATES[p["template"]]["side"] == "Puts" else "CALL"
-                needs.add((side, p["short_strike"]))
-                needs.add((side, p["long_strike"]))
-            quotes = _s8_targeted_quotes(ib, expiration, sorted(needs))
-            if phase == "past_settlement":
-                try:
-                    _, spot_settle = s8_chain.get_underlying(ib)
-                except Exception:
-                    spot_settle = None
-        except Exception as exc:
-            st.caption(f"Live quote pull failed this cycle: {type(exc).__name__}: {exc}")
+    fmt_n, fmt_k, fmt_s = s8_report._fmt_num, s8_report._fmt_strike, s8_report._fmt_signed
+    latest: dict = {}
+    if is_today and session_date:
+        ids = [r.trade_id for r in open_recs]
+        latest = _s8_latest_tick_per_leg(_s8_ticks_dataframe(session_date, ids))
 
     rows = []
-    total_dollars = 0.0
-    any_unknown = False
-    for p in picks:
-        pid = _s8_pick_id(p)
-        cfg = s8_config.TEMPLATES[p["template"]]
-        if pid in frozen:
-            result = frozen[pid]
+    total_pnl = 0.0
+    any_live = False
+    any_unpriced = False
+    for r in open_recs:
+        e = r.entry
+        legs = latest.get(r.trade_id, {})
+        sq = legs.get("short")
+        lq = legs.get("long")
+        # Freshness: the position is only as live as its most recent leg sample; take the
+        # newer of the two legs' tick ages. Stale -> do not present old prices as live.
+        age = None
+        for q in (sq, lq):
+            if q and q.get("ts"):
+                a = _s8_tick_age_secs(q["ts"])
+                if a is not None and (age is None or a < age):
+                    age = a
+        stale = age is not None and age > S8_TICK_STALE_SECS
+        short_ask = (sq.get("ask") if sq else None) if not stale else None
+        long_bid = (lq.get("bid") if lq else None) if not stale else None
+        d = s8_distance_to_stop(r, short_ask, long_bid)
+        if d["running_pnl"] is not None:
+            any_live = True
+            total_pnl += d["running_pnl"]
         else:
-            side = "PUT" if cfg["side"] == "Puts" else "CALL"
-            short_q = quotes.get((side, p["short_strike"]))
-            long_q = quotes.get((side, p["long_strike"]))
-            result = _s8_reprice_pick(p, cfg, short_q, long_q, spot_settle, phase)
-            if result.get("frozen"):
-                frozen[pid] = result
-        if result["pnl_dollars"] is None:
-            any_unknown = True
+            any_unpriced = True
+        if stale:
+            state = "stale"
+        elif d["stopped"]:
+            state = "STOPPED"
+        elif d["running_pnl"] is not None:
+            state = "live"
         else:
-            total_dollars += result["pnl_dollars"]
+            state = "no tick"
         rows.append({
-            "template": p["template"], "entered": p["cycle_ts"],
-            "short/long": f"{p['short_strike']:g}/{p['long_strike']:g}",
-            "entry credit": f"{p['realized_credit']:.2f}",
-            "status": result["status"],
-            "est P&L $": (f"{result['pnl_dollars']:,.0f}"
-                         if result["pnl_dollars"] is not None else "—"),
-            "note": result["note"],
+            "template": r.template or "—", "slot": r.slot or "—", "side": r.side or "—",
+            "short/long": (f"{fmt_k(e.short_strike)}/{fmt_k(e.long_strike)}" if e else "—"),
+            "stop px": fmt_n(d["stop_price"]),
+            "cost to close": fmt_n(d["spread_cost"]),
+            "dist to stop": fmt_s(d["distance_to_stop"]),
+            "running P&L $": (f"{d['running_pnl']:,.0f}" if d["running_pnl"] is not None else "—"),
+            "cur short Δ": fmt_n((sq.get("delta") if sq else None) if not stale else None, 3),
+            "cur short IV": fmt_n((sq.get("iv") if sq else None) if not stale else None, 3),
+            "tick age": _s8_fmt_age(age),
+            "state": state,
         })
-
-    label = "Total estimated hypothetical P&L (today)"
-    if any_unknown:
-        label += " (partial — some picks unpriced this cycle)"
-    st.metric(label, f"${total_dollars:,.0f}")
+    if any_live:
+        label = "Running P&L on open positions (live from recorded ticks)"
+        if any_unpriced:
+            label += " (partial — some positions unpriced/stale this cycle)"
+        st.metric(label, f"${total_pnl:,.0f}")
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-    if ib is None:
-        st.caption("Live-trading Gateway unreachable this cycle — showing logged entry "
-                   "data only; live re-mark resumes once the Gateway is reachable.")
+    if not is_today:
+        st.caption("Past session selected — positions shown without a live overlay "
+                   "(the recorded-tick overlay applies to today's session only).")
+    elif not any_live:
+        st.caption("No fresh recorded ticks for the open positions this cycle — live "
+                   "columns blank; they populate as the pilot records ticks (and go stale "
+                   "after the close, which is expected).")
 
 
 # --- 4.4 Account / margin snapshot ----------------------------------------------
@@ -1174,7 +1242,7 @@ def _render_s8_account(ib) -> None:
 
 
 # --- 4.5 Connection health -------------------------------------------------------
-def _render_s8_connection_health(ib, connect_error: Exception | None) -> None:
+def _render_s8_connection_health(ib, connect_error: Exception | None, records: list) -> None:
     st.markdown("#### Connection health")
     up = _port_open("127.0.0.1", 4003)   # same cheap TCP-probe pattern as the Health
                                           # tab's paper-gateway (4002) check above
@@ -1186,44 +1254,64 @@ def _render_s8_connection_health(ib, connect_error: Exception | None) -> None:
     st.caption("Last successful dashboard live probe (this session): "
               f"{st.session_state.get('s8_last_live_probe', '—')}")
 
-    last_snapshot_ts = "—"
-    for rec in reversed(_s8_read_all_records(max_rows=500)):
-        if not rec.get("error"):
-            last_snapshot_ts = rec.get("ts", "—")
-            break
-    st.caption(f"Last successful runner chain snapshot (from ledger): {last_snapshot_ts}")
+    last_capture = "—"
+    for rec in records:            # records are in first-seen order; last wins
+        if rec.entry and rec.entry.entry_ts:
+            last_capture = rec.entry.entry_ts
+    st.caption(f"Last captured trade entry (from store): {last_capture}")
     if connect_error is not None and ib is None:
         st.caption(f"(dashboard connect attempt this cycle failed: "
                   f"{type(connect_error).__name__}: {connect_error})")
 
 
-# --- 4.6 History view ------------------------------------------------------------
-def render_s8_history() -> None:
-    st.markdown("#### History (all logged S8 cycles)")
-    records = _s8_read_all_records()
-    if not records:
-        st.info("No S8 ledger history yet.")
+# --- 4.6 Closed round-trips (STORE-sourced; works offline) ----------------------
+def render_s8_closed(records: list, date: str | None) -> None:
+    st.markdown("#### Closed round-trips (store)")
+    st.caption("Store-sourced round-trips for the selected session (works offline): "
+               "entry→exit spot move, exit reason, P&L, max adverse excursion (MAE), "
+               "duration, and short-leg greeks at entry vs exit. The aggregate row "
+               "reuses livebot/s8_report.compute_aggregates (win rate / P&L / MAE over "
+               "CLOSED trades only).")
+    day_recs = _s8_records_for_date(records, date)
+    closed = [r for r in day_recs if not s8_report.is_open(r)]
+    if not closed:
+        st.info("No closed round-trips for the selected session yet.")
         return
-    dates = sorted({r.get("ts", "")[:10] for r in records if r.get("ts")}, reverse=True)
-    chosen = st.selectbox("Date", ["(all)"] + dates, key="s8_hist_date")
-    filtered = (records if chosen == "(all)"
-               else [r for r in records if r.get("ts", "").startswith(chosen)])
+
+    agg = s8_report.compute_aggregates(day_recs)
+    cols = st.columns(5)
+    cols[0].metric("Closed", agg["closed_count"])
+    wr = agg["win_rate"]
+    cols[1].metric("Win rate", f"{wr * 100:.0f}%" if wr is not None else "—")
+    cols[2].metric("Total P&L", f"${agg['total_pnl']:,.0f}"
+                   if agg["total_pnl"] is not None else "—")
+    cols[3].metric("Avg P&L", f"${agg['avg_pnl']:,.0f}"
+                   if agg["avg_pnl"] is not None else "—")
+    cols[4].metric("Avg MAE", f"${agg['avg_mae']:,.0f}"
+                   if agg["avg_mae"] is not None else "—")
+
+    fmt_n, fmt_k, fmt_s = s8_report._fmt_num, s8_report._fmt_strike, s8_report._fmt_signed
     rows = []
-    for rec in filtered:
-        ts = rec.get("ts", "—")
-        if rec.get("error"):
-            rows.append({"cycle ts": ts, "template": ", ".join(rec.get("due_templates") or []),
-                        "pick": "—", "outcome": rec["error"]})
-            continue
-        for item in rec.get("results", []):
-            pick = item.get("pick")
-            rows.append({
-                "cycle ts": ts, "template": item.get("template"),
-                "pick": (f"{pick['short_strike']:g}/{pick['long_strike']:g} @ "
-                        f"{pick['realized_credit']:.2f}") if pick else "—",
-                "outcome": (item.get("would_transmit") or item.get("reason")
-                           or item.get("error") or "—"),
-            })
+    for r in closed:
+        e, x = r.entry, r.exit
+        spot_move = None
+        if e and x and e.entry_spot is not None and x.exit_spot is not None:
+            spot_move = x.exit_spot - e.entry_spot
+        sl = e.short_leg if e else None
+        se = x.short_leg_exit if x else None
+        rows.append({
+            "template": r.template or "—", "slot": r.slot or "—", "side": r.side or "—",
+            "short/long": (f"{fmt_k(e.short_strike)}/{fmt_k(e.long_strike)}" if e else "—"),
+            "credit": fmt_n(e.realized_credit if e else None),
+            "reason": (x.exit_reason if x else "—"),
+            "spot move": fmt_s(spot_move),
+            "P&L $": (f"{x.pnl:,.0f}" if x and x.pnl is not None else "—"),
+            "MAE $": (f"{x.max_adverse_excursion:,.0f}"
+                      if x and x.max_adverse_excursion is not None else "—"),
+            "duration": s8_report._fmt_duration(x.duration_secs if x else None),
+            "short Δ entry→exit": (f"{fmt_n(sl.delta if sl else None, 3)} → "
+                                   f"{fmt_n(se.delta if se else None, 3)}"),
+        })
     st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True,
                 height=400)
 
@@ -1233,54 +1321,74 @@ def _s8_connect_readonly_short(timeout: int = 5):
     """Connect to the live-TRADING Gateway (port 4003), read-only and display-only, for
     quote-consistency with s8_runner.py (which reads the same connection). readonly=True
     is passed explicitly here — this account is transmit-capable at the broker level, but
-    a monitor tab only ever reads. SHORT timeout, launch=False (an auto-refreshing 30s
+    a monitor tab only ever reads. SHORT timeout, launch=False (an auto-refreshing 5-minute
     dashboard fragment must never be the thing that boots a Gateway). Mirrors
     render_accounts()'s own _connect_readonly_short pattern for the paper side."""
     from connections import ibkr_live_trade
     return ibkr_live_trade.connect("dashboard_s8", launch=False, readonly=True, timeout=timeout)
 
 
-@st.fragment(run_every="30s")
+@st.fragment(run_every="300s")
 def render_s8_live() -> None:
     """The fast-changing S8 sections (cycle log, live P&L re-mark, account snapshot,
     connection health) — wrapped in its own fragment so ONLY this part of the page
-    reruns every 30s, not the whole app (and not the Health/Backtests/Accounts tabs).
+    reruns every 5 minutes, not the whole app (and not the Health/Backtests/Accounts tabs).
 
-    30s CHOSEN BECAUSE: (a) a live IBKR round trip here (qualify + reqMktData +
-    a 3s settle) takes several real seconds, so 30s leaves comfortable headroom
-    between round trips rather than queuing up overlapping connections; (b) it's the
-    same order of magnitude as this desk's other live-polling cadences (e.g.
-    GatewayWatchdog, ~1min) — fast enough to feel "live" for someone actively watching
-    an intraday monitor, without hammering a connection s8_runner.py's own scheduled
-    cycles are also using. A tighter interval (e.g. 5-10s) would risk stacking
-    overlapping IBKR round trips if one settle window ever runs long; a much looser one
-    (e.g. 2min) would feel stale for a same-day P&L watch. 30s is the sensible middle,
-    not a tuned/curve-fit value (nothing here is a strategy parameter).
+    5min CHOSEN BECAUSE: each refresh reconnects to the live-trading Gateway (port 4003)
+    for the account/margin snapshot, so the cadence directly governs how often the tab
+    churns that connection during a live session. The live exit-monitor data now comes
+    from the pilot's RECORDED tick files (not a Gateway stream), so a tight 30s refresh
+    bought nothing but needless reconnects; a 5-minute cadence keeps the margin panel
+    fresh enough for an intraday watch while leaving the live Gateway alone between
+    round trips. 5min is an operational cadence, not a tuned/curve-fit value (nothing
+    here is a strategy parameter).
 
-    ONE shared connection attempt per refresh cycle feeds all four subsections below
-    (cycle log needs none; P&L, account, and connection-health all reuse the same `ib`)
-    rather than reconnecting per-section — halves the round trips of a naive per-
-    section connect.
+    The exit-monitor overlay no longer needs the Gateway at all — it reads the pilot's
+    RECORDED ticks (files only). The single shared connection attempt per refresh cycle
+    now feeds only the account snapshot + connection-health subsections (both reuse the
+    same `ib`) rather than reconnecting per-section.
     """
-    st.caption("Auto-refreshes every 30s while this tab is open (see render_s8_live's "
-               "docstring for why 30s). Schedule strip and History are cached longer — "
-               "they change far less during the day.")
+    st.caption("Auto-refreshes every 5 minutes while this tab is open (see render_s8_live's "
+               "docstring for why 5min). Schedule strip and Closed round-trips are read "
+               "less often; the exit-monitor reads the latest RECORDED ticks for the "
+               "selected session (today, live).")
 
+    # Read the selected session (default today) from the outer date selector. The
+    # open-position tables are store-sourced (offline); the exit-monitor overlay reads the
+    # recorded ticks (offline); a Gateway connection is only attempted for TODAY's
+    # account/health panels, and only when there is something open to monitor.
+    date = st.session_state.get("s8_view_date")
+    today = datetime.now(tz=CT_ZONE).strftime("%Y%m%d")
+    is_today = (date is None) or (date == today)
+    session_date = date or today
+    records = _s8_store_records()
+    day_recs = _s8_records_for_date(records, date)
+    open_recs = [r for r in day_recs if s8_report.is_open(r)]
+
+    _render_s8_open_positions(open_recs)
+    st.divider()
+
+    # The exit-monitor overlay reads the pilot's RECORDED ticks (files only) — it takes
+    # no Gateway connection at all, so it renders before (and independent of) the live
+    # connect below.
+    _render_s8_live_monitor(open_recs, is_today, session_date=session_date)
+    st.divider()
+
+    # The account/margin snapshot + connection health still read the live-trading Gateway
+    # (a light accountSummary + a cheap TCP probe) — UNCHANGED. Only the exit-monitor
+    # overlay above was repointed off the Gateway onto the recorded ticks.
     ib = None
     connect_error: Exception | None = None
-    try:
-        ib = _s8_connect_readonly_short()
-    except Exception as exc:
-        connect_error = exc
+    if is_today and open_recs:
+        try:
+            ib = _s8_connect_readonly_short()
+        except Exception as exc:
+            connect_error = exc
 
     try:
-        _render_s8_cycle_log()
-        st.divider()
-        _render_s8_pnl(ib)
-        st.divider()
         _render_s8_account(ib)
         st.divider()
-        _render_s8_connection_health(ib, connect_error)
+        _render_s8_connection_health(ib, connect_error, records)
     finally:
         if ib is not None:
             try:
@@ -1291,16 +1399,35 @@ def render_s8_live() -> None:
 
 def render_s8() -> None:
     st.subheader("S8 — British IC + B2 (SPX/SPXW 0DTE)")
-    st.caption("PILOT_MODE monitor. paperbot/s8_runner.py hardcodes PILOT_MODE=True "
-               "and never transmits an order — this tab is a read-only window onto "
-               "its ledger plus a live quote re-mark for display only. This tab never "
-               "places, arms, or transmits anything, and never writes to the ledger.")
+    st.caption("PILOT_MODE monitor over the S8 capture store (livebot/s8_store.py -> "
+               "trades.jsonl). livebot/s8_service.py hardcodes PILOT_MODE=True and never "
+               "transmits an order — this tab is a read-only window onto the captured "
+               "trade records plus a live quote overlay for display only. It never "
+               "places, arms, or transmits anything, and never writes to the store.")
 
-    render_s8_schedule()
+    records = _s8_store_records()
+    render_s8_schedule(records)
     st.divider()
+
+    # Date selector (default = most recent captured session, i.e. today when live). It
+    # lives OUTSIDE the 5-minute fragment (so it is not reset every refresh); the fragment and
+    # the closed-round-trips panel both read the selection back via session_state.
+    dates = _s8_available_dates(records)
+    chosen: str | None = None
+    if dates:
+        chosen = st.selectbox(
+            "Session date", dates, index=0, key="s8_view_date",
+            format_func=lambda d: f"{d[:4]}-{d[4:6]}-{d[6:]}",
+        )
+    else:
+        st.info("No S8 trades captured yet — the store (trades.jsonl) is empty. This is "
+                "the expected state before the first session; panels populate as the "
+                "live service captures trades.")
+    st.divider()
+
     render_s8_live()
     st.divider()
-    render_s8_history()
+    render_s8_closed(records, chosen)
 
 
 # ================================= LAYOUT =====================================
