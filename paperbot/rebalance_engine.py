@@ -75,27 +75,44 @@ def _trade_weight(ln, net_liq: float, target: strategy_target.Target,
     return abs(ln.target_shares - int(ln.actual_shares)) * price / net_liq
 
 
+# Statuses the engine must NEVER auto-trade or breach the band on (S0 corp-action guard):
+# an ALIEN (corp-action/manual) holding is surfaced for human review, a FRACTIONAL DRIP
+# stub is recorded but too small to trade, a SWEEP is a whitelisted cash/money-market
+# fund. None of them may (a) count toward the trade-size band or (b) produce a delta.
+_NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP"})
+# Statuses that ALWAYS breach regardless of trade size — a KNOWN held symbol the model
+# dropped to 0% must be cleared. UNTRACKED is the legacy (universe=None) equivalent;
+# ROTATE_OUT is its refined form when a universe is supplied. Both mean "sell it".
+_ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT"})
+
+
 def band_breached(lines, net_liq: float, target: strategy_target.Target,
                   prices: dict | None = None, band_pct: float | None = None) -> bool:
     """ACCOUNT-LEVEL, all-or-nothing no-trade band test (the single source of truth).
 
     Returns True iff the account needs work: some holding's required TRADE SIZE exceeds
-    band_pct of NetLiq, OR a stray UNTRACKED position is held (always cleared regardless
-    of size). The breach test keys on trade size, NOT raw weight-vs-model drift, so the
-    cash-reserve gap (a fully-invested account sits ~reserve% under raw model weight by
-    construction) can never falsely trip it. Pure — reads `lines` only."""
+    band_pct of NetLiq, OR a stray UNTRACKED/ROTATE_OUT position is held (a known dropped
+    ticker, always cleared regardless of size). The breach test keys on trade size, NOT
+    raw weight-vs-model drift, so the cash-reserve gap (a fully-invested account sits
+    ~reserve% under raw model weight by construction) can never falsely trip it.
+
+    An ALIEN / FRACTIONAL / SWEEP line NEVER breaches by itself — an alien holding is
+    reviewed by a human, not auto-swept, and a fractional stub / whitelisted sweep is not
+    a trade. So an alien-only cycle is 'needs review', not a false 'band breach' page.
+    Pure — reads `lines` only (statuses are set by reconcile with the universe)."""
     if band_pct is None:
         band_pct = config.REBALANCE_BAND_PCT
-    return (any(ln.status == "UNTRACKED" for ln in lines)
+    return (any(ln.status in _ALWAYS_BREACH_STATUSES for ln in lines)
             or any(_trade_weight(ln, net_liq, target, prices) > band_pct
-                   for ln in lines))
+                   for ln in lines if ln.status not in _NO_AUTOTRADE_STATUSES))
 
 
 # --- 2. per-account target shares, deltas, band suppression --------------------
 def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target,
                  prices: dict | None = None,
-                 band_pct: float | None = None) -> AccountPlan:
+                 band_pct: float | None = None,
+                 universe: set[str] | None = None) -> AccountPlan:
     """Reconcile ONE account against its tier model and emit the share deltas to fix it.
 
     Steps (all pure):
@@ -121,9 +138,13 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     investable = compute_investable(net_liq, reserve)
 
     # tolerance_w=band_pct so reconcile classifies a holding MATCHED iff it's inside the
-    # band; DRIFTED/MISSING/UNTRACKED mean it breached and is eligible for a delta.
+    # band; DRIFTED/MISSING/ROTATE_OUT mean it breached and is eligible for a delta. When
+    # `universe` is supplied, reconcile splits the old UNTRACKED bucket into
+    # ROTATE_OUT (sell) / ALIEN (review) / FRACTIONAL / SWEEP (all no-autotrade); when
+    # None, it stays UNTRACKED (behavior-preserving default — backtester untouched).
     lines = reconcile.reconcile(target, net_liq, positions, prices=prices,
-                               tolerance_w=band_pct, investable=investable)
+                               tolerance_w=band_pct, investable=investable,
+                               universe=universe)
 
     # NO-TRADE BAND — ACCOUNT-LEVEL, all-or-nothing (Andrew's decision 2026-06-27): leave
     # the whole account alone unless it genuinely needs work; if it does, rebalance EVERY
@@ -140,23 +161,36 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     # the propose-only account_monitor uses the EXACT same test (no copy-paste).
     breached = band_breached(lines, net_liq, target, prices=prices, band_pct=band_pct)
 
+    # ALIEN / FRACTIONAL / SWEEP lines are NEVER auto-traded (corp-action guard): an alien
+    # holding is left in place and surfaced for human review, a fractional DRIP stub is too
+    # small to trade (int==0 -> delta 0 anyway), a whitelisted sweep is held by design. Only
+    # KNOWN symbols (a real BUY/SELL/ROTATE_OUT delta) move.
     orders: dict = {}
     if breached:
         for ln in lines:
+            if ln.status in _NO_AUTOTRADE_STATUSES:
+                continue
             delta = ln.target_shares - int(ln.actual_shares)
             if abs(delta) >= 1:
                 orders[ln.symbol] = delta
 
+    alien_lines = [ln for ln in lines if ln.status == "ALIEN"]
     return AccountPlan(account, version, net_liq, reserve, investable,
-                       lines, breached, orders)
+                       lines, breached, orders, alien_lines)
 
 
 def plan_accounts(account_inputs: list[dict],
                   targets: dict,
-                  band_pct: float | None = None) -> list[AccountPlan]:
+                  band_pct: float | None = None,
+                  universe: set[str] | None = None) -> list[AccountPlan]:
     """Plan many accounts at once. `account_inputs` is a list of dicts, each:
         {account, version, net_liq, positions, prices(optional)}
     `targets` maps version -> strategy_target.Target (one model per risk tier, run once).
+
+    `universe` (the strategy's tradeable symbols) is threaded into every account's
+    reconcile so a held symbol the model dropped is classified ROTATE_OUT (sell) vs an
+    alien corp-action holding ALIEN (review). None (default) preserves legacy UNTRACKED
+    behavior for every account — nothing changes for callers that don't pass it.
 
     This is the seam the live recon_report fills from accounts.discover()+ib.positions();
     keeping it dict-driven means the engine is testable with synthetic data and never
@@ -165,7 +199,8 @@ def plan_accounts(account_inputs: list[dict],
     for a in sorted(account_inputs, key=lambda x: x["account"]):
         plans.append(plan_account(
             a["account"], a["version"], a["net_liq"], a["positions"],
-            targets[a["version"]], prices=a.get("prices"), band_pct=band_pct))
+            targets[a["version"]], prices=a.get("prices"), band_pct=band_pct,
+            universe=universe))
     return plans
 
 
@@ -263,14 +298,19 @@ def route_blocks(blocks: list[BlockOrder],
 
 def build_plan(account_inputs: list[dict], targets: dict,
                band_pct: float | None = None,
-               tier_groups: dict | None = None) -> dict:
+               tier_groups: dict | None = None,
+               universe: set[str] | None = None) -> dict:
     """End-to-end PURE pipeline: per-account plans -> blocks -> route plans.
 
     Returns {"plans", "blocks", "routes"} — a complete, reviewable what-if of every
     order the engine WOULD route, with nothing built and nothing transmitted. The live
     caller (recon_report / execution_engine) attaches a limit price and hands each
-    RoutePlan to order_router, still behind the arming gate."""
-    plans = plan_accounts(account_inputs, targets, band_pct=band_pct)
+    RoutePlan to order_router, still behind the arming gate.
+
+    `universe` is threaded into per-account reconcile (see plan_accounts). ALIEN holdings
+    produce NO route (they are collected on each AccountPlan.alien_lines for human review);
+    only ROTATE_OUT/DRIFTED/MISSING deltas aggregate into blocks. None -> legacy behavior."""
+    plans = plan_accounts(account_inputs, targets, band_pct=band_pct, universe=universe)
     blocks = aggregate_blocks(plans)
     routes = route_blocks(blocks, tier_groups=tier_groups)
     return {"plans": plans, "blocks": blocks, "routes": routes}

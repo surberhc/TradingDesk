@@ -38,6 +38,23 @@ from strategies.parts import (
 _PERIODS_PER_MONTH = {"monthly": 1, "biweekly": 2, "weekly": 4}
 
 
+def universe() -> set[str]:
+    """Every symbol S0 can EVER hold — the union across all sleeves and regimes.
+
+    Self-describing, derived from the SAME config groups the sleeves draw from, so it can
+    never silently disagree with what the portfolio assembler actually emits:
+      * equity sleeve   -> EQUITY_CORE + SECTORS   (parts/sector.select_sectors)
+      * defensive sleeve-> DEFENSIVE_ASSETS         (parts/defensive + portfolio._BUCKET_OF;
+                           best-tbill fallback BENCHMARK_TBILL is in TBILLS ⊆ DEFENSIVE_ASSETS)
+      * real-asset sleeve-> REAL_ASSETS             (parts/real_assets over REAL_ASSET_BASKET)
+    That union is exactly config.ALL_TICKERS (EQUITY_CORE + SECTORS + DEFENSIVE_ASSETS +
+    REAL_ASSETS), the same universe the backtester loads prices for and the assembler
+    filters every emitted ticker against — so no sleeve can produce a symbol outside this
+    set. Verified against parts/sector.py, parts/defensive.py, parts/real_assets.py, and
+    parts/portfolio.build_target_weights (2026-07-20). READ-ONLY; decides nothing."""
+    return set(config.ALL_TICKERS)
+
+
 def _signal_dates(index: pd.DatetimeIndex, frequency: str, start: str, end: str | None) -> list:
     """Rebalance signal dates within [start, end] at the requested cadence.
 
@@ -150,6 +167,11 @@ class AdaptiveAllWeather(StrategyBase):
     """S0 — rules-based, multi-engine tactical asset allocation."""
 
     name = "adaptive_all_weather"
+
+    def universe(self) -> set[str]:
+        """S0's tradeable universe (union across sleeves/regimes). Delegates to the
+        module-level `universe()` so the instance and module accessors can never drift."""
+        return universe()
 
     def __init__(
         self,

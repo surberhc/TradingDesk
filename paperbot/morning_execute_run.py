@@ -58,6 +58,7 @@ import order_router  # noqa: E402
 import rebalance_execute  # noqa: E402
 import rebalance_guard  # noqa: E402
 import rebalance_run  # noqa: E402
+import reconcile  # noqa: E402
 import transmit_journal  # noqa: E402
 import version  # noqa: E402
 from connections import clientids, ibkr_paper  # noqa: E402
@@ -133,6 +134,52 @@ def _ledger_cycle(*, mode: str, routes: list, as_of, n_sent: int, n_skipped: int
         })
     except Exception as exc:
         print(f"    ! ledger.record_run failed (non-fatal): {exc}")
+
+
+def _strategy_universe() -> set[str] | None:
+    """S0's tradeable universe via the strategy's own universe() accessor. None on failure
+    (alien detection is then skipped — it is informational and must never block execution)."""
+    try:
+        from strategies.all_weather import universe as s0_universe
+        return s0_universe()
+    except Exception as exc:
+        print(f"    ! could not resolve strategy universe ({exc}); skipping alien check.")
+        return None
+
+
+def _corp_action_review(ib, clients: dict) -> list[str]:
+    """Read each enrolled account's positions and surface any ALIEN (corp-action / manual)
+    holding for human review — a held symbol the strategy does not know that the bot will
+    NEVER auto-trade. Best-effort and READ-ONLY: any failure returns [] (never blocks the
+    morning run). Emits its own distinct alert if aliens are found; returns the alert body."""
+    uni = _strategy_universe()
+    if uni is None:
+        return []
+    whitelist = set(getattr(config, "SWEEP_WHITELIST", set()))
+    body: list[str] = []
+    try:
+        for acct in sorted(clients):
+            positions = {p.contract.symbol: p.position
+                         for p in ib.positions(acct) if p.position != 0}
+            aliens = reconcile.alien_holdings(positions, uni, whitelist)
+            if aliens:
+                body.append(f"  account {acct}:")
+                for sym, sh in aliens:
+                    body.append(f"    {sym:6s} qty={sh:,.4f}")
+    except Exception as exc:
+        print(f"    ! alien holdings check failed (non-fatal): {exc}")
+        return []
+    if body:
+        body = [
+            "CORP-ACTION / UNTRACKED REVIEW — a held symbol the strategy does NOT know was "
+            "found. The bot transmits NOTHING against it (fail-closed). A human must: "
+            "(a) manually sell via rebalance_execute.py --arm-i-understand, (b) update "
+            "ENROLLMENT/model if it belongs, or (c) accept + whitelist (config.SWEEP_WHITELIST).",
+            "",
+            "Alien holdings:",
+        ] + body
+        _alert_email("CORP-ACTION / UNTRACKED REVIEW (alien holding found)", body)
+    return body
 
 
 def _stage_path(today: date) -> str:
@@ -301,6 +348,16 @@ def _do_work(ib, today: date, stage_path: str, staged: dict, routes: list) -> in
                      message="re-validation failed; staged file left in place")
         # Leave the staged file in place — do NOT archive a rejected run silently.
         return 1
+
+    # [2b] CORP-ACTION / UNTRACKED REVIEW — surface any alien holding for a human. This is
+    # informational and NON-BLOCKING: the staged ROTATE_OUT/DRIFTED/MISSING trade list
+    # proceeds normally (an alien holding never generates a route in the first place).
+    print("\n[2b] Alien-holding review (read-only, non-blocking)...")
+    aliens = _corp_action_review(ib, clients)
+    if aliens:
+        print("    " + "\n    ".join(aliens))
+    else:
+        print("    no alien holdings found.")
 
     # The cycle's as_of (per-tier); used to derive the deterministic orderRef the gate and
     # journal key on, matching what build()/build_fa_block() stamp on the wire.
