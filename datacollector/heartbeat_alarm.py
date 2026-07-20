@@ -280,6 +280,16 @@ JOBS: list[dict] = [
      "progress": None,
      "threshold_s": DATA_BACKUP_THRESHOLD_S,
      "task_name": "DataBackupDaily",
+     # FIRST-RUN GRACE (absent-heartbeat path only). This alarm's launcher had been
+     # broken since the folder move and was fixed / went live 2026-07-20 ~10:38, but
+     # DataBackupDaily's FIRST scheduled run is 21:00 CT that same night — so the
+     # heartbeat is legitimately absent, not failed, and the alarm false-paged at 10:45
+     # about a backup that isn't broken and isn't even due yet. A full first deep run
+     # completes well before 03:00, and a manual verified cloud copy already existed
+     # (2026-07-18), so nothing is unprotected. Suppress the never-ran MISSING page until
+     # 03:00 CT 2026-07-21; after that an absent heartbeat is a real failure and pages.
+     # ONLY affects the absent path — a cold/stale heartbeat still pages immediately.
+     "missing_ok_until": "2026-07-21T03:00:00-05:00",
      "cause_stale": (
          "No VERIFIED data backup has landed in {age}. The data-backup job refreshes "
          "its heartbeat ONLY on a fully verified success (rclone copy completed AND "
@@ -671,11 +681,37 @@ def _progress_pct(progress_path) -> str:
     return "unknown"
 
 
+def _missing_grace_active(job: dict, now: float) -> tuple[bool, str | None]:
+    """First-run grace for the ABSENT-heartbeat path ONLY.
+
+    A newly-activated job whose FIRST scheduled run simply hasn't come due yet has a
+    legitimately absent heartbeat — paging on it is a false 'never ran' alarm. An
+    OPTIONAL job field `missing_ok_until` (ISO-8601 with tz offset) says "while now <
+    that instant, an absent heartbeat is not-yet-due, not a failure." This does NOT
+    weaken the alert — once now >= missing_ok_until an absent heartbeat pages exactly
+    as before.
+
+    Returns (grace_active, until_iso). FAILS SAFE toward the existing behaviour: if the
+    field is missing OR unparseable, returns (False, ...) so the job pages as it does
+    today. NEVER raises — the alarm must never crash the run, and an unparseable grace
+    must never accidentally suppress a real alert."""
+    raw = job.get("missing_ok_until")
+    if not raw:
+        return False, None
+    try:
+        parsed = dt.datetime.fromisoformat(str(raw))
+        grace_ts = parsed.timestamp()  # tz-aware -> correct POSIX instant
+    except (ValueError, TypeError, OverflowError, OSError):
+        # Unparseable -> fail safe to today's behaviour (no grace -> page).
+        return False, None
+    return (now < grace_ts), str(raw)
+
+
 def assess(job: dict, now: float, heartbeat_override: str | None = None) -> dict:
     """Decide one job's status WITHOUT side effects.
 
     Returns a dict:
-      status : 'fresh' | 'complete' | 'stale' | 'missing'
+      status : 'fresh' | 'complete' | 'stale' | 'missing' | 'pending_first_run'
       alert  : bool  (True only when status == 'stale')
       age_s  : float | None   seconds since the heartbeat was last written
       last_ts: str            last heartbeat text line (or a marker)
@@ -695,6 +731,18 @@ def assess(job: dict, now: float, heartbeat_override: str | None = None) -> dict
                 job.get("progress"), now, job["threshold_s"]):
             return {"status": "complete", "alert": False, "age_s": None,
                     "last_ts": "(no heartbeat file; progress shows complete)",
+                    "hb_path": str(hb_path), "progress": progress}
+        # First-run grace (ABSENT path ONLY): a newly-activated job whose first
+        # scheduled run hasn't come due yet has a legitimately absent heartbeat. While
+        # now < missing_ok_until this is "not yet due", not a failure — so DON'T page.
+        # Fails safe (no/unparseable field -> not active -> pages as today). This never
+        # touches the COLD/STALE path below: a job that ran once and went cold is a real
+        # failure and still pages regardless of missing_ok_until.
+        grace_active, grace_until = _missing_grace_active(job, now)
+        if grace_active:
+            return {"status": "pending_first_run", "alert": False, "age_s": None,
+                    "last_ts": ("(heartbeat absent; first scheduled run not yet due — "
+                                f"grace until {grace_until})"),
                     "hb_path": str(hb_path), "progress": progress}
         return {"status": "missing", "alert": True, "age_s": None,
                 "last_ts": "(heartbeat file absent)",

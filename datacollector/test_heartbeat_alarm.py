@@ -328,3 +328,89 @@ def test_handle_deadline_falls_back_and_logs_when_live_query_fails(tmp_path, mon
     out = capsys.readouterr().out
     assert "fallback" in out.lower()
     assert "TiingoDailyUpdate" in out
+
+
+# --------------------------------------------------------------------------- #
+# 2026-07-20 fix: first-run grace on the ABSENT-heartbeat path (missing_ok_until).
+# A newly-activated job whose first scheduled run hasn't come due yet has a
+# legitimately absent heartbeat and must NOT false-page. The grace applies ONLY to
+# the absent path — a cold/stale heartbeat still pages regardless — and fails safe
+# (missing/unparseable field -> pages exactly as before).
+# --------------------------------------------------------------------------- #
+def _iso(now: float, delta_s: float) -> str:
+    """An ISO-8601 timestamp with tz offset at now+delta_s, for missing_ok_until."""
+    return dt.datetime.fromtimestamp(now + delta_s).astimezone().isoformat()
+
+
+def test_absent_heartbeat_with_future_grace_no_alert(tmp_path):
+    """Absent heartbeat + missing_ok_until in the FUTURE -> NOT an alert: the first
+    scheduled run simply hasn't come due yet (status 'pending_first_run')."""
+    now = dt.datetime.now().timestamp()
+    job = _job(tmp_path, name="data_backup")
+    job["progress"] = None
+    job["missing_ok_until"] = _iso(now, +6 * 3600)  # 6h in the future
+    assert not job["heartbeat"].exists()
+
+    a = hba.assess(job, now)
+    assert a["alert"] is False, "absent heartbeat under future grace must NOT alert"
+    assert a["status"] == "pending_first_run"
+    assert a["status"] != "complete"  # must not borrow the special 'complete' word
+
+
+def test_absent_heartbeat_with_past_grace_alerts(tmp_path):
+    """Absent heartbeat + missing_ok_until in the PAST -> unchanged behaviour: the
+    first run is genuinely overdue, so status 'missing' and ALERT."""
+    now = dt.datetime.now().timestamp()
+    job = _job(tmp_path, name="data_backup")
+    job["progress"] = None
+    job["missing_ok_until"] = _iso(now, -3600)  # 1h ago
+    assert not job["heartbeat"].exists()
+
+    a = hba.assess(job, now)
+    assert a["alert"] is True, "absent heartbeat past the grace must ALERT"
+    assert a["status"] == "missing"
+
+
+def test_absent_heartbeat_without_grace_alerts(tmp_path):
+    """Absent heartbeat + NO missing_ok_until -> unchanged behaviour (missing/alert).
+    Jobs without the field must behave exactly as before."""
+    now = dt.datetime.now().timestamp()
+    job = _job(tmp_path, name="data_backup")
+    job["progress"] = None
+    assert "missing_ok_until" not in job
+    assert not job["heartbeat"].exists()
+
+    a = hba.assess(job, now)
+    assert a["alert"] is True
+    assert a["status"] == "missing"
+
+
+def test_cold_heartbeat_with_future_grace_still_alerts(tmp_path):
+    """The grace must NOT touch the COLD/STALE path: a heartbeat that EXISTS but is
+    old is a job that ran once and went cold — a real failure — and must still ALERT
+    even with a FUTURE missing_ok_until set."""
+    now = dt.datetime.now().timestamp()
+    job = _job(tmp_path, name="data_backup")
+    job["progress"] = None
+    job["missing_ok_until"] = _iso(now, +6 * 3600)  # future grace present
+    hb = job["heartbeat"]
+    hb.write_text("2026-07-20 21:30:00  rclone copy started\n")
+    os.utime(hb, (now - 2 * THRESHOLD_S, now - 2 * THRESHOLD_S))  # well past threshold
+
+    a = hba.assess(job, now)
+    assert a["alert"] is True, "a cold existing heartbeat must ALERT despite future grace"
+    assert a["status"] == "stale"
+
+
+def test_absent_heartbeat_with_unparseable_grace_alerts(tmp_path):
+    """An unparseable missing_ok_until must FAIL SAFE toward the existing behaviour:
+    do not crash, do not suppress -> status 'missing' and ALERT."""
+    now = dt.datetime.now().timestamp()
+    job = _job(tmp_path, name="data_backup")
+    job["progress"] = None
+    job["missing_ok_until"] = "not-a-timestamp"
+    assert not job["heartbeat"].exists()
+
+    a = hba.assess(job, now)
+    assert a["alert"] is True, "an unparseable grace must never suppress a real alert"
+    assert a["status"] == "missing"
