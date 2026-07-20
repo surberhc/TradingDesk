@@ -304,6 +304,124 @@ def test_resolve_skips_candidate_that_does_not_exist():
 
 
 # --------------------------------------------------------------------------- #
+# resolve_drive_dest_waiting() — the BOUNDED wait for the DriveFS logon mount race
+# (2026-07-20: AtLogon fire false-paged because Drive had not finished mounting).
+# The load-bearing distinction: absent == retry (Drive still mounting); present-but-
+# REJECTED == the wrong-folder danger, page IMMEDIATELY, never wait.
+# --------------------------------------------------------------------------- #
+class _FakeClock:
+    """Injected monotonic + sleep. sleep(dt) ADVANCES the clock, mirroring reality, so
+    the wait is deterministic and INSTANT no matter how many times now() is read."""
+
+    def __init__(self):
+        self.t = 0.0
+        self.sleeps = 0
+
+    def now(self):
+        return self.t
+
+    def sleep(self, dt):
+        self.sleeps += 1
+        self.t += dt
+
+
+def _absent():
+    """An unresolved dict whose ONLY reason for failure is absence (the logon race)."""
+    return {"resolved": False, "dest": None, "mount": None, "source": "none",
+            "drive_managed": False,
+            "note": (r"probe candidate 'X:\My Drive': does not exist | "
+                     "NOTHING RESOLVED — no Drive-managed mount found")}
+
+
+def _rejected():
+    """An unresolved dict where a candidate EXISTED but failed is_drive_managed() — the
+    wrong-folder case. Carries the 'REJECTED' marker resolve_drive_dest writes."""
+    return {"resolved": False, "dest": None, "mount": None, "source": "none",
+            "drive_managed": False,
+            "note": (r"probe candidate 'C:\': REJECTED — resolves to the SYSTEM volume | "
+                     "NOTHING RESOLVED — no Drive-managed mount found")}
+
+
+def test_waiting_resolves_on_first_try_with_zero_wait():
+    """The common case (Drive mounted — the 20:00 run): resolve once, never sleep."""
+    clock = _FakeClock()
+    resolve = Recorder(_resolved())
+    log = Recorder(None)
+    info = rb.resolve_drive_dest_waiting(
+        resolve_fn=resolve, sleep_fn=clock.sleep, monotonic_fn=clock.now, log_fn=log)
+    assert info["resolved"] is True
+    assert resolve.calls == 1
+    assert clock.sleeps == 0
+
+
+def test_waiting_polls_until_the_mount_appears_then_resolves():
+    """The logon race: absent twice, then Drive finishes mounting and it resolves.
+    Polls on the injected clock — zero real waiting — and sleeps the expected count."""
+    clock = _FakeClock()
+    resolve = Recorder(values=[_absent(), _absent(), _resolved()])
+    info = rb.resolve_drive_dest_waiting(
+        resolve_fn=resolve, sleep_fn=clock.sleep, monotonic_fn=clock.now,
+        deadline_s=180, interval_s=15, log_fn=Recorder(None))
+    assert info["resolved"] is True
+    assert resolve.calls == 3          # 1 immediate + 2 polls
+    assert clock.sleeps == 2           # one sleep before each of the 2 re-probes
+
+
+def test_waiting_pages_immediately_on_a_present_but_rejected_candidate():
+    """THE SAFETY DISTINCTION: a candidate that EXISTS but is REJECTED is the wrong-
+    folder danger. It must page AT ONCE — resolve called exactly once, NO polling — so
+    the alarm we most want prompt is never delayed by the mount-race wait."""
+    clock = _FakeClock()
+    resolve = Recorder(_rejected())
+    info = rb.resolve_drive_dest_waiting(
+        resolve_fn=resolve, sleep_fn=clock.sleep, monotonic_fn=clock.now,
+        deadline_s=180, interval_s=15, log_fn=Recorder(None))
+    assert info["resolved"] is False
+    assert "REJECTED" in info["note"]
+    assert resolve.calls == 1          # no wait on a real failure
+    assert clock.sleeps == 0
+
+
+def test_waiting_is_bounded_and_gives_up_at_the_deadline():
+    """Drive never mounts: always absent. The wait is BOUNDED — it crosses the deadline
+    and returns unresolved (does NOT loop forever), and the note explains it waited for
+    the mount and it never appeared (not a bare 'does not exist')."""
+    clock = _FakeClock()
+    resolve = Recorder(_absent())      # fixed value: absent forever
+    info = rb.resolve_drive_dest_waiting(
+        resolve_fn=resolve, sleep_fn=clock.sleep, monotonic_fn=clock.now,
+        deadline_s=180, interval_s=15, log_fn=Recorder(None))
+    assert info["resolved"] is False
+    # Bounded: 180s / 15s == 12 sleeps, then the deadline check exits the loop.
+    assert clock.sleeps == 12
+    assert resolve.calls == 13         # 1 immediate + 12 polls, then stop
+    assert clock.t >= 180
+    assert "never appeared" in info["note"]
+    assert "180" in info["note"]       # records the wait duration it gave up after
+
+
+def test_run_backup_fails_closed_when_resolution_times_out(tmp_path, monkeypatch):
+    """The existing failure contract is unchanged, just delayed: when the waiting
+    resolver ultimately times out, run_backup still fails closed and leaves the
+    heartbeat COLD — exactly as an unresolvable Drive always did."""
+    clock = _FakeClock()
+    inner = Recorder(_absent())        # Drive never mounts
+
+    def timing_out_resolve():
+        return rb.resolve_drive_dest_waiting(
+            resolve_fn=inner, sleep_fn=clock.sleep, monotonic_fn=clock.now,
+            deadline_s=60, interval_s=15, log_fn=Recorder(None))
+
+    st, f = _run(tmp_path, monkeypatch, resolve_fn=Recorder(timing_out_resolve()))
+    assert st["ok"] is False
+    assert st["drive_resolved"] is False
+    assert f["heartbeat_fn"].calls == 0          # heartbeat stays cold — the whole point
+    assert f["create_fn"].calls == 0             # never bundled
+    assert any("could NOT be resolved" in e for e in st["errors"])
+    assert clock.sleeps == 4                      # 60s / 15s, bounded
+
+
+# --------------------------------------------------------------------------- #
 # is_drive_managed() — the wrong-folder check
 # --------------------------------------------------------------------------- #
 def test_drive_managed_rejects_system_volume():

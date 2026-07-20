@@ -246,6 +246,18 @@ CLOUD_HTTP_TIMEOUT = 30      # per HTTP call — this job must never hang on the
 CLOUD_POLL_DEADLINE_S = 300
 CLOUD_POLL_INTERVAL_S = 15
 
+# At LOGON, Google DriveFS has not finished mounting its virtual drive yet, so the
+# mount path simply DOES NOT EXIST for the first minutes (observed 2026-07-20: the
+# AtLogon fire at 08:29 hard-failed with "does not exist | NOTHING RESOLVED"; a manual
+# run 9 minutes later from the SAME path succeeded). resolve_drive_dest_waiting polls
+# resolution until the mount appears or this deadline expires. 180s comfortably covers
+# observed DriveFS mount time at logon; the 20:00 scheduled run resolves on the FIRST
+# probe (Drive long since mounted) so this adds ZERO delay there. Env-overridable in
+# the same style as the cloud tunables above.
+DRIVE_MOUNT_WAIT_DEADLINE_S = int(os.environ.get("TRADINGDESK_DRIVE_MOUNT_WAIT_S", 180))
+DRIVE_MOUNT_WAIT_INTERVAL_S = int(
+    os.environ.get("TRADINGDESK_DRIVE_MOUNT_WAIT_INTERVAL_S", 15))
+
 MD5_CHUNK = 1024 * 1024      # the bundle is ~41MB — hash it streaming, never in RAM
 
 # The status file's `state` — what this run ACTUALLY DID, as a distinct value rather
@@ -557,6 +569,80 @@ def resolve_drive_dest(*, db_fn=None, candidates=None, exists_fn=None,
     notes.append("NOTHING RESOLVED — no Drive-managed mount found")
     return {"resolved": False, "dest": None, "mount": None, "source": "none",
             "drive_managed": False, "note": " | ".join(notes)}
+
+
+def resolve_drive_dest_waiting(*, resolve_fn=None, sleep_fn=None, monotonic_fn=None,
+                               deadline_s=None, interval_s=None, log_fn=None) -> dict:
+    """resolve_drive_dest, but with a BOUNDED wait for the DriveFS logon mount race.
+
+    THE RACE (observed 2026-07-20): RepoBackupDaily has an AtLogon trigger. At logon,
+    Google DriveFS has not finished mounting its virtual drive, so every candidate is
+    merely ABSENT and resolve_drive_dest fails on its single probe — a false page. A
+    run minutes later, once Drive is mounted, resolves on the first try.
+
+    THE SAFE DISTINCTION, and the whole reason this wrapper is careful:
+      * A candidate that DOES NOT EXIST YET is the logon race — Drive still mounting —
+        and is RETRYABLE. We keep polling until it appears or the deadline expires.
+      * A candidate that EXISTS but is REJECTED by is_drive_managed() is the WRONG-FOLDER
+        danger this module exists to catch. That is a REAL failure and must page
+        IMMEDIATELY — waiting on it would delay the exact alarm we most want prompt. So
+        if ANY candidate was present-but-rejected we return that dict at once, no wait.
+
+    So: retry ONLY while the sole reason for non-resolution is absence. The common case
+    (Drive mounted, e.g. the 20:00 run) resolves on the first call with ZERO wait.
+
+    Returns the same dict shape as resolve_drive_dest. On timeout it returns the LAST
+    unresolved dict with its `note` augmented to record that we waited for the mount and
+    it never appeared — so the page reads "waited for Drive to mount and it never did",
+    not a bare "does not exist".
+    """
+    resolve_fn = resolve_fn or resolve_drive_dest
+    sleep_fn = sleep_fn or time.sleep
+    monotonic_fn = monotonic_fn or time.monotonic
+    deadline_s = DRIVE_MOUNT_WAIT_DEADLINE_S if deadline_s is None else deadline_s
+    interval_s = DRIVE_MOUNT_WAIT_INTERVAL_S if interval_s is None else interval_s
+    log_fn = log_fn or log
+
+    # The "REJECTED —" marker is written by resolve_drive_dest (see its per-candidate
+    # note line: `... REJECTED — {why}`). Matching that literal marker is the coupling:
+    # its presence in the note means at least one candidate EXISTED but failed
+    # is_drive_managed(), i.e. a present-but-rejected candidate = a REAL failure, not the
+    # absent-only logon race. This is the one available signal for "present but wrong".
+    def _has_rejected(res: dict) -> bool:
+        return "REJECTED" in (res.get("note") or "")
+
+    info = resolve_fn()
+    if info.get("resolved"):
+        return info
+    if _has_rejected(info):
+        # Present-but-rejected: the wrong-folder case. Page fast, never wait.
+        return info
+
+    start = monotonic_fn()
+    deadline = start + max(0, deadline_s)
+    attempt = 0
+    while monotonic_fn() < deadline:
+        attempt += 1
+        log_fn(f"Drive not resolved yet (every candidate merely absent — DriveFS mount "
+               f"race at logon?); waited {monotonic_fn() - start:.0f}s of {deadline_s}s, "
+               f"retrying in {interval_s}s (attempt {attempt})")
+        sleep_fn(interval_s)
+        info = resolve_fn()
+        if info.get("resolved"):
+            return info
+        if _has_rejected(info):
+            # A candidate appeared but is NOT Drive-managed — real failure, stop waiting.
+            return info
+
+    waited = monotonic_fn() - start
+    info = dict(info)
+    info["note"] = (
+        f"{info.get('note') or ''} | waited {waited:.0f}s for Google DriveFS to mount "
+        f"and it never appeared (bounded retry of {deadline_s}s exhausted) — every "
+        f"candidate remained absent, not rejected")
+    log_fn(f"Drive mount never appeared after waiting {waited:.0f}s — giving up "
+           f"(bounded, did not loop forever)")
+    return info
 
 
 # --------------------------------------------------------------------------- #
@@ -1496,7 +1582,11 @@ def run_backup(*, now=None, dry_run: bool = False, force: bool = False, resolve_
     asymmetry disappears.
     """
     log_fn = log_fn or log
-    resolve_fn = resolve_fn or resolve_drive_dest
+    # Default to the WAITING resolver so both the scheduled (20:00) and AtLogon paths
+    # get the bounded mount-race wait. The 20:00 run resolves on the first probe (Drive
+    # long mounted) so it costs nothing there; the logon run no longer false-pages while
+    # DriveFS is still mounting. An injected resolve_fn (tests) overrides this untouched.
+    resolve_fn = resolve_fn or resolve_drive_dest_waiting
     paused_fn = paused_fn or is_sync_paused
     verify_fn = verify_fn or bundle_verify
     head_fn = head_fn or bundle_head_sha
