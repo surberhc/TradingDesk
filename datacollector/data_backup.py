@@ -687,6 +687,11 @@ VOLATILE_PATTERNS = (
     "*heartbeat*",
     # Progress/state bookkeeping the long-running collectors rewrite as they advance.
     "*_progress*.json", "*_state.json",
+    # state/last_email_ok.txt is re-stamped every time the alarm sweep sends an email.
+    # It changed mid-run during the 2026-07-20 deep-verify (copy 21:00 -> check 02:25),
+    # tripping a false "sizes differ" hard-failure with the warehouse itself intact.
+    # Exact path (like the .ps1/.bat below) so an unexpected change elsewhere still pages.
+    "state/last_email_ok.txt",
     # Lock files appear/disappear/change for the life of a running job.
     "*.lock",
     # Observed: all 9 of the "file not in Google drive root" entries were under here.
