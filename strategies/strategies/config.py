@@ -225,6 +225,28 @@ SECTOR_COUNT_WHEN_USED = (3, 4)       # number of sectors held when tilt is on
 
 
 # ---------------------------------------------------------------------------
+# STUDY-ONLY equity-sleeve broadening tilt (PREREG_S0_equity_sleeve_broadening
+# _2026-07-20). DEFAULT OFF and byte-neutral: with EQUITY_TILT_ENABLED = False
+# the equity sleeve is assembled exactly as today (sector.select_sectors on the
+# frozen SECTOR_TILT_PCT). Nothing here is a production knob; it exists only so
+# the pre-registered study can be run behind a flag without touching frozen
+# config. Reuses the sector engine's blessed gate/RS basis — no new indicator.
+#   When ON: a static EQUITY_TILT_PCT fraction of the equity sleeve is carved out
+#   for the best momentum-leading candidates among {size funds + 11 sectors},
+#   gated on (above 200d trend) AND (positive RS vs SPY, score = mean(RS_3m,
+#   RS_6m)); top-N by score, each weighted min(EQUITY_TILT_PCT/N, SECTOR_MAX_WEIGHT);
+#   any unfilled tilt budget falls back to broad beta. The remaining
+#   (1 - filled) of the sleeve stays broad beta (SPY/VTI/RSP) exactly as today.
+# ---------------------------------------------------------------------------
+EQUITY_TILT_ENABLED = False           # master STUDY flag; OFF => production byte-identical
+EQUITY_TILT_PCT = 0.0                 # fraction of equity sleeve made available to the tilt
+EQUITY_TILT_COUNT = 4                 # N: number of top candidates held (prereg sweeps 3/4/5)
+EQUITY_TILT_SIZE_FUNDS = ("IJH", "IJR")     # default size pair (S&P mid/small, GICS-consistent)
+EQUITY_TILT_SIZE_FUNDS_ALT = ("VO", "VB")   # pre-registered robustness swap pair (Vanguard)
+EQUITY_TILT_USE_ALT_SIZE = False      # swap flag: use the VO/VB pair instead of IJH/IJR
+
+
+# ---------------------------------------------------------------------------
 # Duration Filter & Inflation/Deflation Engine (SPEC §6)
 # ---------------------------------------------------------------------------
 LONG_TSY_PERMISSION_MIN_PASSES = 4    # need ~4 of 5 permission rules

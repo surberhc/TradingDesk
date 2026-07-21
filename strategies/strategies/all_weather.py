@@ -25,6 +25,7 @@ from strategies.base import MarketState, StrategyBase, TargetWeights
 from strategies.parts import (
     defensive,
     duration,
+    equity_tilt,
     portfolio,
     real_assets,
     reentry,
@@ -254,7 +255,11 @@ class AdaptiveAllWeather(StrategyBase):
             float(s["ladder_cap"].loc[t]),
         )
 
-        sleeve = sector.select_sectors(s["prices"], t, config.SECTOR_TILT_PCT)
+        # Equity-sleeve internal mix. STUDY-ONLY broadening tilt lives behind
+        # config.EQUITY_TILT_ENABLED (default OFF); when off this is a pure
+        # pass-through to sector.select_sectors(prices, t, SECTOR_TILT_PCT), so
+        # production S0 is byte-identical (PREREG 2026-07-20).
+        sleeve = equity_tilt.select_equity_sleeve(s["prices"], t)
         ddec = duration.duration_decision(s["dur_signals"].loc[t], reg)
         def_rank = s["def_scores"].loc[t].dropna().sort_values(ascending=False)
         real = real_assets.select_real_basket(s["prices"], t) if self.use_real_assets else None

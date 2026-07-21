@@ -85,7 +85,7 @@ Rule #1 bars curve-fitting the **strategy**; it does not license curve-fitting t
 ## Verification bar
 Nothing is called "working" without the relevant check actually run:
 - Affected package's tests green, from that package's folder with the venv python:
-  - backtester:  `cd backtester` → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest -q`   (currently 436 passing)
+  - backtester:  `cd backtester` → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest -q`   (currently 444 passing)
   - paperbot:    `cd paperbot`   → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest -q`
 - Standing causality guard (the closest thing to a parity check):
   `cd backtester` → `"C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest tests/test_no_lookahead.py -v`
