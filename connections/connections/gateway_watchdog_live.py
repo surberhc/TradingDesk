@@ -5,7 +5,7 @@ rate-limiting so it can never become a hot loop.
 
 This is the sibling of gateway_watchdog.py for the SECOND, independent Gateway
 instance: the LIVE-side, READ-ONLY-ONLY market-data Gateway defined in
-ibkr_live_data.py (distinct install dir C:\IBC-Live, distinct port 4001,
+ibkr_live_data.py (distinct install dir C:\IBC-Live-Data, distinct port 4001,
 distinct launch-mutex, distinct login). It never touches order transmission —
 ibkr_live_data.py has no writable connect path at all (see its module docstring)
 — so this watchdog restarting the gateway process carries the same paper-only-
@@ -15,7 +15,7 @@ cannot place an order.
 REUSE, NOT DUPLICATION, WHERE CLEAN
   * `_kill_gateway_processes` (the PowerShell kill wrapper) is IMPORTED from
     gateway_watchdog.py and called scoped to this instance
-    (port=4001, dir_substring=r"C:\IBC-Live") — the function was built with this
+    (port=4001, dir_substring=r"C:\IBC-Live-Data") — the function was built with this
     exact second-instance scoping in mind; no PowerShell logic is duplicated here.
   * `_in_maintenance_window` and `_prune_restarts` (small pure helpers with no
     hardcoded coupling to the paper module's globals) are IMPORTED and reused.
@@ -80,12 +80,12 @@ GRACE_SECS = 300               # gateway must be continuously down this long bef
 MAX_RESTARTS_PER_HOUR = 3      # after this many restarts in a rolling hour, STOP and alert
 
 # TODO(live-data-gateway-setup): PLACEHOLDER — the live-data Gateway instance
-# (C:\IBC-Live) does not exist yet, so its config.ini AutoRestartTime is
+# (C:\IBC-Live-Data) does not exist yet, so its config.ini AutoRestartTime is
 # UNKNOWN. This value is a structural placeholder only, copied from the paper
 # default's format so the maintenance-window plumbing has something to point
 # at — it is NOT a confirmed nightly-reset time for this instance. UPDATE THIS
 # once the user builds the second IBC instance and sets its own AutoRestartTime
-# in C:\IBC-Live\config.ini; until then a "down" reading in this window will be
+# in C:\IBC-Live-Data\config.ini; until then a "down" reading in this window will be
 # (incorrectly) treated as an expected nightly bounce rather than a wedge.
 MAINTENANCE_WINDOW_ET = ("23:45", "00:45")  # PLACEHOLDER — see TODO above
 
@@ -296,7 +296,7 @@ def main() -> int:
             now=now,
             healthy=ibkr_live_data.gateway_running,
             state=state,
-            kill_fn=lambda: _kill_gateway_processes(port=4001, dir_substring=r"C:\IBC-Live"),
+            kill_fn=lambda: _kill_gateway_processes(port=4001, dir_substring=r"C:\IBC-Live-Data"),
             launch_fn=ibkr_live_data.ensure_gateway,
             log_fn=_log,
         )
