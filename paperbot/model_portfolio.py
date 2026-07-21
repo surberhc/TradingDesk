@@ -37,6 +37,7 @@ See docs/MODEL_PORTFOLIO_SPEC.md, conductor/ACCOUNT_ALLOCATION.md, conductor/DEC
 """
 from __future__ import annotations
 
+import asyncio
 import math
 from dataclasses import dataclass, field
 
@@ -266,13 +267,24 @@ def build_model_limit_order(symbol: str, side: str, quantity: int, limit_price: 
 # (d) READ WRAPPERS FOR PER-MODEL STATE  (READ-ONLY)
 #     Per-model ACCOUNT VALUES: cleanly supported. Per-model POSITIONS: gap workaround.
 # =============================================================================
-def read_model_account_values(ib, account: str = "", model_code: str = "") -> list:
-    """Per-model account VALUES (NetLiq etc. per sleeve). CLEANLY supported by ib_async:
-    subscribes via reqAccountUpdatesMulti(account, modelCode), then returns the AccountValue
-    rows filtered to (account, model_code). AccountValue carries a real `modelCode` field, so
-    this genuinely separates e.g. S0 vs S8 exposure. READ-ONLY."""
+def read_model_account_values(ib, account: str = "", model_code: str = "", *,
+                              timeout: float = 6.0) -> list:
+    """Per-model account VALUES (NetLiq etc. per sleeve). Subscribes via
+    reqAccountUpdatesMulti(account, modelCode), then returns the AccountValue rows filtered to
+    (account, model_code). AccountValue carries a real `modelCode` field, so this genuinely
+    separates e.g. S0 vs S8 exposure. READ-ONLY.
+
+    TIMEOUT-BOUNDED (verified against the paper gateway 2026-07-20): the bare *sync*
+    `ib.reqAccountUpdatesMulti` blocks until IBKR sends the accountUpdateMultiEnd marker — but
+    the gateway NEVER sends that End for a broad request (account="") or for a modelCode that
+    exists in the UI yet has NO account allocated into it, so the sync form hangs FOREVER.
+    We instead drive the async form under asyncio.wait_for; on TimeoutError we simply keep
+    whatever values streamed in before the deadline (a partial/empty read, never a hang)."""
     try:
-        ib.reqAccountUpdatesMulti(account, model_code)   # blocking subscribe; populates cache
+        ib.run(asyncio.wait_for(
+            ib.reqAccountUpdatesMultiAsync(account, model_code), timeout))
+    except asyncio.TimeoutError:
+        pass   # no End marker (empty account or an unallocated model) -> use what we have
     except Exception as exc:
         print(f"    ! reqAccountUpdatesMulti failed ({type(exc).__name__}: {exc})")
     rows = ib.accountValues(account) if account else ib.accountValues()
