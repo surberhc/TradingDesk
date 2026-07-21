@@ -30,6 +30,19 @@ import pytest
 import morning_execute_run as mer
 
 
+# The staged-file filename is derived from date.today() in production (mer.main via
+# _stage_path). Pin that clock to the fixtures' staging date so these tests pass every
+# day instead of only on their birth day (2026-07-09). FakeDate subclasses date so
+# isoformat()/strftime()/isinstance() all keep working; only today() is overridden.
+FIXED_TODAY = date(2026, 7, 9)
+
+
+class FakeDate(date):
+    @classmethod
+    def today(cls):
+        return FIXED_TODAY
+
+
 class _FakeIB:
     def __init__(self):
         self.disconnected = False
@@ -61,6 +74,9 @@ def _write_staged(tmp_path, today: date, routes=None) -> str:
 
 
 def _patch_common(monkeypatch, tmp_path):
+    # Pin production's date.today() to the fixtures' staging date (see FakeDate above) so
+    # main()/_stage_path() look for the file the fixtures actually wrote — date-independent.
+    monkeypatch.setattr(mer, "date", FakeDate)
     monkeypatch.setattr(mer, "PENDING_TRADES_DIR", str(tmp_path))
     monkeypatch.setattr(mer, "ARCHIVE_DIR", os.path.join(str(tmp_path), "archive"))
     monkeypatch.setattr(mer, "AUTOTRADE_DISABLED_SENTINEL",
@@ -161,7 +177,12 @@ def test_staged_pilot_mode_never_transmits_and_archives(monkeypatch, tmp_path):
     archived = os.path.join(str(tmp_path), "archive", "2026-07-09.json")
     assert os.path.exists(archived)
     assert any("PILOT" in subj for subj, _ in alerts)
-    assert any("WOULD HAVE TRANSMITTED" in "\n".join(lines) for _, lines in alerts)
+    # The pilot email reports what WOULD have transmitted while sending nothing. Match
+    # production's actual wording (module docstring paraphrases it as "WOULD HAVE
+    # TRANSMITTED"; the emitted body says "...WOULD have been sent if PILOT_MODE were False").
+    assert any("nothing was transmitted" in "\n".join(lines)
+               and "WOULD have been sent" in "\n".join(lines)
+               for _, lines in alerts)
 
 
 # --- staged + guard re-validation FAILS: left in place, alert fires --------------
