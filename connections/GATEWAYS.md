@@ -7,11 +7,11 @@ file ever disagree, fix whichever is wrong so they match.
 
 | Lane | Port | Connection module | Install bat | Launch-lock env var | Launch-lock dir |
 |------|------|-------------------|-------------|---------------------|-----------------|
-| **Paper** | 4002 | `connections/connections/ibkr_paper.py` | `C:\IBC-Paper\StartGatewayPaper.bat` | `TRADINGDESK_PAPER_GATEWAY_LAUNCH_LOCK` | `C:\TradingDesk-Local\state\paper\` |
+| **Paper** | 4002 | `connections/connections/ibkr_paper.py` | `C:\IBC\StartGateway.bat` | `TRADINGDESK_PAPER_GATEWAY_LAUNCH_LOCK` | `C:\TradingDesk-Local\state\paper\` |
 | **Live-Data** | 4001 | `connections/connections/ibkr_live_data.py` | `C:\IBC-Live-Data\StartGatewayLiveData.bat` | `TRADINGDESK_LIVE_DATA_GATEWAY_LAUNCH_LOCK` | `C:\TradingDesk-Local\state\live_data\` |
 | **Live-Trade** | 4003 | `connections/connections/ibkr_live_trade.py` | `C:\IBC-Live-Trade\StartGatewayLiveTrade.bat` | `TRADINGDESK_LIVE_TRADE_GATEWAY_LAUNCH_LOCK` | `C:\TradingDesk-Local\state\live_trade\` |
 
-> **Machine-side install dirs** (`C:\IBC-Paper`, `C:\IBC-Live-Data`, `C:\IBC-Live-Trade`)
+> **Machine-side install dirs** (`C:\IBC`, `C:\IBC-Live-Data`, `C:\IBC-Live-Trade`)
 > are set up separately by the user and **must match the `GATEWAY_BAT` constant** in each
 > module. Renaming a bat path here without moving the install on disk will break launch.
 

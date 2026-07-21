@@ -29,7 +29,7 @@ from connections import clientids
 
 HOST = "127.0.0.1"
 PAPER_PORT = clientids.PAPER_PORT          # 4002
-GATEWAY_BAT = r"C:\IBC-Paper\StartGatewayPaper.bat"   # IBController auto-login (paper)
+GATEWAY_BAT = r"C:\IBC\StartGateway.bat"   # IBController auto-login (paper)
 
 # Launch mutex state. LOCAL C: only — Drive sync corrupts O_EXCL atomicity, and
 # the file must be readable by non-elevated processes (the incident's cleanup
