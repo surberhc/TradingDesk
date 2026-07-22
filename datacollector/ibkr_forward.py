@@ -200,15 +200,22 @@ def _to_df(rows: list[dict], sym: str, daystr: str, snap_ts: str, spot) -> pd.Da
 
 
 def collect_day(ib: IB, sym: str, daystr: str,
-                band: int | None = None, max_exps: int | None = None) -> tuple[str, int]:
+                band: int | None = None, max_exps: int | None = None,
+                base=None) -> tuple[str, int]:
     """Snapshot one root for one day and write it. Resumable: skips days on disk.
 
     Deliberately does NOT write an empty marker when nothing comes back (unlike the
     ThetaData backfill). A forward run that finds no data is almost always transient
     (after-hours, farm hiccup), and a false marker would poison the day forever via
     have_day(). Leaving it unwritten lets the next run retry.
+
+    base : storage namespace override (see storage.have_day/write_day). Default None
+           means the production raw/options warehouse (unchanged behavior). Pass
+           config.RAW_OPTIONS_IBKR to write into the parallel A/B namespace instead —
+           the same redirect ibkr_forward_live.py uses — so a paper-Gateway test pull
+           never collides with or corrupts the real ThetaData warehouse.
     """
-    if storage.have_day(sym, daystr):
+    if storage.have_day(sym, daystr, base=base):
         return ("skip", 0)
     c, spot, contracts = build_chain(ib, sym, band, max_exps)
     if not contracts:
@@ -219,7 +226,7 @@ def collect_day(ib: IB, sym: str, daystr: str,
     if populated == 0:
         return ("no-data", 0)        # don't poison the day; retry next run
     df = _to_df(rows, sym, daystr, snap_ts, spot)
-    n = storage.write_day(sym, daystr, df)
+    n = storage.write_day(sym, daystr, df, base=base)
     return ("ok", n)
 
 
@@ -228,6 +235,13 @@ def main() -> None:
     test = "--test" in args
     launch = "--launch" in args
     full = "--full" in args              # override the band, capture the literal full chain
+    # OPT-IN A/B namespace redirect (default OFF -> byte-identical production behavior).
+    # When set, writes/skip-checks go to config.RAW_OPTIONS_IBKR (raw/options_ibkr) via
+    # storage's base= redirect — the exact mechanism ibkr_forward_live.py uses — so a
+    # paper-Gateway test pull can never collide with or corrupt the real ThetaData
+    # warehouse (raw/options).
+    ibkr_ns = "--ibkr-namespace" in args
+    base = config.RAW_OPTIONS_IBKR if ibkr_ns else None
     roots = [a.upper() for a in args if not a.startswith("--")]
     if test and not roots:
         roots = ["SPY"]
@@ -247,13 +261,14 @@ def main() -> None:
         real_errors.append(f"[{code}] {msg}") if code not in OK_STATUS else None)
     ib.reqMarketDataType(3)              # ask for delayed — EOD snapshot doesn't need live entitlement
     print(f"connected={ib.isConnected()} clientId={gw.clientids.get(CLIENT)} "
-          f"{'TEST slice' if test else 'FULL chain'} | day={daystr} | roots={roots}")
+          f"{'TEST slice' if test else 'FULL chain'} | day={daystr} | roots={roots}"
+          + (f" | namespace={base}" if base else ""))
 
     try:
         for sym in roots:
             t0 = datetime.now()
             b, mx = (band, max_exps) if (test or full) else config.forward_depth(sym)
-            status, n = collect_day(ib, sym, daystr, band=b, max_exps=mx)
+            status, n = collect_day(ib, sym, daystr, band=b, max_exps=mx, base=base)
             dt = (datetime.now() - t0).total_seconds()
             print(f"  {sym:6} {status:9} rows={n:<7} {dt:5.1f}s"
                   + (f"  errors={len(real_errors)}" if real_errors else ""))
