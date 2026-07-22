@@ -568,6 +568,17 @@ def test_check_uses_the_check_subcommand_with_the_same_scope():
     assert str(db.RCLONE_CONFIG) in argv
 
 
+def test_check_is_one_way_so_remote_only_leftovers_do_not_false_page():
+    """`rclone check` must run --one-way: `rclone copy` is additive (never deletes on
+    the remote), so a locally-deleted file (e.g. a superseded warehouse/lib/ terminal
+    jar) legitimately lingers on the remote. A two-way check would flag that leftover as
+    a difference and fail the backup closed -- a false page over fully-backed-up data.
+    One-way still reports a local file missing from the remote or a changed local file."""
+    assert "--one-way" in db.check_argv(r"C:\fake\rclone.exe")
+    # ...and still there in the scoped (incremental) form.
+    assert "--one-way" in db.check_argv(r"C:\fake\rclone.exe", files_from=r"C:\tmp\list.txt")
+
+
 # --------------------------------------------------------------------------- #
 # parse_check_output — the summary counts, absence != zero
 # --------------------------------------------------------------------------- #

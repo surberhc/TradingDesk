@@ -433,12 +433,26 @@ def check_argv(rclone_path: str, files_from: str | None = None) -> list[str]:
     ends support it (Google Drive does), so no extra flag is needed to make it a
     checksum comparison.
 
+    The check is ONE-WAY (--one-way): it verifies every local file is present and
+    byte-identical on the remote, but does not flag files that exist only on the remote
+    (locally-deleted files that linger there under the additive copy-not-sync design).
+
     files_from (incremental mode only) scopes the check to exactly the paths listed in
     that file — the ones this run actually copied. With no files_from the check is the
     original full-scope pass over everything.
     """
     argv = [rclone_path, "check", str(DATA_SOURCE), RCLONE_REMOTE]
     argv += _base_flags()
+    # --one-way: verify every LOCAL file is present + byte-identical on the remote,
+    # but DO NOT report files that exist only on the remote. This is REQUIRED by the
+    # copy-not-sync design (see the COPY-NOT-SYNC note in the module docstring): `rclone
+    # copy` is additive and never deletes on the remote, so a file deleted locally (e.g.
+    # a superseded ThetaData terminal jar under warehouse/lib/, replaced when the terminal
+    # auto-updates) legitimately lingers there forever. A two-way check flags that leftover
+    # as a difference and fails the whole backup closed -- a false page over data that is
+    # fully backed up. One-way removes ZERO protection: a local file missing from the
+    # remote, or a corrupted/changed local file, is still reported and still fails tier-1.
+    argv += ["--one-way"]
     if files_from:
         argv += ["--files-from", str(files_from)]
     return argv
