@@ -15,8 +15,12 @@ cannot place an order.
 REUSE, NOT DUPLICATION, WHERE CLEAN
   * `_kill_gateway_processes` (the PowerShell kill wrapper) is IMPORTED from
     gateway_watchdog.py and called scoped to this instance
-    (port=4001, dir_substring=r"C:\IBC-Live-Data") — the function was built with this
-    exact second-instance scoping in mind; no PowerShell logic is duplicated here.
+    (port=LIVE_DATA_INSTANCE.port, instance=LIVE_DATA_INSTANCE) — the function was
+    built with this exact second-instance scoping in mind; no PowerShell logic is
+    duplicated here. (2026-07-23: the old `dir_substring=r"C:\IBC-Live-Data"` form
+    was safe for THIS lane but the parameter itself was unsafe by design — see
+    docs/INCIDENT_2026-07-23_arm_restart_killed_live_gateway.md — and is now an
+    exact per-instance GatewayInstance identity instead of a bare substring.)
   * `_in_maintenance_window` and `_prune_restarts` (small pure helpers with no
     hardcoded coupling to the paper module's globals) are IMPORTED and reused.
   * The top-level `run_once(...)` orchestration in gateway_watchdog.py is NOT
@@ -66,6 +70,7 @@ import time
 
 from connections import ibkr_live_data
 from connections.gateway_watchdog import (
+    LIVE_DATA_INSTANCE,
     _in_maintenance_window,
     _kill_gateway_processes,
     _prune_restarts,
@@ -296,7 +301,8 @@ def main() -> int:
             now=now,
             healthy=ibkr_live_data.gateway_running,
             state=state,
-            kill_fn=lambda: _kill_gateway_processes(port=4001, dir_substring=r"C:\IBC-Live-Data"),
+            kill_fn=lambda: _kill_gateway_processes(
+                port=LIVE_DATA_INSTANCE.port, instance=LIVE_DATA_INSTANCE),
             launch_fn=ibkr_live_data.ensure_gateway,
             log_fn=_log,
         )

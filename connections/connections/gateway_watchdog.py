@@ -212,59 +212,209 @@ def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn):
 
 
 # --------------------------------------------------------------------------- #
-# REAL kill wrapper (mocked in tests). Stdlib + PowerShell only, NO new pip deps.
+# GATEWAY INSTANCE (LANE) IDENTITY — the discriminator, as PURE PYTHON.
 # --------------------------------------------------------------------------- #
+# INCIDENT 2026-07-23 (docs/INCIDENT_2026-07-23_arm_restart_killed_live_gateway.md)
+# ------------------------------------------------------------------------------
+# The old secondary discriminator was `CommandLine -match 'C:\IBC'` (the paper
+# install dir). `C:\IBC` is a STRING PREFIX of the sibling installs C:\IBC-Live-Data
+# and C:\IBC-Live-Trade, so a zero-argument paper kill matched and DESTROYED the S8
+# live-pilot Gateway on port 4003 (2m51s outage on a real funded account's pilot).
+#
+# The obvious "add a trailing separator" fix (`C:\IBC\`) is NOT sufficient and was
+# verified insufficient against the real running processes: ALL THREE lanes launch
+# IBC from the SHARED classpath entry `C:\IBC\IBC.jar` (IBC_PATH=%SYSTEMDRIVE%\IBC in
+# every StartGateway*.bat), so EVERY Gateway JVM's command line contains the literal
+# `C:\IBC\`. That fix would spare the cmd.exe launchers and still kill sibling JVMs.
+#
+# THE ONLY THING THAT IS ACTUALLY PER-INSTANCE is the IBC config file and the
+# launcher .bat:
+#     paper       C:\IBC\config.ini                 C:\IBC\StartGateway.bat
+#     live-data   C:\IBC-Live-Data\config.ini       C:\IBC-Live-Data\StartGatewayLiveData.bat
+#     live-trade  C:\IBC-Live-Trade\config.ini      C:\IBC-Live-Trade\StartGatewayLiveTrade.bat
+# None of those strings is a substring of another. The JVM carries its config path as
+# the trailing argument to ibcalpha.ibc.IbcGateway (and its settings dir as
+# -DjtsConfigDir); the cmd.exe launcher shell carries the .bat path.
+#
 # We kill, for THIS Gateway instance only:
 #   * java processes whose command line matches "IbcGateway" (the IB Gateway JVM
-#     launched by IBController), AND
-#   * cmd processes whose command line matches "StartGateway" (the launcher shell),
-# ...AND (instance scoping, added when a second independent Gateway instance was
-# introduced on the same box on a different port/install dir):
+#     launched by IBController), or cmd processes whose command line matches
+#     "StartGateway" (the launcher shell), AND
 #   * the process is the one actually LISTENING on `port` (PRIMARY discriminator —
-#     same Get-NetTCPConnection idiom already used below for the ThetaData
-#     carve-out), OR
-#   * its CommandLine contains `dir_substring` (SECONDARY discriminator — catches a
-#     not-yet-port-bound process during a wedge/launch race window, before it's
-#     listening).
-# We SPARE:
+#     same Get-NetTCPConnection idiom used for the ThetaData carve-out), OR its
+#     CommandLine carries one of THIS instance's exact identity markers (SECONDARY
+#     discriminator — catches a not-yet-port-bound process during a wedge/launch
+#     race window, before it is listening).
+# We SPARE, unconditionally:
+#   * any process carrying ANOTHER lane's identity marker (the HARD NEVER-KILL
+#     guard — it overrides even the port match; see _foreign_instance_marker),
 #   * the ThetaData terminal (the java that owns local port 25503), and
 #   * ALL python (never kill ourselves or any sibling desk process).
 # Because the task runs ELEVATED it can read command lines and kill elevated java.
-# Implemented via a single PowerShell Get-CimInstance Win32_Process filter piped to
-# Stop-Process (mirrors the approach that worked during the incident cleanup).
 #
-# Defaults (port=ibkr_paper.PAPER_PORT, dir_substring=C:\IBC) reproduce the ORIGINAL,
-# pre-multi-instance behavior for the paper Gateway: every call site today
-# (gateway_watchdog.main() and paperbot/gateway_arm_restart_elevated.py) invokes
-# this with NO arguments and must keep doing so unchanged.
-_KILL_PS_TEMPLATE = r"""
+# The process enumeration happens in PowerShell (Get-CimInstance Win32_Process, no
+# new pip deps); the DECISION is made here in Python by `should_kill()` so it is
+# directly unit-testable against real captured command lines — the old all-in-one
+# PowerShell filter could only be tested by asserting on the generated script text,
+# which is exactly why the prefix collision was invisible to the suite.
+
+# The SHARED IBC program directory. All three lanes set IBC_PATH=%SYSTEMDRIVE%\IBC
+# and put C:\IBC\IBC.jar on the classpath, so this path identifies NOTHING about
+# which lane a process belongs to and must never be used as a discriminator.
+IBC_PROGRAM_DIR = r"C:\IBC"
+
+
+class GatewayInstance:
+    """One Gateway lane's identity — the exact strings that distinguish it from
+    every other Gateway instance on this box.
+
+    install_dir   : the lane's own IBC instance directory.
+    config_path   : the lane's own config.ini (the JVM's trailing IbcGateway arg).
+    launcher_path : the lane's own StartGateway*.bat (the cmd.exe launcher's arg).
+    """
+    __slots__ = ("name", "port", "install_dir", "config_path", "launcher_path")
+
+    def __init__(self, name: str, port: int, install_dir: str,
+                 config_path: str, launcher_path: str):
+        self.name = name
+        self.port = int(port)
+        self.install_dir = install_dir
+        self.config_path = config_path
+        self.launcher_path = launcher_path
+
+    def __repr__(self) -> str:  # pragma: no cover — debugging aid only
+        return f"GatewayInstance({self.name!r}, port={self.port})"
+
+    def identity_markers(self) -> tuple[str, ...]:
+        """Strings whose presence in a command line PROVES the process belongs to
+        this lane. Exact per-instance paths only — never a bare install root."""
+        return (self.config_path, self.launcher_path)
+
+    def exclusion_markers(self) -> tuple[str, ...]:
+        """Strings whose presence proves the process belongs to this lane, used to
+        EXCLUDE it when some other lane is the kill target. Adds the install root
+        (with a trailing separator) for lanes that own their own directory — but
+        NOT for the shared IBC program dir, which every lane's JVM references."""
+        markers = list(self.identity_markers())
+        if self.install_dir.rstrip("\\").lower() != IBC_PROGRAM_DIR.lower():
+            markers.append(self.install_dir.rstrip("\\") + "\\")
+        return tuple(markers)
+
+
+PAPER_INSTANCE = GatewayInstance(
+    "paper", ibkr_paper.PAPER_PORT, r"C:\IBC",
+    r"C:\IBC\config.ini", r"C:\IBC\StartGateway.bat")
+LIVE_DATA_INSTANCE = GatewayInstance(
+    "live-data", 4001, r"C:\IBC-Live-Data",
+    r"C:\IBC-Live-Data\config.ini", r"C:\IBC-Live-Data\StartGatewayLiveData.bat")
+LIVE_TRADE_INSTANCE = GatewayInstance(
+    "live-trade", 4003, r"C:\IBC-Live-Trade",
+    r"C:\IBC-Live-Trade\config.ini", r"C:\IBC-Live-Trade\StartGatewayLiveTrade.bat")
+
+KNOWN_INSTANCES: tuple[GatewayInstance, ...] = (
+    PAPER_INSTANCE, LIVE_DATA_INSTANCE, LIVE_TRADE_INSTANCE)
+
+
+def _norm(cl) -> str:
+    """Normalize a command line for matching: str, lowercased. Windows paths are
+    case-insensitive, and Win32_Process reports the JVM path in lowercase."""
+    return (cl or "").lower()
+
+
+def matches_instance(command_line, instance: GatewayInstance) -> bool:
+    """True if `command_line` carries one of `instance`'s EXACT identity markers.
+
+    This is the secondary (pre-port-bind) discriminator. It is deliberately exact:
+    no bare install-root substring test, because C:\\IBC is a prefix of the sibling
+    installs AND is on every lane's classpath (see the incident note above)."""
+    cl = _norm(command_line)
+    return any(_norm(m) in cl for m in instance.identity_markers())
+
+
+def foreign_instance_marker(command_line, instance: GatewayInstance,
+                            known=KNOWN_INSTANCES):
+    """HARD NEVER-KILL guard.
+
+    Returns the (lane_name, marker) of a DIFFERENT lane whose identity marker is
+    present in `command_line`, else None. A process that trips this is excluded
+    from the kill no matter what else matched — including the port discriminator.
+    Belt and braces: the 2026-07-23 incident proves one discriminator failing open
+    is enough to lose a live Gateway."""
+    cl = _norm(command_line)
+    for other in known:
+        if other.name == instance.name:
+            continue
+        for marker in other.exclusion_markers():
+            if _norm(marker) in cl:
+                return (other.name, marker)
+    return None
+
+
+def should_kill(*, name: str, command_line, pid: int,
+                gw_pids, theta_pids, instance: GatewayInstance,
+                known=KNOWN_INSTANCES) -> bool:
+    """The whole kill predicate, as a pure function (see the module comment).
+
+    name        : process image name (e.g. 'java.exe').
+    command_line: the process's full CommandLine (may be None).
+    pid         : the process id.
+    gw_pids     : pids currently LISTENING on this instance's port (primary match).
+    theta_pids  : pids owning port 25503 (the ThetaData terminal) — always spared.
+    instance    : the lane being restarted.
+    """
+    nm = (name or "").lower()
+    cl = _norm(command_line)
+    pid = int(pid)
+    gw_pids = {int(p) for p in (gw_pids or [])}
+    theta_pids = {int(p) for p in (theta_pids or [])}
+
+    # Never kill ourselves or any sibling desk process.
+    if nm in ("python.exe", "pythonw.exe"):
+        return False
+    # Never kill the ThetaData terminal.
+    if pid in theta_pids:
+        return False
+    # Must look like a Gateway process at all.
+    is_gateway_proc = ((nm == "java.exe" and "ibcgateway" in cl) or
+                       (nm == "cmd.exe" and "startgateway" in cl))
+    if not is_gateway_proc:
+        return False
+    # HARD NEVER-KILL: another lane's process, whatever else matched.
+    if foreign_instance_marker(command_line, instance, known) is not None:
+        return False
+    # Primary: it owns this instance's port. Secondary: exact instance markers.
+    return (pid in gw_pids) or matches_instance(command_line, instance)
+
+
+# --------------------------------------------------------------------------- #
+# REAL kill wrapper (mocked in tests). Stdlib + PowerShell only, NO new pip deps.
+# Phase 1 ENUMERATES (PowerShell), Python DECIDES, phase 2 KILLS the chosen pids.
+# --------------------------------------------------------------------------- #
+_ENUM_PS_TEMPLATE = r"""
 $ErrorActionPreference = 'SilentlyContinue'
-$dirSubstring = '{dir_substring}'
 # PID that owns local port 25503 = the ThetaData terminal -> SPARE it.
-$thetaPid = (Get-NetTCPConnection -LocalPort 25503 -State Listen).OwningProcess |
-            Select-Object -Unique
+$thetaPid = @((Get-NetTCPConnection -LocalPort 25503 -State Listen).OwningProcess |
+              Select-Object -Unique)
 # PID that owns local port {port} = THIS Gateway instance -> primary discriminator
 # (mirrors the ThetaData carve-out idiom above).
-$gwPid = (Get-NetTCPConnection -LocalPort {port} -State Listen).OwningProcess |
-         Select-Object -Unique
-$procs = Get-CimInstance Win32_Process | Where-Object {{
-    $n  = $_.Name
-    $cl = $_.CommandLine
-    (
-        ($n -eq 'java.exe' -and $cl -match 'IbcGateway') -or
-        ($n -eq 'cmd.exe'  -and $cl -match 'StartGateway')
-    ) -and
-    (
-        ($_.ProcessId -in $gwPid) -or
-        ($cl -match [regex]::Escape($dirSubstring))
-    ) -and
-    ($_.ProcessId -notin $thetaPid) -and
-    ($n -ne 'python.exe') -and ($n -ne 'pythonw.exe')
-}}
+$gwPid = @((Get-NetTCPConnection -LocalPort {port} -State Listen).OwningProcess |
+           Select-Object -Unique)
+$procs = @(Get-CimInstance Win32_Process | Where-Object {{
+    ($_.Name -eq 'java.exe' -and $_.CommandLine -match 'IbcGateway') -or
+    ($_.Name -eq 'cmd.exe'  -and $_.CommandLine -match 'StartGateway')
+}} | ForEach-Object {{
+    [pscustomobject]@{{ pid = $_.ProcessId; name = $_.Name; cl = $_.CommandLine }}
+}})
+[pscustomobject]@{{ theta = $thetaPid; gw = $gwPid; procs = $procs }} |
+    ConvertTo-Json -Depth 4 -Compress
+"""
+
+_KILL_PS_TEMPLATE = r"""
+$ErrorActionPreference = 'SilentlyContinue'
 $killed = @()
-foreach ($p in $procs) {{
-    Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
-    if ($?) {{ $killed += $p.ProcessId }}
+foreach ($id in @({pids})) {{
+    Stop-Process -Id $id -Force -ErrorAction SilentlyContinue
+    if ($?) {{ $killed += $id }}
 }}
 # Emit the killed PIDs as JSON on the last line for the caller to parse.
 $killed | ConvertTo-Json -Compress
@@ -276,40 +426,100 @@ def _ps_single_quote(s: str) -> str:
     return s.replace("'", "''")
 
 
-def _kill_gateway_processes(port: int = ibkr_paper.PAPER_PORT,
-                            dir_substring: str = r"C:\IBC") -> list[int]:
-    """Kill THIS Gateway instance's processes only — sparing the ThetaData
-    terminal, all python, and any OTHER Gateway instance running on a different
-    port/install dir (see the module comment above for the discriminator logic).
-
-    port          : the port THIS instance's Gateway listens on (primary match).
-    dir_substring : a substring of THIS instance's install dir, matched against
-                    CommandLine (secondary match, for the pre-listen race window).
-    Defaults (ibkr_paper.PAPER_PORT / C:\\IBC) reproduce the original unscoped behavior
-    for the paper Gateway — every call site today invokes this with NO arguments.
-
-    Returns the list of killed PIDs. Never raises — on any failure returns []."""
-    ps = _KILL_PS_TEMPLATE.format(
-        port=int(port),
-        dir_substring=_ps_single_quote(dir_substring),
-    )
+def _run_ps(script: str, timeout: int = 60):
+    """Run a PowerShell script, return stdout text ('' on any failure)."""
     try:
         out = subprocess.run(
             ["powershell", "-NoProfile", "-NonInteractive",
-             "-ExecutionPolicy", "Bypass", "-Command", ps],
-            capture_output=True, text=True, timeout=60,
+             "-ExecutionPolicy", "Bypass", "-Command", script],
+            capture_output=True, text=True, timeout=timeout,
         )
     except Exception as e:  # noqa: BLE001 — the kill must never crash the watchdog
-        print(f"_kill_gateway_processes: subprocess error {e!r}")
-        return []
-    text = (out.stdout or "").strip()
+        print(f"_run_ps: subprocess error {e!r}")
+        return ""
+    return (out.stdout or "").strip()
+
+
+def _parse_json_last_line(text: str):
+    """Parse the LAST line of `text` as JSON; None on any failure."""
     if not text:
-        return []
+        return None
     last = text.splitlines()[-1].strip()
     try:
-        parsed = json.loads(last)
+        return json.loads(last)
     except (ValueError, TypeError):
+        return None
+
+
+def _as_list(v) -> list:
+    """PowerShell's ConvertTo-Json collapses single-element arrays; normalize."""
+    if v is None:
         return []
+    if isinstance(v, list):
+        return v
+    return [v]
+
+
+def _kill_gateway_processes(port: int = ibkr_paper.PAPER_PORT,
+                            instance: GatewayInstance = PAPER_INSTANCE) -> list[int]:
+    r"""Kill THIS Gateway instance's processes ONLY.
+
+    Spares, unconditionally: the ThetaData terminal (port 25503), all python, and —
+    this is the 2026-07-23 fix — ANY process carrying another lane's identity marker
+    (C:\IBC-Live-Data\* / C:\IBC-Live-Trade\* / C:\IBC\config.ini as appropriate).
+    See docs/INCIDENT_2026-07-23_arm_restart_killed_live_gateway.md.
+
+    port     : the port THIS instance's Gateway listens on (PRIMARY discriminator —
+               the pid that owns it). This discriminator was always correct.
+    instance : the lane's GatewayInstance — supplies the EXACT per-instance config
+               and launcher paths used as the secondary (pre-port-bind)
+               discriminator and, for every OTHER lane, as a hard never-kill guard.
+               Formerly `dir_substring`, a bare install-root substring; that name and
+               semantics are gone because C:\IBC is a prefix of the sibling installs
+               AND appears on every lane's classpath, so it identified nothing.
+
+    `port` and `instance.port` must agree; a mismatch is a wiring bug and we refuse
+    to kill anything rather than guess (a refused kill leaves a wedged gateway,
+    which is loud and recoverable; a wrong kill is not).
+
+    Returns the list of killed PIDs. Never raises — on any failure returns []."""
+    port = int(port)
+    if port != instance.port:
+        print(f"_kill_gateway_processes: REFUSING — port {port} does not match "
+              f"instance {instance.name!r} (port {instance.port}). Killing nothing.")
+        return []
+
+    info = _parse_json_last_line(_run_ps(_ENUM_PS_TEMPLATE.format(port=port)))
+    if not isinstance(info, dict):
+        return []
+    theta_pids = _as_list(info.get("theta"))
+    gw_pids = _as_list(info.get("gw"))
+    procs = _as_list(info.get("procs"))
+
+    targets: list[int] = []
+    for p in procs:
+        if not isinstance(p, dict):
+            continue
+        try:
+            pid = int(p.get("pid"))
+        except (TypeError, ValueError):
+            continue
+        cl = p.get("cl")
+        if should_kill(name=p.get("name") or "", command_line=cl, pid=pid,
+                       gw_pids=gw_pids, theta_pids=theta_pids, instance=instance):
+            targets.append(pid)
+        else:
+            foreign = foreign_instance_marker(cl, instance)
+            if foreign is not None:
+                print(f"_kill_gateway_processes: SPARING pid {pid} ({p.get('name')}) "
+                      f"— belongs to lane {foreign[0]!r} (marker {foreign[1]!r})")
+
+    if not targets:
+        return []
+
+    pids_literal = ",".join(str(t) for t in targets)
+    parsed = _parse_json_last_line(
+        _run_ps(_KILL_PS_TEMPLATE.format(pids=pids_literal)))
     if parsed is None:
         return []
     if isinstance(parsed, int):
@@ -388,7 +598,10 @@ def main() -> int:
             now=now,
             healthy=ibkr_paper.gateway_running,
             state=state,
-            kill_fn=_kill_gateway_processes,
+            # EXPLICIT lane scoping — never rely on the defaults (2026-07-23 incident:
+            # a defaults-only call from the arm path killed the live-trade Gateway).
+            kill_fn=lambda: _kill_gateway_processes(
+                port=PAPER_INSTANCE.port, instance=PAPER_INSTANCE),
             launch_fn=ibkr_paper.ensure_gateway,
             log_fn=_log,
         )

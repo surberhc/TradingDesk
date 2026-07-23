@@ -11,6 +11,8 @@ under a hard rolling-hour restart cap, and NEVER inside the IBKR nightly-reset
 maintenance window. It must never become a hot loop.
 """
 import datetime as dt
+import json
+import re
 from zoneinfo import ZoneInfo
 
 import pytest
@@ -238,11 +240,226 @@ def test_already_alerted_stays_rate_limited_no_restart():
     assert kill.calls == 0 and launch.calls == 0
 
 
+# ===========================================================================
+# 10. THE KILL DISCRIMINATOR — regression suite for the 2026-07-23 incident.
+#
+#     docs/INCIDENT_2026-07-23_arm_restart_killed_live_gateway.md
+#
+#     A zero-argument (paper) `_kill_gateway_processes()` killed the S8 LIVE-pilot
+#     Gateway on port 4003, because the secondary discriminator was the bare
+#     substring `C:\IBC` — a string PREFIX of C:\IBC-Live-Data / C:\IBC-Live-Trade.
+#
+#     These tests exercise the REAL match semantics (gw.should_kill /
+#     gw.matches_instance / gw.foreign_instance_marker) against command lines
+#     CAPTURED FROM Win32_Process on this box on 2026-07-23 — including the shared
+#     `C:\IBC\IBC.jar` classpath entry that defeats the naive trailing-separator
+#     fix. The old tests asserted only on generated PowerShell TEXT, which is
+#     exactly why the prefix collision was invisible to the suite.
+# ===========================================================================
+
+# ---- FIXTURES: real command lines --------------------------------------------
+# Captured 2026-07-23 via `Get-CimInstance Win32_Process`. Truncated in the middle
+# of the -cp classpath (elided with "...") but PRESERVING the two things that
+# matter: the shared `C:\IBC\IBC.jar` classpath entry and the per-instance
+# -DjtsConfigDir / trailing config.ini argument.
+
+# pid 3496 — the java JVM that was LISTENING on 4003 (the live pilot) at capture time.
+LIVE_TRADE_JVM_CL = (
+    r'"c:\users\andre\appdata\local\programs\common\i4j_jres\oda-jk0qgtemvssflllp'
+    r'\17.0.16.0.101-zulu_64\bin\java.exe"  --add-opens=java.base/java.util=ALL-UNNAMED '
+    r'-cp  "C:\Jts\ibgateway\1045\jars\batik-all-1.16.jar;...;'
+    r'C:\Jts\ibgateway\1045\.install4j\i4jruntime.jar;C:\IBC\IBC.jar"  -Xmx768m '
+    r'-DvmOptionsPath=C:\Jts\ibgateway\1045\ibgateway.vmoptions '
+    r'-Dinstall4jType=standalone -DjtsConfigDir="C:\IBC-Live-Trade\GatewaySettings" '
+    r'-Dibcsessionid="2269714722"  ibcalpha.ibc.IbcGateway '
+    r'"C:\IBC-Live-Trade\config.ini" live'
+)
+
+# pid 7004 — the cmd.exe launcher shell that started pid 3496.
+LIVE_TRADE_CMD_CL = r'"cmd.exe" /c "C:\IBC-Live-Trade\StartGatewayLiveTrade.bat"'
+
+# pid 29236 — the ORPHAN live-trade JVM from the 09:55 self-heal race. Bound to NO
+# port, so the port discriminator cannot see it: only the lane markers can.
+LIVE_TRADE_ORPHAN_JVM_CL = LIVE_TRADE_JVM_CL.replace("2269714722", "2217120932")
+
+# pid 30728 — the orphan's cmd.exe launcher.
+LIVE_TRADE_ORPHAN_CMD_CL = r"cmd /c C:\IBC-Live-Trade\StartGatewayLiveTrade.bat"
+
+# Live-data lane. No live-data gateway was running at capture time; this is built
+# from the SAME captured JVM shape with the lane's own config/settings paths, which
+# C:\IBC-Live-Data\StartGatewayLiveData.bat sets (CONFIG=C:\IBC-Live-Data\config.ini,
+# TWS_SETTINGS_PATH=C:\IBC-Live-Data\GatewaySettings — read from the .bat).
+LIVE_DATA_JVM_CL = (LIVE_TRADE_JVM_CL
+                    .replace(r"C:\IBC-Live-Trade", r"C:\IBC-Live-Data"))
+LIVE_DATA_CMD_CL = r'"cmd.exe" /c "C:\IBC-Live-Data\StartGatewayLiveData.bat"'
+
+# PAPER lane — DERIVED, NOT OBSERVED. No paper gateway was running at capture time,
+# so no paper JVM command line could be captured. Derived by reading
+# C:\IBC\StartGateway.bat (CONFIG=%SYSTEMDRIVE%\IBC\config.ini, TRADING_MODE=paper,
+# TWS_SETTINGS_PATH empty) and C:\IBC\scripts\StartIBC.bat, which does
+# `if not defined TWS_SETTINGS_PATH set TWS_SETTINGS_PATH=%TWS_PATH%` (-> C:\Jts) and
+# invokes: java ... -DjtsConfigDir="%TWS_SETTINGS_PATH%" %ENTRY_POINT% "%CONFIG%" %MODE%
+PAPER_JVM_CL = (
+    r'"c:\users\andre\appdata\local\programs\common\i4j_jres\oda-jk0qgtemvssflllp'
+    r'\17.0.16.0.101-zulu_64\bin\java.exe"  --add-opens=java.base/java.util=ALL-UNNAMED '
+    r'-cp  "C:\Jts\ibgateway\1045\jars\batik-all-1.16.jar;...;'
+    r'C:\Jts\ibgateway\1045\.install4j\i4jruntime.jar;C:\IBC\IBC.jar"  -Xmx768m '
+    r'-DvmOptionsPath=C:\Jts\ibgateway\1045\ibgateway.vmoptions '
+    r'-Dinstall4jType=standalone -DjtsConfigDir="C:\Jts" '
+    r'-Dibcsessionid="1234567890"  ibcalpha.ibc.IbcGateway '
+    r'"C:\IBC\config.ini" paper'
+)
+PAPER_CMD_CL = r"cmd /c C:\IBC\StartGateway.bat"
+
+_LIVE_TRADE_ALL = (LIVE_TRADE_JVM_CL, LIVE_TRADE_CMD_CL,
+                   LIVE_TRADE_ORPHAN_JVM_CL, LIVE_TRADE_ORPHAN_CMD_CL)
+_LIVE_DATA_ALL = (LIVE_DATA_JVM_CL, LIVE_DATA_CMD_CL)
+_PAPER_ALL = (PAPER_JVM_CL, PAPER_CMD_CL)
+
+
+# ---- The exact bug: the shared classpath defeats the naive fixes -------------
+def test_fixtures_actually_reproduce_the_bug_conditions():
+    """Guard the fixtures themselves: if these stop holding, the tests below stop
+    testing the incident. Both naive discriminators MUST match the live-trade JVM."""
+    # The original bug: bare 'C:\IBC' matches every live-trade process.
+    for cl in _LIVE_TRADE_ALL:
+        assert r"C:\IBC" in cl
+    # The "obvious" trailing-separator fix STILL matches the live JVMs, because all
+    # three lanes load IBC from the shared classpath entry C:\IBC\IBC.jar.
+    assert r"C:\IBC\IBC.jar" in LIVE_TRADE_JVM_CL
+    assert r"C:\IBC\\" .replace("\\\\", "\\") in LIVE_TRADE_JVM_CL   # i.e. 'C:\IBC\'
+    assert r"C:\IBC\IBC.jar" in LIVE_DATA_JVM_CL
+    # ...but it does spare the cmd.exe launchers, which is why it looked plausible.
+    assert r"C:\IBC" + "\\" not in LIVE_TRADE_CMD_CL
+
+
+# ---- matches_instance(): the positive discriminator --------------------------
+def test_paper_discriminator_does_not_match_live_lanes():
+    """THE REGRESSION. The paper instance must not match ANY live-lane command
+    line — including the JVMs carrying C:\\IBC\\IBC.jar on their classpath."""
+    for cl in _LIVE_TRADE_ALL + _LIVE_DATA_ALL:
+        assert gw.matches_instance(cl, gw.PAPER_INSTANCE) is False, cl
+
+
+def test_paper_discriminator_matches_the_paper_instance():
+    for cl in _PAPER_ALL:
+        assert gw.matches_instance(cl, gw.PAPER_INSTANCE) is True, cl
+
+
+def test_live_lane_discriminators_match_only_their_own_lane():
+    for cl in _LIVE_TRADE_ALL:
+        assert gw.matches_instance(cl, gw.LIVE_TRADE_INSTANCE) is True, cl
+        assert gw.matches_instance(cl, gw.LIVE_DATA_INSTANCE) is False, cl
+    for cl in _LIVE_DATA_ALL:
+        assert gw.matches_instance(cl, gw.LIVE_DATA_INSTANCE) is True, cl
+        assert gw.matches_instance(cl, gw.LIVE_TRADE_INSTANCE) is False, cl
+    # And the live lanes never match paper (already covered) nor paper the lives.
+    for cl in _PAPER_ALL:
+        assert gw.matches_instance(cl, gw.LIVE_TRADE_INSTANCE) is False, cl
+        assert gw.matches_instance(cl, gw.LIVE_DATA_INSTANCE) is False, cl
+
+
+# ---- foreign_instance_marker(): the HARD never-kill guard --------------------
+def test_never_kill_guard_flags_every_live_process_for_a_paper_kill():
+    for cl in _LIVE_TRADE_ALL:
+        found = gw.foreign_instance_marker(cl, gw.PAPER_INSTANCE)
+        assert found is not None and found[0] == "live-trade", cl
+    for cl in _LIVE_DATA_ALL:
+        found = gw.foreign_instance_marker(cl, gw.PAPER_INSTANCE)
+        assert found is not None and found[0] == "live-data", cl
+
+
+def test_never_kill_guard_does_not_flag_a_lane_against_itself():
+    """The shared C:\\IBC\\IBC.jar classpath entry must NOT make the live lanes look
+    foreign to themselves — that would make their own watchdogs unable to recover."""
+    for cl in _LIVE_TRADE_ALL:
+        assert gw.foreign_instance_marker(cl, gw.LIVE_TRADE_INSTANCE) is None, cl
+    for cl in _LIVE_DATA_ALL:
+        assert gw.foreign_instance_marker(cl, gw.LIVE_DATA_INSTANCE) is None, cl
+    for cl in _PAPER_ALL:
+        assert gw.foreign_instance_marker(cl, gw.PAPER_INSTANCE) is None, cl
+
+
+# ---- should_kill(): the whole predicate -------------------------------------
+def _kill(cl, name, instance, pid=3496, gw_pids=(), theta_pids=()):
+    return gw.should_kill(name=name, command_line=cl, pid=pid,
+                          gw_pids=gw_pids, theta_pids=theta_pids,
+                          instance=instance)
+
+
+def test_paper_kill_spares_the_live_trade_gateway_that_owns_4003():
+    """THE INCIDENT, end to end: a PAPER kill running while pid 3496 serves 4003."""
+    assert _kill(LIVE_TRADE_JVM_CL, "java.exe", gw.PAPER_INSTANCE, pid=3496) is False
+    assert _kill(LIVE_TRADE_CMD_CL, "cmd.exe", gw.PAPER_INSTANCE, pid=7004) is False
+    # The unbound orphan too — the port discriminator can't see it, markers must.
+    assert _kill(LIVE_TRADE_ORPHAN_JVM_CL, "java.exe", gw.PAPER_INSTANCE,
+                 pid=29236) is False
+    assert _kill(LIVE_TRADE_ORPHAN_CMD_CL, "cmd.exe", gw.PAPER_INSTANCE,
+                 pid=30728) is False
+    for cl, nm in ((LIVE_DATA_JVM_CL, "java.exe"), (LIVE_DATA_CMD_CL, "cmd.exe")):
+        assert _kill(cl, nm, gw.PAPER_INSTANCE, pid=555) is False
+
+
+def test_paper_kill_does_kill_the_paper_gateway():
+    assert _kill(PAPER_JVM_CL, "java.exe", gw.PAPER_INSTANCE, pid=33576) is True
+    assert _kill(PAPER_CMD_CL, "cmd.exe", gw.PAPER_INSTANCE, pid=33500) is True
+    # Also via the PRIMARY discriminator alone (owns port 4002).
+    assert _kill(PAPER_JVM_CL, "java.exe", gw.PAPER_INSTANCE,
+                 pid=33576, gw_pids=[33576]) is True
+
+
+def test_never_kill_guard_overrides_even_the_port_discriminator():
+    """Belt and braces: if the port lookup ever returned a live lane's pid (a wrong
+    port, a race, a reused pid), the lane markers must still veto the kill."""
+    assert _kill(LIVE_TRADE_JVM_CL, "java.exe", gw.PAPER_INSTANCE,
+                 pid=3496, gw_pids=[3496]) is False
+
+
+def test_live_trade_lane_can_still_kill_its_own_gateway():
+    """The guard must not make the live lanes unrecoverable by their own tooling."""
+    assert _kill(LIVE_TRADE_JVM_CL, "java.exe", gw.LIVE_TRADE_INSTANCE,
+                 pid=3496) is True
+    assert _kill(LIVE_DATA_JVM_CL, "java.exe", gw.LIVE_DATA_INSTANCE,
+                 pid=555) is True
+
+
+def test_should_kill_preserves_the_original_spares():
+    """ThetaData terminal, python, and non-gateway processes: unchanged behavior."""
+    # ThetaData terminal (owns 25503) — spared even though it is a java.exe.
+    theta_cl = r'"C:\ThetaTerminal\java.exe" -jar ThetaTerminal.jar IbcGateway'
+    assert _kill(theta_cl, "java.exe", gw.PAPER_INSTANCE,
+                 pid=15608, theta_pids=[15608]) is False
+    # python / pythonw — never.
+    assert _kill(PAPER_JVM_CL, "python.exe", gw.PAPER_INSTANCE, pid=1) is False
+    assert _kill(PAPER_JVM_CL, "pythonw.exe", gw.PAPER_INSTANCE, pid=1) is False
+    # A java that is not an IbcGateway, and a cmd that is not a StartGateway.
+    assert _kill(r'java.exe -jar something.jar C:\IBC\config.ini', "java.exe",
+                 gw.PAPER_INSTANCE, pid=2) is False
+    assert _kill(r'cmd /c C:\IBC\EnableAPI.bat', "cmd.exe",
+                 gw.PAPER_INSTANCE, pid=3) is False
+    # A null CommandLine (Win32_Process returns None for protected processes).
+    assert _kill(None, "java.exe", gw.PAPER_INSTANCE, pid=4) is False
+
+
+def test_instance_registry_matches_the_clientids_port_topology():
+    from connections import clientids
+    assert gw.PAPER_INSTANCE.port == clientids.PAPER_PORT == 4002
+    assert gw.LIVE_DATA_INSTANCE.port == clientids.LIVE_DATA_PORT == 4001
+    assert gw.LIVE_TRADE_INSTANCE.port == clientids.LIVE_TRADE_PORT == 4003
+    # No lane's identity marker may be a substring of another's — that property is
+    # the whole fix, and it is what `C:\IBC` violated.
+    for a in gw.KNOWN_INSTANCES:
+        for b in gw.KNOWN_INSTANCES:
+            if a.name == b.name:
+                continue
+            for ma in a.identity_markers():
+                for mb in b.identity_markers():
+                    assert ma.lower() not in mb.lower(), (ma, mb)
+
+
 # ---------------------------------------------------------------------------
-# 10. _kill_gateway_processes() PowerShell generation — port/dir_substring
-#     instance-scoping added for the second (market-data-only) Gateway instance.
-#     No real PowerShell/gateway involved: subprocess.run is monkeypatched to
-#     capture the generated script instead of executing it.
+# 11. _kill_gateway_processes() wiring — enumerate (PowerShell) -> decide (Python)
+#     -> kill. No real PowerShell/gateway: subprocess.run is monkeypatched.
 # ---------------------------------------------------------------------------
 class _FakeCompletedProcess:
     def __init__(self, stdout=""):
@@ -250,57 +467,103 @@ class _FakeCompletedProcess:
         self.stderr = ""
 
 
-def _capture_ps(monkeypatch, **kwargs):
-    """Call _kill_gateway_processes(**kwargs) with subprocess.run stubbed out;
-    return the generated PowerShell script (the -Command argument)."""
-    captured = {}
+def _fake_ps(monkeypatch, enum_payload):
+    """Stub subprocess.run: 1st call returns the enumeration JSON, 2nd returns the
+    killed-pid JSON echoing whatever pids the kill script was asked to stop.
+    Returns the list of captured scripts."""
+    scripts = []
 
     def fake_run(cmd, **_kw):
-        captured["cmd"] = cmd
-        return _FakeCompletedProcess(stdout="[]")
+        script = cmd[-1]
+        scripts.append(script)
+        if "Win32_Process" in script:
+            return _FakeCompletedProcess(stdout=json.dumps(enum_payload))
+        # Kill phase: echo back the pids embedded in the generated script.
+        pids = [int(x) for x in re.findall(r"\d+", script.split("foreach")[1]
+                                           .split("Stop-Process")[0])]
+        return _FakeCompletedProcess(stdout=json.dumps(pids))
 
     monkeypatch.setattr(gw.subprocess, "run", fake_run)
-    result = gw._kill_gateway_processes(**kwargs)
-    assert result == []          # "[]" JSON -> no PIDs, from our fake stdout
-    return captured["cmd"][-1]   # the -Command script is the last argv element
+    return scripts
 
 
-def test_kill_gateway_processes_default_reproduces_original_paper_filter(monkeypatch):
-    """Golden-reference check: a ZERO-ARGUMENT call must still generate a filter
-    that matches the paper Gateway's java.exe/IbcGateway + cmd.exe/StartGateway
-    processes and still spares ThetaData (port 25503) + all python — exactly what
-    the pre-change, unscoped _KILL_PS matched — now additionally scoped to the
-    paper port/dir (which is a no-op against today's real single-instance box)."""
-    ps = _capture_ps(monkeypatch)
+_REAL_BOX_2026_07_23 = {
+    "theta": [15608],
+    "gw": [],                       # nothing was listening on 4002
+    "procs": [
+        {"pid": 30728, "name": "cmd.exe", "cl": LIVE_TRADE_ORPHAN_CMD_CL},
+        {"pid": 29236, "name": "java.exe", "cl": LIVE_TRADE_ORPHAN_JVM_CL},
+        {"pid": 7004, "name": "cmd.exe", "cl": LIVE_TRADE_CMD_CL},
+        {"pid": 3496, "name": "java.exe", "cl": LIVE_TRADE_JVM_CL},
+    ],
+}
 
-    # Original match conditions, unchanged.
-    assert "$n -eq 'java.exe' -and $cl -match 'IbcGateway'" in ps
-    assert "$n -eq 'cmd.exe'  -and $cl -match 'StartGateway'" in ps
-    # Original spares, unchanged.
-    assert "-LocalPort 25503" in ps
-    assert "$n -ne 'python.exe'" in ps
-    assert "$n -ne 'pythonw.exe'" in ps
 
-    # NEW scoping defaults to the paper instance: port 4002 / C:\IBC.
-    assert f"-LocalPort {gw.ibkr_paper.PAPER_PORT}" in ps
+def test_paper_kill_against_the_real_box_kills_nothing(monkeypatch):
+    """Replay of the incident's actual process table: a PAPER kill must kill ZERO
+    processes. Before the fix this killed all four, including pid 3496 on 4003."""
+    _fake_ps(monkeypatch, _REAL_BOX_2026_07_23)
+    assert gw._kill_gateway_processes(port=gw.PAPER_INSTANCE.port,
+                                      instance=gw.PAPER_INSTANCE) == []
+
+
+def test_paper_kill_with_defaults_also_kills_nothing(monkeypatch):
+    """Defaults are now safe too — the call sites pass explicitly, but a defaults-
+    only call (which is what caused the incident) must no longer be destructive."""
+    _fake_ps(monkeypatch, _REAL_BOX_2026_07_23)
+    assert gw._kill_gateway_processes() == []
+
+
+def test_paper_kill_kills_the_paper_processes_and_only_those(monkeypatch):
+    payload = dict(_REAL_BOX_2026_07_23)
+    payload = {
+        "theta": [15608],
+        "gw": [33576],
+        "procs": list(_REAL_BOX_2026_07_23["procs"]) + [
+            {"pid": 33576, "name": "java.exe", "cl": PAPER_JVM_CL},
+            {"pid": 33500, "name": "cmd.exe", "cl": PAPER_CMD_CL},
+        ],
+    }
+    _fake_ps(monkeypatch, payload)
+    killed = gw._kill_gateway_processes(port=gw.PAPER_INSTANCE.port,
+                                        instance=gw.PAPER_INSTANCE)
+    assert sorted(killed) == [33500, 33576]
+
+
+def test_live_trade_kill_targets_only_the_live_trade_lane(monkeypatch):
+    payload = {
+        "theta": [15608],
+        "gw": [3496],
+        "procs": list(_REAL_BOX_2026_07_23["procs"]) + [
+            {"pid": 33576, "name": "java.exe", "cl": PAPER_JVM_CL},
+        ],
+    }
+    _fake_ps(monkeypatch, payload)
+    killed = gw._kill_gateway_processes(port=gw.LIVE_TRADE_INSTANCE.port,
+                                        instance=gw.LIVE_TRADE_INSTANCE)
+    assert sorted(killed) == [3496, 7004, 29236, 30728]
+    assert 33576 not in killed
+
+
+def test_kill_refuses_when_port_and_instance_disagree(monkeypatch):
+    """A port/instance mismatch is a wiring bug — refuse rather than guess. A
+    refused kill leaves a wedged gateway (loud, recoverable); a wrong kill doesn't."""
+    scripts = _fake_ps(monkeypatch, _REAL_BOX_2026_07_23)
+    assert gw._kill_gateway_processes(port=4003,
+                                      instance=gw.PAPER_INSTANCE) == []
+    assert scripts == []          # never even enumerated, let alone killed
+
+
+def test_enumeration_script_keeps_the_thetadata_and_port_carve_outs(monkeypatch):
+    """The PowerShell half only ENUMERATES now, but must still supply the two pid
+    sets the Python predicate needs: ThetaData (25503) and this instance's port."""
+    scripts = _fake_ps(monkeypatch, {"theta": [], "gw": [], "procs": []})
+    gw._kill_gateway_processes(port=gw.PAPER_INSTANCE.port,
+                               instance=gw.PAPER_INSTANCE)
+    enum = scripts[0]
+    assert "-LocalPort 25503" in enum
+    assert f"-LocalPort {gw.ibkr_paper.PAPER_PORT}" in enum
     assert gw.ibkr_paper.PAPER_PORT == 4002
-    assert r"$dirSubstring = 'C:\IBC'" in ps
-
-
-def test_kill_gateway_processes_second_instance_scoped_and_distinct(monkeypatch):
-    """A second, independently-configured Gateway (different port + install dir)
-    generates a filter scoped to ITS OWN port/dir — never the paper defaults —
-    proving the two instances' kill filters can never overlap."""
-    ps = _capture_ps(monkeypatch, port=4001, dir_substring=r"C:\IBC-Live")
-
-    assert "-LocalPort 4001" in ps
-    assert r"$dirSubstring = 'C:\IBC-Live'" in ps
-    # Must NOT reference the paper instance's port/dir at all.
-    assert "-LocalPort 4002" not in ps
-    assert r"$dirSubstring = 'C:\IBC'" not in ps   # not the bare paper dir string
-
-    # Original generic pattern + ThetaData/python spares still present regardless
-    # of instance scoping.
-    assert "IbcGateway" in ps and "StartGateway" in ps
-    assert "-LocalPort 25503" in ps
-    assert "$n -ne 'python.exe'" in ps
+    assert "IbcGateway" in enum and "StartGateway" in enum
+    # The old, over-broad substring parameter is GONE from the generated script.
+    assert "dirSubstring" not in enum
