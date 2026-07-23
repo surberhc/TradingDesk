@@ -509,5 +509,94 @@ mid-build:
 
 ---
 
+## 12. Operational refinements (design session 2026-07-22, Andrew)
+
+Five refinements worked out with Andrew. These **refine** the sections named; where they add
+detail, they win. No frozen numbers are set here — mechanics only.
+
+### 12.1 Reconciliation is TRIAGED, not binary-freeze (refines §7.4)
+
+The §7.4 checksum stays, but "any mismatch → freeze" is wrong on its own — it would bury the
+desk in alerts for ordinary events (a dividend on a held position). The freeze is **per account**
+already (never system-wide); the missing piece is grading *what* the drift is:
+
+- **Explain drift from the broker's own transaction ledger — do NOT rebuild it from holdings.**
+  Rather than predict what a dividend *should* be (holdings × rate × a corporate-action calendar),
+  read IBKR's **activity ledger**, where every entry is already **labeled by the broker** (dividend,
+  interest, payment-in-lieu, corporate action, fee, trade). Explaining a drift is then a lookup:
+  cash moved $X → a labeled transaction for $X on that symbol exists → **explained, book it,
+  no alert.** Less work than a calendar and it catches adjustments/reversals a calendar never would.
+  Source = the **Flex activity sections** (extends the nightly Flex pull already in §4 source #2).
+- **Timing consequence — the ledger is EOD, not live.** So intraday drift is held as
+  **`UNEXPLAINED_PENDING`, not frozen.** The nightly transaction sweep clears the bulk
+  automatically; only the **residual that survives the sweep** (drift with no matching broker
+  transaction) escalates to the exclude-and-alert path. Don't panic on a mismatch we haven't had a
+  chance to explain yet.
+- Net behavior: tolerance band absorbs rounding → transaction ledger explains ordinary events →
+  only genuinely unexplained residual latches the account out (§12.3).
+
+### 12.2 Two-tier data cadence (refines §4)
+
+Split the per-account reads by how fast they change:
+
+- **Heavy Flex (account type, capabilities, trading permissions) — once daily**, flagged on change.
+  This is account-management truth that rarely moves.
+- **Balances / margin / buying-power (`reqAccountSummary` socket tags) — re-pulled PER TRANCHE,
+  pre-flight.** A lightweight real-time socket read (already used at execution time) is cheap enough
+  to run right before every scheduled option fire (e.g. pull at 09:03 for a 09:05 tranche). This
+  pull **freezes the roster**: it decides which accounts are in, at what whole-contract count, and
+  **locks that in before the order opens.** More tranches = more of these cheap pulls; fine.
+- Keep distinct from §12.1: the pre-flight pull answers *"is the money there right now to size this
+  tranche"* (live socket); ledger reconciliation answers *"did the books drift and can the broker's
+  transaction log explain it"* (EOD Flex). Two needs, two cadences.
+
+### 12.3 Faults LATCH — the unifying rule (refines §5.2, §7.3, §7.4)
+
+Ledger drift, unexplained transaction, and below-floor size are the same rule in three hats:
+**a fault pulls the account out, alerts ONCE, and the account sits idle for the REST OF THE DAY
+until a human clears it. It never silently re-fires.** No re-evaluating fresh each tranche, no
+assuming anyone is watching the alert screen. An account already latched-out is excluded at
+pre-flight (§12.2) **without** re-alerting.
+
+Two **distinct alert types** — different problems, different resolutions:
+
+- **`TRADE_SKIPPED_LATCHED`** — operational; account is out for the day, resolve when convenient.
+- **`TEMPLATE_NO_LONGER_QUALIFIES`** — the account's *situation changed* so its assigned template is
+  no longer valid (classic case: a client runs the overlay for months, then makes a large withdrawal
+  to buy a house and drops under the contract floor). This is **not** a trade hiccup — the fix is
+  **reassigning the account to a fitting strategy**, not clearing a flag so it retries and fails
+  again tomorrow. It points at reassignment, not retry.
+
+### 12.4 Whole-contract sizing floor, per-firing / peak-concurrent (refines §5.2, §6 step 4)
+
+Options are atomic — an account holds ≥1 whole contract or zero; there is no fractional contract.
+Two rules the base spec's "integer-share" language does not cover:
+
+- **Round each account to whole contracts independently** — no account rides another's fractional
+  remainder.
+- **Minimum-viable floor = 1 contract × (max firings open at once) × margin per spread.** If the
+  strategy fires N times a day and those 0DTE spreads stay open until expiry, **peak concurrent
+  exposure is N contracts**, so the floor is the capital to carry one contract at the day's
+  worst concurrent moment — not one contract flat. An account below that **sits out entirely** and
+  raises `TEMPLATE_NO_LONGER_QUALIFIES` (§12.3). This feeds the capability gate's soft-warn (§5.2)
+  and means small accounts carry more weight-drift on the options sleeve than on the ETF sleeve —
+  the design owns that instead of pretending contracts are continuous.
+- **Sub-decision deferred to Andrew (frozen, rule #1):** an account above zero but below the
+  full-schedule floor — sit out entirely, or run a **reduced schedule** (fewer firings/contracts)?
+  Andrew's answer this session: **sit out entirely.** The CRM enforces whatever floor is blessed;
+  it does not decide the schedule.
+
+### 12.5 Cadence is CONFIG, not code (refines §6, §12.4)
+
+The tranche schedule / firing spacing is **read as a parameter**, never hardcoded, so the §12.4
+floor math (peak concurrent contracts × margin) recomputes automatically when the cadence changes.
+**This does not loosen rule #1** — the cadence *values* stay frozen/blessed; we merely refuse to
+bake them into code so a future blessed change needs no rewrite. Configurable ≠ tunable-on-a-whim.
+Consequence: **no concrete floor number is computed until the tranche cadence is settled** (still
+open as of this session) — the *formula* is what gets coded; the number drops in once blessed.
+
+---
+
 *End of spec. Grounded in `paperbot/{rebalance_engine,order_router,rebalance_execute,accounts,config,model_portfolio}.py`
-and `docs/{CRM_HANDOFF_model_allocation,MODEL_PORTFOLIO_RESEARCH}.md` as of 2026-07-21. Not committed.*
+and `docs/{CRM_HANDOFF_model_allocation,MODEL_PORTFOLIO_RESEARCH}.md` as of 2026-07-21;
+§12 refinements added 2026-07-22. Not committed.*
