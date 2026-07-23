@@ -498,9 +498,12 @@ Division of labor (unchanged in spirit from the handoff, restated for Option A):
    successfully (§13.2). The `whatIf` half of the original probe turned out to be **impossible** —
    see §13.4. Full evidence in **§13**. (`config.LADDER_FA_BLOCKS` remains `False`; FA-block ×
    MIDPRICE/Adaptive is still unconfirmed and was not part of this test.)
-5. **`OrderAllocation` vs `replaceFA`-per-block (NEW, §13.6):** Andrew's call — do we keep mutating
-   the shared GROUPS XML in the hot path of every order, or move to explicit per-order allocations
-   (requires patching/replacing `ib_async`)? **Open decision, not made here** — conductor **#50**.
+5. **`OrderAllocation` vs `replaceFA`-per-block (§13.6):** **RESOLVED 2026-07-23 — keep
+   `faGroup`/`replaceFA`.** Research established `OrderAllocation` is an **inbound-only** class on
+   `OrderState` (added TWS API 10.33, 2024-12-17), *not* an outbound submission mechanism — so the
+   swap the original decision imagined does not exist. The real hot-path hazard is handled
+   architecturally: rewrite a group's XML only on **membership** change, never per-order; serialize
+   the writes. Conductor **#50 CLOSED**; a follow-up item tracks removing the per-order `replaceFA`.
 
 ---
 
@@ -748,29 +751,53 @@ trusted as evidence of anything.
 more strongly by §13.1/§13.2 (an actual fill beats a what-if), so **retiring it is the likely right
 call** — but that is a deliberate decision, not something to assume here. Conductor **#49**.
 
-### 13.6 OPEN DECISION for Andrew — `OrderAllocation` vs `replaceFA`-per-block
+### 13.6 RESOLVED 2026-07-23 — keep `faGroup`/`replaceFA`; `OrderAllocation` is inbound-only
 
-**Surfaced, not decided.**
+**Decision: keep the `faGroup` / `replaceFA` submission path.** The choice this section originally
+posed turned out to be **largely a false choice.** Research on 2026-07-23 (deep, adversarially
+verified, high-confidence with citations) established that **`OrderAllocation` is not an outbound
+order-submission mechanism at all** — so there is no library to swap *to* for submission.
 
-- Newer TWS API exposes an **`OrderAllocation`** class: explicit per-account allocations attached
-  directly to a single order, with **no shared-config mutation**.
-- **Our installed `ib_async` 2.1.0 does NOT implement it** — verified: the `Order` dataclass exposes
-  only `faGroup`, `faProfile`, `faMethod`, `faPercentage`.
+**What `OrderAllocation` actually is (high-confidence, documented):** an **INBOUND** class carried on
+`OrderState` — the server *returns* it to describe an allocation, in `whatIf`/order-preview and in
+order state. It was added in **TWS API 10.33** (IBKR Campus changelog dated **2024-12-17**). Its
+fields are `Account`, `Position`, `PositionDesired`, `PositionAfter`, `DesiredAllocQty`,
+`AllowedAllocQty`, `IsMonetary` — i.e. a *description* of an allocation, not a *directive* to place
+one. There is **no "attach `OrderAllocation` to the order instead of `replaceFA`" path.** Outbound
+allocation is still driven by `Order.faGroup` / `faMethod` / `faPercentage`.
 
-So this design's current pattern (§6 step 7, §8) — **`replaceFA` the GROUPS XML before every
-block** — means a **shared-config write in the hot path of every order.**
+*Sources:* IBKR Campus TWS API changelog (2024-12-17 entry, `OrderAllocation` added to `OrderState`);
+two independent wire-protocol ports agreeing field-for-field — **scmhub/ibapi** (Go) and
+**wboayue/rust-ibapi** (Rust) — decode the `OrderAllocation` array only on the *inbound* `openOrder`/
+`orderStatus`/`whatIf` decode, never on the outbound `placeOrder` encode.
 
-| | `replaceFA` per block (today) | `OrderAllocation` (not available in our client) |
-|---|---|---|
-| Works with installed stack | **Yes — proven today (§13.1/§13.2)** | No — requires patching or replacing `ib_async` |
-| Concurrency | Mutates one global GROUPS XML; needs the gateway lock + full-XML backup on every block; a crash mid-sequence leaves the shared config edited | Per-order payload; nothing global to corrupt |
-| Blast radius of a bug | Whole-XML overwrite affects **every** group, not just ours | Confined to the one order |
-| Auditability | Intent recorded in our own written split + backups | Intent recorded on the order itself |
-| Cost | Zero new work | Client-library patch/replacement + revalidation of the entire order path |
+Consequences for this design:
 
-**Andrew's call.** Both are defensible: the current path is proven and shipping-ready; the
-alternative removes a genuine shared-mutable-state hazard at the cost of owning a patched client
-library. **The desk does not decide this unilaterally.**
+- **Keep `faGroup`/`replaceFA` for submission.** It is current, documented, un-removed, and the path
+  `ib_async` 2.1.0 supports. There is no submission mechanism to switch libraries *for* — the switch
+  the original trade-off table imagined does not exist.
+- **`ib_async` 2.1.0 has no `orderAllocations`** on `OrderState`. If the CRM ever needs to *read* the
+  preview allocation array (inbound), it would need the official `ibapi` or a port — but that is a
+  **read** concern, not a submission one, and `ib_async` remains fully sufficient for the legacy
+  `faGroup`/`replaceFA` path we use.
+
+**The real concern — `replaceFA` in the hot path — is addressed architecturally, not by a library
+swap.** The genuine hazard the original decision worried about (a shared GROUPS-XML write per order)
+is removed by design, not by `OrderAllocation`:
+
+- **Only rewrite a group's XML when its MEMBERSHIP changes — never per-order.** The per-order mutation
+  exists only because `ContractsOrShares` encodes share counts *as group config*.
+- **Serialize the writes** (already the design intent: gateway lock + full-XML backup).
+- **Open follow-up (conductor):** evaluate whether a stable allocation method (or `faPercentage` /
+  order-size) removes the per-order `replaceFA` entirely **without losing the CRM brain's explicit
+  per-account control.** Tracked as a new conductor item.
+
+*(Historical note: the original §13.6 posed this as an open `OrderAllocation`-vs-`replaceFA` decision
+and carried a trade-off table premised on `OrderAllocation` being an alternative *submission* path.
+That premise was wrong — `OrderAllocation` is inbound-only — so the table is superseded by this
+resolution. Also relevant: no FA-allocation breaking changes appear in the 2025 (10.35–10.42) or 2026
+(10.43–10.48) production release notes; the last FA-relevant change was the 2022 v981/10.22
+groups/profiles unification we are already on.)*
 
 ---
 
