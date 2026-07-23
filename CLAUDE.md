@@ -98,6 +98,32 @@ shared code path), not a number to diff. If the paperbot is ever changed to comp
 on its own, that's an architecture change (pull-and-clarify) and a real parity test must be
 written first.
 
+## IBKR currency — build against what IBKR does now
+IBKR ships builds, removes API surfaces, and raises the minimum supported build on its own
+schedule. A desk built once against whatever the API did that day rots silently, and the
+failure shows up as a rejected or mis-allocated order.
+- **Verify before you build.** Before building on ANY IBKR mechanism — order type, algo,
+  TIF, FA/allocation path, market-data or execution call — check IBKR's CURRENT
+  documentation and release notes first. Never from memory. Never from a pattern already in
+  this repo: an existing pattern is evidence that something worked once, not that it is
+  current, supported, or the best way now. Cite the page or release note you checked, dated.
+- **Review cadence: quarterly, plus event-triggered.** Triggers: any TWS/Gateway build
+  change, any IBC upgrade, any `ib_async` bump, any new IBKR surface we start using. Each
+  review must actually check (a) the TWS API production AND beta release notes since the
+  last review, for removals, deprecations, and behavior changes; (b) our installed
+  Gateway / IBC / `ib_async` versions against IBKR's current supported floor; (c) every row
+  of the currency doc's dependency table — still supported, still behaving as recorded;
+  (d) whether anything new makes one of our workarounds obsolete.
+- **Record it or it didn't happen.** Findings go in `docs\IBKR_API_CURRENCY.md` — dependency
+  table, gotchas, review log — with dated evidence and the source, and verified-live kept
+  separate from read-from-docs.
+- **A version or behavior change that touches order routing is an order-affecting change** —
+  it carries the `paperbot\version.py` VERSION bump + CHANGELOG line like any other.
+- **Deprecation exposure is tracked risk, not a surprise.** Anything we depend on that IBKR
+  has deprecated, announced for removal, or already removed in a build above ours gets an
+  entry with its clock (`reqFundamentalData`, removed in 10.47, is the live example). Find
+  these on the review — don't discover them when an order fails.
+
 ## Commits & versioning
 - **Auto-commit each logical change-set** with a clear what+why message (this is the
   compliance change history). Never amend, force, or rewrite history. No remote exists, so
