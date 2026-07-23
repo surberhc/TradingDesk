@@ -171,7 +171,13 @@ once) allocates with **zero per-order `replaceFA`**, but on **odd** order sizes 
 fractional shares** (`BUY 3 → 1.5/1.5`, `BUY 5 → 2.5/2.5`) — **disqualifying for whole-contract sizing**
 (options). Unequal-whole-contract splits therefore require **`ContractsOrShares`**, whose per-order
 amounts make the `replaceFA` write structurally required (see `docs\CRM_DESIGN_groups_brain.md`
-§13.7.2). **`EqualQuantity` odd-size rounding was NOT tested** — open.
+§13.7.2). **`EqualQuantity` is NOT accepted as an FA group `defaultMethod` on this gateway** — creating
+a group with `defaultMethod=EqualQuantity` was REJECTED with **error 10260** *"Group <name> has
+unsupported method (EqualQuantity)"* (verified 2026-07-23 pm; the `replaceFA` write was refused
+atomically, existing groups unchanged). Only **`ContractsOrShares`** and **`Percent`-family** are valid
+stored-group methods; `EqualQuantity`/`NetLiq` are order-time methods, not stored-group methods
+(`NetLiq`/`AvailableEquity` as group defaults untested). The odd-size rounding question is moot. The
+stored-group method matrix is now complete — see `docs\CRM_DESIGN_groups_brain.md` §13.7.5.
 
 **`reqPositions` settle delay (new, verified 2026-07-23 pm):** `reqPositions` returns a **stale
 snapshot** if read immediately after a fill on a fresh master connection; a **~4–5 s settle** before

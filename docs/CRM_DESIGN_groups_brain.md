@@ -865,9 +865,16 @@ is **DISQUALIFYING for whole-contract sizing** — options cannot be fractional.
 
 | Need | Method | Per-order `replaceFA`? |
 |---|---|---|
-| EQUAL split, whole shares, stable | **EqualQuantity** | None — *but* EqualQuantity's odd-size rounding was **NOT tested** (open item below) |
+| EQUAL split, whole shares, stable | **No stored-group method exists** — `EqualQuantity` is **REJECTED as a group `defaultMethod`** (error 10260, verified 2026-07-23 pm — §13.7.5); it is an *order-time* method only. Falls back to `ContractsOrShares` | Per-order write required (via `ContractsOrShares`) |
 | UNEQUAL split, fractional acceptable (equity sleeves, e.g. S0) | **Percent** | **None** — stable, write-free |
 | UNEQUAL split, **WHOLE contracts** (options sleeves, e.g. S8 — the CRM brain's core case) | **ContractsOrShares ONLY** | **Per-order write STRUCTURALLY REQUIRED** — the per-account amounts change every order |
+
+**MATRIX NOW COMPLETE (2026-07-23 pm):** the only two methods valid as a stored-group `defaultMethod`
+on this paper master are **`ContractsOrShares`** and **`Percent`**. **`EqualQuantity` is not a
+stored-group method** (rejected, error 10260 — §13.7.5); `EqualQuantity`/`NetLiq` are **order-time**
+allocation methods. There is therefore **no stable whole-contract group method** — for unequal whole
+contracts, `ContractsOrShares` + its per-order `replaceFA` is the only path, now confirmed from two
+directions (`Percent` gives fractionals on odd sizes; `EqualQuantity` is rejected as a group method).
 
 **CONSEQUENCE for this design:** the `replaceFA` hot-path corruption risk behind #50 **CANNOT be
 engineered away for the unequal-whole-contract case** — the CRM brain's primary use case (S8 options
@@ -900,6 +907,30 @@ connection; a **~4–5 s settle** before reading resolves it. Any monitoring tha
 after an order **must include a settle delay or re-read** (reinforces the §12.2 pre-flight read
 discipline and the §7.2 position-delta attribution, which now must wait for the settle before
 snapshotting).
+
+#### 13.7.5 `EqualQuantity` is REJECTED as a group `defaultMethod` (error 10260) — the matrix's last cell, closed
+
+The one untested cell of the §13.7.2 matrix — `EqualQuantity`'s odd-size rounding — is **moot**:
+`EqualQuantity` cannot be a stored-group method at all. Attempting to create a group with
+`defaultMethod=EqualQuantity` on the paper FA master (`DF8922141`, port 4002, master clientId 0,
+**verified by observation 2026-07-23 pm**) was **REJECTED** with:
+
+> `Error 10260: Group <name> has unsupported method (EqualQuantity)`
+
+The `replaceFA` write was refused **atomically** — no group created; the three existing groups
+(Balanced / Conservative / Growth, all `ContractsOrShares`) stayed **byte-identical to backup**.
+`EqualQuantity` is an **order-time** allocation method, **not** a valid stored-group `defaultMethod` on
+this master. The odd-size rounding question is therefore never reached.
+
+**CONCLUSION — the matrix is COMPLETE.** The only two methods valid as a stored-group `defaultMethod`
+are **`ContractsOrShares`** and **`Percent`**; `EqualQuantity` (and `NetLiq`) are order-time methods,
+not stored-group methods. There is **no stable whole-contract group method**, so the CRM brain's core
+case (unequal split of whole option contracts) is served by **`ContractsOrShares` + per-order
+`replaceFA` only** — now confirmed from two directions (`Percent` → fractionals on odd sizes;
+`EqualQuantity` → rejected as a group method). This **reinforces, does not change,** the #50 resolution
+(§13.6 / §13.7.2): the per-order write is structurally required and its mitigation is operational (§12).
+*(`NetLiq`/`AvailableEquity` as group `defaultMethod`s were **not** tested — the two-viable conclusion
+is grounded in the `ContractsOrShares`/`Percent`/`EqualQuantity` observations above.)*
 
 ---
 
