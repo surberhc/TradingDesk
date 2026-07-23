@@ -5,6 +5,10 @@
 **Status:** design LOCKED on **Architecture Option A** (one blended account per client; FA Account
 Groups + our own engine; **no** IBKR Model Portfolios for automation). Buildable spec — a
 developer can implement against it.
+**Execution architecture VALIDATED live on paper 2026-07-23** — the load-bearing §10.4 test PASSED
+for both single-leg and multi-leg-combo FA blocks. Evidence + the two limitations it exposed
+(no per-subaccount executions; no what-if pre-trade gate) are in **§13**, which corrects §6, §7.1,
+§7.2 and §11 where they assumed otherwise.
 
 > **SUPERSEDES (execution architecture only):** this document supersedes
 > `docs/CRM_HANDOFF_model_allocation.md` **for the execution architecture**. That handoff
@@ -123,7 +127,7 @@ tables are append-only.
 
 | Entity | Key fields | Notes |
 |---|---|---|
-| **GroupDef** | `fa_group_name` (PK), `sleeve_id` (FK), `fa_method` | The FA group as it must exist on the gateway. `fa_method` is stored as **`""`** — the group's `ContractsOrShares` allocation governs; an order-level `faMethod="NetLiq"` is **rejected (Error 10226)** (see `order_router._base_fields` and `rebalance_engine` module docstring). |
+| **GroupDef** | `fa_group_name` (PK), `sleeve_id` (FK), `fa_method` | The FA group as it must exist on the gateway. `fa_method` is stored as **`""`** — the group's `ContractsOrShares` allocation governs; an order-level `faMethod="NetLiq"` is **rejected (Error 10226)** (see `order_router._base_fields` and `rebalance_engine` module docstring). **`faMethod=""` is the DOCUMENTED path, not a workaround** — IBKR: *"If specifying actual group name and the faMethod is blank/omitted the default method of that group will be used."* ([financial_advisor_methods_and_orders](https://interactivebrokers.github.io/tws-api/financial_advisor_methods_and_orders.html)). Note `ContractsOrShares` is a **profile-style** method, not one of the documented *group* methods (EqualQuantity / NetLiq / AvailableEquity / PctChange); under TWS build 983+ *"Use Account Groups with Allocation Methods"* groups and profiles are **unified** — `requestFA`/`replaceFA` accept **Group only** (Profile errors, which matches what `fa_probe.py` observed) and `placeOrder` accepts a profile name in `faGroup` ([financial_advisor](https://interactivebrokers.github.io/tws-api/financial_advisor.html)). Also documented: *"Unlike in TWS, there is not a default account allocation for the API — it must be specified with every order placed."* |
 | **GroupMembership** | (`fa_group_name` FK, `account_id` FK) (composite PK), `synced_at` | Which accounts are in which group. **Derived** from template assignments (an account is in the group of every sleeve its template runs). CRM keeps IBKR in sync via `replaceFA` (§8). |
 
 ### 3.5 THE SLEEVE LEDGER (the heart of Option A)
@@ -274,6 +278,14 @@ This is the heart. It **reuses the existing Option-B engine** (`rebalance_engine
    split; the block re-forms without it). Fail closed — a `HALTED`/veto stops the whole cycle with
    nothing transmitted.
 
+   > **CONSTRAINT (verified 2026-07-23, §13.4): this pre-check must be built ENTIRELY from our own
+   > account-summary reads — there is NO broker margin preview for an FA block order.**
+   > `whatIfOrder` is not usable on an allocation order (with `transmit=True` the FA master returns
+   > nothing at all; with `transmit=False` IBKR errors 321 and the call hangs). **Placing is the only
+   > way IBKR will validate a block.** Any design that assumed a what-if gate in front of a block is
+   > revised out — the gate is ours, computed from `reqAccountSummary` tags (§4) per account, never
+   > an IBKR-returned margin delta.
+
 7. **Place the block behind review → arm → transmit.**
    Exactly the existing armed path (`rebalance_execute.execute_armed` / `_run_armed_session`):
    acquire the gateway lock, back up the live GROUPS XML (`backup_fa_groups`), set that one group's
@@ -282,12 +294,18 @@ This is the heart. It **reuses the existing Option-B engine** (`rebalance_engine
    qty, limit, fa_group, fa_method="", as_of, ib)` (HARD PRICE GUARD `_check_limit_price` runs
    first), then `order_router.place(..., armed=True)` — one block at a time. The four-part gate
    (`READONLY=False` ∧ `DRY_RUN=False` ∧ `armed=True` ∧ exact `--arm-i-understand` token) is
-   untouched and fails closed. **Never `whatIfOrder` a group order (it hangs).**
+   untouched and fails closed. **Never `whatIfOrder` a group order** — it returns nothing at best
+   and hangs the caller at worst (§13.4).
 
-8. **On fills, reconcile via `orderRef` back into each account's sleeve ledger.**
-   The block fills come back per allocated account (`execDetails` carry `execution.acctNumber`).
-   Attribute each account's share of the block to `(account, sleeve)` — the sleeve is known from
-   the block's **group → sleeve** mapping. Update `attributed_positions` / `attributed_cash`, bump
+8. **On fills, reconcile back into each account's sleeve ledger — from POSITIONS, not executions.**
+   **Verified 2026-07-23 (§13.3): IBKR returns allocation-order executions ONLY at the FA master
+   (`DF8922141`).** `execDetails` for a block carry the master's `acctNumber`, not the allocated
+   subaccount's, and `reqExecutions(ExecutionFilter(acctCode=<DU…>))` returned **nothing** for any
+   subaccount on this paper FA. So the attribution input is the **post-fill per-account position
+   delta** (`reqPositions` / `ib.positions(account)` + `avgCost`), cross-checked EOD against a
+   **Flex/activity statement** — *not* per-account `execDetails`. The sleeve is still known from the
+   block's **group → sleeve** map, and the block's own price/commission come from the master-level
+   execution + `commissionReport`. Update `attributed_positions` / `attributed_cash`, bump
    `ledger_version`, set `last_reconciled_at`, then run the checksum (§7). The dedup gate
    (`order_router.already_present` → `LegState`) still protects against double-sends across
    restarts.
@@ -296,8 +314,11 @@ This is the heart. It **reuses the existing Option-B engine** (`rebalance_engine
 block machinery above. S8 credit spreads are **two-leg BAG/combo** orders — they still route
 through an FA group (block fills at one price across the overlay group's accounts) but use the
 options-safe order path (capped LMT → `REL` peg → marketable, per `config.ORDER_LADDER[INDEX_OPTION]`;
-**never MIDPRICE/Adaptive** on options). The combo-as-FA-block path is **not yet exercised** and is
-a gateway-test item (§10, §11).
+**never MIDPRICE/Adaptive** on options). **The combo-as-FA-block path is now PROVEN — PASSED live on
+paper 2026-07-23 (§13.2): a two-leg BAG rode an FA block and both legs allocated coherently to both
+member accounts at identical avgCosts.** Spread-based sleeves therefore do **not** need per-account
+routing. (`config.LADDER_FA_BLOCKS` is still `False`; FA-block × MIDPRICE/Adaptive remains
+unconfirmed and untested — the proven path is a plain LMT combo.)
 
 ---
 
@@ -312,10 +333,14 @@ Every order carries an `orderRef` that encodes the sleeve so fills attribute cor
 
 - **Block orders** allocate to accounts by the group's `ContractsOrShares`, so a single block
   carries **one** `orderRef` keyed on the **group** — today
-  `paperbot:<fa_group>:<as_of>:<side>:<symbol>` (`order_router.build_fa_block`). The **account**
-  comes from `execution.acctNumber` on each fill; the **sleeve** comes from the **group → sleeve**
-  map. So `(sleeve, account)` is recoverable from `(orderRef group, acctNumber)` **without**
-  changing the block orderRef.
+  `paperbot:<fa_group>:<as_of>:<side>:<symbol>` (`order_router.build_fa_block`). The **sleeve**
+  comes from the **group → sleeve** map. The **account** does **NOT** come from
+  `execution.acctNumber` — **verified 2026-07-23 (§13.3), the only execution IBKR returns for an
+  allocation order is the FA master's**, so `acctNumber` on a block fill is `DF8922141`, never a
+  `DU…` sub. The account split must be recovered from the **`ContractsOrShares` split we ourselves
+  wrote for that block** and confirmed against the **per-account position delta** afterwards. So
+  `(sleeve, account)` is recoverable from `(orderRef group, our own per-account split)` and
+  *verified* from positions — **without** changing the block orderRef.
 - **Direct (single-account) legs** should extend the ref with the sleeve so two sleeves in one
   account never collide — reuse the scheme already proven in
   `model_portfolio.model_order_ref`: `paperbot:<account>:<sleeve>:<as_of>:<side>:<symbol>`
@@ -329,10 +354,24 @@ Every order carries an `orderRef` that encodes the sleeve so fills attribute cor
 
 ### 7.2 Attribution on fill
 
-`execDetails` + `commissionReport` per account → add shares to `attributed_positions[(account,
-sleeve)]`, subtract/add cash (fill notional + commission) to `attributed_cash`. Positive delta
-buys into the sleeve; negative sells out of it. The sleeve's P&L is derived from its attributed
-cost basis vs. mark — the CRM computes it because IBKR won't split it.
+**REVISED 2026-07-23 — there are no per-subaccount executions to attribute from (§13.3).** The
+block's **master-level** `execDetails` + `commissionReport` give the block's price, quantity and
+total commission (one record, at `DF8922141`). The **per-account split** comes from a `reqPositions`
+snapshot taken before/after the block, whose `avgCost` also carries each account's pro-rata share of
+commission (observed: PDBC filled 2 @ 18.14 with commission 0.368706, and both subaccounts booked
+`avgCost = 18.3244` = price + half the commission). From that delta → add shares to
+`attributed_positions[(account, sleeve)]`, subtract/add cash (fill notional + its commission share)
+to `attributed_cash`. Positive delta buys into the sleeve; negative sells out of it. The sleeve's
+P&L is derived from its attributed cost basis vs. mark — the CRM computes it because IBKR won't
+split it.
+
+**Reconciliation must therefore be designed around positions + Flex, not around the execution
+stream.** Treat the API as a **dead end for per-account execution records**: the durable
+per-account audit artifact is the **Flex / activity statement**, and the intraday artifact is the
+position delta. This is a real weakening of the compliance trail relative to what §7 originally
+assumed, and the design owns it: **our own written `ContractsOrShares` split is the intended
+allocation record, the position delta is the achieved-allocation proof, and Flex is the
+independent EOD confirmation.**
 
 ### 7.3 NETTING WATCH (mandatory, even if low-risk)
 
@@ -453,12 +492,15 @@ Division of labor (unchanged in spirit from the handoff, restated for Option A):
    `replaceFA` path is proven and the Web API adds OAuth + session-keepalive churn. Revisit only if
    REST/browser access is independently required (the options-level `details` call in §4 is the one
    Web API dependency we do accept, and only as a gated fallback).
-4. **Gateway test of the group block path:** a same-price allocation `whatIf`/live probe proving a
-   **group block fills every member account at one price** with the `ContractsOrShares` split, and
-   that an **S8 multi-leg combo can ride an FA block** (`config.LADDER_FA_BLOCKS` is currently
-   `False`; FA-block × MIDPRICE/Adaptive is unconfirmed). This is the load-bearing unrun test for
-   Option A execution — analogous to the research's "Test 0," now re-pointed at groups+combos
-   instead of models.
+4. ~~**Gateway test of the group block path**~~ — **CLOSED / PASSED 2026-07-23.** Both halves ran
+   live on the paper FA and passed: a group block filled **both** member accounts at one price with
+   the `ContractsOrShares` split (§13.1), and a **two-leg S8-shaped combo rode an FA block**
+   successfully (§13.2). The `whatIf` half of the original probe turned out to be **impossible** —
+   see §13.4. Full evidence in **§13**. (`config.LADDER_FA_BLOCKS` remains `False`; FA-block ×
+   MIDPRICE/Adaptive is still unconfirmed and was not part of this test.)
+5. **`OrderAllocation` vs `replaceFA`-per-block (NEW, §13.6):** Andrew's call — do we keep mutating
+   the shared GROUPS XML in the hot path of every order, or move to explicit per-order allocations
+   (requires patching/replacing `ib_async`)? **Open decision, not made here** — conductor **#50**.
 
 ---
 
@@ -474,15 +516,20 @@ mid-build:
    per-sleeve capital and per-sleeve current holdings** — that wiring does not exist. (`model_portfolio`
    has the per-sleeve sizing math but was built for the dead `modelCode` path.)
 
-2. **The block `orderRef` carries no sleeve/account tag.** `build_fa_block` keys the block on the
-   **group** only (`paperbot:<fa_group>:…`). Attribution to `(account, sleeve)` relies on
-   `execution.acctNumber` + a **group → sleeve** map that **does not exist yet**, and on the
-   invariant **one group == one sleeve** (which must be enforced). Direct legs need the
-   sleeve-tagged ref from `model_portfolio.model_order_ref` re-purposed.
+2. **The block `orderRef` carries no sleeve/account tag — and `execution.acctNumber` cannot supply
+   the account.** `build_fa_block` keys the block on the **group** only (`paperbot:<fa_group>:…`).
+   The **group → sleeve** map still **does not exist yet**, and the invariant **one group == one
+   sleeve** must be enforced. **Worse than originally written (verified 2026-07-23, §13.3):** the
+   account side cannot come from `execution.acctNumber` at all — allocation-order executions arrive
+   only at the FA master. Attribution must be driven from the written `ContractsOrShares` split and
+   confirmed by per-account position deltas (§7.1/§7.2). Direct legs need the sleeve-tagged ref from
+   `model_portfolio.model_order_ref` re-purposed.
 
 3. **No per-sleeve fill attribution / ledger writer exists.** `rebalance_execute` reconciles by
    re-reading blended `ib.positions(account)` against a tier model — it has **no** notion of
-   attributing a fill to a sleeve. The entire §7 attribution + checksum layer is net-new.
+   attributing a fill to a sleeve. The entire §7 attribution + checksum layer is net-new. The
+   position-delta-based attribution mandated by §13.3 makes this **more** work, not less: it needs a
+   before/after positions snapshot per block rather than a passive execution listener.
 
 4. **`set_group_contracts_or_shares` edits amounts, not membership.** It rewrites `<ListOfAccts>`
    with the per-order share split for a placement, then (implicitly) that group's members are
@@ -495,17 +542,21 @@ mid-build:
    netting watch (§7.3) has no code and must be added before two sleeves can safely share an
    instrument. (Low probability given S0-ETF vs S8-options, but unhandled today.)
 
-6. **No margin/buying-power pre-check for a blended, multi-sleeve account.** `risk_manager.evaluate`
-   checks per-account NAV/position/daily-loss limits, but there is **no** check that an account's
-   **ExcessLiquidity/BuyingPower** can carry an **added options sleeve** on top of its existing ETF
-   sleeve. §6 step 6's margin headroom check is net-new.
+6. **No margin/buying-power pre-check for a blended, multi-sleeve account — and IBKR will not help.**
+   `risk_manager.evaluate` checks per-account NAV/position/daily-loss limits, but there is **no**
+   check that an account's **ExcessLiquidity/BuyingPower** can carry an **added options sleeve** on
+   top of its existing ETF sleeve. §6 step 6's margin headroom check is net-new — and per §13.4 it
+   must be **entirely self-computed**, because `whatIfOrder` gives no margin preview for an FA block
+   order. There is no broker-side pre-trade gate available to us on the block path.
 
 7. **No capability/permission reads at all.** Nothing in the codebase reads options level, account
    type, or trading permissions. The §5 gate — and its Web API/Flex sources — is entirely to-build.
 
-8. **FA-block × multi-leg combo is unproven.** `config.LADDER_FA_BLOCKS = False`; FA-block
-   compatibility with MIDPRICE/Adaptive is explicitly unconfirmed, and no S8 combo has been placed
-   as an FA block. §10 item 4 must PASS before the S8 overlay can execute via groups.
+8. ~~**FA-block × multi-leg combo is unproven.**~~ **RESOLVED 2026-07-23 — PASSED (§13.2).** A
+   two-leg SPY vertical BAG was placed as an FA block on `Balanced` and allocated coherently to both
+   member accounts. §10 item 4 is closed. **Still open within this gap:** `config.LADDER_FA_BLOCKS`
+   remains `False` and **FA-block × MIDPRICE/Adaptive is still unconfirmed** — the proven combo path
+   is a plain LMT, not a laddered/adaptive one.
 
 ---
 
@@ -597,6 +648,133 @@ open as of this session) — the *formula* is what gets coded; the number drops 
 
 ---
 
+## 13. VERIFIED GATEWAY TEST RESULTS — 2026-07-23 (paper, live orders)
+
+The load-bearing §10.4 test **ran and PASSED.** Everything in this section was **observed live on
+the PAPER account (FA master `DF8922141`, port 4002) on 2026-07-23** — real orders, real fills, not
+a simulation and not a what-if. Claims are limited to what was observed; nothing is extrapolated.
+
+**Net verdict: FA Account Groups execute Option A's block model correctly, for single-leg AND for
+multi-leg combos. The execution architecture is validated.** Two limitations came out of the same
+session — no per-subaccount execution records (§13.3) and no what-if pre-trade gate (§13.4) — both
+of which change *how we reconcile and how we pre-check*, not *whether the architecture works*.
+
+### 13.1 Test 0 — single-leg FA block: **PASSED**
+
+One order: `BUY 2 PDBC`, `faGroup="Balanced"`, `faMethod=""`, DAY marketable limit, clientId 35.
+
+| Evidence | Observed |
+|---|---|
+| Fill | **ONE block**, single `execId` `00025b49.6a697500.01.01`, **2 shares @ 18.14** |
+| Commission | 0.368706 |
+| `permId` | 1979856224 |
+| `orderRef` | `paperbot:Balanced:fa_block_fill_test:BUY:PDBC` |
+| Where the execution appeared | **FA master `DF8922141` ONLY** |
+| Per-account result (`reqPositions`) | `DU8922143` PDBC = **1**, `DU8922144` PDBC = **1**, both `avgCost` **18.3244** (= 18.14 + half the commission each). Master **flat**. |
+| Errors | **Zero rejections. No error 10226.** |
+
+**Reads:** the block filled at one price, split across both member accounts per
+`ContractsOrShares`, commission was allocated pro-rata into `avgCost`, and the master netted flat.
+This is exactly the fairness/best-execution property §1 relies on. `faMethod=""` was accepted
+without complaint (consistent with the documented behavior cited in §3.4).
+
+### 13.2 The open unknown — multi-leg COMBO on an FA block: **PASSED**
+
+One BAG order, an S8-shaped vertical:
+
+- SPY, expiry **20260814** (22 DTE), **BUY 1× 739C** (`conId` 898044756) / **SELL 1× 740C**
+  (`conId` 898044796), ratio 1:1, **BUY 2 spreads**, **LMT 0.68 debit**
+- `faGroup="Balanced"`, `faMethod=""`, `account=""`
+
+| Evidence | Observed |
+|---|---|
+| Fill | **2 @ 0.66** in ~11 s |
+| `permId` | 1979856236 |
+| Errors | **Zero IBKR errors** |
+| Where the executions appeared | **`DF8922141` ONLY** — legs `BOT 2 @ 12.27` / `SLD 2 @ 11.61`, plus a **BAG-level** execution (`conId` 28812380) `BOT 2 @ 0.66` |
+| Per-account result (`reqPositions`) | `DU8922143` and `DU8922144` **each** +1 × 739C / −1 × 740C, **identical** avgCosts (1227.4473 / 1160.5255). Master **netted flat**. |
+
+**CONCLUSION — this is the result that unblocks the S8 overlay:** a combo **can** ride an FA block;
+**both legs allocate coherently** to every member account at identical cost; therefore
+**spread-based sleeves do NOT need per-account routing.** §11 gap 8 is closed.
+
+*Scope of the claim:* proven for a **plain LMT** 1:1 two-leg equity-option vertical on a 2-account
+group. Not proven for MIDPRICE/Adaptive (`config.LADDER_FA_BLOCKS` is still `False`), not proven for
+SPX/SPXW index options specifically, and not proven at larger group sizes. Those are extensions, not
+doubts about the mechanism.
+
+### 13.3 Reporting limitation — executions come back ONLY at the FA master
+
+`reqExecutions(ExecutionFilter(acctCode=…))` was run **individually for all six managed accounts**.
+It returned records for **`DF8922141` ONLY** — **nothing** for any `DU…` subaccount.
+
+This matches IBKR's documented wording — *"Advisors executing allocation orders will receive
+execution details and commissions for the allocation order itself. To receive allocation details and
+commissions for a specific subaccount `IBApi.EClient.reqExecutions` can be used"* — **except that on
+this paper FA the per-subaccount filter returned nothing.** Whether that is a paper-FA limitation or
+general behavior is **UNCERTAIN and untested on a live FA.**
+
+**Design consequence (already applied to §6 step 8, §7.1, §7.2, §11 gap 2):** treat the API as a
+**dead end for per-account execution records.** Per-account proof of allocation must come from
+**`reqPositions` + `avgCost`**, or from a **Flex / activity statement**. Reconciliation and the
+compliance trail are designed around positions + Flex, not around the execution stream.
+
+### 13.4 `whatIf` is NOT usable for FA allocation orders
+
+Two distinct findings, both verified:
+
+1. **A real bug in our own code path.** `ib_async`'s `whatIfOrder` copies the order with
+   `whatIf=True` but **does not set `transmit`**. IBKR replies **error 321** — *"Error validating
+   request.-'bD' : cause - What-If order should have transmit flag set to TRUE."* — and then
+   **never resolves the future**, so `ib.whatIfOrder()` **hangs forever**. This affects
+   `order_router.what_if()` for **ANY `transmit=False` order, not just FA ones**. It needs a hard
+   timeout. *(Not fixed in this session — conductor **#48**.)*
+2. **With `transmit=True`, the FA master returns nothing at all** for a group order. Tested at both
+   30 s and 90 s deadlines, with **zero error events**. No IBKR documentation claims what-if support
+   for allocation orders.
+
+**CONSEQUENCE: there is no margin-preview / pre-trade gate available for FA block orders. Placing is
+the only way to validate.** Any design element that assumed a what-if gate in front of a block is
+**revised out** (§6 step 6, §11 gap 6). The pre-check is ours to compute from `reqAccountSummary`.
+
+### 13.5 `paperbot\fa_block_test.py`'s recorded result is SUSPECT
+
+That script's conclusion — *"the FA master ACCEPTS a group order, what-if only"* — used **exactly
+the path §13.4 just showed is broken**: `order_router.what_if()` on a `transmit=False` order, which
+**would have hung rather than returned an acceptance.** The recorded result therefore cannot be
+trusted as evidence of anything.
+
+**Flagged for re-verification or retirement.** Note that its underlying question is now answered far
+more strongly by §13.1/§13.2 (an actual fill beats a what-if), so **retiring it is the likely right
+call** — but that is a deliberate decision, not something to assume here. Conductor **#49**.
+
+### 13.6 OPEN DECISION for Andrew — `OrderAllocation` vs `replaceFA`-per-block
+
+**Surfaced, not decided.**
+
+- Newer TWS API exposes an **`OrderAllocation`** class: explicit per-account allocations attached
+  directly to a single order, with **no shared-config mutation**.
+- **Our installed `ib_async` 2.1.0 does NOT implement it** — verified: the `Order` dataclass exposes
+  only `faGroup`, `faProfile`, `faMethod`, `faPercentage`.
+
+So this design's current pattern (§6 step 7, §8) — **`replaceFA` the GROUPS XML before every
+block** — means a **shared-config write in the hot path of every order.**
+
+| | `replaceFA` per block (today) | `OrderAllocation` (not available in our client) |
+|---|---|---|
+| Works with installed stack | **Yes — proven today (§13.1/§13.2)** | No — requires patching or replacing `ib_async` |
+| Concurrency | Mutates one global GROUPS XML; needs the gateway lock + full-XML backup on every block; a crash mid-sequence leaves the shared config edited | Per-order payload; nothing global to corrupt |
+| Blast radius of a bug | Whole-XML overwrite affects **every** group, not just ours | Confined to the one order |
+| Auditability | Intent recorded in our own written split + backups | Intent recorded on the order itself |
+| Cost | Zero new work | Client-library patch/replacement + revalidation of the entire order path |
+
+**Andrew's call.** Both are defensible: the current path is proven and shipping-ready; the
+alternative removes a genuine shared-mutable-state hazard at the cost of owning a patched client
+library. **The desk does not decide this unilaterally.**
+
+---
+
 *End of spec. Grounded in `paperbot/{rebalance_engine,order_router,rebalance_execute,accounts,config,model_portfolio}.py`
 and `docs/{CRM_HANDOFF_model_allocation,MODEL_PORTFOLIO_RESEARCH}.md` as of 2026-07-21;
-§12 refinements added 2026-07-22. Not committed.*
+§12 refinements added 2026-07-22; **§13 verified live-paper test results added 2026-07-23** (and the
+corrections it forced into §3.4, §6, §7.1, §7.2, §10, §11).*
