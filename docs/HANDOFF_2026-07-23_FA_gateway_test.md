@@ -30,6 +30,16 @@
 - clientIds: 33 = paperbot_fa (read), 36 = paperbot_fa_admin (write). Recon script lives in the session scratchpad as `fa_inventory.py`.
 - **Live gateway = port 4003 (S8 zero-transmit pilot; daily 08:15 CT restart) — NEVER touch.**
 
+## Incident
+**`paperbot\arming.py arm` killed the S8 LIVE-pilot Gateway on port 4003 (2m51s outage, 09:55:17→09:58:08 CDT).**
+Step 2 of NEXT ACTION below (flip `ReadOnlyApi=no` + relaunch) went through `arming.py arm`, whose
+elevated restart calls `_kill_gateway_processes()` with the paper default `dir_substring=r"C:\IBC"` —
+which is a string **prefix** of `C:\IBC-Live-Trade`, so it killed the live pilot too and then reported
+success. Zero-transmit wall never breached; recovered by re-running `LiveTradeGatewayOpen_0815CT`.
+**Until the fix lands, `arming.py arm` AND `disarm` are unsafe to run while any other Gateway is up.**
+Full writeup: `docs/INCIDENT_2026-07-23_arm_restart_killed_live_gateway.md` — conductor **#46** (fix)
+and **#47** (orphan `java` pid 29236 cleanup + the unresolved 4002 disappearance).
+
 ## NEXT ACTION — resume AFTER 3 PM CT (Andrew authorized adding the member)
 1. Confirm the shared paper login is free (other users off).
 2. Flip IBC `ReadOnlyApi=no`; relaunch ONE clean paper gateway via `ensure_gateway()`.
