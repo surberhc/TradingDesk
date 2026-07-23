@@ -123,7 +123,7 @@ conductor items **#26** and **#48** (the latter is the client-side timeout fix f
 > Still re-test at every review: a `ib_async` bump could fix the helper directly and make the preview
 > reachable without leaving `ib_async`.
 
-### 3.2 Per-subaccount executions — **REVISED 2026-07-23** (likely a master-client-id artifact, NOT an IBKR limit)
+### 3.2 Per-subaccount executions — **VERIFIED-WITH-NUANCE 2026-07-23 pm** (master-connect returns equity legs; options/combos/closes stay master-only)
 
 **Original observation (live, 2026-07-23, paper account):** for an allocation (group/block) order,
 `reqExecutions` filtered per subaccount returned **nothing** for all six managed accounts; only the FA
@@ -139,16 +139,44 @@ connecting as the MASTER CLIENT ID.** Today's test connected as **clientId 35** 
 concluded the API was a dead end for per-account fills. Source:
 <https://interactivebrokers.github.io/tws-api/executions_commissions.html>.
 
-- **Confidence — the API documentation (per-subaccount `Execution.acctNumber`; all-client records
-  require the master client id): HIGH** (documented on the tws-api reference).
-- **Confidence — that clientId-35-vs-master is *why* we saw master-only records here: STRONG HYPOTHESIS,
-  NOT YET RE-TESTED.** This has **not** been re-run on our Gateway connecting as the master client id.
-  It is well-supported by the documentation but remains unverified on our build.
+**RE-TESTED AND CONFIRMED — 2026-07-23 afternoon (paper, port 4002, connecting as MASTER clientId 0;
+the gateway's `OverrideTwsMasterClientID` is empty so 0 is the default master).** The hypothesis held
+**for equities, with a decisive nuance for options:**
 
-**Consequence (revised):** do **NOT** design the reconciliation around Flex being *required* on the
-strength of the original observation. **Re-test `reqExecutions` connecting as the master client id first**
-(new conductor follow-up). Flex may still be *chosen*, but the API is not established as a dead end. The
-positions/`avgCost` path remains a valid independent cross-check regardless.
+- **Equity blocks — per-subaccount execs DO return as master.** On a PDBC equity block, `DU8922143`
+  and `DU8922144` **each surfaced their own 1-share `Execution.acctNumber` row** (execIds
+  `0001106d.6a61995c.01.01` and `...6a61995a.01.01`), and `ExecutionFilter(acctCode=<DU…>)` returned
+  them individually. The morning "master-only, use Flex" conclusion is **reversed for equities.**
+- **Options/combos AND closing orders — master-only even as master.** The SPY option combo and **all**
+  closing orders attributed **only to the FA master `DF8922141`**, even with explicit `acctCode`
+  filters — no sub-account legs. This was **not** session-cache aging: the surviving sub-account
+  equity legs were the **oldest** fills.
+- **`reqPositions` is the reliable per-account allocation proof for equities too** — positions
+  reconcile per subaccount regardless of the execution-stream gap (and need a settle delay after a
+  fill, see below).
+
+- **Confidence — equity per-account execs visible via master-connect: VERIFIED** (observed live 2026-07-23 pm).
+- **Confidence — options/combos/closes are master-only on this paper FA: VERIFIED** (observed live 2026-07-23 pm).
+- **Confidence — the API-doc fact (per-subaccount `Execution.acctNumber`; all-client records require the
+  master client id): HIGH** (documented on the tws-api reference).
+
+**Consequence (revised):** for **equity** sleeves the API is **not** a dead end — per-account fills are
+obtainable via master-connect, and `reqPositions` is a reliable cross-check. For **options/combos and
+closes**, a complete per-account trail **still requires Flex / activity statements** (master-only on
+this paper FA). Reconciliation should read per-account executions for equities where available and rely
+on positions + Flex for options — matching `docs\CRM_DESIGN_groups_brain.md` §13.7.1.
+
+**Allocation-method constraint (new, verified 2026-07-23 pm):** a stable **Percent** group (configured
+once) allocates with **zero per-order `replaceFA`**, but on **odd** order sizes allocates **exact
+fractional shares** (`BUY 3 → 1.5/1.5`, `BUY 5 → 2.5/2.5`) — **disqualifying for whole-contract sizing**
+(options). Unequal-whole-contract splits therefore require **`ContractsOrShares`**, whose per-order
+amounts make the `replaceFA` write structurally required (see `docs\CRM_DESIGN_groups_brain.md`
+§13.7.2). **`EqualQuantity` odd-size rounding was NOT tested** — open.
+
+**`reqPositions` settle delay (new, verified 2026-07-23 pm):** `reqPositions` returns a **stale
+snapshot** if read immediately after a fill on a fresh master connection; a **~4–5 s settle** before
+reading resolves it. Any monitoring that reads positions right after an order must include a settle
+delay or re-read.
 
 ### 3.3 `faMethod=""` is the documented path, not a workaround
 **RECORDED** (IBKR documentation, cited by a prior session in `docs\CRM_DESIGN_groups_brain.md`
@@ -329,6 +357,7 @@ citations.
 
 | Date | Trigger | What was checked | Outcome |
 |---|---|---|---|
+| **2026-07-23** (pm paper test) | Live FA test, PAPER port 4002, connecting as **MASTER clientId 0** (reads only; orders placed/modified/cancelled, none real-money) | Re-ran `reqExecutions` per subaccount as master; ran Percent-group allocation on even/odd sizes; exercised place→modify→cancel on a resting FA block; timed `reqPositions` after fills. | §3.2 upgraded to **VERIFIED-WITH-NUANCE**: equity per-account `Execution.acctNumber` legs **DO** return as master (PDBC block), but **options/combos and closes stay master-only** → complete per-account options trail still needs Flex. Added: **Percent allocates fractional shares on odd sizes** (disqualifying for whole contracts) → unequal-whole-contract needs `ContractsOrShares` + structural per-order `replaceFA`; `EqualQuantity` odd-size rounding untested (open). Added: `reqPositions` needs ~4–5 s settle after a fill. FA block **modify/cancel lifecycle** proven. Settles conductor #52; opens EqualQuantity-rounding item. Detail in `docs\CRM_DESIGN_groups_brain.md` §13.7. |
 | **2026-07-23** (research pass) | FA-allocation deep research (documentation + wire-protocol cross-checks; no gateway, no orders) | IBKR Campus TWS API changelog, tws-api GitHub docs, 2025/2026 production release notes, and two independent wire-protocol ports (scmhub/ibapi Go, wboayue/rust-ibapi) reviewed for FA allocation + `OrderAllocation` semantics. | New **§3.9** research-findings subsection added. Established `OrderAllocation` is **inbound-only** (added 10.33, 2024-12-17) → §13.6 decision resolved to keep `faGroup`/`replaceFA` (conductor #50 closed). **Corrected two same-day "known constraints" as test artifacts:** §3.1 (what-if hang is an `ib_async` client bug, not a missing IBKR margin gate — per-account preview exists on 10.45.1g; HIGH) and §3.2 (per-subaccount executions *are* API-obtainable, likely master-client-id artifact — API doc HIGH, "clientId-35-is-why" a STRONG HYPOTHESIS not yet re-tested). §3.5/§3.8 reframed (`OrderAllocation` not a superseding submission path). §4 monitoring channels **populated** (Campus changelog + tws-api docs + annual release notes). No FA breaking changes in 10.35–10.48. Two conductor follow-ups opened (master-client-id reqExecutions re-test; reach whatIf preview via `ibapi`/patched transmit). |
 | **2026-07-23** | Initial — standing practice established (`CLAUDE.md` § *IBKR currency*) | Venv introspected (`ib_async` 2.1.0, aeventkit 2.1.0, nest-asyncio 1.6.0, Python 3.12.9, wire protocol 157–178). Gateway build read from `C:\Jts\ibgateway\1045\launcher.log` (**10.45.1g**, May 27 2026) and the `TWS_MAJOR_VRSN=1045` pin confirmed in all three IBC launchers. IBC **3.24.0** confirmed from `C:\IBC\version`. Repo grepped for the IBKR surfaces actually used (§2b). `Order` dataclass introspected: **no `OrderAllocation`**, legacy FA fields only. | Doc created. §3 seeded with two **live-verified** paper-account findings from the same-day FA block test: **what-if is unusable for FA allocation orders (error 321 + indefinite hang) — no pre-trade margin gate exists for FA blocks**; and **allocation executions return only at the FA master, never per subaccount**. Deprecation table opened; `reqFundamentalData` removal at **10.47** is the live clock (we are on 10.45.1g, and no repo code calls it — forward exposure only). §4 left explicitly **incomplete**. |
 

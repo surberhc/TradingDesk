@@ -503,7 +503,11 @@ Division of labor (unchanged in spirit from the handoff, restated for Option A):
    `OrderState` (added TWS API 10.33, 2024-12-17), *not* an outbound submission mechanism — so the
    swap the original decision imagined does not exist. The real hot-path hazard is handled
    architecturally: rewrite a group's XML only on **membership** change, never per-order; serialize
-   the writes. Conductor **#50 CLOSED**; a follow-up item tracks removing the per-order `replaceFA`.
+   the writes. Conductor **#50 CLOSED**. **Follow-up RESOLVED 2026-07-23 (§13.7.2):** the per-order
+   `replaceFA` **is structurally required for the unequal-whole-contract (options) case** — a stable
+   method (Percent) removes it **only** for fractional-tolerant equity sleeves (Percent allocates exact
+   *fractional* shares on odd sizes, disqualifying for whole contracts). So the mitigation is
+   **operational** (§12), not elimination. Net verdict unchanged: **keep `faGroup`/`replaceFA`.**
 
 ---
 
@@ -714,8 +718,15 @@ It returned records for **`DF8922141` ONLY** — **nothing** for any `DU…` sub
 This matches IBKR's documented wording — *"Advisors executing allocation orders will receive
 execution details and commissions for the allocation order itself. To receive allocation details and
 commissions for a specific subaccount `IBApi.EClient.reqExecutions` can be used"* — **except that on
-this paper FA the per-subaccount filter returned nothing.** Whether that is a paper-FA limitation or
-general behavior is **UNCERTAIN and untested on a live FA.**
+this paper FA the per-subaccount filter returned nothing.**
+
+> **PARTLY OVERTURNED 2026-07-23 afternoon (§13.7.1):** this "master-only" result was taken while
+> connected as a **non-master clientId (35)**. Re-run connecting as the **MASTER client id (0)**,
+> per-subaccount `Execution.acctNumber` rows **DO** return **for EQUITY blocks** — so the morning "API
+> is a dead end, use Flex" conclusion is **reversed for equities.** BUT **options/combos and closing
+> orders remained master-only even as master**, so a complete per-account **options** trail still
+> requires **Flex / activity statements.** `reqPositions` is the reliable per-account proof for
+> equities too. See §13.7.1.
 
 **Design consequence (already applied to §6 step 8, §7.1, §7.2, §11 gap 2):** treat the API as a
 **dead end for per-account execution records.** Per-account proof of allocation must come from
@@ -788,9 +799,18 @@ is removed by design, not by `OrderAllocation`:
 - **Only rewrite a group's XML when its MEMBERSHIP changes — never per-order.** The per-order mutation
   exists only because `ContractsOrShares` encodes share counts *as group config*.
 - **Serialize the writes** (already the design intent: gateway lock + full-XML backup).
-- **Open follow-up (conductor):** evaluate whether a stable allocation method (or `faPercentage` /
-  order-size) removes the per-order `replaceFA` entirely **without losing the CRM brain's explicit
-  per-account control.** Tracked as a new conductor item.
+- **Follow-up RESOLVED 2026-07-23 (§13.7.2):** a stable method **does** remove the per-order
+  `replaceFA` — but only where fractional shares are acceptable. **Percent** (configured once) allocated
+  even *and* uneven order sizes with **zero per-order `replaceFA`**, but allocates **exact fractional
+  shares on odd sizes** (`BUY 3 → 1.5/1.5`) — **disqualifying for whole contracts.** So for the CRM
+  brain's core case — **unequal split of WHOLE contracts** (S8 options) — only **`ContractsOrShares`**
+  works, and its per-account amounts change every order, making the **per-order `replaceFA` write
+  STRUCTURALLY REQUIRED, not eliminable.** The hot-path hazard therefore **cannot be engineered away**
+  for the primary use case; it is **managed operationally** (serialize, backup-before-write, read-back
+  verify + fault-latch — the §12 refinements). Percent remains a stable, write-free option for
+  fractional-tolerant **equity** sleeves only. This refines the *why*; it does **not** reverse the
+  keep-`faGroup`/`replaceFA` verdict. (`EqualQuantity`'s odd-size rounding is the one untested cell —
+  new conductor open item.)
 
 *(Historical note: the original §13.6 posed this as an open `OrderAllocation`-vs-`replaceFA` decision
 and carried a trade-off table premised on `OrderAllocation` being an alternative *submission* path.
@@ -798,6 +818,88 @@ That premise was wrong — `OrderAllocation` is inbound-only — so the table is
 resolution. Also relevant: no FA-allocation breaking changes appear in the 2025 (10.35–10.42) or 2026
 (10.43–10.48) production release notes; the last FA-relevant change was the 2022 v981/10.22
 groups/profiles unification we are already on.)*
+
+### 13.7 Afternoon paper tests — 2026-07-23 (master-connect, allocation methods, order lifecycle)
+
+A second live paper session the **afternoon of 2026-07-23** (PAPER account, port 4002, connecting as
+the gateway's **MASTER API client id — clientId 0**; the gateway's `OverrideTwsMasterClientID` is empty
+so 0 is the default master) settled three questions the morning test (§13.1–13.6) had left open or
+recorded too pessimistically. Everything below is **verified by observation on 2026-07-23**; the one
+untested cell is called out explicitly and tracked as a new open item.
+
+#### 13.7.1 Per-subaccount executions ARE visible to a master-connect — for EQUITY blocks (settles the morning "master-only, use Flex" reversal)
+
+Connecting as the **master client id** DOES return per-subaccount `Execution.acctNumber` rows —
+**overturning the morning session's "allocation executions come back only at the FA master, use Flex"
+conclusion** (§13.3), which was taken while connected as a non-master clientId (35).
+
+| Evidence | Observed |
+|---|---|
+| Instrument | PDBC equity block |
+| Per-subaccount execs (master-connect) | `DU8922143` and `DU8922144` **each surfaced their own 1-share execution** — execIds `0001106d.6a61995c.01.01` and `0001106d.6a61995a.01.01` |
+| `ExecutionFilter(acctCode=<DU…>)` | Returned each subaccount's leg **individually** |
+
+**BUT INCOMPLETE — a decisive nuance:** the **SPY option combo and ALL closing orders** attributed
+**only to the FA master `DF8922141`**, even as master with explicit `acctCode` filters — no
+sub-account legs came back. This was **NOT** session-cache aging: the surviving sub-account legs were
+the **OLDEST** fills, so it is not a "recent fills not yet propagated" artifact.
+
+**CONCLUSION:** per-account execution records are API-visible for **EQUITY blocks** via master-connect,
+but **options/combos and closing orders are master-only** on this paper FA. So a **complete per-account
+options trail still requires Flex / activity statements.** Also confirmed: **`reqPositions` (not
+`reqExecutions`) is the reliable per-account allocation proof for equities too** — positions reconcile
+per subaccount regardless of the execution-stream gap.
+
+#### 13.7.2 A stable allocation method removes the per-order `replaceFA` — but only where fractional shares are acceptable (resolves the #50 architectural follow-up)
+
+A **Percent** method group (`defaultMethod=Percent`, 50/50), configured **once**, allocated
+`BUY 4 → 2/2` and `BUY 2 → 1/1` across `DU8922143`/`DU8922144` with **ZERO `replaceFA` between
+orders** — proving a **stable method removes the shared-config hot-path write** the #50 follow-up
+worried about.
+
+**HOWEVER — the disqualifying limitation:** on **ODD** order sizes, Percent allocates **EXACT
+FRACTIONAL shares**, not whole: `BUY 3 → 1.5/1.5`, `BUY 5 → 2.5/2.5` (deterministic exact-half). This
+is **DISQUALIFYING for whole-contract sizing** — options cannot be fractional.
+
+**THE DECISION MATRIX** (the resolution):
+
+| Need | Method | Per-order `replaceFA`? |
+|---|---|---|
+| EQUAL split, whole shares, stable | **EqualQuantity** | None — *but* EqualQuantity's odd-size rounding was **NOT tested** (open item below) |
+| UNEQUAL split, fractional acceptable (equity sleeves, e.g. S0) | **Percent** | **None** — stable, write-free |
+| UNEQUAL split, **WHOLE contracts** (options sleeves, e.g. S8 — the CRM brain's core case) | **ContractsOrShares ONLY** | **Per-order write STRUCTURALLY REQUIRED** — the per-account amounts change every order |
+
+**CONSEQUENCE for this design:** the `replaceFA` hot-path corruption risk behind #50 **CANNOT be
+engineered away for the unequal-whole-contract case** — the CRM brain's primary use case (S8 options
+with explicit per-account contract counts). It must be **MANAGED operationally**: serialize writes,
+backup-before-write, read-back verify + fault-latch on mismatch — **exactly the §12 refinements already
+specify.** For equity-only sleeves that tolerate fractional shares, **Percent is a stable, write-free
+alternative.**
+
+This does **NOT reverse the #50 decision** (keep `faGroup`/`replaceFA`, §13.6). It **explains WHY** the
+per-order write is unavoidable for the primary use case and points the mitigation at **operations, not
+elimination.**
+
+#### 13.7.3 FA block modify/cancel lifecycle works (previously never exercised)
+
+The morning test proved only **place-and-fill**. This session proved the **full working-order
+lifecycle** on an FA group order:
+
+| Step | Observed |
+|---|---|
+| Place | Resting (non-marketable) **DAY LIMIT** FA block on a Percent group → **Submitted**, `orderId` 174 / `permId` 1979857105 |
+| Modify | Re-priced → **still Submitted**, `orderId` **and** `permId` both **stable** across the modify |
+| Cancel | Reached **Cancelled**, `filled=0`, gone from `reqAllOpenOrders` (IBKR error 202 is the normal cancel ack) |
+
+Nothing filled. **Place → modify → cancel is proven for FA group orders**, not just place-and-fill.
+
+#### 13.7.4 Operational note — `reqPositions` needs a settle delay after a fill
+
+`reqPositions` returns a **stale snapshot** if read immediately after a fill on a fresh master
+connection; a **~4–5 s settle** before reading resolves it. Any monitoring that reads positions right
+after an order **must include a settle delay or re-read** (reinforces the §12.2 pre-flight read
+discipline and the §7.2 position-delta attribution, which now must wait for the settle before
+snapshotting).
 
 ---
 
