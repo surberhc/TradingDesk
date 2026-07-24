@@ -11,6 +11,18 @@ file ever disagree, fix whichever is wrong so they match.
 | **Live-Data** | 4001 | `connections/connections/ibkr_live_data.py` | `C:\IBC-Live-Data\StartGatewayLiveData.bat` | `TRADINGDESK_LIVE_DATA_GATEWAY_LAUNCH_LOCK` | `C:\TradingDesk-Local\state\live_data\` |
 | **Live-Trade** | 4003 | `connections/connections/ibkr_live_trade.py` | `C:\IBC-Live-Trade\StartGatewayLiveTrade.bat` | `TRADINGDESK_LIVE_TRADE_GATEWAY_LAUNCH_LOCK` | `C:\TradingDesk-Local\state\live_trade\` |
 
+## IBKR login per lane (distinct — never shared)
+
+Each lane has its OWN IBKR login. They are never the same username on two ports — that is the whole reason there are three instances, and it is why all three can run at once without one booting another via `ExistingSessionDetectedAction`.
+
+| Lane | Port | IBKR login username |
+|------|------|---------------------|
+| Paper | 4002 | `apsvpaper` |
+| Live-Data | 4001 | `databot0001` |
+| Live-Trade | 4003 | `apsv1816` |
+
+> Passwords and 2FA are the user's and are never stored in the repo. This records only which login belongs to which lane. Confirmed by Andrew 2026-07-24.
+
 > **Machine-side install dirs** (`C:\IBC`, `C:\IBC-Live-Data`, `C:\IBC-Live-Trade`)
 > are set up separately by the user and **must match the `GATEWAY_BAT` constant** in each
 > module. Renaming a bat path here without moving the install on disk will break launch.

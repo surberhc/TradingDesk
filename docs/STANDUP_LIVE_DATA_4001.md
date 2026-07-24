@@ -77,9 +77,9 @@ the A/B intends to validate live intraday quotes, that would need a separate ent
 - [ ] **Credentials in `C:\IBC-Live-Data\config.ini`** — `IbLoginId` + `IbPassword`.
       Under Path A these already exist; under Path B, replace the `<<FILL-…>>` placeholders.
       Claude never handles these values.
-- [ ] **Distinct username check** — if the live-data and live-trade (4003) logins share an
+- [x] **Distinct username check** — if the live-data and live-trade (4003) logins share an
       IBKR username, they cannot run simultaneously (`ExistingSessionDetectedAction=primary`
-      would boot the other). Confirm they are distinct before running both.
+      would boot the other). Confirm they are distinct before running both. CONFIRMED 2026-07-24: the three lanes use distinct logins — 4001 databot0001, 4002 apsvpaper, 4003 apsv1816 — so 4001 and 4003 never boot each other (see connections/GATEWAYS.md).
 
 ## 2. Launch + verify port 4001 listening
 
