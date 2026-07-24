@@ -15,10 +15,39 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.18.0"
+VERSION = "0.19.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.19.0", "2026-07-24", "flatten_accounts.py SAFETY REWORK (conductor #51 — was "
+                             "HIGH-severity DO-NOT-RUN). The one-shot liquidation tool was "
+                             "load-bearing-unsafe: it hardcoded all five DU sub-accounts, "
+                             "took no args, hardcoded order.transmit=True, and RUNNING THE "
+                             "MODULE WAS THE SWEEP — so a launch would liquidate the entire "
+                             "live S0 book. It also priced EVERY position via a Stock() "
+                             "quote, so an OPTION position was priced at the UNDERLYING and "
+                             "legged out NAKED. Reworked: (a) argparse with REQUIRED "
+                             "--accounts AND --symbols/--conids allowlists (no default) + a "
+                             "hard guard at the top of main() that exits non-zero and never "
+                             "connects if either is absent; --execute is now the ONLY thing "
+                             "that transmits, DRY-RUN is the default (prints intended "
+                             "orders, places nothing). (b) instrument-aware: refuses any "
+                             "non-STK secType (OPT/FUT/BAG/…) with a loud warning and marks "
+                             "the run non-flat — never prices off the underlying, never "
+                             "legs out an option (combo-close left as an explicit TODO). "
+                             "(c) flatten now validates its OWN limit price (rejects NaN / "
+                             "non-finite / <=0 via math.isfinite — the old `if not ref:` let "
+                             "NaN through) instead of trusting live_quotes upstream. (d) "
+                             "cancels any still-working order before disconnect, and a "
+                             "non-flat reconcile is now a HARD FAILURE (non-zero exit), not "
+                             "a printed note. (e) copies the live position's contract before "
+                             "forcing exchange=SMART instead of mutating it in place. "
+                             "Order-affecting: changes which accounts/instruments the "
+                             "liquidation tool will act on and how it routes/cancels — a "
+                             "flatten can no longer default to 'everything in five "
+                             "accounts' or send a mispriced naked option order. PAPER only; "
+                             "+13-case offline test matrix (test_flatten_accounts.py). Rule "
+                             "#1 clean: no strategy/regime/band/sizing value touched."),
     ("0.18.0", "2026-07-20", "S0 live-account reconciliation / corp-action guard (armed-live "
                              "prereq #3). reconcile.reconcile() gains an opt-in `universe` "
                              "param (the strategy's tradeable symbols, from a new "
