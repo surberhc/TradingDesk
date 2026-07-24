@@ -22,8 +22,14 @@ EXPORT_PATH = REPO_ROOT / "conductor" / "status_export.md"
 
 def _fetch_open_items(conn):
     return conn.execute(
-        "SELECT * FROM items WHERE status != 'done' ORDER BY area, "
+        "SELECT * FROM items WHERE status NOT IN ('done', 'parked') ORDER BY area, "
         "CASE status WHEN 'blocked' THEN 0 ELSE 1 END, opened_date"
+    ).fetchall()
+
+
+def _fetch_parked(conn):
+    return conn.execute(
+        "SELECT * FROM items WHERE status = 'parked' ORDER BY area, id"
     ).fetchall()
 
 
@@ -50,6 +56,7 @@ def build_markdown() -> str:
     conn = get_connection()
     try:
         open_items = _fetch_open_items(conn)
+        parked_items = _fetch_parked(conn)
         pending_decisions = _fetch_pending_decisions(conn)
         log_entries = _fetch_log_entries(conn)
     finally:
@@ -86,6 +93,12 @@ def build_markdown() -> str:
         for d in pending_decisions:
             opts = f" | options: {d['options']}" if d["options"] else ""
             lines.append(f"> - (#{d['id']}) [{d['lane']}] {d['question']}{opts}")
+
+    if parked_items:
+        lines.append(">")
+        lines.append(f"> **PARKED / SHELVED ({len(parked_items)})** — off the active list, restore with `conductor/cli.py unpark --id N`:")
+        for it in parked_items:
+            lines.append(f"> - (#{it['id']}) [{it['area']}] {it['title']}")
 
     lines.append("")
 

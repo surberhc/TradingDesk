@@ -31,7 +31,7 @@ CREATE TABLE IF NOT EXISTS items (
     id INTEGER PRIMARY KEY,
     title TEXT,
     area TEXT,
-    status TEXT CHECK(status IN ('open', 'blocked', 'done')),
+    status TEXT CHECK(status IN ('open', 'blocked', 'done', 'parked')),
     opened_date TEXT,
     last_touched TEXT,
     closed_date TEXT,

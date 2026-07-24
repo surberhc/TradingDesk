@@ -113,6 +113,42 @@ def cmd_block(args):
     conn.close()
 
 
+def cmd_park(args):
+    conn = get_connection()
+    today = _today()
+    if args.notes:
+        cur = conn.execute(
+            "UPDATE items SET status='parked', last_touched=?, notes=? WHERE id=?",
+            (today, args.notes, args.id),
+        )
+    else:
+        cur = conn.execute(
+            "UPDATE items SET status='parked', last_touched=? WHERE id=?",
+            (today, args.id),
+        )
+    conn.commit()
+    if cur.rowcount == 0:
+        print(f"No item with id {args.id}")
+    else:
+        print(f"Parked item #{args.id} (shelved — excluded from active list, retrievable)")
+    conn.close()
+
+
+def cmd_unpark(args):
+    conn = get_connection()
+    today = _today()
+    cur = conn.execute(
+        "UPDATE items SET status='open', last_touched=? WHERE id=?",
+        (today, args.id),
+    )
+    conn.commit()
+    if cur.rowcount == 0:
+        print(f"No item with id {args.id}")
+    else:
+        print(f"Unparked item #{args.id} (back to open)")
+    conn.close()
+
+
 def cmd_decide(args):
     conn = get_connection()
     conn.execute(
@@ -144,7 +180,7 @@ def cmd_answer(args):
 def cmd_status(args):
     conn = get_connection()
     open_items = conn.execute(
-        "SELECT * FROM items WHERE status != 'done' ORDER BY area, "
+        "SELECT * FROM items WHERE status NOT IN ('done', 'parked') ORDER BY area, "
         "CASE status WHEN 'blocked' THEN 0 ELSE 1 END, opened_date"
     ).fetchall()
     pending = conn.execute(
@@ -174,6 +210,16 @@ def cmd_status(args):
         for d in pending:
             opts = f" | options: {d['options']}" if d["options"] else ""
             print(f"  #{d['id']} [{d['lane']}] {d['question']}{opts}")
+
+    conn2 = get_connection()
+    parked = conn2.execute(
+        "SELECT * FROM items WHERE status = 'parked' ORDER BY area, id"
+    ).fetchall()
+    conn2.close()
+    print()
+    print(f"=== PARKED / SHELVED ({len(parked)}) — hidden from active list, `unpark --id N` to restore ===")
+    for it in parked:
+        print(f"    #{it['id']} [{it['area']}] {it['title']}")
 
 
 def cmd_render(args):
@@ -209,6 +255,15 @@ def main():
     p_block.add_argument("--id", required=True, type=int)
     p_block.add_argument("--notes", default="")
     p_block.set_defaults(func=cmd_block)
+
+    p_park = sub.add_parser("park", help="shelve an item (hidden until unparked)")
+    p_park.add_argument("--id", required=True, type=int)
+    p_park.add_argument("--notes", default="")
+    p_park.set_defaults(func=cmd_park)
+
+    p_unpark = sub.add_parser("unpark", help="restore a parked item to open")
+    p_unpark.add_argument("--id", required=True, type=int)
+    p_unpark.set_defaults(func=cmd_unpark)
 
     p_decide = sub.add_parser("decide", help="record a pending decision")
     p_decide.add_argument("--lane", required=True)
