@@ -246,6 +246,66 @@ DEEP_MAX_AGE_DAYS = float(os.environ.get("TRADINGDESK_DATA_BACKUP_DEEP_MAX_AGE_D
 # scoped remote and report spurious differences.
 EXCLUDES = ["venv/**", "backups/**", "secrets/**"]
 
+# --------------------------------------------------------------------------- #
+# CHECK-ONLY excludes — the live-churn paths kept OUT of the DEEP verification (only).
+# --------------------------------------------------------------------------- #
+# WHY (the 2026-07-23 deep-check failure, conductor #56): a DEEP check re-hashes ~863k
+# files and runs for HOURS (21:00 -> 03:21 that night). Over that window the desk's own
+# live files — running-job logs, heartbeats, the conductor db, append-only journals,
+# lock files — are continuously WRITTEN, ROTATED, or briefly LOCKED. rclone then either
+# sees a size/md5 diff (the file changed between copy and check) OR gets a transient
+# read/hash ERROR (the file was mid-rotation / locked when it tried to hash it). That
+# night produced 8 benign volatile diffs plus ~13 transient errors; rclone's OWN retry
+# (--retries default 3) re-ran the check and reconciled the transient errors away (the
+# FINAL summary was 8/8), but the run still failed on a stale first-attempt error count
+# (see parse_check_output's note). None of these paths are irreplaceable — they are all
+# REGENERABLE desk state, NOT warehouse/raw market data — so there is nothing lost by not
+# re-hashing them in the long deep pass. They are still COPIED to the remote every run
+# (copy is untouched); they are simply not part of the byte-for-byte proof.
+#
+# CRITICAL: this list must NEVER exclude warehouse/raw/** (the write-once, irreplaceable
+# market data). Only the *_manifest.json INDEX sidecar inside warehouse/raw is excluded,
+# exactly as it is already treated as tier-2 volatile — it is an index, not warehouse
+# data, and is rewritten every time the collector adds a file. Every .parquet under
+# warehouse/raw stays fully in the deep check, so real corruption still fails tier-1.
+#
+# Applied to the DEEP check ONLY. An INCREMENTAL check is scoped by --files-from to
+# exactly the files THIS run copied and must verify all of them (its `proves` string
+# claims those files), so these excludes are NOT applied there; the tier-2 classifier
+# already forgives benign churn in that short pass. These mirror VOLATILE_PATTERNS, as
+# rclone-filter globs (a non-rooted pattern matches at any depth; '*' does not cross '/').
+CHECK_ONLY_EXCLUDES = [
+    "state/**",                       # running desk state: journals, watchdog logs, etc.
+    "*.log",                          # any log, any depth (heartbeat_alarm.log, theta_watchdog.log …)
+    "*.jsonl",                        # append-only run journals (state/paperbot/runs.jsonl)
+    "*.db", "*.db-wal", "*.db-shm",   # sqlite dbs + their journals (conductor/conductor.db)
+    "*.sqlite", "*.sqlite-wal", "*.sqlite-shm",
+    "*_manifest.json", "*manifest*.json",  # warehouse INDEX sidecars (NOT the .parquet data)
+    "*heartbeat*",                    # heartbeat files exist to be re-stamped
+    "*_progress*.json", "*_state.json",    # long-running collector progress/state
+    "*.lock",                         # lock files appear/change for a running job's life
+    "s8_pilot/logs/**",               # live pilot logs, written by a concurrent session
+    "warehouse/register_forward_live.ps1",  # rewritten in place by a running job
+    "warehouse/run_forward_live.bat",
+]
+
+# Machine-readable per-path report files rclone check writes (one path per line). Driving
+# classification off THESE instead of scraping human-readable stderr is the robust half of
+# the #56 fix: a long check emits MULTIPLE stderr summary blocks (rclone retries the whole
+# operation on error), so the scraped "N errors" count can be a STALE first-attempt figure
+# that no longer matches the reconciled per-file lines — the exact "13 unaccounted" gap
+# that failed 2026-07-23. These files carry the FINAL reconciled result, one path per line,
+# with the report FLAG itself naming the kind (differ / error / missing) — no summary-count
+# vs per-line reconciliation to get wrong. They live under BACKUP_DIR (EXCLUDES), so they
+# are never themselves backed up, and are empty on a clean run.
+CHECK_DIFFER_FILE = Path(os.environ.get(
+    "TRADINGDESK_DATA_BACKUP_DIFFER", str(BACKUP_DIR / "data_backup_check_differ.txt")))
+CHECK_ERROR_FILE = Path(os.environ.get(
+    "TRADINGDESK_DATA_BACKUP_ERROR", str(BACKUP_DIR / "data_backup_check_error.txt")))
+CHECK_MISSING_DST_FILE = Path(os.environ.get(
+    "TRADINGDESK_DATA_BACKUP_MISSING_DST",
+    str(BACKUP_DIR / "data_backup_check_missing_dst.txt")))
+
 # Same parallelism the first full sync used. rclone's own defaults are lower; 8/8 was
 # chosen for the 464k-file warehouse.
 TRANSFERS = "8"
@@ -427,7 +487,8 @@ def copy_argv(rclone_path: str, dry_run: bool = False, deep: bool = True) -> lis
     return argv
 
 
-def check_argv(rclone_path: str, files_from: str | None = None) -> list[str]:
+def check_argv(rclone_path: str, files_from: str | None = None,
+               deep: bool = False, with_reports: bool = True) -> list[str]:
     """`rclone check SRC REMOTE` — recompute + compare hashes (md5) local vs remote.
     This is the integrity proof. rclone check compares by hash by default when both
     ends support it (Google Drive does), so no extra flag is needed to make it a
@@ -440,9 +501,27 @@ def check_argv(rclone_path: str, files_from: str | None = None) -> list[str]:
     files_from (incremental mode only) scopes the check to exactly the paths listed in
     that file — the ones this run actually copied. With no files_from the check is the
     original full-scope pass over everything.
+
+    deep=True adds CHECK_ONLY_EXCLUDES so the long full pass does NOT re-hash the live
+    live-churn state (regenerable logs/heartbeats/dbs, never warehouse/raw data) that
+    would otherwise churn or transiently error across the multi-hour window (#56).
+    Applied to the DEEP pass ONLY: an incremental check is scoped by --files-from to the
+    exact files this run copied and must verify all of them.
+
+    with_reports=True (real runs) adds --differ/--error/--missing-on-dst so rclone writes
+    the machine-readable per-path result of THIS check to files. Classification is driven
+    off those files, not scraped stderr — see the CHECK_*_FILE note. (Tests that build a
+    canned proc leave this off / ignore it and exercise the stderr-fallback path.)
     """
     argv = [rclone_path, "check", str(DATA_SOURCE), RCLONE_REMOTE]
     argv += _base_flags()
+    if deep and files_from is None:
+        for ex in CHECK_ONLY_EXCLUDES:
+            argv += ["--exclude", ex]
+    if with_reports:
+        argv += ["--differ", str(CHECK_DIFFER_FILE),
+                 "--error", str(CHECK_ERROR_FILE),
+                 "--missing-on-dst", str(CHECK_MISSING_DST_FILE)]
     # --one-way: verify every LOCAL file is present + byte-identical on the remote,
     # but DO NOT report files that exist only on the remote. This is REQUIRED by the
     # copy-not-sync design (see the COPY-NOT-SYNC note in the module docstring): `rclone
@@ -463,10 +542,48 @@ def _run_copy(rclone_path: str, dry_run: bool, deep: bool = True):
                           text=True, timeout=RCLONE_TIMEOUT, check=False)
 
 
-def _run_check(rclone_path: str, files_from: str | None = None):
-    return subprocess.run(check_argv(rclone_path, files_from=files_from),
-                          capture_output=True, text=True, timeout=RCLONE_TIMEOUT,
-                          check=False)
+def _read_report(path: Path) -> list[str] | None:
+    """rclone report file -> list of non-empty path lines, or None if it does not exist.
+
+    None means "rclone did not write this report" (it never ran, or crashed before it
+    could) and is distinct from an EMPTY list ("rclone wrote it and there were no such
+    paths") — the caller must not read absence as a clean result.
+    """
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except OSError:
+        return None
+    return [ln.strip() for ln in raw.splitlines() if ln.strip()]
+
+
+def _run_check(rclone_path: str, files_from: str | None = None, deep: bool = False):
+    """Run `rclone check` and attach the machine-readable per-path reports to the proc.
+
+    The three report files are DELETED first so a stale file from a previous run can never
+    be mistaken for this run's result, then rclone rewrites them. After the run they are
+    read back and attached as proc.reports = {"differ": [...], "error": [...],
+    "missing": [...]}; run_backup drives classification off that dict rather than scraping
+    stderr. If rclone never wrote the differ report, proc.reports is None and run_backup
+    falls back to the stderr parse (the pre-#56 path).
+    """
+    for f in (CHECK_DIFFER_FILE, CHECK_ERROR_FILE, CHECK_MISSING_DST_FILE):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    proc = subprocess.run(
+        check_argv(rclone_path, files_from=files_from, deep=deep, with_reports=True),
+        capture_output=True, text=True, timeout=RCLONE_TIMEOUT, check=False)
+    differ = _read_report(CHECK_DIFFER_FILE)
+    if differ is None:
+        proc.reports = None
+    else:
+        proc.reports = {
+            "differ": differ,
+            "error": _read_report(CHECK_ERROR_FILE) or [],
+            "missing": _read_report(CHECK_MISSING_DST_FILE) or [],
+        }
+    return proc
 
 
 # --------------------------------------------------------------------------- #
@@ -769,6 +886,39 @@ def parse_check_errors(text: str) -> list[dict]:
     return found
 
 
+def build_diffs_from_reports(reports: dict) -> list[dict]:
+    """rclone's machine-readable report files -> [{path, reason, kind}], the SAME shape
+    parse_check_errors produces, so the identical tier classifier runs on it.
+
+    This is the robust replacement for scraping stderr summary counts (#56). Each report
+    file lists one path per line and the FLAG names the kind, so there is no summary-count
+    vs per-file-line reconciliation to get wrong, and a multi-attempt (retried) check's
+    stale first-attempt counts cannot inflate the accounting:
+        differ  (--differ)        -> kind "differ"  (present both sides, bytes differ)
+        error   (--error)         -> kind "error"   (could not read/hash -> tier 1)
+        missing (--missing-on-dst)-> kind "missing" (local file not on the remote)
+    Deduped by path; a path reported in more than one file keeps its first (most severe:
+    differ/error before missing) classification.
+    """
+    found: list[dict] = []
+    seen: set[str] = set()
+    ordered = (
+        [("differ", p) for p in reports.get("differ", [])] +
+        [("error", p) for p in reports.get("error", [])] +
+        [("missing", p) for p in reports.get("missing", [])]
+    )
+    reasons = {"differ": "differ (rclone --differ report)",
+               "error": "error reading or hashing (rclone --error report)",
+               "missing": "file not in destination (rclone --missing-on-dst report)"}
+    for kind, raw in ordered:
+        path = normalise_path(raw)
+        if not path or path in seen:
+            continue
+        seen.add(path)
+        found.append({"path": path, "reason": reasons[kind], "kind": kind})
+    return found
+
+
 def is_volatile(path: str) -> bool:
     """True iff the path matches an EXPLICIT known-volatile pattern (tier 2)."""
     p = normalise_path(path)
@@ -833,6 +983,15 @@ def classify_difference(diff: dict, *, run_start: float, mtime_fn=None) -> dict:
         out.update(tier=1, why="changed file that matches no known-volatile pattern — "
                                "failing closed; if this is legitimate churn, add it to "
                                "VOLATILE_PATTERNS deliberately, with a reason")
+        return out
+
+    if kind == "error":
+        # rclone could not read or hash the file (locked, mid-rotation, I/O error, API
+        # failure). Unverifiable is not verified — the same rule as "hashes could not be
+        # checked". Fail closed regardless of where the file lives.
+        out.update(tier=1, why="rclone reported an error reading or hashing this file "
+                               "(--error report) — unverifiable is not verified, "
+                               "failing closed")
         return out
 
     out.update(tier=1, why=f"unrecognised rclone check reason {diff['reason']!r} — a "
@@ -1156,8 +1315,8 @@ def run_backup(*, now=None, dry_run: bool = False, mode: str = "auto", resolve_f
                          f"run an unscoped or unverified check")
 
     try:
-        cproc = check_fn(rclone_path) if files_from is None else check_fn(
-            rclone_path, files_from=files_from)
+        cproc = check_fn(rclone_path, deep=(mode == "deep")) if files_from is None else \
+            check_fn(rclone_path, files_from=files_from, deep=False)
     except subprocess.TimeoutExpired as e:
         return _fail(f"rclone check TIMED OUT after {RCLONE_TIMEOUT}s ({e!r})")
     except Exception as e:  # noqa: BLE001
@@ -1173,20 +1332,47 @@ def run_backup(*, now=None, dry_run: bool = False, mode: str = "auto", resolve_f
     # 4a. CLASSIFY. rclone check exits non-zero on ANY difference, and the first real run
     #     proved that most nightly differences are harmless live-file churn (see the
     #     three-tier section of the module docstring). So instead of blanket-failing on a
-    #     non-zero exit, we account for EVERY reported problem with a per-file ERROR line
-    #     and sort each one into a tier. The bar is unchanged where it matters: ZERO
-    #     tier-1 failures, and anything we cannot explain IS a tier-1 failure.
-    diffs = errors_fn(ccombined)
+    #     non-zero exit, we account for EVERY reported problem and sort each into a tier.
+    #     The bar is unchanged where it matters: ZERO tier-1 failures, and anything we
+    #     cannot explain IS a tier-1 failure.
+    #
+    #     SOURCE OF THE PER-PATH PROBLEMS (#56). Prefer rclone's machine-readable report
+    #     files (proc.reports, written via --differ/--error/--missing-on-dst): they carry
+    #     the FINAL reconciled result, one path per line, the flag naming the kind — so
+    #     there is NO summary-count vs per-file-line reconciliation to get wrong, and a
+    #     retried multi-attempt check's stale first-attempt counts cannot manufacture a
+    #     phantom "unaccounted" failure (the exact 2026-07-23 bug). If the reports are
+    #     absent (proc.reports is None — a test double, or rclone crashed before writing
+    #     them) fall back to scraping the per-file ERROR lines out of stderr, the pre-#56
+    #     path, still gated by required_accounted below.
+    reports = getattr(cproc, "reports", None)
+    if reports is not None:
+        diffs = build_diffs_from_reports(reports)
+        st["check_result"] = (
+            f"reports: differ={len(reports.get('differ', []))}, "
+            f"error={len(reports.get('error', []))}, "
+            f"missing_on_dst={len(reports.get('missing', []))}"
+            + (f"; {parsed['summary']}" if parsed.get("summary") else ""))
+    else:
+        diffs = errors_fn(ccombined)
     classified = classify_differences(diffs, run_start=run_start, mtime_fn=mtime_fn)
     tier1 = [d for d in classified if d["tier"] == 1]
     tier2 = [d for d in classified if d["tier"] == 2]
     tier3 = [d for d in classified if d["tier"] == 3]
 
-    # Unverifiable is NOT verified: a hash rclone could not compute proves nothing, and
-    # it produces no per-file path to classify, so it is its own tier-1 condition.
-    unchecked = parsed.get("hashes_unchecked") or 0
-    # Reported problems with no per-file ERROR line to explain them.
-    unaccounted = max(0, required_accounted(parsed) - len(classified))
+    if reports is not None:
+        # The reports ARE the complete per-path result — every non-identical path is a
+        # line, and each line is now classified. There is nothing left to reconcile, so
+        # the stderr-summary accounting gates do not apply.
+        unchecked = 0
+        unaccounted = 0
+    else:
+        # STDERR FALLBACK. Unverifiable is NOT verified: a hash rclone could not compute
+        # produces no per-file path to classify, so it is its own tier-1 condition. And a
+        # reported problem with no per-file ERROR line to explain it is unaccounted, hence
+        # a tier-1 failure — never a benign one.
+        unchecked = parsed.get("hashes_unchecked") or 0
+        unaccounted = max(0, required_accounted(parsed) - len(classified))
 
     st["hard_failures"] = [{"path": d["path"], "reason": d["reason"], "why": d["why"]}
                            for d in tier1]

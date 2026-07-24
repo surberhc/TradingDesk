@@ -1114,3 +1114,225 @@ def test_status_records_the_mode_and_why(tmp_path):
     st, _ = _incremental(tmp_path, last_deep="2026-07-10T21:00:00")
     assert st["mode"] == "incremental"
     assert "explicitly requested" in st["mode_why"]
+
+
+# --------------------------------------------------------------------------- #
+# #56 — DRIVE THE CHECK OFF rclone's MACHINE-READABLE REPORT FILES, not stderr.
+#
+# The 2026-07-23 deep check ran 21:00 -> 03:21 and FAILED, not on corruption but on a
+# PARSER GAP. A multi-hour check re-hashes ~863k files while the desk's live files churn;
+# rclone's default --retries 3 re-ran the whole check, so stderr accumulated MULTIPLE
+# summary blocks. The FIRST "N errors" line (attempt 1: 8 real volatile diffs + 13
+# transient read/hash errors = "21 errors while checking") was scraped by parse_check_output,
+# while rclone's own retry reconciled the transient errors away and the FINAL summary was
+# "8 differences / 8 errors". required_accounted=max(8,21)=21 but only 8 per-file ERROR
+# lines were classifiable -> 13 "unaccounted" -> fail closed on data that was fine.
+#
+# The fix: classify off rclone's --differ/--error/--missing-on-dst report files (one path
+# per line, FINAL reconciled state, the flag names the kind), so there is no summary-count
+# vs per-file-line reconciliation to get wrong; AND exclude the regenerable live-churn
+# paths from the DEEP check so they cannot diff/error during the long window. warehouse/raw
+# stays fully checked, so tier-1 corruption detection is intact.
+# --------------------------------------------------------------------------- #
+
+# The EXACT stderr shape the 2026-07-23 run produced: two summary blocks with DIFFERENT
+# error counts (21 then 8), which is what fooled the first-match stderr scrape. Captured
+# from the failed run's status JSON (final block) + rclone 1.74.4's "errors while checking"
+# wording (verified live). Kept here to prove the decision no longer consults it.
+REAL_2026_07_23_STDERR = (
+    "2026/07/23 23:10:04 ERROR : state/last_email_ok.txt: sizes differ\n"
+    "2026/07/23 23:10:04 ERROR : Google drive root 'TradingDesk-DataBackup': "
+    "8 differences found\n"
+    "2026/07/23 23:10:04 ERROR : Google drive root 'TradingDesk-DataBackup': "
+    "21 errors while checking\n"
+    "2026/07/23 23:10:04 NOTICE: Google drive root 'TradingDesk-DataBackup': "
+    "863283 matching files\n"
+    "2026/07/23 23:10:04 ERROR : Failed to check with 21 errors: last error was: "
+    "8 differences found\n"
+    # ... rclone retried; the FINAL, reconciled block ...
+    "2026/07/24 03:21:17 NOTICE: Google drive root 'TradingDesk-DataBackup': "
+    "8 differences found\n"
+    "2026/07/24 03:21:17 NOTICE: Google drive root 'TradingDesk-DataBackup': "
+    "8 errors while checking\n"
+    "2026/07/24 03:21:17 NOTICE: Google drive root 'TradingDesk-DataBackup': "
+    "863283 matching files\n"
+    "2026/07/24 03:21:17 NOTICE: Failed to check with 8 errors: last error was: "
+    "8 differences found\n")
+
+# The 8 live-churn paths that legitimately differed that night (from the status JSON).
+REAL_2026_07_23_VOLATILE = [
+    "state/last_email_ok.txt",
+    "warehouse/heartbeat_alarm.log",
+    "warehouse/heartbeat_alarm_ran.txt",
+    "warehouse/heartbeat_alarm_state.json",
+    "state/backfill/backfill_watchdog.log",
+    "state/backfill/backfill_watchdog_heartbeat.txt",
+    "warehouse/theta_watchdog.log",
+    "warehouse/theta_watchdog_heartbeat.txt",
+]
+
+
+def _proc_reports(returncode=1, stderr="", differ=None, error=None, missing=None):
+    """A check proc carrying rclone's machine-readable report files, as _run_check attaches
+    them. Its presence routes run_backup down the report-driven path."""
+    p = _proc(returncode, stderr=stderr)
+    p.reports = {"differ": list(differ or []), "error": list(error or []),
+                 "missing": list(missing or [])}
+    return p
+
+
+def test_56_stale_stderr_summary_no_longer_fails_when_reports_are_clean(tmp_path):
+    """THE #56 REGRESSION. With the churn excluded from the deep check, the 8 volatile
+    files never enter the report -> reports are empty and rclone exits 0. The misleading
+    '21 errors' still sitting in stderr must NOT fail the run, because the decision is now
+    made off the reports, not the scraped summary."""
+    proc = _proc_reports(returncode=0, stderr=REAL_2026_07_23_STDERR)  # all reports empty
+    st, f = _run(tmp_path, None, check_fn=Recorder(proc))
+    assert st["ok"] is True
+    assert f["heartbeat_fn"].calls == 1
+    assert st["hard_failures"] == []
+    assert not any("unaccounted" in e or "could not be accounted" in e
+                   for e in st["errors"])
+
+
+def test_56_volatile_diffs_in_reports_are_benign_without_the_unaccounted_phantom(tmp_path):
+    """Even if some volatile files DO reach the differ report (e.g. a churn path not
+    excluded), they classify tier-2 benign and the run succeeds — and the stale '21 errors'
+    stderr summary can no longer inflate required_accounted into a phantom failure, because
+    the report path does not use it."""
+    proc = _proc_reports(returncode=1, stderr=REAL_2026_07_23_STDERR,
+                         differ=REAL_2026_07_23_VOLATILE)
+    st, f = _run(tmp_path, None, check_fn=Recorder(proc), mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is True
+    assert f["heartbeat_fn"].calls == 1
+    assert st["hard_failures"] == []
+    assert st["benign_differences"]["count"] == 8
+    assert st["benign_differences"]["tier2_known_volatile"] == 8
+    assert not any("could not be accounted" in e for e in st["errors"])
+
+
+def test_56_genuine_warehouse_raw_corruption_in_differ_report_still_fails_tier1(tmp_path):
+    """The guarantee the fix must NOT blunt: a real .parquet difference under warehouse/raw
+    is corruption. It reaches the differ report and must fail tier-1, cold heartbeat."""
+    proc = _proc_reports(returncode=1,
+                         differ=["warehouse/raw/options/spy/2024-01-02.parquet"])
+    st, f = _run(tmp_path, None, check_fn=Recorder(proc), mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert len(st["hard_failures"]) == 1
+    assert st["hard_failures"][0]["path"] == "warehouse/raw/options/spy/2024-01-02.parquet"
+    assert "TIER-1" in st["proves"]
+    assert "2024-01-02.parquet" in st["proves"]
+
+
+def test_56_error_report_entry_is_tier1_unverifiable(tmp_path):
+    """A path in the --error report means rclone could not read or hash it. Unverifiable is
+    not verified — tier 1, wherever it lives."""
+    proc = _proc_reports(returncode=1,
+                         error=["warehouse/raw/options/x.parquet"])
+    st, f = _run(tmp_path, None, check_fn=Recorder(proc), mtime_fn=lambda p: BEFORE_RUN)
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+    assert len(st["hard_failures"]) == 1
+    assert "unverifiable is not verified" in st["hard_failures"][0]["why"]
+
+
+def test_56_missing_on_dst_report_uses_the_same_mtime_tier_rule(tmp_path):
+    """A file in --missing-on-dst is a local file not on the remote. Created-during-run ->
+    benign tier 3; existed-before-run -> tier 1 (should have been backed up and wasn't)."""
+    during = _proc_reports(returncode=1, missing=["s8_pilot/logs/pilot.log"])
+    st, f = _run(tmp_path, None, check_fn=Recorder(during), mtime_fn=lambda p: DURING_RUN)
+    assert st["ok"] is True
+    assert st["benign_differences"]["tier3_created_during_run"] == 1
+
+    before = _proc_reports(returncode=1, missing=["warehouse/raw/options/old.parquet"])
+    st2, f2 = _run(tmp_path, None, check_fn=Recorder(before), mtime_fn=lambda p: BEFORE_RUN)
+    assert st2["ok"] is False
+    assert f2["heartbeat_fn"].calls == 0
+    assert "existed BEFORE the run" in st2["hard_failures"][0]["why"]
+
+
+def test_56_reports_present_but_empty_with_nonzero_exit_fails_closed(tmp_path):
+    """Safety net: reports say nothing yet rclone exited non-zero -> unexplained, fail
+    closed. A non-zero exit with no per-path evidence is never blessed."""
+    proc = _proc_reports(returncode=1)  # all empty, but rc=1
+    st, f = _run(tmp_path, None, check_fn=Recorder(proc))
+    assert st["ok"] is False
+    assert f["heartbeat_fn"].calls == 0
+
+
+# --- build_diffs_from_reports ------------------------------------------------------- #
+def test_build_diffs_from_reports_maps_each_flag_to_its_kind():
+    diffs = db.build_diffs_from_reports({
+        "differ": ["a/x.parquet"],
+        "error": ["b/y.log"],
+        "missing": ["c/z.txt"]})
+    kinds = {d["path"]: d["kind"] for d in diffs}
+    assert kinds == {"a/x.parquet": "differ", "b/y.log": "error", "c/z.txt": "missing"}
+
+
+def test_build_diffs_from_reports_dedups_keeping_most_severe():
+    """A path in both differ and missing keeps the differ (listed first) classification."""
+    diffs = db.build_diffs_from_reports({
+        "differ": ["dup/path.parquet"], "error": [], "missing": ["dup/path.parquet"]})
+    assert len(diffs) == 1
+    assert diffs[0]["kind"] == "differ"
+
+
+def test_build_diffs_from_reports_normalises_separators():
+    diffs = db.build_diffs_from_reports(
+        {"differ": [r"warehouse\raw\x.parquet"], "error": [], "missing": []})
+    assert diffs[0]["path"] == "warehouse/raw/x.parquet"
+
+
+def test_build_diffs_from_reports_empty_is_no_diffs():
+    assert db.build_diffs_from_reports({"differ": [], "error": [], "missing": []}) == []
+
+
+# --- check_argv: churn excludes (deep only) + report flags --------------------------- #
+def test_check_argv_deep_excludes_the_live_churn_but_NOT_warehouse_raw():
+    """The DEEP full check drops regenerable live-churn state so it cannot diff/error over
+    the multi-hour window — but warehouse/raw (the irreplaceable data) stays fully in scope
+    so real corruption still pages."""
+    argv = db.check_argv(r"C:\fake\rclone.exe", deep=True)
+    excluded = [argv[i + 1] for i, a in enumerate(argv) if a == "--exclude"]
+    assert "state/**" in excluded
+    assert "*.log" in excluded
+    assert "*heartbeat*" in excluded
+    assert "*.db" in excluded
+    # The irreplaceable data must NEVER be excluded from the deep check.
+    assert not any("warehouse/raw" in e for e in excluded)
+    assert not any(e == "*.parquet" for e in excluded)
+
+
+def test_check_argv_incremental_does_NOT_apply_the_churn_excludes():
+    """An incremental check is scoped by --files-from to exactly what this run copied and
+    must verify all of it, so the churn excludes (a deep-only optimisation) are not added."""
+    argv = db.check_argv(r"C:\fake\rclone.exe", files_from=r"C:\tmp\list.txt", deep=False)
+    excluded = [argv[i + 1] for i, a in enumerate(argv) if a == "--exclude"]
+    assert "state/**" not in excluded
+    assert "*.log" not in excluded
+    # base excludes are still present in both paths
+    assert "venv/**" in excluded
+
+
+def test_check_argv_writes_the_machine_readable_report_files():
+    argv = db.check_argv(r"C:\fake\rclone.exe")
+    assert "--differ" in argv and argv[argv.index("--differ") + 1] == str(db.CHECK_DIFFER_FILE)
+    assert "--error" in argv and argv[argv.index("--error") + 1] == str(db.CHECK_ERROR_FILE)
+    assert "--missing-on-dst" in argv
+    assert argv[argv.index("--missing-on-dst") + 1] == str(db.CHECK_MISSING_DST_FILE)
+
+
+def test_check_report_files_live_under_an_EXCLUDED_dir_so_they_are_never_backed_up():
+    for f in (db.CHECK_DIFFER_FILE, db.CHECK_ERROR_FILE, db.CHECK_MISSING_DST_FILE):
+        assert str(db.BACKUP_DIR).lower() in str(f).lower()
+    assert "backups/**" in db.EXCLUDES
+
+
+def test_error_kind_classifies_tier1():
+    """Direct unit check of the new 'error' kind in the classifier."""
+    out = db.classify_difference(
+        {"path": "warehouse/raw/x.parquet", "reason": "error", "kind": "error"},
+        run_start=BEFORE_RUN)
+    assert out["tier"] == 1
