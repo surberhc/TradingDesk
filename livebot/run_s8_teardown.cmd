@@ -39,4 +39,11 @@ if not exist "%BASE_PY%" (
 )
 
 "%BASE_PY%" -u "%REPO%\livebot\s8_reap.py" --all
-endlocal & exit /b %ERRORLEVEL%
+set "REAP_RC=%ERRORLEVEL%"
+
+REM --- Also reap any ORPHANED live-trade Gateway (java bound to no port) ---
+REM  See livebot\s8_gateway_reap.py. Best-effort, always exits 0, and it SPARES the
+REM  process that owns port 4003 (the live gateway) plus any still within boot grace.
+"%BASE_PY%" -u "%REPO%\livebot\s8_gateway_reap.py"
+
+endlocal & exit /b %REAP_RC%

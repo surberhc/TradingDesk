@@ -236,6 +236,18 @@ Do not assert a cause without evidence. This is logged as open.
 
 ---
 
+## Follow-up RESOLVED — 2026-07-24: orphan reaped + orphan-prevention built
+
+- The residual orphan `java` pid 29236 was reaped 2026-07-24 (verified: port 4003 stayed owned by the healthy gateway pid 26956 throughout).
+- Built a standing fix for the recurring orphan class (enforces the port-4003 invariant: exactly one `C:\IBC-Live-Trade` gateway, and it must own 4003):
+  - `livebot/s8_gateway_reap.py` — orphan reaper. Positive-ID by the FULL install dir `C:\IBC-Live-Trade` (never the bare `C:\IBC` prefix — the root cause of this incident's mis-kill); never kills the 4003 owner; 180s boot grace so a still-binding gateway is spared; refuses all if the port owner or process scan is undeterminable; never raises. 12 offline tests.
+  - `livebot/run_live_trade_gateway_open.cmd` — port-aware idempotent cold-start wrapper: reap orphans, then launch `StartGatewayLiveTrade.bat` ONLY if 4003 has no listener (fail-open). Scheduled task `LiveTradeGatewayOpen_0815CT` repointed to it (machine-side).
+  - `livebot/run_s8_teardown.cmd` — the 15:05 teardown now also runs the gateway reaper (the regular clean).
+  - `connections/connections/ibkr_live_trade.py` — `ensure_gateway()` now re-checks `port_listening()` before spawning and refuses to stack a second launch (closes the self-heal race path).
+- NOT fixed here (separate item): the `C:\IBC` prefix-match kill bug in `gateway_watchdog._kill_gateway_processes()` that started this incident by killing the live gateway from a paper-lane arm. That remains open.
+
+---
+
 ## 9. Operational lesson — read this before running `arming.py`
 
 **`paperbot\arming.py arm` is NOT safe to run while any other Gateway instance is up, until the

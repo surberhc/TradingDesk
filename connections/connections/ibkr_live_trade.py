@@ -45,6 +45,7 @@ import os
 import socket
 import subprocess
 import time
+from typing import Optional
 
 from ib_async import IB, Stock
 
@@ -162,6 +163,21 @@ def _poll_until_up(wait_secs: int) -> bool:
     return False
 
 
+def port_listening(port: int = LIVE_TRADE_PORT, host: Optional[str] = None,
+                   timeout: float = 2.0) -> bool:
+    """True if something is already accepting TCP connections on ``port`` — i.e. a Gateway
+    is bound to it — independent of whether it is logged in and serving DATA yet. Used to
+    avoid stacking a SECOND StartGatewayLiveTrade.bat launch on top of a gateway that is
+    already bound / still booting, which is exactly how an unbound orphan is created
+    (incident 2026-07-23). A bare socket probe, never a data round-trip."""
+    h = host if host is not None else HOST
+    try:
+        with socket.create_connection((h, int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 def ensure_gateway(wait_secs: int = 180) -> bool:
     """Make sure the live-trading Gateway is up; launch it (IBC auto-login) if not.
     Returns True once it's serving data, False if it never came up within wait_secs.
@@ -241,6 +257,22 @@ def ensure_gateway(wait_secs: int = 180) -> bool:
 
     if not is_launcher:
         # Exhausted reclaim attempts without winning the lock -> wait, don't launch.
+        return _poll_until_up(wait_secs)
+
+    # ORPHAN-PREVENTION: we hold the launch lock, but re-check the PORT before spawning.
+    # If a gateway is ALREADY bound to 4003 (a sibling launch path — the scheduled
+    # cold-start, or a prior self-heal — won the bind while we were acquiring the lock),
+    # launching a second StartGatewayLiveTrade.bat here would create the exact unbound
+    # orphan this guards against (incident 2026-07-23). Release our lock and wait instead.
+    if port_listening(LIVE_TRADE_PORT):
+        print("ensure_gateway: port 4003 already has a listener; NOT launching a second "
+              "gateway (orphan-prevention). Releasing lock and waiting for it to serve.")
+        try:
+            rec = _read_lock_record(GATEWAY_LAUNCH_LOCK)
+            if rec is not None and int(rec.get("pid") or 0) == os.getpid():
+                os.unlink(GATEWAY_LAUNCH_LOCK)
+        except OSError:
+            pass
         return _poll_until_up(wait_secs)
 
     # We are the sole launcher. Popen EXACTLY ONCE, then poll.
