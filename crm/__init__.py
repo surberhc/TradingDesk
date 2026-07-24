@@ -1,0 +1,1 @@
+"""CRM 'brain' domain model (conductor #42/#43, per docs/CRM_DESIGN_groups_brain.md Option A). Pure/offline: templates, sleeves, account assignments + audit, and the derived capability-requirements and FA-group-membership. No broker, no transport (open question §8), no blessed weights (rule #1)."""
