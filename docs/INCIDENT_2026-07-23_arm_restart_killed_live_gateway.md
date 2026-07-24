@@ -2,8 +2,10 @@
 
 **Severity:** High — an unrelated PAPER-lane operation destroyed a **live, funded-account**
 pilot's Gateway, and reported success while doing it.
-**Status:** Recovered (2m51s outage). Root cause identified and confirmed in code. **Fix NOT
-implemented** — proposed below. One orphan process still running (see Follow-ups).
+**Status:** Recovered (2m51s outage). Root cause identified and confirmed in code. **Fix
+IMPLEMENTED** in commit `de7a999` (conductor #46): the kill discriminator is now
+instance-exact with a hard never-kill guard for the other lanes, and all three call sites
+are lane-scoped. Residual orphan reaped 2026-07-24 (see the RESOLVED follow-up below).
 **All times CDT (UTC-05:00), the box's local time.**
 
 ---
@@ -147,7 +149,9 @@ it outright would reintroduce that gap; it needs to be made *exact*, not deleted
 
 ---
 
-## 6. The fix — **PROPOSED, not implemented**
+## 6. The fix — **IMPLEMENTED in commit de7a999 (conductor #46)**
+
+> Implemented 2026-07-24 as described below. Verified: `_kill_gateway_processes()` is instance-exact (`should_kill` + `foreign_instance_marker`), all three call sites pass an explicit `GatewayInstance`, and tests are green — `connections/test_gateway_watchdog.py` 31 passed (incl. a live-trade-instance case and the incident regression), `paperbot/test_gateway_arm_restart_elevated.py` 11 passed.
 
 ### 6.1 Primary: make the directory discriminator exact, not a prefix
 
