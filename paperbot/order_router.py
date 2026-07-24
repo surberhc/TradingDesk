@@ -19,12 +19,20 @@ skip). whatIfOrder is NEVER used (known hang).
 """
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 
 from ib_async import (LimitOrder, Order, PriceCondition, Stock, TagValue,
-                      TimeCondition)
+                      TimeCondition, util)
 
 import config
+
+# HARD TIMEOUT (seconds) for a single what-if request. ib_async's whatIfOrder has NO
+# timeout (IB.RequestTimeout defaults to 0 = wait forever), so a what-if that never
+# resolves — the FA/transmit-flag hang, see docs/IBKR_API_CURRENCY.md §3.1 and what_if()
+# below — would otherwise wedge the loop over `built` indefinitely. 10s is generous for a
+# genuine margin/commission round-trip and short enough that a hung request is abandoned.
+WHATIF_TIMEOUT_SEC = 10.0
 
 
 # =============================================================================
@@ -628,15 +636,40 @@ def place_laddered(ib, *, symbol, side, total_qty, caps, instrument_class,
     return result
 
 
-def what_if(ib, built) -> list:
+def what_if(ib, built, *, timeout: float | None = None) -> list:
     """Validate each order WITHOUT transmitting: IBKR returns margin + commission and,
     crucially, whether it would accept the order at all (e.g. an FA master may reject a
-    direct, unallocated order). Sends a what-if message only — never a live order."""
+    direct, unallocated order). Sends a what-if message only — never a live order.
+
+    HARD TIMEOUT (BUG #48): `ib.whatIfOrder` sets whatIf=True but NOT transmit, which trips
+    IBKR error 321 ("What-If order should have transmit flag set to TRUE"). IBKR delivers
+    321 as an error EVENT that never resolves the request future, and ib_async's whatIfOrder
+    has no timeout (IB.RequestTimeout defaults to 0), so the bare call HANGS FOREVER. A hang
+    is not an exception, so the try/except below can never catch it. We therefore drive the
+    async variant through ib_async's OWN event loop (util.run — the exact loop ib.whatIfOrder
+    uses internally, so we are not fighting it with a second loop) but with an explicit
+    WHATIF_TIMEOUT_SEC, so one hung request is abandoned and the loop over `built` moves on.
+
+    A timeout is treated as NO STATE RETURNED: None is appended and it is logged plainly. A
+    timeout is NEVER recorded as acceptance. Real rejections still arrive as exceptions and
+    keep their existing path (also -> None).
+
+    NOTE: setting transmit=True is NOT the fix. Even with transmit=True an FA group (block)
+    order returns nothing at all (docs/IBKR_API_CURRENCY.md §3.1; conductor #53), so the
+    timeout is the load-bearing backstop regardless of the transmit flag — and we never
+    flip transmit on a what-if copy here anyway."""
+    timeout = WHATIF_TIMEOUT_SEC if timeout is None else timeout
     print("    What-if validation (no transmission):")
     states = []
     for b in built:
         try:
-            state = ib.whatIfOrder(b.contract, b.order)
+            # asyncio.wait_for(whatIfOrderAsync(...), timeout) driven through ib_async's loop.
+            state = util.run(ib.whatIfOrderAsync(b.contract, b.order), timeout=timeout)
+        except asyncio.TimeoutError:
+            print(f"      {b.symbol:6s} what-if TIMED OUT after {timeout:g}s — NO STATE "
+                  f"RETURNED (recording None; a timeout is NEVER an acceptance).")
+            states.append(None)
+            continue
         except Exception as exc:
             print(f"      {b.symbol:6s} REJECTED by what-if: {exc}")
             states.append(None)
