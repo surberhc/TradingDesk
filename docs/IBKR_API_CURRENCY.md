@@ -123,6 +123,18 @@ conductor items **#26** and **#48** (the latter is the client-side timeout fix f
 > Still re-test at every review: a `ib_async` bump could fix the helper directly and make the preview
 > reachable without leaving `ib_async`.
 
+**Further corrected 2026-07-24 (client-version cap):** the "10.45.1g satisfies the preview gate, so the
+preview is reachable" reading above is **necessary but NOT sufficient.** The per-account `OrderAllocation`
+preview array is gated at TWS **server version >= 195** (`MIN_SERVER_VER_FULL_ORDER_PREVIEW_FIELDS = 195`),
+but **`ib_async` 2.1.0 advertises `MaxClientVersion = 178`** (**VERIFIED** at
+`C:\TradingDesk-Local\venv\Lib\site-packages\ib_async\client.py:89`) and the handshake caps the negotiated
+server version at what the client advertises — so through `ib_async` the negotiated version is 178 < 195 and
+the array is **never placed on the wire, regardless of gateway build.** Consequently the single live data
+point above (`transmit=True` -> FA master returned nothing) is **CONFOUNDED**: that test ran through
+`ib_async` at negotiated v178, so the empty result may simply be the version cap, **not** proof that a block
+what-if fails to populate the array. It is not evidence either way. See §3.9 item 2 for the full
+"necessary-not-sufficient" write-up and the port cross-confirmation of the 195 constant.
+
 ### 3.2 Per-subaccount executions — **VERIFIED-WITH-NUANCE 2026-07-23 pm** (master-connect returns equity legs; options/combos/closes stay master-only)
 
 **Original observation (live, 2026-07-23, paper account):** for an allocation (group/block) order,
@@ -293,6 +305,28 @@ citations.
    the inbound `OrderState.orderAllocations` preview array would need the official `ibapi` (or a port);
    `ib_async` is fully sufficient for the `faGroup`/`replaceFA` submission path we use.
 
+   **2a. Client-version cap makes the preview UNREACHABLE via `ib_async` — "necessary but not sufficient." (VERIFIED 2026-07-24.)**
+   The per-account `OrderAllocation` full-order-preview array is gated at TWS **server version >= 195**
+   (`MIN_SERVER_VER_FULL_ORDER_PREVIEW_FIELDS = 195`), cross-confirmed **field-for-field in two independent
+   wire-protocol ports** (scmhub/ibapi in Go, wboayue/rust-ibapi in Rust). But **`ib_async` 2.1.0 advertises
+   `MaxClientVersion = 178`** (**VERIFIED** at `C:\TradingDesk-Local\venv\Lib\site-packages\ib_async\client.py:89`),
+   and the handshake adopts a negotiated server version capped by what the client advertises
+   (`client.py:218-226` sends `v157..178`; `client.py:384-391` adopts the reply, which cannot exceed 178).
+   `ib_async` also has **zero** `OrderAllocation`/`FULL_ORDER_PREVIEW` support (grep of the installed package
+   is empty). So §3.1's "10.45.1g satisfies the preview gate, so the preview is reachable" is **necessary but
+   NOT sufficient — the 178 < 195 client cap is the real wall.** The array is **never placed on the wire
+   through `ib_async`, regardless of gateway build.** A decoder-only `ib_async` monkeypatch would read
+   NOTHING ("not sent," not "sent and discarded"), so the earlier notion of a "minimal `ib_async` port" is
+   wrong: a working port must **also** raise `MaxClientVersion` >= 195 **AND** make the outbound encoder emit
+   valid >= 195 messages (a fork of version negotiation + encoder, risky to the order path). Only the
+   **official `ibapi`** — which advertises a current `MaxClientVersion` >= 195, uses a **separate import
+   namespace**, and ships in the **TWS API download, not on PyPI (a NEW dependency)** — can actually receive
+   `orderState.orderAllocations`. **Open question (UNCONFIRMED):** whether an `faGroup` **BLOCK** what-if
+   (group set, no explicit account) even populates the array is resolvable only by a live test with official
+   `ibapi` connected as the master clientId — tracked as conductor **#57** (deferred follow-up). This also
+   confounds §3.1's single live data point (the `transmit=True` empty result ran through `ib_async` at
+   negotiated v178, so it is evidence neither way).
+
 3. **Two of the same-day recorded limitations were TEST ARTIFACTS, not IBKR limits** — corrected in §3.1
    and §3.2:
    - **Per-subaccount executions ARE obtainable via the API** (`reqExecutions` with `acctCode`/`execFilter`
@@ -363,6 +397,7 @@ citations.
 
 | Date | Trigger | What was checked | Outcome |
 |---|---|---|---|
+| **2026-07-24** | Trigger: conductor #53 evaluation (no gateway, no orders) | Checked `ib_async` client-version negotiation vs the `OrderAllocation` preview gate | Outcome: found `ib_async` 2.1.0 `MaxClientVersion=178` caps the negotiated version below `MIN_SERVER_VER_FULL_ORDER_PREVIEW_FIELDS=195`, so the per-account `OrderAllocation` preview is UNREACHABLE via `ib_async` regardless of gateway build; only official `ibapi` can receive it. Corrected §3.1/§3.9 ("10.45.1g satisfies 195" is necessary-not-sufficient). #53 EVALUATED->DEFER; opened #57 (deferred build gated on a live faGroup-block whatIf populate test + 2nd funded account). |
 | **2026-07-23** (pm paper test) | Live FA test, PAPER port 4002, connecting as **MASTER clientId 0** (reads only; orders placed/modified/cancelled, none real-money) | Re-ran `reqExecutions` per subaccount as master; ran Percent-group allocation on even/odd sizes; exercised place→modify→cancel on a resting FA block; timed `reqPositions` after fills. | §3.2 upgraded to **VERIFIED-WITH-NUANCE**: equity per-account `Execution.acctNumber` legs **DO** return as master (PDBC block), but **options/combos and closes stay master-only** → complete per-account options trail still needs Flex. Added: **Percent allocates fractional shares on odd sizes** (disqualifying for whole contracts) → unequal-whole-contract needs `ContractsOrShares` + structural per-order `replaceFA`; `EqualQuantity` odd-size rounding untested (open). Added: `reqPositions` needs ~4–5 s settle after a fill. FA block **modify/cancel lifecycle** proven. Settles conductor #52; opens EqualQuantity-rounding item. Detail in `docs\CRM_DESIGN_groups_brain.md` §13.7. |
 | **2026-07-23** (research pass) | FA-allocation deep research (documentation + wire-protocol cross-checks; no gateway, no orders) | IBKR Campus TWS API changelog, tws-api GitHub docs, 2025/2026 production release notes, and two independent wire-protocol ports (scmhub/ibapi Go, wboayue/rust-ibapi) reviewed for FA allocation + `OrderAllocation` semantics. | New **§3.9** research-findings subsection added. Established `OrderAllocation` is **inbound-only** (added 10.33, 2024-12-17) → §13.6 decision resolved to keep `faGroup`/`replaceFA` (conductor #50 closed). **Corrected two same-day "known constraints" as test artifacts:** §3.1 (what-if hang is an `ib_async` client bug, not a missing IBKR margin gate — per-account preview exists on 10.45.1g; HIGH) and §3.2 (per-subaccount executions *are* API-obtainable, likely master-client-id artifact — API doc HIGH, "clientId-35-is-why" a STRONG HYPOTHESIS not yet re-tested). §3.5/§3.8 reframed (`OrderAllocation` not a superseding submission path). §4 monitoring channels **populated** (Campus changelog + tws-api docs + annual release notes). No FA breaking changes in 10.35–10.48. Two conductor follow-ups opened (master-client-id reqExecutions re-test; reach whatIf preview via `ibapi`/patched transmit). |
 | **2026-07-23** | Initial — standing practice established (`CLAUDE.md` § *IBKR currency*) | Venv introspected (`ib_async` 2.1.0, aeventkit 2.1.0, nest-asyncio 1.6.0, Python 3.12.9, wire protocol 157–178). Gateway build read from `C:\Jts\ibgateway\1045\launcher.log` (**10.45.1g**, May 27 2026) and the `TWS_MAJOR_VRSN=1045` pin confirmed in all three IBC launchers. IBC **3.24.0** confirmed from `C:\IBC\version`. Repo grepped for the IBKR surfaces actually used (§2b). `Order` dataclass introspected: **no `OrderAllocation`**, legacy FA fields only. | Doc created. §3 seeded with two **live-verified** paper-account findings from the same-day FA block test: **what-if is unusable for FA allocation orders (error 321 + indefinite hang) — no pre-trade margin gate exists for FA blocks**; and **allocation executions return only at the FA master, never per subaccount**. Deprecation table opened; `reqFundamentalData` removal at **10.47** is the live clock (we are on 10.45.1g, and no repo code calls it — forward exposure only). §4 left explicitly **incomplete**. |
