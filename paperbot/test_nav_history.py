@@ -115,3 +115,71 @@ def test_append_skips_unenrolled_account(tmp_path, monkeypatch):
     nh.append_snapshot(date(2026, 7, 7), [{"account": "DU9999999", "net_liq": 500_000.0}])
 
     assert not p.exists()
+
+
+# --- buying_power / excess_liquidity columns (conductor #26) ------------------------
+def test_bp_xl_flow_through_into_csv(tmp_path, monkeypatch):
+    p = _csv_path(tmp_path)
+    monkeypatch.setattr(nh, "NAV_HISTORY_CSV", p)
+
+    nh.append_snapshot(date(2026, 7, 7), [{
+        "account": "DU8922142", "net_liq": 1_100_000.0,
+        "buying_power": 3_800_000.0, "excess_liquidity": 900_000.0}])
+
+    df = nh.load_history()
+    assert list(df.columns) == nh.COLUMNS
+    row = df.iloc[0]
+    assert row["buying_power"] == 3_800_000.0
+    assert row["excess_liquidity"] == 900_000.0
+
+
+def test_missing_bp_xl_become_nan(tmp_path, monkeypatch):
+    p = _csv_path(tmp_path)
+    monkeypatch.setattr(nh, "NAV_HISTORY_CSV", p)
+
+    # net_liq present but no BP/XL keys -> columns exist, values NaN (row still written).
+    nh.append_snapshot(date(2026, 7, 7), [{"account": "DU8922142", "net_liq": 1_100_000.0}])
+
+    df = nh.load_history()
+    assert list(df.columns) == nh.COLUMNS
+    assert len(df) == 1
+    assert pd.isna(df.iloc[0]["buying_power"])
+    assert pd.isna(df.iloc[0]["excess_liquidity"])
+    assert df.iloc[0]["net_liq"] == 1_100_000.0
+
+
+def test_preexisting_csv_without_new_columns_upserts(tmp_path, monkeypatch):
+    p = _csv_path(tmp_path)
+    monkeypatch.setattr(nh, "NAV_HISTORY_CSV", p)
+
+    # Simulate a legacy CSV written BEFORE the two new columns existed (old 4-col shape).
+    legacy = pd.DataFrame([{"date": "2026-07-06", "account": "DU8922142",
+                            "version": "Conservative", "net_liq": 1_000_000.0}])
+    legacy.to_csv(p, index=False)
+
+    # A new day's snapshot with BP/XL must upsert cleanly against the legacy file.
+    nh.append_snapshot(date(2026, 7, 7), [{
+        "account": "DU8922142", "net_liq": 1_100_000.0,
+        "buying_power": 3_800_000.0, "excess_liquidity": 900_000.0}])
+
+    df = nh.load_history()
+    assert list(df.columns) == nh.COLUMNS
+    assert len(df) == 2
+    old = df[df["date"] == "2026-07-06"].iloc[0]
+    assert pd.isna(old["buying_power"])          # legacy row backfilled NaN
+    new = df[df["date"] == "2026-07-07"].iloc[0]
+    assert new["buying_power"] == 3_800_000.0
+
+
+def test_load_history_reindexes_legacy_csv_to_full_shape(tmp_path, monkeypatch):
+    p = _csv_path(tmp_path)
+    monkeypatch.setattr(nh, "NAV_HISTORY_CSV", p)
+
+    legacy = pd.DataFrame([{"date": "2026-07-06", "account": "DU8922142",
+                            "version": "Conservative", "net_liq": 1_000_000.0}])
+    legacy.to_csv(p, index=False)
+
+    df = nh.load_history()
+    assert list(df.columns) == nh.COLUMNS        # full shape even though CSV had 4 cols
+    assert pd.isna(df.iloc[0]["buying_power"])
+    assert pd.isna(df.iloc[0]["excess_liquidity"])

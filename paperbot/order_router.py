@@ -26,6 +26,8 @@ from ib_async import (LimitOrder, Order, PriceCondition, Stock, TagValue,
                       TimeCondition, util)
 
 import config
+import margin_monitor   # per-run margin/buying-power observability (conductor #26). Imports
+                        # only config + a lazy ledger; neither imports order_router — acyclic.
 
 # HARD TIMEOUT (seconds) for a single what-if request. ib_async's whatIfOrder has NO
 # timeout (IB.RequestTimeout defaults to 0 = wait forever), so a what-if that never
@@ -376,7 +378,8 @@ def transmit_guard(armed: bool) -> tuple[bool, str]:
 
 
 def place(ib, built, armed: bool = False, fill_timeout: int = 60, *,
-          day=None, journal_states: dict | None = None) -> dict:
+          day=None, journal_states: dict | None = None, account=None,
+          context: str = "") -> dict:
     """Log every constructed order; transmit ONLY if the guard fully permits, then
     watch each order up to fill_timeout seconds for fills.
 
@@ -385,7 +388,13 @@ def place(ib, built, armed: bool = False, fill_timeout: int = 60, *,
     transmits nothing and is reported in `skipped`/`leg_states` for the caller to alert on.
     `journal_states` optionally maps order_ref -> the caller's PRE-ATTEMPTING journal
     snapshot (so the gate never trips on this run's own ATTEMPTING record); absent, the gate
-    queries the transmit journal itself."""
+    queries the transmit journal itself.
+
+    Per-RUN margin observability (conductor #26): in the ARMED+permitted branch only, an
+    accountSummary snapshot is captured once BEFORE the first transmit and once AFTER the
+    fill-watch, diffed, persisted (kind="margin_impact"), and returned as result["margin"].
+    NOT per-single-order (a per-leg round-trip would add latency and race fills). Fully
+    fail-soft: any capture error degrades to margin=None and never blocks/alters an order."""
     permit, why = transmit_guard(armed)
     print(f"\n    OrderRouter: transmission {'PERMITTED' if permit else 'BLOCKED'} ({why}).")
     if not built:
@@ -403,6 +412,11 @@ def place(ib, built, armed: bool = False, fill_timeout: int = 60, *,
 
     # --- ARMED + permitted: dedup PER LEG against broker truth, then transmit FRESH legs. ---
     print("    *** ARMED: transmitting LIMIT orders to the PAPER account ***")
+    # Per-RUN margin snapshot BEFORE the first transmit (conductor #26). One read per run,
+    # not per leg — see docstring. Fully fail-soft (read_snapshot returns None on any error).
+    acct = account or next(
+        (b.order.account for b in built if getattr(b.order, "account", None)), None)
+    before = margin_monitor.read_snapshot(ib, acct) if acct else None
     trades = []
     leg_states: dict[str, str] = {}
     skipped: list[dict] = []
@@ -433,8 +447,20 @@ def place(ib, built, armed: bool = False, fill_timeout: int = 60, *,
                       "avgFillPrice": float(st.avgFillPrice or 0.0)})
         print(f"      {t.contract.symbol:6s} {st.status:12s} filled={st.filled:g} "
               f"remaining={st.remaining:g} @ {st.avgFillPrice or 0.0:,.2f}")
+
+    # Per-RUN margin snapshot AFTER the fill-watch, diffed against `before`, persisted, and
+    # returned as result["margin"] (conductor #26). Fully fail-soft — any error here degrades
+    # to margin=None and NEVER changes the order result already computed above.
+    try:
+        after = margin_monitor.read_snapshot(ib, acct) if acct else None
+        margin_rec = margin_monitor.to_record(before, after, account=acct,
+                                               context=context or "place")
+        margin_monitor.record_impact(before, after, account=acct,
+                                     context=context or "place")
+    except Exception:
+        margin_rec = None
     return {"transmitted": len(trades), "logged": len(built), "fills": fills,
-            "leg_states": leg_states, "skipped": skipped}
+            "leg_states": leg_states, "skipped": skipped, "margin": margin_rec}
 
 
 def _shown_cap(order) -> float:
@@ -479,7 +505,7 @@ def place_laddered(ib, *, symbol, side, total_qty, caps, instrument_class,
                    account=None, fa_group=None, fa_method="", order_ref=None,
                    armed: bool = False, rung_seconds: float | None = None,
                    poll: float | None = None, day=None,
-                   journal_state=_JOURNAL_UNSET) -> dict:
+                   journal_state=_JOURNAL_UNSET, context: str = "") -> dict:
     """Place ONE leg through its instrument-class ladder: place rung 1 for the full qty,
     watch fills for a bounded window, and if not fully filled CANCEL the residual and
     escalate the UNFILLED REMAINDER to the next rung — until filled or the terminal
@@ -538,6 +564,9 @@ def place_laddered(ib, *, symbol, side, total_qty, caps, instrument_class,
     filled = 0.0                     # CUMULATIVE filled across rungs — the ONLY completion truth
     rungs_used = 0
     avg_px = 0.0
+    # Per-RUN margin snapshot BEFORE rung 1 (conductor #26). One read per laddered leg, not
+    # per rung. Fully fail-soft (read_snapshot returns None on any error).
+    before = margin_monitor.read_snapshot(ib, account) if account else None
     for i, rung in enumerate(ladder):
         remaining = target - filled
         if remaining <= 0:           # genuinely complete (cumulative fill met the target)
@@ -619,9 +648,20 @@ def place_laddered(ib, *, symbol, side, total_qty, caps, instrument_class,
         ib.placeOrder(contract, rest_order)
         rested = True
 
+    # Per-RUN margin snapshot AFTER the ladder settles, diffed/persisted/returned as
+    # result["margin"] (conductor #26). Fully fail-soft — any error degrades to margin=None.
+    try:
+        after = margin_monitor.read_snapshot(ib, account) if account else None
+        margin_rec = margin_monitor.to_record(before, after, account=account,
+                                               context=context or "place_laddered")
+        margin_monitor.record_impact(before, after, account=account,
+                                     context=context or "place_laddered")
+    except Exception:
+        margin_rec = None
     result = {"transmitted": rungs_used + (1 if rested else 0),
               "filled": filled, "remaining": remaining, "rungs_used": rungs_used,
               "avgFillPrice": avg_px, "rested": rested, "resting_qty": remaining if rested else 0.0,
+              "margin": margin_rec,
               "fills": [{"symbol": symbol, "filled": filled, "remaining": remaining,
                          "avgFillPrice": avg_px, "rungs_used": rungs_used,
                          "rested_gtc": rested}]}

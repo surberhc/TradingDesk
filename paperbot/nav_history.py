@@ -13,11 +13,19 @@ The live paper test started 2026-07-07 (all 5 accounts brought to target). There
 is no way to backfill NAV history before that date — tracking starts accumulating
 from whenever this feature first runs forward.
 
-CSV columns: date, account, version, net_liq
-  date    — ISO date string (YYYY-MM-DD), the day of the read-only cycle.
-  account — full account number (e.g. "DU8922142").
-  version — strategy version per config.ENROLLMENT (Conservative/Balanced/Growth).
-  net_liq — NetLiquidation read that day (float).
+CSV columns: date, account, version, net_liq, buying_power, excess_liquidity
+  date            — ISO date string (YYYY-MM-DD), the day of the read-only cycle.
+  account         — full account number (e.g. "DU8922142").
+  version         — strategy version per config.ENROLLMENT (Conservative/Balanced/Growth).
+  net_liq         — NetLiquidation read that day (float). REQUIRED (row skipped if None).
+  buying_power    — BuyingPower read that day (float | NaN). OPTIONAL observability.
+  excess_liquidity— ExcessLiquidity read that day (float | NaN). OPTIONAL observability.
+
+BP/XL are optional observability (conductor #26 — an EOD margin time series), read from
+the SAME accountValues the S0 monitor already pulls (no extra broker call). They may be
+absent on a given read (-> NaN); net_liq stays required. A pre-existing CSV written before
+these two columns existed is reindexed on read so the old rows simply carry NaN for them —
+no migration needed.
 
 Upsert semantics: a row for a given (date, account) is OVERWRITTEN, not
 duplicated, if the monitor happens to run more than once on the same day
@@ -36,7 +44,7 @@ import config
 
 NAV_HISTORY_CSV = Path(config.STATE_DIR) / "nav_history.csv"
 
-COLUMNS = ["date", "account", "version", "net_liq"]
+COLUMNS = ["date", "account", "version", "net_liq", "buying_power", "excess_liquidity"]
 
 
 def append_snapshot(today: date, snapshots: list[dict]) -> None:
@@ -60,8 +68,14 @@ def append_snapshot(today: date, snapshots: list[dict]) -> None:
         version = config.ENROLLMENT.get(acct)
         if version is None:
             continue
+        # BP/XL are OPTIONAL — store the float when present, else None (-> NaN in CSV).
+        # net_liq stays required (row already skipped above if it is None).
+        bp = snap.get("buying_power")
+        xl = snap.get("excess_liquidity")
         new_rows.append({"date": today_str, "account": acct,
-                          "version": version, "net_liq": float(net_liq)})
+                          "version": version, "net_liq": float(net_liq),
+                          "buying_power": float(bp) if bp is not None else None,
+                          "excess_liquidity": float(xl) if xl is not None else None})
 
     if not new_rows:
         return
@@ -71,6 +85,9 @@ def append_snapshot(today: date, snapshots: list[dict]) -> None:
     if NAV_HISTORY_CSV.exists():
         existing = pd.read_csv(NAV_HISTORY_CSV, dtype={"date": str, "account": str,
                                                          "version": str})
+        # A CSV written before buying_power/excess_liquidity existed lacks those columns.
+        # Reindex to the full COLUMNS so the missing ones become NaN before the upsert.
+        existing = existing.reindex(columns=COLUMNS)
     else:
         existing = pd.DataFrame(columns=COLUMNS)
 
@@ -92,10 +109,11 @@ def append_snapshot(today: date, snapshots: list[dict]) -> None:
 
 
 def load_history() -> pd.DataFrame:
-    """Read NAV_HISTORY_CSV. Returns an empty-but-correctly-shaped DataFrame
-    (columns: date, account, version, net_liq) if the file doesn't exist yet —
-    graceful cold start, never raises."""
+    """Read NAV_HISTORY_CSV. Returns an empty-but-correctly-shaped DataFrame (the full
+    COLUMNS) if the file doesn't exist yet — graceful cold start, never raises. A
+    pre-existing CSV that lacks the buying_power/excess_liquidity columns is reindexed so
+    callers always get the full shape (missing columns -> NaN)."""
     if not NAV_HISTORY_CSV.exists():
         return pd.DataFrame(columns=COLUMNS)
     df = pd.read_csv(NAV_HISTORY_CSV, dtype={"date": str, "account": str, "version": str})
-    return df[COLUMNS]
+    return df.reindex(columns=COLUMNS)

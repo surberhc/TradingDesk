@@ -15,10 +15,30 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.19.0"
+VERSION = "0.20.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.20.0", "2026-07-24", "Per-run margin/buying-power monitoring (conductor #26). New "
+                             "margin_monitor.py snapshots accountSummary immediately before "
+                             "and after the ARMED transmit in order_router.place()/"
+                             "place_laddered(), diffs BuyingPower/ExcessLiquidity/"
+                             "InitMarginReq/MaintMarginReq/AvailableFunds, and writes a "
+                             "durable kind='margin_impact' record to the audit ledger "
+                             "(runs.jsonl) for after-the-fact intraday margin review — "
+                             "closing the gap where s4_risk.margin_preflight()'s result was "
+                             "only printed, never persisted. Capture is per-RUN not "
+                             "per-single-order (a per-leg accountSummary round-trip would add "
+                             "latency and race fills) and fully fail-soft: any summary read "
+                             "error degrades to margin=None and never blocks or alters order "
+                             "transmission. nav_history.py daily CSV now also carries "
+                             "buying_power + excess_liquidity columns (read from "
+                             "accountValues the S0 monitor already pulls — no extra broker "
+                             "call; pre-existing rows backfilled NaN) for an EOD margin time "
+                             "series. Order-path-adjacent OBSERVABILITY only — no routing/"
+                             "sizing/allocation/frozen-config change; S0 is cash-only so "
+                             "nothing fires there today, this is the prerequisite for S8 "
+                             "options going live in paperbot."),
     ("0.19.0", "2026-07-24", "flatten_accounts.py SAFETY REWORK (conductor #51 — was "
                              "HIGH-severity DO-NOT-RUN). The one-shot liquidation tool was "
                              "load-bearing-unsafe: it hardcoded all five DU sub-accounts, "

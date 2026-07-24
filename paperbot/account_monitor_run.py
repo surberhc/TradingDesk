@@ -192,6 +192,11 @@ def read_account_cycle(ib, account: str, today: date) -> dict:
     values = ib.accountValues(account)
     net_liq = _float_tag(values, account, "NetLiquidation")
     total_cash = _float_tag(values, account, "TotalCashValue")
+    # BuyingPower / ExcessLiquidity for the EOD margin time series (conductor #26) — read
+    # from the SAME `values` already pulled above, NO extra broker call. Optional (None if
+    # the account doesn't report them); flows through nav_history into the daily CSV.
+    buying_power = _float_tag(values, account, "BuyingPower")
+    excess_liquidity = _float_tag(values, account, "ExcessLiquidity")
 
     settled_raw = _account_value(values, account, "SettledCashByDate")
     decoded = accounts.parse_settled_cash_by_date(settled_raw)
@@ -205,6 +210,7 @@ def read_account_cycle(ib, account: str, today: date) -> dict:
     fills = _read_today_fills(ib, account, today)
 
     return {"account": account, "net_liq": net_liq, "total_cash": total_cash,
+            "buying_power": buying_power, "excess_liquidity": excess_liquidity,
             "settled_cash": settled_cash, "settled_date": settled_date,
             "settled_raw": settled_raw, "positions": positions, "fills": fills}
 
