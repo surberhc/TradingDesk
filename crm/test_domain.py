@@ -309,6 +309,36 @@ def test_assignment_roundtrip_with_none_prior():
     assert AccountAssignment.from_dict(a.to_dict()) == a
 
 
+def test_assignment_book_roundtrip_preserves_current_history_and_chain():
+    book = AssignmentBook()
+    t0 = datetime(2026, 7, 24, 9, 0, 0)
+    book.assign("DU1", "balanced", set_by="andrew", now=t0)
+    book.assign("DU1", "balanced_overlay", set_by="andrew", now=t0 + timedelta(hours=1))
+    book.assign("DU2", "balanced", set_by="andrew", now=t0 + timedelta(hours=2))
+
+    back = AssignmentBook.from_dict(book.to_dict())
+
+    # current is the one-active-row-per-account map (superseded row is gone from current)
+    assert back.current("DU1").template_id == "balanced_overlay"
+    assert back.current("DU2").template_id == "balanced"
+
+    # full append-only history survives, in order
+    hist = back.history("DU1")
+    assert [h.template_id for h in hist] == ["balanced", "balanced_overlay"]
+    # the prior_template_id chain survives the round-trip
+    assert hist[0].prior_template_id is None
+    assert hist[1].prior_template_id == "balanced"
+
+    # every row survives with its datetimes intact
+    assert back.to_dict() == book.to_dict()
+
+
+def test_assignment_book_roundtrip_empty_book():
+    back = AssignmentBook.from_dict(AssignmentBook().to_dict())
+    assert back.all_current() == {}
+    assert back.history("DU1") == []
+
+
 # ---------------------------------------------------------------------------
 # EXAMPLE_TEMPLATES — illustrative fixtures must at least be well-formed
 # ---------------------------------------------------------------------------

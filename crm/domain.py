@@ -337,6 +337,36 @@ class AssignmentBook:
         """A COPY of the current-assignment map, account_id -> current AccountAssignment."""
         return dict(self._current)
 
+    def to_dict(self) -> dict:
+        """Serialize the whole book (§8 transport boundary). `history` is the FULL
+        append-only audit trail; `current` is the derived one-active-row-per-account map.
+        Both are just lists of AccountAssignment.to_dict() rows. PURE — dict only, no I/O."""
+        return {
+            "history": [row.to_dict() for row in self._history],
+            "current": [row.to_dict() for row in self._current.values()],
+        }
+
+    @classmethod
+    def from_dict(cls, d: Mapping) -> "AssignmentBook":
+        """Rebuild a book from to_dict() output, preserving BOTH the append-only history
+        AND the current-row invariant. `_history` is restored in order; `_current` is the
+        derived last-row-per-account map (what a replay of assign() would produce), then
+        OVERRIDDEN by any explicit d["current"] rows (defensive — should match). PURE."""
+        book = cls()
+        history = [AccountAssignment.from_dict(r) for r in d.get("history", [])]
+        book._history = list(history)
+        # Rebuild the current-row map from the chronological history (last row per account
+        # wins), so the reconstructed book matches what a replay of assign() would produce.
+        current: dict[str, AccountAssignment] = {}
+        for row in history:
+            current[row.account_id] = row
+        # If an explicit current list was serialized, honor it (defensive; should match).
+        for r in d.get("current", []):
+            row = AccountAssignment.from_dict(r)
+            current[row.account_id] = row
+        book._current = current
+        return book
+
 
 # =============================================================================
 # Group-membership derivation  (spec §2 / §3.4)
