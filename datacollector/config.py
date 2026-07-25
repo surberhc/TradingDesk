@@ -102,6 +102,43 @@ def forward_depth(sym: str) -> tuple[int, int]:
         return FORWARD_DEEP_STRIKE_BAND, FORWARD_DEEP_MAX_EXPIRATIONS
     return FORWARD_STRIKE_BAND, FORWARD_MAX_EXPIRATIONS
 
+
+# --------------------------------------------------------------------------- #
+# IBKR forward collector — unattended-run safety bounds (conductor #59)
+# --------------------------------------------------------------------------- #
+# The nightly forward pull is UNATTENDED; one bad root must never wedge the whole
+# run. A root with no options market-data entitlement (e.g. QQQ -> every option
+# returns IBKR Error 10091, greeks/OI never populate) otherwise walks all its
+# batches at SETTLE_SECS each — 10+ minutes of silent no-progress that reads as a
+# hang — and a non-returning underlying can block the synchronous spot lookup
+# indefinitely. These three bounds (all applied in ibkr_forward_live.py) each
+# degrade to skip / partial-and-continue, never abort the run.
+
+# 1) PER-ROOT WALL-CLOCK DEADLINE — the definitive backstop. GENEROUS on purpose
+#    so it never aborts a legitimately-large root: SPX/SPXW at the current deep
+#    depth legitimately take ~11-13 min and could take longer at wider depth, so
+#    30 min leaves ample headroom. Only a genuinely stuck root (dead gateway, a
+#    non-returning line) ever reaches it; when it does, the collector stops,
+#    cancels open data lines, writes whatever it harvested (partial), and moves on.
+FORWARD_PER_ROOT_TIMEOUT_SECS = 1800     # 30 min hard ceiling per root
+
+# 2) FAST EARLY-OUT on a no-entitlement / no-data root, so QQQ costs ~seconds not
+#    the full deadline. A real liquid root populates greeks/OI within its FIRST
+#    expiration, so ZERO populated rows after a meaningful sample means there is no
+#    data to wait for. CONSERVATIVE thresholds — we bail only once we have processed
+#    at least FORWARD_EARLY_OUT_MIN_BATCHES batches OR FORWARD_EARLY_OUT_MIN_CONTRACTS
+#    contracts (whichever comes first) with the populated count still EXACTLY zero,
+#    so a slow-but-real root is never falsely bailed and a few empty far-OTM strikes
+#    never trigger it.
+FORWARD_EARLY_OUT_MIN_BATCHES = 6        # sample >= this many batches, or ...
+FORWARD_EARLY_OUT_MIN_CONTRACTS = 300    # ... >= this many contracts, before bailing
+
+# 3) SPOT PRE-CHAIN TIMEOUT — the synchronous reqTickers for the underlying spot
+#    can block indefinitely on a non-returning contract (IB.RequestTimeout defaults
+#    to 0 = wait forever). Bound it; spot=None is already tolerated downstream
+#    (model-greeks undPrice backfills per row), so on timeout we log and continue.
+FORWARD_SPOT_TIMEOUT_SECS = 15           # seconds to wait for the underlying spot
+
 # Curated universe (~36 roots) — chosen to leave doors open across every strategy
 # theme we've discussed, WITHOUT exploding into the full OPRA single-name universe.
 # SPX/SPXW dominate storage; everything else is comparatively tiny.

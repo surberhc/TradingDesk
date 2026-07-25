@@ -36,11 +36,13 @@ Usage:
 
 from __future__ import annotations
 
+import asyncio
 import sys
+import time
 from datetime import date, datetime
 
 import pandas as pd
-from ib_async import IB, Index, Option, Stock
+from ib_async import IB, Index, Option, Stock, util
 
 import config
 import storage
@@ -100,6 +102,37 @@ def _fmt_exp(yyyymmdd: str) -> str:
     return f"{s[0:4]}-{s[4:6]}-{s[6:8]}" if len(s) == 8 else s
 
 
+def _spot_with_timeout(ib: IB, c, timeout: float | None = None):
+    """reqTickers for the underlying spot, TIME-BOUNDED so it can't hang the run.
+
+    `ib.reqTickers` is synchronous and, with IB.RequestTimeout=0 (the default), can
+    block FOREVER on a non-returning underlying — an unattended nightly pull must
+    never wedge there. We drive the async form through ib_async's OWN event loop
+    (util.run — the same loop the sync call uses, so we're not fighting it with a
+    second loop) with an explicit asyncio timeout, matching how
+    paperbot/order_router.py bounds its blocking ib_async calls.
+
+    On timeout OR any error we return None: spot=None is already tolerated
+    downstream (the per-row model-greeks undPrice backfills the underlying price in
+    _to_df), so a missing spot degrades gracefully instead of hanging. Extracted as
+    a helper so the timeout wrapper is unit-testable without a live gateway.
+    """
+    if timeout is None:
+        timeout = config.FORWARD_SPOT_TIMEOUT_SECS
+    try:
+        tickers = util.run(ib.reqTickersAsync(c), timeout=timeout)
+    except asyncio.TimeoutError:
+        print(f"    spot lookup timed out after {timeout:g}s — proceeding spot=None")
+        return None
+    except Exception as e:                 # fail-soft: any spot error -> None, never raise
+        print(f"    spot lookup failed ({e!r}) — proceeding spot=None")
+        return None
+    if not tickers:
+        return None
+    t = tickers[0]
+    return t.marketPrice() or t.close or t.last
+
+
 def _underlying(ib: IB, sym: str):
     """Return (underlying_contract, spot, tradingClass_filter) for a root."""
     if sym in ("SPX", "SPXW"):
@@ -112,8 +145,7 @@ def _underlying(ib: IB, sym: str):
         c = Stock(_STOCK_SYMBOL_MAP.get(sym, sym), "SMART", "USD")
         tclass = None
     ib.qualifyContracts(c)
-    [t] = ib.reqTickers(c)
-    spot = t.marketPrice() or t.close or t.last
+    spot = _spot_with_timeout(ib, c)       # bounded; never blocks the nightly run
     return c, spot, tclass
 
 
@@ -150,17 +182,41 @@ def build_chain(ib: IB, sym: str, band: int | None = None, max_exps: int | None 
     return c, spot, _qualify(ib, candidates)
 
 
-def snapshot_chain(ib: IB, contracts: list[Option]) -> list[dict]:
-    """Stream the chain in line-limit batches, harvest greeks+OI+quotes, cancel."""
+def snapshot_chain(ib: IB, contracts: list[Option],
+                   deadline: float | None = None) -> tuple[list[dict], str]:
+    """Stream the chain in line-limit batches, harvest greeks+OI+quotes, cancel.
+
+    Bounded for unattended runs (conductor #59). Returns (rows, status) where
+    status is one of:
+      * "ok"      — the whole chain was walked normally.
+      * "timeout" — the per-root wall-clock `deadline` (time.monotonic() seconds)
+                    was exceeded; we stopped, cancelled open lines, and returned the
+                    partial rows harvested so far. `deadline=None` disables it.
+      * "no-data" — after a meaningful sample NOTHING populated (a no-entitlement /
+                    no-data root, e.g. QQQ Error 10091); we stopped early instead of
+                    walking every remaining batch at SETTLE_SECS each.
+
+    The harvested schema/columns and the batch depth logic are unchanged; the only
+    additions are the two guards below and the running populated/processed counters.
+    """
     rows: list[dict] = []
+    populated = 0            # cumulative rows with delta OR open_interest (collect_day's predicate)
+    processed = 0            # cumulative contracts processed
+    batches = 0             # cumulative batches processed
+    status = "ok"
     for i in range(0, len(contracts), LINE_LIMIT):
+        # (1) Per-root wall-clock backstop — checked at the TOP of each batch so a
+        # stuck root can't keep sleeping SETTLE_SECS forever. Return the partial.
+        if deadline is not None and time.monotonic() >= deadline:
+            status = "timeout"
+            break
         batch = contracts[i:i + LINE_LIMIT]
         tickers = [ib.reqMktData(o, "100,101", False, False) for o in batch]  # 101=OI
         ib.sleep(SETTLE_SECS)
         for o, t in zip(batch, tickers):
             mg = t.modelGreeks
             oi = t.callOpenInterest if o.right == "C" else t.putOpenInterest
-            rows.append({
+            row = {
                 "expiration": _fmt_exp(o.lastTradeDateOrContractMonth),
                 "strike": float(o.strike),
                 "right": "CALL" if o.right == "C" else "PUT",
@@ -175,11 +231,25 @@ def snapshot_chain(ib: IB, contracts: list[Option]) -> list[dict]:
                 "implied_vol": _num(mg.impliedVol) if mg else None,
                 "underlying_price": _num(mg.undPrice) if mg else None,
                 "open_interest": _num(oi),
-            })
+            }
+            rows.append(row)
+            if row["delta"] is not None or row["open_interest"] is not None:
+                populated += 1
         for o in batch:
             ib.cancelMktData(o)
         ib.sleep(0.2)
-    return rows
+        batches += 1
+        processed += len(batch)
+        # (2) Fast early-out — after a meaningful sample with ZERO populated rows,
+        # this root has no data/entitlement to wait for. Stop now instead of walking
+        # every batch. Conservative: only once we've sampled >= MIN_BATCHES batches
+        # OR >= MIN_CONTRACTS contracts (whichever first) AND still nothing populated.
+        if (populated == 0
+                and (batches >= config.FORWARD_EARLY_OUT_MIN_BATCHES
+                     or processed >= config.FORWARD_EARLY_OUT_MIN_CONTRACTS)):
+            status = "no-data"
+            break
+    return rows, status
 
 
 def _to_df(rows: list[dict], sym: str, daystr: str, snap_ts: str, spot) -> pd.DataFrame:
@@ -208,13 +278,25 @@ def _to_df(rows: list[dict], sym: str, daystr: str, snap_ts: str, spot) -> pd.Da
 
 
 def collect_day(ib: IB, sym: str, daystr: str,
-                band: int | None = None, max_exps: int | None = None) -> tuple[str, int]:
+                band: int | None = None, max_exps: int | None = None,
+                deadline: float | None = None) -> tuple[str, int]:
     """Snapshot one root for one day and write it. Resumable: skips days on disk.
 
     Deliberately does NOT write an empty marker when nothing comes back (unlike the
     ThetaData backfill). A forward run that finds no data is almost always transient
     (after-hours, farm hiccup), and a false marker would poison the day forever via
     have_day(). Leaving it unwritten lets the next run retry.
+
+    `deadline` (time.monotonic() seconds) is the per-root wall-clock backstop for
+    unattended runs (conductor #59); None disables it. Statuses returned:
+      * "skip"     — already on disk.
+      * "no-chain" — the chain couldn't be built (no qualified contracts).
+      * "no-data"  — nothing populated (transient no-data OR the fast early-out on a
+                     no-entitlement root); NOT written, so the next run retries.
+      * "timeout"  — the per-root deadline was hit. Partial rows are written ONLY if
+                     something actually populated (same rule as the happy path);
+                     otherwise ("timeout", 0) and nothing is written (don't poison).
+      * "ok"       — written normally.
     """
     if storage.have_day(sym, daystr, base=config.RAW_OPTIONS_IBKR):
         return ("skip", 0)
@@ -222,13 +304,18 @@ def collect_day(ib: IB, sym: str, daystr: str,
     if not contracts:
         return ("no-chain", 0)
     snap_ts = datetime.now().isoformat(timespec="milliseconds")
-    rows = snapshot_chain(ib, contracts)
+    rows, snap_status = snapshot_chain(ib, contracts, deadline=deadline)
     populated = sum(1 for r in rows if r["delta"] is not None or r["open_interest"] is not None)
     if populated == 0:
-        return ("no-data", 0)        # don't poison the day; retry next run
+        # Covers both the transient no-data case and the fast early-out; on a
+        # deadline hit with nothing harvested, report "timeout" but likewise don't
+        # write (no empty marker), consistent with the existing no-data behavior.
+        return ("timeout" if snap_status == "timeout" else "no-data", 0)
     df = _to_df(rows, sym, daystr, snap_ts, spot)
     n = storage.write_day(sym, daystr, df, base=config.RAW_OPTIONS_IBKR)
-    return ("ok", n)
+    # A deadline-aborted-but-partial day is written (populated>0) but flagged so the
+    # run log shows it was truncated rather than a clean full capture.
+    return ("timeout" if snap_status == "timeout" else "ok", n)
 
 
 def main() -> None:
@@ -261,7 +348,16 @@ def main() -> None:
         for sym in roots:
             t0 = datetime.now()
             b, mx = (band, max_exps) if (test or full) else config.forward_depth(sym)
-            status, n = collect_day(ib, sym, daystr, band=b, max_exps=mx)
+            # Per-root wall-clock deadline: one stuck root can never wedge the run.
+            deadline = time.monotonic() + config.FORWARD_PER_ROOT_TIMEOUT_SECS
+            try:
+                status, n = collect_day(ib, sym, daystr, band=b, max_exps=mx,
+                                        deadline=deadline)
+            except Exception as e:
+                # Fully fail-soft: any unexpected raise degrades to skip-and-continue
+                # so a single bad root never aborts an unattended nightly run.
+                status, n = "error", 0
+                real_errors.append(f"[{sym}] collect_day raised: {e!r}")
             dt = (datetime.now() - t0).total_seconds()
             print(f"  {sym:6} {status:9} rows={n:<7} {dt:5.1f}s"
                   + (f"  errors={len(real_errors)}" if real_errors else ""))
