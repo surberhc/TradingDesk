@@ -52,6 +52,15 @@ def connect_s0_live(launch: bool = False, timeout: int = 10):
                                    readonly=True, timeout=timeout)
 
 
+def connect_s0_live_armed(timeout: int = 10):
+    """ARMED connect for s0_live_exec's tiny-test path ONLY. Passes readonly=False so the
+    session CAN transmit; the gateway's own read-only toggle + arming.probe_api_readonly
+    stay the physical human wall, and s0_live_exec's caps + --arm-i-understand are the code
+    wall. Uses clientId s0_live_exec (58). NEVER call this from the read-only pilot path."""
+    return ibkr_live_trade.connect("s0_live_exec", launch=False, readonly=False,
+                                   timeout=timeout)
+
+
 def filter_account_summary(summary, account: str = S0_LIVE_ACCOUNT):
     """Keep only the accountSummary rows for `account` (default S0_LIVE_ACCOUNT).
 

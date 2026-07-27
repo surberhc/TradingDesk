@@ -15,10 +15,41 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.21.0"
+VERSION = "0.22.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.22.0", "2026-07-27", "S0 tiny-test REAL-TRANSMISSION path (Andrew-authorized): new "
+                             "s0_live_exec.py — the desk's FIRST order path that can transmit a "
+                             "real order, on the funded individual live TEST account U5721712 on "
+                             "the Live-Trade Gateway (port 4003; NEVER the trust account "
+                             "U14438624). It reuses the read-only pilot verbatim for WHAT to trade "
+                             "(strategy_target.current_target -> rebalance_engine.plan_account "
+                             "against U5721712 with live prices, filtered to the individual "
+                             "account) and adds ONE capped, marketable LIMIT built with "
+                             "order_router.build_marketable_limit and placed with "
+                             "order_router.place(armed=True) — both UNCHANGED. PREVIEW BY DEFAULT: "
+                             "with no flag it sizes, picks + builds the candidate, prints 'WOULD "
+                             "TRANSMIT', and sends nothing. Transmission requires ALL of: the exact "
+                             "--arm-i-understand token (sets armed=True; never defaulted), no "
+                             "kill-switch sentinel (AUTOTRADE_DISABLED), target account EXACTLY "
+                             "U5721712, a BUY of a whitelisted symbol (USFR only), qty <= "
+                             "MAX_TEST_SHARES (1) AND shares*limit <= MAX_TEST_NOTIONAL ($150), 1 "
+                             "order/run, the Gateway physically armed (Read-Only API toggle off, "
+                             "measured live via arming's zero-transmission cancel-a-fabricated-"
+                             "order probe mirrored against the open 4003 connection — arming.py "
+                             "itself is paper-4002-only and can't be pointed at 4003 without "
+                             "editing it), and the pre-transmit dedup gate "
+                             "(order_router.already_present) FRESH. Miss any -> preview, prints "
+                             "WHY. NEVER a market order. No auto-arm, nothing scheduled; a human "
+                             "arms + fires. New connect_s0_live_armed() in s0_live.py (readonly="
+                             "False, clientId s0_live_exec=58) is the ONLY armed lane; the "
+                             "read-only pilot lane is untouched. Order-affecting (introduces real "
+                             "transmission). Rule #1 clean: reuses strategy_target / "
+                             "rebalance_engine / order_router / arming idiom / config UNCHANGED — "
+                             "no strategy/regime/band/sizing value touched. NOTHING was transmitted "
+                             "building or testing it (built + tested preview-only, fully mocked). "
+                             "+offline test matrix (test_s0_live_exec.py)."),
     ("0.21.0", "2026-07-27", "S0 live-pilot PREVIEW path (conductor #3/#41, Slice 2): new "
                              "s0_live_pilot_run.py — the single-account analog of the paper FA "
                              "morning pipeline, pointed at a REAL funded account. It reads the "
