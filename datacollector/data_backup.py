@@ -451,13 +451,25 @@ def resolve_rclone(*, which_fn=None, glob_fn=None) -> tuple[str | None, str]:
 # --------------------------------------------------------------------------- #
 # rclone argv construction
 # --------------------------------------------------------------------------- #
-def _base_flags() -> list[str]:
+def _base_flags(*, include_excludes: bool = True) -> list[str]:
     """Flags shared by copy AND check, so the check verifies EXACTLY the scope that was
     copied. A mismatch here (e.g. a different exclude) would make check compare against
-    a differently-scoped remote and report spurious differences — a false page."""
+    a differently-scoped remote and report spurious differences — a false page.
+
+    include_excludes=False drops the EXCLUDES filter flags but keeps the transport/config
+    flags. This is REQUIRED for the incremental `rclone check --files-from` call: as of
+    rclone 1.74.4, `--files-from` "over-ride and cannot be combined with other filter
+    options" — passing any of --exclude/--include/--filter alongside it is a FATAL init
+    error ("the usage of --files-from overrides all other filters, it should be used alone
+    or with --files-from-raw"), rclone.org/filtering (verified 2026-07-27). Dropping the
+    excludes there removes nothing: the scoped list only ever contains paths this run
+    actually COPIED, and the copy already applied EXCLUDES, so no excluded path can appear
+    in the list. --transfers/--checkers/--fast-list/--config are NOT filter options and
+    stay in both forms."""
     flags: list[str] = []
-    for ex in EXCLUDES:
-        flags += ["--exclude", ex]
+    if include_excludes:
+        for ex in EXCLUDES:
+            flags += ["--exclude", ex]
     flags += ["--transfers", TRANSFERS, "--checkers", CHECKERS, "--fast-list",
               "--config", str(RCLONE_CONFIG)]
     return flags
@@ -514,7 +526,14 @@ def check_argv(rclone_path: str, files_from: str | None = None,
     canned proc leave this off / ignore it and exercise the stderr-fallback path.)
     """
     argv = [rclone_path, "check", str(DATA_SOURCE), RCLONE_REMOTE]
-    argv += _base_flags()
+    # rclone 1.74.4 FATAL-errors if --files-from is combined with ANY other filter flag
+    # (--exclude/--include/--filter): "the usage of --files-from overrides all other
+    # filters, it should be used alone or with --files-from-raw" (rclone.org/filtering,
+    # verified 2026-07-27). So when scoping the check with --files-from, drop the EXCLUDES
+    # filters — they are redundant here anyway: --files-from only lists paths this run
+    # copied, and copy already applied EXCLUDES, so no excluded path can be in the list.
+    # The DEEP path (files_from is None) is UNCHANGED: it keeps EXCLUDES + CHECK_ONLY_EXCLUDES.
+    argv += _base_flags(include_excludes=(files_from is None))
     if deep and files_from is None:
         for ex in CHECK_ONLY_EXCLUDES:
             argv += ["--exclude", ex]

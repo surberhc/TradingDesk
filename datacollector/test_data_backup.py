@@ -1312,8 +1312,38 @@ def test_check_argv_incremental_does_NOT_apply_the_churn_excludes():
     excluded = [argv[i + 1] for i, a in enumerate(argv) if a == "--exclude"]
     assert "state/**" not in excluded
     assert "*.log" not in excluded
-    # base excludes are still present in both paths
-    assert "venv/**" in excluded
+
+
+def test_incremental_check_must_NOT_combine_files_from_with_any_other_filter_flag():
+    """REGRESSION (rclone 1.74.4, 2026-07-25): `--files-from` "over-rides and cannot be
+    combined with other filter options" — combining it with --exclude/--include/--filter is
+    a FATAL init error ("the usage of --files-from overrides all other filters, it should be
+    used alone or with --files-from-raw"). That bug died before the check ran, so every
+    incremental verify since 2026-07-25 failed and froze the backup heartbeat.
+
+    The incremental check argv must therefore carry --files-from and NONE of the conflicting
+    filter flags. The transport/config flags (not filters) are unaffected."""
+    argv = db.check_argv(r"C:\fake\rclone.exe", files_from=r"C:\tmp\list.txt", deep=False)
+    assert "--files-from" in argv
+    for filter_flag in ("--exclude", "--include", "--filter", "--exclude-from",
+                        "--include-from", "--filter-from"):
+        assert filter_flag not in argv, (
+            f"{filter_flag} must not be combined with --files-from under rclone 1.74.4")
+    # ...and the non-filter transport flags are still present so the scoped check runs the
+    # same way (config path, parallelism), just without the illegal filters.
+    assert str(db.RCLONE_CONFIG) in argv
+    assert "--fast-list" in argv
+
+
+def test_deep_check_STILL_carries_the_base_excludes_when_unscoped():
+    """The fix must NOT weaken the DEEP (unscoped) pass: with no --files-from it still
+    applies the base EXCLUDES (venv/backups/secrets) so it verifies the SAME scope the
+    copy wrote. Only the --files-from path drops them."""
+    argv = db.check_argv(r"C:\fake\rclone.exe")  # deep default, no files_from
+    assert "--files-from" not in argv
+    excluded = [argv[i + 1] for i, a in enumerate(argv) if a == "--exclude"]
+    for ex in ("venv/**", "backups/**", "secrets/**"):
+        assert ex in excluded
 
 
 def test_check_argv_writes_the_machine_readable_report_files():
