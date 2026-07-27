@@ -37,6 +37,9 @@
 > - (#7) [S4] Pick an account/profile for S4 (SPX vol-control fund) paper-deploy
 > - (#8) [S5] S5 (financed convexity overlay) financing-structure sizing decision
 
+### 2026-07-27 (main) — Close out ThetaData tail: dead 1-min tooling removed, dormant product modules kept per decision
+Andrew's call 2026-07-27: dead 1-minute collection tooling deleted (commit 33d7b59); remaining ThetaData-dependent modules KEPT, not deleted. universe_download cluster (universe_download.py + universe_config.py) = dormant reference; canslim/pull_equity_options.py = keep + re-source from IBKR later; thetadata_client.py/download.py + config keys THETA_BASE_URL/THETA_RATE_TYPE retained as leaf deps. All five got a DORMANT/ThetaData-RETIRED header marker (comment-only, commit 42b5712). Nothing runs ThetaData at runtime (EOD feed on IBKR). datacollector 235 passed; canslim 81 passed (1 pre-existing unrelated failure).
+
 ### 2026-07-27 (main) — Removed the nightly data-warehouse backup entirely (Andrew's call): DataBackupDaily task deleted, data_backup.py + launcher + register script deleted, heartbeat_alarm 'data_backup' job removed (commits 320ce3e, bf4d4da). It was over-engineered (104GB nightly rclone+checksum to Drive, broke on rclone 1.74.4, the real alert-flood source) and low-value (frozen 1-min history already verified in Drive 07-25; rest re-pullable). Git/repo bundle backup stays. If any conductor issue/STATUS still lists DataBackupDaily as a live task, it's stale.
 
 ### 2026-07-27 (main) — Fractional ETF research: NOT possible via TWS API -- desk will fund account, not build CPAPI
