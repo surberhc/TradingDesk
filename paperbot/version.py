@@ -15,10 +15,37 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.20.0"
+VERSION = "0.21.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.21.0", "2026-07-27", "S0 live-pilot PREVIEW path (conductor #3/#41, Slice 2): new "
+                             "s0_live_pilot_run.py — the single-account analog of the paper FA "
+                             "morning pipeline, pointed at a REAL funded account. It reads the "
+                             "individual live-trading TEST account U5721712 on the Live-Trade "
+                             "gateway (port 4003 — the same gateway S8 pilots on; S8 uses the "
+                             "TRUST account U14438624 under the same login, never this one) via "
+                             "the read-only s0_live lane (connect_s0_live -> "
+                             "ibkr_live_trade.connect(readonly=True); readonly=False is never "
+                             "passed), filters every read to U5721712 (never the trust account), "
+                             "computes S0's target with the shared brain (strategy_target."
+                             "current_target -> backtester run_backtest), fetches real-time "
+                             "reference prices on 4003, sizes the target against the real account "
+                             "with the UNCHANGED rebalance_engine.plan_account (config."
+                             "REBALANCE_BAND_PCT band; reserve 0 since U5721712 is not in "
+                             "cashflows.SCHEDULE), and prints + emails 'WOULD HAVE TRANSMITTED' "
+                             "via the shared dailyreport mailer/status. ZERO-TRANSMIT with two "
+                             "independent walls: (1) the connection is read-only, and (2) the "
+                             "runner is BUILD/PREVIEW-ONLY — there is NO arm path and NO transmit "
+                             "code in the file at all (imports no order_router; never calls "
+                             "place()/place_laddered()/ib.placeOrder()/arming). MANUAL, on-demand "
+                             "for now — deliberately NOT scheduled; the first pilot cycles are "
+                             "human-reviewed before any automation. Order-affecting (new order-"
+                             "sizing preview path against a real account), though it transmits "
+                             "nothing. Rule #1 clean: reuses strategy_target / rebalance_engine / "
+                             "reconcile / cashflows / config UNCHANGED — no strategy/regime/band/"
+                             "sizing value touched. +offline test matrix "
+                             "(test_s0_live_pilot_run.py)."),
     ("0.20.0", "2026-07-24", "Per-run margin/buying-power monitoring (conductor #26). New "
                              "margin_monitor.py snapshots accountSummary immediately before "
                              "and after the ARMED transmit in order_router.place()/"
