@@ -22,9 +22,13 @@ Resilience: weekday guard, launches the live-data Gateway if it's down (via
 connections.ibkr_live_data.ensure_gateway()), per-root error isolation (one bad
 root never aborts the run), resumable (skips any root already on disk for today).
 Logs to warehouse\\forward_live.log and updates warehouse\\forward_heartbeat_live.txt
-so a glance confirms it ran and how far it got. Writes its own jobstatus key
-("forward_live") so it never collides with the paper variant's ("forward") entry
-in dailyreport/status.py.
+so a glance confirms it ran and how far it got. As of the 2026-07-27 ThetaData->IBKR
+cutover this is THE production nightly EOD option collector, so it writes the canonical
+"forward" jobstatus key (dailyreport/status.py) that the EOD report and
+heartbeat_alarm's "forward" deadline watchdog read — taking over from the retired
+ThetaData eod_daily.py. (It formerly wrote "forward_live" during the A/B window to avoid
+colliding with the paper variant forward_daily.py, which is a manual/dev tool and not
+scheduled nightly.)
 
 Run manually any time:  <venv python> forward_daily_live.py
 """
@@ -76,7 +80,7 @@ def main() -> None:
     daystr = today.strftime("%Y%m%d")
     if today.weekday() >= 5:             # 5=Sat, 6=Sun
         log(f"{daystr} is a weekend — nothing to collect.")
-        jobstatus.write("forward_live", "ok", message="weekend — no trading day", day=daystr)
+        jobstatus.write("forward", "ok", message="weekend — no trading day", day=daystr)
         return
 
     log(f"=== forward_live run {daystr} start (per-root depth: SPX/SPXW band=+/-"
@@ -84,7 +88,7 @@ def main() -> None:
         f"others band=+/-{config.FORWARD_STRIKE_BAND} exps<={config.FORWARD_MAX_EXPIRATIONS}) ===")
     if not gw.ensure_gateway():
         log("Live-data Gateway did not come up within timeout - aborting; retry next scheduled run.")
-        jobstatus.write("forward_live", "fail", message="Gateway did not come up", day=daystr)
+        jobstatus.write("forward", "fail", message="Gateway did not come up", day=daystr)
         return
 
     real_errors: list[str] = []
@@ -141,7 +145,7 @@ def main() -> None:
         f"ok={ok} skip={skip} empty={empty} fail={fail}")
 
     overall = "ok" if fail == 0 and (ok > 0 or skip > 0) else ("partial" if ok > 0 else "fail")
-    jobstatus.write("forward_live", overall, day=daystr,
+    jobstatus.write("forward", overall, day=daystr,
                     metrics={"roots": len(roots), "ok": ok, "skip": skip,
                              "empty": empty, "fail": fail, "real_errors": len(real_errors)},
                     message=f"EOD option-chain collect, live-data Gateway ({ok} roots written)")

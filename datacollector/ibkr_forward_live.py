@@ -18,15 +18,14 @@ Design choices that keep it safe alongside other Gateway clients:
   * Streams in batches under IBKR's ~100 simultaneous market-data-line cap, so it
     won't exhaust the account's data lines out from under another client.
 
-Pulls the SAME root/universe list as ibkr_forward.py (config.all_roots()), but during
-the ThetaData A/B validation window it writes to the PARALLEL raw/options_ibkr
-namespace (config.RAW_OPTIONS_IBKR) via storage.py's base= redirect — NOT the main
-warehouse — so IBKR and ThetaData days for the same root/day can coexist (they would
-otherwise collide via storage.have_day) and be diffed daily by forward_ab_check.py.
-It does NOT union into the ThetaData catalog during validation (that namespace is kept
-out of catalog.duckdb). The collected column schema is byte-for-byte the SAME as the
-ThetaData parquet, so a future cutover can union the two or simply repoint back to the
-main namespace. Only the connection/Gateway and the write namespace differ.
+Pulls the SAME root/universe list as ibkr_forward.py (config.all_roots()) and, as of
+the 2026-07-27 ThetaData->IBKR cutover, writes to the MAIN warehouse namespace
+(config.RAW_OPTIONS = raw/options) — the same namespace ThetaData used to fill. (During
+the earlier A/B validation window it wrote to the parallel raw/options_ibkr namespace
+for daily side-by-side comparison; that validation is complete and the redirect is
+dropped.) The collected column schema is byte-for-byte the SAME as the historical
+ThetaData parquet, so the IBKR days union cleanly with the ThetaData history already on
+disk. Only the connection/Gateway differs from the paper variant.
 
 Usage:
     <venv python> ibkr_forward_live.py --test [ROOT]     # safe small slice (≈40 lines), default SPY
@@ -298,7 +297,7 @@ def collect_day(ib: IB, sym: str, daystr: str,
                      otherwise ("timeout", 0) and nothing is written (don't poison).
       * "ok"       — written normally.
     """
-    if storage.have_day(sym, daystr, base=config.RAW_OPTIONS_IBKR):
+    if storage.have_day(sym, daystr, base=config.RAW_OPTIONS):
         return ("skip", 0)
     c, spot, contracts = build_chain(ib, sym, band, max_exps)
     if not contracts:
@@ -312,7 +311,7 @@ def collect_day(ib: IB, sym: str, daystr: str,
         # write (no empty marker), consistent with the existing no-data behavior.
         return ("timeout" if snap_status == "timeout" else "no-data", 0)
     df = _to_df(rows, sym, daystr, snap_ts, spot)
-    n = storage.write_day(sym, daystr, df, base=config.RAW_OPTIONS_IBKR)
+    n = storage.write_day(sym, daystr, df, base=config.RAW_OPTIONS)
     # A deadline-aborted-but-partial day is written (populated>0) but flagged so the
     # run log shows it was truncated rather than a clean full capture.
     return ("timeout" if snap_status == "timeout" else "ok", n)

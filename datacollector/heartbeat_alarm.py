@@ -366,15 +366,15 @@ DEADLINE_JOBS: list[dict] = [
      "market_dependent": False},
     {"name": "forward", "label": "IBKR forward options collector",
      "status_file": _STATUS_DIR / "forward.json",
-     # ThetaEodDaily TRIGGERS at 17:30 but the full-chain EOD grab (50 roots) takes
-     # ~35 min to WRITE its status -- observed finishing 18:06 (2026-07-21). A 15-min
-     # buffer put the deadline at 17:45, so the 17:45 alarm sweep false-paged every
-     # evening and self-cleared an hour later when the real run landed. 60 min puts the
-     # deadline at 18:30 (~24 min past the observed finish), still well before the 21:00
-     # EodReport that consumes this data. Raise further only if the grab starts running
-     # longer.
+     # IbkrForwardEodDaily TRIGGERS ~17:30 CT (the ThetaData->IBKR cutover of 2026-07-27;
+     # this job replaced the retired ThetaEodDaily/eod_daily.py). The index-only IBKR
+     # forward grab (SPX/SPXW/RUT/NDX, per-root deep depth) writes its "forward" status
+     # after the run; SPX/SPXW alone legitimately take ~11-13 min each, so the whole
+     # index run can take a while. A 60-min buffer puts the deadline at ~18:30, still
+     # well before the 21:00 EodReport that consumes this data. Raise further only if the
+     # grab starts running longer.
      "deadline_hhmm_fallback": (19, 0), "deadline_buffer_min": 60,
-     "task_name": "ThetaEodDaily",
+     "task_name": "IbkrForwardEodDaily",
      "market_dependent": True},
     {"name": "tiingo", "label": "Tiingo daily data refresh",
      "status_file": _STATUS_DIR / "tiingo.json",

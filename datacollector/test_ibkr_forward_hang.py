@@ -159,7 +159,7 @@ def test_early_out_stops_before_full_walk():
 
 
 def test_early_out_collect_day_returns_no_data(monkeypatch, tmp_path):
-    monkeypatch.setattr(m.config, "RAW_OPTIONS_IBKR", tmp_path)
+    monkeypatch.setattr(m.config, "RAW_OPTIONS", tmp_path)
     ib = FakeIB({"QQQ": _rootcfg(6, 40, populate=False)})
     status, n = m.collect_day(ib, "QQQ", "20260724")
     assert status == "no-data"
@@ -172,7 +172,7 @@ def test_early_out_collect_day_returns_no_data(monkeypatch, tmp_path):
 # (b) per-root wall-clock deadline + main-style loop continues to the next root
 # --------------------------------------------------------------------------- #
 def test_deadline_timeout_and_loop_continues(monkeypatch, tmp_path):
-    monkeypatch.setattr(m.config, "RAW_OPTIONS_IBKR", tmp_path)
+    monkeypatch.setattr(m.config, "RAW_OPTIONS", tmp_path)
     clock = FakeClock()
     monkeypatch.setattr(m.time, "monotonic", clock.monotonic)
 
@@ -198,7 +198,7 @@ def test_deadline_timeout_and_loop_continues(monkeypatch, tmp_path):
 
 def test_deadline_with_no_populated_rows_does_not_write(monkeypatch, tmp_path):
     # Deadline hit AND nothing populated -> "timeout" but no write (don't poison day).
-    monkeypatch.setattr(m.config, "RAW_OPTIONS_IBKR", tmp_path)
+    monkeypatch.setattr(m.config, "RAW_OPTIONS", tmp_path)
     clock = FakeClock()
     monkeypatch.setattr(m.time, "monotonic", clock.monotonic)
     ib = FakeIB({"SPX": _rootcfg(6, 40, populate=False)})
@@ -227,7 +227,7 @@ def test_spot_timeout_falls_back_to_none(monkeypatch):
 
 
 def test_spot_timeout_collection_still_proceeds(monkeypatch, tmp_path):
-    monkeypatch.setattr(m.config, "RAW_OPTIONS_IBKR", tmp_path)
+    monkeypatch.setattr(m.config, "RAW_OPTIONS", tmp_path)
 
     def boom(*a, **k):
         for x in a:                          # close the un-run coroutine (no warning)
@@ -248,7 +248,7 @@ def test_spot_timeout_collection_still_proceeds(monkeypatch, tmp_path):
 # (d) regression: a normal populated root collects fully, schema unchanged
 # --------------------------------------------------------------------------- #
 def test_normal_root_collects_fully(monkeypatch, tmp_path):
-    monkeypatch.setattr(m.config, "RAW_OPTIONS_IBKR", tmp_path)
+    monkeypatch.setattr(m.config, "RAW_OPTIONS", tmp_path)
     ib = FakeIB({"SPY": _rootcfg(3, 25, populate=True)})   # 3*25*2 = 150 rows
     status, n = m.collect_day(ib, "SPY", "20260724")
     assert status == "ok"

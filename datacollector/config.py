@@ -49,8 +49,14 @@ THETA_KEY_NAME = "THETADATA_API_KEY"
 # --------------------------------------------------------------------------- #
 # ThetaData local Terminal (v3) — REST gateway on localhost
 # --------------------------------------------------------------------------- #
+# NOTE: the ThetaData subscription lapsed 2026-07-25 and the nightly EOD feed cut
+# over to the IBKR forward collector (raw/options, key "forward"). These keys are
+# retained ONLY because still-present (non-nightly) modules import them —
+# universe_download.py / download.py / thetadata_client.py / collect_spx_1m.py /
+# canslim\pull_equity_options.py — so removing them would break those imports. The
+# old THETA_TERMINAL_JAR key was removed in the cutover (its only users,
+# start_terminal.py + theta_terminal_watchdog.py, were deleted).
 THETA_BASE_URL = "http://127.0.0.1:25503/v3"
-THETA_TERMINAL_JAR = DATA_ROOT / "ThetaTerminalv3.jar"       # downloaded once, kept local
 THETA_RATE_TYPE = "sofr"                                     # greeks risk-free basis (default)
 
 # --------------------------------------------------------------------------- #
