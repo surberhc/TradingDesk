@@ -37,6 +37,9 @@
 > - (#7) [S4] Pick an account/profile for S4 (SPX vol-control fund) paper-deploy
 > - (#8) [S5] S5 (financed convexity overlay) financing-structure sizing decision
 
+### 2026-07-27 (main) — Session close 2026-07-27
+All threads landed: S8 morning bring-up hardened; dashboard restored; ThetaData fully retired + EOD feed on IBKR (IbkrForwardEodDaily + LiveDataGatewayEnsureUp_1720CT + IbkrNightlyVerify_0727); over-engineered nightly data-warehouse backup removed entirely (the real alert-flood source); dead ThetaData 1-min tooling deleted, dormant product modules (universe_download, canslim pull_equity_options) kept+marked per Andrew's call. OPEN: watch tonight's first IBKR nightly (17:30, PASS/FAIL email 18:45); pre-existing canslim test stale-My-Drive-path failure spun off as a task; optional later retire of RAW_OPTIONS_IBKR A/B vestige.
+
 ### 2026-07-27 (main) — Close out ThetaData tail: dead 1-min tooling removed, dormant product modules kept per decision
 Andrew's call 2026-07-27: dead 1-minute collection tooling deleted (commit 33d7b59); remaining ThetaData-dependent modules KEPT, not deleted. universe_download cluster (universe_download.py + universe_config.py) = dormant reference; canslim/pull_equity_options.py = keep + re-source from IBKR later; thetadata_client.py/download.py + config keys THETA_BASE_URL/THETA_RATE_TYPE retained as leaf deps. All five got a DORMANT/ThetaData-RETIRED header marker (comment-only, commit 42b5712). Nothing runs ThetaData at runtime (EOD feed on IBKR). datacollector 235 passed; canslim 81 passed (1 pre-existing unrelated failure).
 
