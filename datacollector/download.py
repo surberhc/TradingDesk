@@ -20,6 +20,10 @@ Usage:
     python download.py                 # full universe (long; resumable)
 """
 
+# DORMANT / ThetaData-RETIRED 2026-07-27. One-time ThetaData EOD bulk pull;
+# retained only because universe_download.py reuses pull_day. Not runnable
+# without ThetaData.
+
 from __future__ import annotations
 
 import sys

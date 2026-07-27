@@ -48,6 +48,10 @@ USAGE
 
 ASCII-only console output (Windows cp1252 console).
 """
+# DORMANT / ThetaData-RETIRED 2026-07-27. This expanded-universe puller sourced
+# from the (now-dead) ThetaData Terminal and was never cut into use; its
+# UniverseDownloadEod task is disabled. Kept as reference only — would need
+# re-sourcing off IBKR to run. Do not enable as-is.
 from __future__ import annotations
 
 import argparse

@@ -11,6 +11,11 @@ Joined on (symbol, expiration, strike, right, date), they give everything the
 GEX / gamma-flip / expected-move features are built from.
 """
 
+# ThetaData-RETIRED 2026-07-27 (subscription dead). Retained ONLY as the leaf
+# client for the dormant download.py/universe_download.py and CANSLIM
+# pull_equity_options.py. Not used by any live/nightly path (EOD feed is on
+# IBKR now).
+
 from __future__ import annotations
 
 import io

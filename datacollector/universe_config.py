@@ -22,6 +22,9 @@ Both layers pull 2018-01-01..present (single-name option history on ThetaData
 generally starts ~2020; earlier days simply return empty and are marked done).
 """
 
+# Config for the DORMANT universe_download puller (ThetaData-retired 2026-07-27,
+# kept as reference).
+
 from __future__ import annotations
 
 import config  # shared paths / terminal URL — reused, not duplicated

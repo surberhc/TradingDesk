@@ -51,6 +51,11 @@ Usage:
     python pull_equity_options.py --workers 4
 """
 
+# DORMANT / ThetaData-RETIRED 2026-07-27. Real single-stock option-chain
+# validation for the CANSLIM overlay, sourced from the (now-dead) ThetaData
+# Terminal. KEPT per Andrew's call — TODO: re-source from IBKR option chains
+# before re-enabling. Cannot run as-is.
+
 from __future__ import annotations
 
 import argparse
