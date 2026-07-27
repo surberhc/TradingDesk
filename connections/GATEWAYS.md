@@ -90,3 +90,5 @@ call sites, which are authoritative over any drifted registry comment).
 - 54 `s8_live_pilot` (s8_runner live-cycle read: account summary + 0DTE chain)
 - 55 `s8_monitor` (streaming exit-monitor read-only; runs concurrently with s8_live_pilot)
 - 56 `s8_collector` (intraday ATM-band market collector read-only; runs concurrently with s8_live_pilot + s8_monitor; band bounded to a conservative line budget so the monitor's position-leg lines keep headroom)
+- 57 `s0_live_pilot` (S0 morning-pilot read-only: reads the individual test account U5721712's NetLiq/positions/margin for morning_execute's WOULD-HAVE-TRANSMITTED reports; runs concurrently with the S8 consumers; PILOT_MODE + readonly are the zero-transmit walls)
+- 58 `s0_live_exec` (RESERVED, not built: future transmit-capable S0 executor pinned to U5721712 — the gated real-money milestone)

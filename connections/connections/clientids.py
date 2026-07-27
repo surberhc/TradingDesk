@@ -26,6 +26,13 @@ port 4001 live-data login, this account is transmit-CAPABLE at the account-permi
 level. Nothing transmits on it during the pilot: the primary wall is hardcoded
 PILOT_MODE=True in livebot/s8_runner.py, backstopped by ibkr_live_trade.connect()'s
 readonly=True default. Ports 4001 (live read-only data) and 4002 (paper) are unchanged.
+
+NOTE (2026-07-27): S0 (adaptive_all_weather) now also READS on port 4003 -- "s0_live_pilot"
+(57) is morning_execute_run.py's read-only live-pilot connection to the individual test
+account U5721712 (S8 uses the trust account U14438624 under the same login). Order
+TRANSMISSION on 4003 stays zero during both pilots: PILOT_MODE (hardcoded) in each runner
+is the primary wall, ibkr_live_trade.connect(readonly=True) the fail-safe. "s0_live_exec"
+(58) is reserved for the future, gated S0 transmit path -- not built.
 """
 from __future__ import annotations
 
@@ -68,6 +75,8 @@ CLIENT_IDS = {
     "s8_live_pilot": 54,             # livebot/s8_runner.py's live-cycle connection to the NEW live-TRADING Gateway (connections.ibkr_live_trade, port 4003, transmit-capable account) -- connects readonly=True during the PILOT (reads accountSummary + 0DTE SPXW chain only, never transmits; PILOT_MODE in s8_runner is the primary wall). Distinct id from the retired live-DATA path paperbot_s8_livedata (51, port 4001) and from the reserved future executor paperbot_s8_exec (50)
     "s8_monitor": 55,                # livebot/s8_monitor.py's live exit-monitor SERVICE connection to the live-TRADING Gateway (connections.ibkr_live_trade, port 4003) -- the streaming exit-monitor's READ-ONLY consumer (connects readonly=True; only ever reqMktData/cancelMktData/reads, no order path anywhere). Distinct from s8_live_pilot (54, the entry runner) so the monitor and the entry runner can both poll port 4003 concurrently without a clientId collision. Zero-transmit like the rest of the pilot: PILOT_MODE upstream + this connection's readonly are the walls
     "s8_collector": 56,              # livebot/s8_collector.py's intraday ATM-BAND MARKET COLLECTOR connection to the live-TRADING Gateway (connections.ibkr_live_trade, port 4003) -- the periodic context feed's READ-ONLY consumer (connects readonly=True; only ever reqMktData/cancelMktData/reads, no order path anywhere). Streams a bounded ATM band of SPXW 0DTE strikes + SPX + VIX with model greeks and harvests a market-context snapshot at a configurable cadence. Distinct from s8_live_pilot (54) and s8_monitor (55) so the entry runner, exit monitor, and collector can all poll port 4003 concurrently without a clientId collision. Band size is bounded to a conservative market-data-line budget (Risk #1) so the exit monitor's position-leg lines always have headroom; on an IBKR line-limit error the band shrinks rather than crashing. Zero-transmit: PILOT_MODE upstream + this connection's readonly are the walls
+    "s0_live_pilot": 57,             # paperbot S0 (adaptive_all_weather): morning-pilot READ-ONLY connection to the live-TRADING Gateway (connections.ibkr_live_trade, port 4003) to read the REAL individual test account U5721712's NetLiq/positions/margin, so morning_execute_run.py's "WOULD HAVE TRANSMITTED" pilot reports (conductor #3/#41) reflect genuine account state. Connects readonly=True (see paperbot/s0_live.py); PILOT_MODE in morning_execute_run.py is the primary zero-transmit wall. Distinct from every S8 consumer on 4003 (s8_live_pilot 54 / s8_monitor 55 / s8_collector 56) so the S0 pilot and the S8 pilot/monitor/collector never collide on the shared gateway
+    "s0_live_exec": 58,              # paperbot S0 EXECUTOR (RESERVED, not yet built): the future transmit-capable S0 live executor (would connect readonly=False, pinned to U5721712, to transmit the staged S0 rebalance armed). Own id reserved now so it never collides when built, mirroring the S4 44/45 and S8 49/50 reserved-exec pattern. Transmitting real money on this account remains the deliberate, gated milestone behind PILOT_MODE — nothing transmits today
 }
 
 # Ids seen in old stray scripts — DO NOT reuse without checking; left here as history.
