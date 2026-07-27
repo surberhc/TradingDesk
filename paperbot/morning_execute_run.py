@@ -31,7 +31,7 @@ still needs it to act manually).
 
 Run (no-ops instantly if nothing is staged for today):
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe ^
-    "C:\\Users\\andre\\My Drive (andrew@surberhc.com)\\TradingDesk\\paperbot\\morning_execute_run.py"
+    "C:\\TradingDesk\\paperbot\\morning_execute_run.py"
 """
 from __future__ import annotations
 
