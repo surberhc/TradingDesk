@@ -92,16 +92,6 @@ try:
 except Exception:  # noqa: BLE001 — the alarm must import even if the job module doesn't
     _repo_backup = None
 
-# The data-backup job (rclone copy of C:\TradingDesk-Local -> Google Drive) owns its own
-# heartbeat path too; import it rather than keeping a hand-maintained SECOND COPY here,
-# for the same reason as repo_backup above (a copied constant drifts and false-pages).
-# Imported defensively — data_backup is stdlib-only, but if it ever fails to import, the
-# alarm must still run and we fall back to the literal path.
-try:
-    import data_backup as _data_backup
-except Exception:  # noqa: BLE001 — the alarm must import even if the job module doesn't
-    _data_backup = None
-
 # The Drive-sync tripwire — a STATE ASSERTION (not a staleness check): it pages the
 # moment C:\TradingDesk-Local comes under Google Drive sync/backup management (the
 # 2026-07-16 wrong-folder corruption risk). Evaluated every sweep by handle_tripwire()
@@ -214,24 +204,6 @@ _REPO_BACKUP_HB = (
     _repo_backup.HEARTBEAT_FILE if _repo_backup is not None
     else Path(r"C:\TradingDesk-Local\backups\repo_backup_heartbeat.txt"))
 
-# How long without a VERIFIED data backup before we page. The data backup is intended to
-# run DAILY, but unlike the git-bundle repo backup it can run for HOURS: it is an rclone
-# copy+check of the ~99 GB / ~464k-file warehouse, and a busy day's incremental sync plus
-# the full checksum verification pass can legitimately take a long time. So the grace on
-# top of the 24h cadence is generous: 30h = one day (24h) + ~6h for a long run.
-#
-# CADENCE <-> THRESHOLD COUPLING (Andrew's call, same warning as REPO_BACKUP_THRESHOLD_S):
-# this number ASSUMES the DataBackupDaily task runs every 24h (register_data_backup_task.ps1
-# schedules it at 21:00). It is NOT derived from the task automatically. If you change the
-# cadence, change this number too, or it will FALSE-PAGE (threshold too tight for the new
-# gap) or SLEEP THROUGH a real outage (threshold too loose). If you find the real run
-# routinely takes longer than ~6h, RAISE the grace rather than letting it page nightly.
-DATA_BACKUP_THRESHOLD_S = 30 * 3600
-
-_DATA_BACKUP_HB = (
-    _data_backup.HEARTBEAT_FILE if _data_backup is not None
-    else Path(r"C:\TradingDesk-Local\backups\data_backup_heartbeat.txt"))
-
 JOBS: list[dict] = [
     # repo_backup — THE 2026-07-16 GAP. Google Drive silently synced the WRONG folder
     # for 9 days (2026-07-07..07-16); 85 commits never left the machine and NO ERROR
@@ -266,48 +238,12 @@ JOBS: list[dict] = [
          "failed. Check Task Scheduler task <b>{task_name}</b> and run repo_backup.py "
          "by hand; the status file (repo_backup_status.json) records the exact failure."),
      },
-    # data_backup — the DATA analogue of repo_backup. repo_backup insures the CODE;
-    # this insures the ~99 GB / ~464k-file irreplaceable market-data warehouse under
-    # C:\TradingDesk-Local (none of it is in git). data_backup.py runs `rclone copy`
-    # (additive, never deletes on the remote) then `rclone check` (checksum comparison,
-    # md5), and refreshes this heartbeat IF AND ONLY IF the copy succeeded AND check
-    # reported 0 differences / 0 errors. Every failure path leaves it untouched, so a
-    # failed backup and a never-ran backup look IDENTICAL from here — both go cold, both
-    # page. Same silence-is-the-signal design as repo_backup.
-    {"name": "data_backup",
-     "label": "TradingDesk data backup (rclone -> Drive)",
-     "heartbeat": _DATA_BACKUP_HB,
-     "progress": None,
-     "threshold_s": DATA_BACKUP_THRESHOLD_S,
-     "task_name": "DataBackupDaily",
-     # FIRST-RUN GRACE (absent-heartbeat path only). This alarm's launcher had been
-     # broken since the folder move and was fixed / went live 2026-07-20 ~10:38, but
-     # DataBackupDaily's FIRST scheduled run is 21:00 CT that same night — so the
-     # heartbeat is legitimately absent, not failed, and the alarm false-paged at 10:45
-     # about a backup that isn't broken and isn't even due yet. A full first deep run
-     # completes well before 03:00, and a manual verified cloud copy already existed
-     # (2026-07-18), so nothing is unprotected. Suppress the never-ran MISSING page until
-     # 03:00 CT 2026-07-21; after that an absent heartbeat is a real failure and pages.
-     # ONLY affects the absent path — a cold/stale heartbeat still pages immediately.
-     "missing_ok_until": "2026-07-21T03:00:00-05:00",
-     "cause_stale": (
-         "No VERIFIED data backup has landed in {age}. The data-backup job refreshes "
-         "its heartbeat ONLY on a fully verified success (rclone copy completed AND "
-         "rclone check confirmed the remote copy byte-identical by md5, 0 differences / "
-         "0 errors), so this means the backup either FAILED or never ran — and your "
-         "~99 GB of irreplaceable market data may exist on exactly one disk right now. "
-         "The run can take HOURS (99 GB / 464k files), and the threshold already allows "
-         "for that; {age} past it is a real problem, not a slow run. Check Task "
-         "Scheduler task <b>{task_name}</b>, then run data_backup.py by hand and read "
-         "its output; the status file (data_backup_status.json) records the exact "
-         "failure."),
-     "cause_missing": (
-         "The data-backup heartbeat file is ABSENT — no verified data backup has EVER "
-         "been recorded. Either the job has never successfully run, or its very first "
-         "run failed. Check Task Scheduler task <b>{task_name}</b> and run "
-         "data_backup.py by hand; the status file (data_backup_status.json) records the "
-         "exact failure."),
-     },
+    # data_backup REMOVED 2026-07-27 (Andrew's call): the nightly rclone copy+check of
+    # the ~104 GB warehouse to Drive was over-engineered and low-value — the only
+    # irreplaceable data (frozen 1-min history) is already verified in Drive (07-25
+    # backup, 912k files) and everything newer is re-pullable. Its staleness job was the
+    # alert-flood source once the backup stopped running, so it (plus data_backup.py, its
+    # launcher, and the DataBackupDaily task) is gone. repo_backup below is UNCHANGED.
     # spxw_1m (SPXW 1-min collector / Spxw1mCollector task) REMOVED 2026-07-07: the
     # one-time historical backfill finished 2026-07-02 (1127/1127 days, 100%) and the
     # job was intentionally superseded by universe_dl (UniverseDownloadEod) below. The

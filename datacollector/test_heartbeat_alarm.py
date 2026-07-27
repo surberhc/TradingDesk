@@ -346,7 +346,7 @@ def test_absent_heartbeat_with_future_grace_no_alert(tmp_path):
     """Absent heartbeat + missing_ok_until in the FUTURE -> NOT an alert: the first
     scheduled run simply hasn't come due yet (status 'pending_first_run')."""
     now = dt.datetime.now().timestamp()
-    job = _job(tmp_path, name="data_backup")
+    job = _job(tmp_path, name="new_job")
     job["progress"] = None
     job["missing_ok_until"] = _iso(now, +6 * 3600)  # 6h in the future
     assert not job["heartbeat"].exists()
@@ -361,7 +361,7 @@ def test_absent_heartbeat_with_past_grace_alerts(tmp_path):
     """Absent heartbeat + missing_ok_until in the PAST -> unchanged behaviour: the
     first run is genuinely overdue, so status 'missing' and ALERT."""
     now = dt.datetime.now().timestamp()
-    job = _job(tmp_path, name="data_backup")
+    job = _job(tmp_path, name="new_job")
     job["progress"] = None
     job["missing_ok_until"] = _iso(now, -3600)  # 1h ago
     assert not job["heartbeat"].exists()
@@ -375,7 +375,7 @@ def test_absent_heartbeat_without_grace_alerts(tmp_path):
     """Absent heartbeat + NO missing_ok_until -> unchanged behaviour (missing/alert).
     Jobs without the field must behave exactly as before."""
     now = dt.datetime.now().timestamp()
-    job = _job(tmp_path, name="data_backup")
+    job = _job(tmp_path, name="new_job")
     job["progress"] = None
     assert "missing_ok_until" not in job
     assert not job["heartbeat"].exists()
@@ -390,7 +390,7 @@ def test_cold_heartbeat_with_future_grace_still_alerts(tmp_path):
     old is a job that ran once and went cold — a real failure — and must still ALERT
     even with a FUTURE missing_ok_until set."""
     now = dt.datetime.now().timestamp()
-    job = _job(tmp_path, name="data_backup")
+    job = _job(tmp_path, name="new_job")
     job["progress"] = None
     job["missing_ok_until"] = _iso(now, +6 * 3600)  # future grace present
     hb = job["heartbeat"]
@@ -406,7 +406,7 @@ def test_absent_heartbeat_with_unparseable_grace_alerts(tmp_path):
     """An unparseable missing_ok_until must FAIL SAFE toward the existing behaviour:
     do not crash, do not suppress -> status 'missing' and ALERT."""
     now = dt.datetime.now().timestamp()
-    job = _job(tmp_path, name="data_backup")
+    job = _job(tmp_path, name="new_job")
     job["progress"] = None
     job["missing_ok_until"] = "not-a-timestamp"
     assert not job["heartbeat"].exists()
