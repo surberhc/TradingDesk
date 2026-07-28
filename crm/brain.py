@@ -6,7 +6,7 @@ its own worth the name — every decision lives in one of the four modules it co
 
   * crm/domain.py     — Template / SLEEVE_REGISTRY / AssignmentBook / derive_group_membership
   * crm/capability.py — the §5 capability gate (evaluate_template / assignable_templates)
-  * crm/ledger.py     — the §7 sleeve ledger + reconcile checksum (attribute_block_fill /
+  * crm/sleeve_ledger.py — the §7 sleeve ledger + reconcile checksum (attribute_block_fill /
                         reconcile_account / ReconResult)
   * crm/latch.py      — the §12 triage + fault-latch lifecycle (triage_reconcile /
                         fault_for_latch / LatchBook / below_floor)
@@ -25,7 +25,7 @@ single module can enforce alone:
     an account being excluded at pre-flight.
 
 HARD BOUNDARIES honored here (load-bearing — do not cross):
-  * PURE / OFFLINE. stdlib only (dataclasses, datetime, typing) + crm.domain / crm.ledger /
+  * PURE / OFFLINE. stdlib only (dataclasses, datetime, typing) + crm.domain / crm.sleeve_ledger /
     crm.latch / crm.capability (all pure). NO broker, NO ib_async, NO paperbot/config/order
     path, NO gateway. Broker snapshots (positions / cash / capabilities) and the broker
     activity ledger are passed IN as data — the brain fetches NOTHING.
@@ -44,13 +44,13 @@ from datetime import date, datetime
 from typing import Mapping, Optional
 
 import domain
-import ledger
+import sleeve_ledger
 import latch
 import capability
 
-# Alias the ledger module's SleeveLedger — the constructor's `ledger` PARAMETER (named per the
-# slice contract) shadows the `ledger` module inside __init__, so we reach the class this way.
-from ledger import SleeveLedger as _SleeveLedger, POS_TOL as _POS_TOL, CASH_TOL as _CASH_TOL
+# Alias the sleeve_ledger module's SleeveLedger — the constructor's `ledger` PARAMETER (named
+# per the slice contract) reads more clearly reaching the class through this alias.
+from sleeve_ledger import SleeveLedger as _SleeveLedger, POS_TOL as _POS_TOL, CASH_TOL as _CASH_TOL
 
 
 # =============================================================================
@@ -62,7 +62,7 @@ class ReconcileReport:
     (§12.1), and whether that verdict actually latched the account out (§12.3). Frozen — an
     operational audit fact once produced.
 
-      * `recon`   — the raw ledger.ReconResult (per-instrument + cash + verdict).
+      * `recon`   — the raw sleeve_ledger.ReconResult (per-instrument + cash + verdict).
       * `outcome` — the latch.TriageOutcome (CLEAN / EXPLAINED / UNEXPLAINED_PENDING / LATCH).
       * `reason`  — the human triage reason string.
       * `latched` — True iff this reconcile drove a fault-latch (outcome == LATCH and the
@@ -71,7 +71,7 @@ class ReconcileReport:
                     False when an already-active latch absorbed it (alert-once, §12.3)."""
     account_id: str
     day: date
-    recon: "ledger.ReconResult"
+    recon: "sleeve_ledger.ReconResult"
     outcome: "latch.TriageOutcome"
     reason: str
     latched: bool
@@ -91,7 +91,7 @@ class CRMBrain:
     def __init__(self, templates: Mapping[str, "domain.Template"], *,
                  registry: Mapping[str, "domain.Sleeve"] = domain.SLEEVE_REGISTRY,
                  assignments: Optional["domain.AssignmentBook"] = None,
-                 ledger: Optional["ledger.SleeveLedger"] = None,
+                 ledger: Optional["sleeve_ledger.SleeveLedger"] = None,
                  latches: Optional["latch.LatchBook"] = None) -> None:
         self.templates: dict = dict(templates)
         self.registry = registry
@@ -110,7 +110,7 @@ class CRMBrain:
         return self._assignments
 
     @property
-    def ledger(self) -> "ledger.SleeveLedger":
+    def ledger(self) -> "sleeve_ledger.SleeveLedger":
         return self._ledger
 
     @property
@@ -189,24 +189,24 @@ class CRMBrain:
             self._assignments, self.templates, self.registry)
 
     # =========================================================================
-    # Ledger ops — §7 attribution (delegate to crm.ledger)
+    # Ledger ops — §7 attribution (delegate to crm.sleeve_ledger)
     # =========================================================================
     def attribute_block(self, *, fa_group: str,
                         per_account_split: Mapping[str, float],
-                        instrument: "ledger.Instrument", price: float,
+                        instrument: "sleeve_ledger.Instrument", price: float,
                         commission_total: float = 0.0, side: str = "BUY",
                         now: Optional[datetime] = None) -> dict:
         """Attribute an FA-group block fill across accounts (§7.2 / §13.3). Delegates to
-        ledger.attribute_block_fill over this brain's ledger; the sleeve is recovered from the
-        group via the registry. Returns the per-account applied report."""
-        return ledger.attribute_block_fill(
+        sleeve_ledger.attribute_block_fill over this brain's ledger; the sleeve is recovered from
+        the group via the registry. Returns the per-account applied report."""
+        return sleeve_ledger.attribute_block_fill(
             self._ledger, fa_group=fa_group, per_account_split=per_account_split,
             instrument=instrument, price=price, commission_total=commission_total,
-            side=side, group_sleeve_map=ledger.build_group_sleeve_map(self.registry),
+            side=side, group_sleeve_map=sleeve_ledger.build_group_sleeve_map(self.registry),
             now=now)
 
     def attribute_leg(self, account: str, sleeve: str,
-                     instrument: "ledger.Instrument", qty_delta: float, price: float, *,
+                     instrument: "sleeve_ledger.Instrument", qty_delta: float, price: float, *,
                      commission: float = 0.0, now: Optional[datetime] = None) -> float:
         """Attribute one filled leg to one sleeve (§7.2 primitive) — SleeveLedger.attribute_fill.
         Returns the cash_delta applied (BUY drains, SELL adds; commission always a cost)."""
@@ -226,7 +226,7 @@ class CRMBrain:
     # The end-to-end reconcile → triage → latch flow (§7.4 → §12.1 → §12.3)
     # =========================================================================
     def reconcile(self, account_id: str,
-                  broker_positions: Mapping["ledger.Instrument", float],
+                  broker_positions: Mapping["sleeve_ledger.Instrument", float],
                   broker_cash: float, transactions: list, *,
                   day: date, is_eod: bool, now: Optional[datetime] = None,
                   pos_tol: float = _POS_TOL,
@@ -235,7 +235,7 @@ class CRMBrain:
         when triage says LATCH — actually pull the account out via the LatchBook (§12.3).
 
         Flow:
-          1. ledger.reconcile_account  → ReconResult (verdict OK / REVIEW / DRIFT).
+          1. sleeve_ledger.reconcile_account  → ReconResult (verdict OK / REVIEW / DRIFT).
           2. latch.triage_reconcile    → (TriageOutcome, reason), using the broker's own labeled
              `transactions` and the intraday-vs-EOD `is_eod` timing.
           3. If outcome == LATCH: self._latches.latch(account_id, day,
@@ -246,7 +246,7 @@ class CRMBrain:
         A DRIFT verdict therefore flows all the way to the account being latched out and
         excluded at pre-flight. The broker snapshot + activity ledger are passed IN (pure).
         `pos_tol`/`cash_tol` are mechanical float-slop params passed through (not strategy)."""
-        recon = ledger.reconcile_account(
+        recon = sleeve_ledger.reconcile_account(
             self._ledger, account_id, broker_positions, broker_cash,
             pos_tol=pos_tol, cash_tol=cash_tol)
         outcome, reason = latch.triage_reconcile(
@@ -317,7 +317,7 @@ class CRMBrain:
             for tid, td in d.get("templates", {}).items()
         }
         assignments = domain.AssignmentBook.from_dict(d.get("assignments", {}))
-        led = ledger.SleeveLedger.from_dict(d.get("ledger", {}))
+        led = sleeve_ledger.SleeveLedger.from_dict(d.get("ledger", {}))
         latches = latch.LatchBook.from_dict(d.get("latches", {}))
         brain = cls(templates, registry=registry, assignments=assignments,
                     ledger=led, latches=latches)

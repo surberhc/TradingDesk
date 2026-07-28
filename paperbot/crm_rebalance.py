@@ -68,18 +68,18 @@ capital (net_liq_sleeve = blended_net_liq[account] x template_weight) as `net_li
 
 CROSS-PACKAGE IMPORT (the crm/ flat-import bridge)
 --------------------------------------------------
-crm/ modules use flat imports (`import domain`, `import ledger`, ...) that resolve only with
-crm/ on sys.path — the same precedent as account_monitor_run.py adding the sibling
-dailyreport dir. One wrinkle the slice contract under-stated: crm/ledger.py COLLIDES by name
-with paperbot/ledger.py (the paperbot audit trail), which 6 paperbot modules import as
-`import ledger`. So we do NOT just leave crm's modules registered under bare names in
-sys.modules — that would make a later `import ledger` in the paperbot suite return crm's
-ledger and break execution_engine / the margin tests. Instead _load_crm_modules() registers
-the crm modules under their bare names ONLY transiently (so their sibling flat imports
-resolve against crm/), captures the module objects, then RESTORES sys.modules to its prior
-state. The captured crm modules keep working because their cross-references are already bound
-inside each module's globals. (domain/capability/latch/brain/store do not collide; only
-`ledger` does — but we restore all six to be a clean citizen.)
+crm/ modules use flat imports (`import domain`, `import sleeve_ledger`, ...) that resolve only
+with crm/ on sys.path — the same precedent as account_monitor_run.py adding the sibling
+dailyreport dir. This USED to require a sys.modules save/restore dance: crm's ledger module
+collided by bare name with paperbot/ledger.py (the audit trail, imported as `import ledger` by
+execution_engine and ~6 others), so leaving crm's `ledger` registered in sys.modules would
+have made a later `import ledger` in the paperbot suite return the WRONG module. Conductor #58
+removed that collision by renaming crm/ledger.py -> crm/sleeve_ledger.py, so NO crm module now
+shares a bare name with any paperbot module (verified: domain / capability / sleeve_ledger /
+latch / brain / store have no paperbot namesake). The loader is therefore a plain sys.path
+insert + normal import — it registers the crm modules under their now-distinct bare names, and
+a later `import ledger` in the paperbot suite still resolves to paperbot's own audit-trail
+ledger. sys.path is restored after the load (the loaded modules persist in sys.modules).
 """
 from __future__ import annotations
 
@@ -92,26 +92,28 @@ import rebalance_engine
 
 
 # =============================================================================
-# CRM cross-package loader — transient bare-name registration + restore
+# CRM cross-package loader — plain sys.path insert + normal import (#58)
 # =============================================================================
 _CRM_DIR = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "crm")
 
 # Dependency order: each module's flat sibling imports must already be registered when it
-# executes (domain has none; capability/ledger need domain; latch needs ledger; brain needs
-# domain/ledger/latch/capability; store needs brain/domain).
-_CRM_MODULE_NAMES = ("domain", "capability", "ledger", "latch", "brain", "store")
+# executes (domain has none; capability/sleeve_ledger need domain; latch needs sleeve_ledger;
+# brain needs domain/sleeve_ledger/latch/capability; store needs brain/domain).
+_CRM_MODULE_NAMES = ("domain", "capability", "sleeve_ledger", "latch", "brain", "store")
 
 
 def _load_crm_modules() -> dict:
-    """Load crm/'s flat-import modules under their bare names WITHOUT permanently polluting
-    sys.modules.
+    """Load crm/'s flat-import modules under their bare names.
 
-    Why the dance: paperbot has its OWN `ledger` module (the audit trail) imported as
-    `import ledger` by execution_engine and others. If we left crm's ledger registered as
-    sys.modules['ledger'], a subsequent `import ledger` anywhere in the paperbot suite would
-    return the WRONG module. So we register the crm modules transiently, capture the objects
-    (their cross-references bind at import time and survive), then restore sys.modules.
+    crm/ modules import their siblings flatly (`import domain`, `import sleeve_ledger`, ...),
+    which only resolves with crm/ on sys.path. Conductor #58 renamed crm/ledger.py ->
+    crm/sleeve_ledger.py, eliminating the sole bare-name collision with a paperbot module
+    (paperbot/ledger.py, the audit trail). With no collision left, this is a plain load: put
+    crm/ on sys.path, import the modules (registering each in sys.modules under its now-distinct
+    bare name BEFORE exec so its sibling flat imports resolve to the crm version), then drop
+    crm/ back off sys.path. A subsequent `import ledger` anywhere in the paperbot suite still
+    resolves to paperbot's own audit-trail ledger, since no crm module is named `ledger`.
 
     Fails LOUDLY (ImportError) if crm/ or any expected module is missing."""
     if not os.path.isdir(_CRM_DIR):
@@ -119,8 +121,9 @@ def _load_crm_modules() -> dict:
             f"CRM package dir not found at {_CRM_DIR!r} — the crm/ sibling package is "
             f"required for the CRM->desk rebalance bridge.")
 
-    saved = {name: sys.modules.get(name) for name in _CRM_MODULE_NAMES}
-    sys.path.insert(0, _CRM_DIR)
+    added_to_path = _CRM_DIR not in sys.path
+    if added_to_path:
+        sys.path.insert(0, _CRM_DIR)
     try:
         loaded: dict = {}
         for name in _CRM_MODULE_NAMES:
@@ -129,34 +132,25 @@ def _load_crm_modules() -> dict:
                 raise ImportError(
                     f"CRM module {name!r} not found at {path!r} — cannot build the "
                     f"CRM->desk rebalance bridge.")
-            # Drop any cached (possibly paperbot's) entry so the crm version re-resolves
-            # from _CRM_DIR, then register the fresh module BEFORE exec so its siblings'
-            # flat imports find it.
-            sys.modules.pop(name, None)
             spec = importlib.util.spec_from_file_location(name, path)
             module = importlib.util.module_from_spec(spec)
-            sys.modules[name] = module
+            sys.modules[name] = module          # register before exec (siblings resolve to it)
             spec.loader.exec_module(module)
             loaded[name] = module
         return loaded
     finally:
-        # Restore sys.modules to its pre-load state (paperbot's `ledger`, absent siblings).
-        # The captured crm module objects retain their internal cross-references, so this is
-        # safe — it only cleans the shared import namespace.
-        for name, prev in saved.items():
-            if prev is None:
-                sys.modules.pop(name, None)
-            else:
-                sys.modules[name] = prev
-        try:
-            sys.path.remove(_CRM_DIR)
-        except ValueError:
-            pass
+        # Leave sys.path pristine; the loaded modules persist in sys.modules under their
+        # (collision-free) bare names, which is all the bridge needs.
+        if added_to_path:
+            try:
+                sys.path.remove(_CRM_DIR)
+            except ValueError:
+                pass
 
 
 _crm = _load_crm_modules()
 crm_domain = _crm["domain"]
-crm_ledger = _crm["ledger"]
+crm_ledger = _crm["sleeve_ledger"]
 crm_brain = _crm["brain"]
 crm_store = _crm["store"]
 

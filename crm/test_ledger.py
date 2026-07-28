@@ -11,7 +11,7 @@ from datetime import datetime
 import pytest
 
 import domain
-from ledger import (
+from sleeve_ledger import (
     POS_EPS,
     Instrument,
     SleeveLedgerEntry,

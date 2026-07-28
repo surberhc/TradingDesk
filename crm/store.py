@@ -11,7 +11,7 @@ WHAT IS DIFFERENT ABOUT THIS LAYER (and what is NOT):
   * IT IS THE TRANSPORT, so — unlike domain/ledger/latch/brain — it IS allowed to do I/O:
     sqlite3 (stdlib) + the filesystem for the DB file. That is the whole point of the slice.
   * BUT the dependency wall still stands. It imports ONLY sqlite3 / json / pathlib (stdlib)
-    and the pure crm.* modules (brain / domain — which themselves pull ledger / latch /
+    and the pure crm.* modules (brain / domain — which themselves pull sleeve_ledger / latch /
     capability). NO broker, NO ib_async, NO paperbot / config / order path, NO gateway. It
     PERSISTS the brain; it never touches an account or an order.
 
@@ -395,7 +395,7 @@ class CRMStore:
     def upsert_ledger_entry(self, entry, *, now=None) -> None:
         """Persist ONE mutated sleeve-ledger entry (the on-every-fill hot path): replace its
         entry row and its position rows (a closed line drops out), then bump version — one
-        transaction. `entry` is a ledger.SleeveLedgerEntry."""
+        transaction. `entry` is a sleeve_ledger.SleeveLedgerEntry."""
         with self._conn:
             self._insert_ledger_entry(entry.to_dict())
             self._bump(now=now)

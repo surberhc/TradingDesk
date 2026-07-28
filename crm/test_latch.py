@@ -10,8 +10,8 @@ from datetime import date, datetime
 
 import pytest
 
-import ledger
-from ledger import Instrument, SleeveLedger, reconcile_account
+import sleeve_ledger
+from sleeve_ledger import Instrument, SleeveLedger, reconcile_account
 from latch import (
     DRIFT_TOL,
     FaultType,

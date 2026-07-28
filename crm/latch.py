@@ -1,7 +1,7 @@
 """latch.py — the CRM fault-latch + reconciliation-triage lifecycle (conductor #42/#43).
 
-The OPERATIONAL layer on top of the §7.4 sleeve-ledger checksum (crm/ledger.py). Where
-ledger.reconcile_account produces a per-account verdict ("OK"/"REVIEW"/"DRIFT") and its
+The OPERATIONAL layer on top of the §7.4 sleeve-ledger checksum (crm/sleeve_ledger.py). Where
+sleeve_ledger.reconcile_account produces a per-account verdict ("OK"/"REVIEW"/"DRIFT") and its
 per-instrument classifications (MATCH / LEDGER_DRIFT / ALIEN / CASH_DRIFT), THIS module
 decides what that means operationally and holds the resulting state:
 
@@ -23,7 +23,7 @@ decides what that means operationally and holds the resulting state:
            blesses the number (rule #1).
 
 HARD BOUNDARIES honored here (load-bearing — do not cross):
-  * PURE / OFFLINE. stdlib only (dataclasses, enum, datetime, math, typing) + crm.ledger /
+  * PURE / OFFLINE. stdlib only (dataclasses, enum, datetime, math, typing) + crm.sleeve_ledger /
     crm.domain (both pure). NO broker, NO ib_async, NO paperbot/config/order path, NO
     gateway. The broker activity ledger and the recon snapshot are passed IN as data — this
     module never fetches them.
@@ -32,7 +32,7 @@ HARD BOUNDARIES honored here (load-bearing — do not cross):
   * NO FROZEN NUMBER INVENTED (rule #1). The drift-match tolerance is a MECHANICAL float-slop
     param with a sensible default (see below), NOT a strategy number. The contract FLOOR is
     passed IN, never derived here (§12.4/§12.5).
-  * STATE + PURE DECISIONS ONLY. This slice consumes ledger.ReconResult; it does NOT
+  * STATE + PURE DECISIONS ONLY. This slice consumes sleeve_ledger.ReconResult; it does NOT
     re-implement reconciliation. triage_* DECIDES (pure); LatchBook HOLDS state.
 """
 from __future__ import annotations
@@ -42,14 +42,14 @@ from dataclasses import dataclass, replace
 from datetime import date, datetime
 from typing import Mapping, Optional
 
-import ledger  # crm.ledger — pure; we consume its ReconResult / verdict, never re-run recon
+import sleeve_ledger  # crm.sleeve_ledger — pure; we consume its ReconResult / verdict, never re-run recon
 
 
 # =============================================================================
 # Mechanical tolerance — float/rounding slop only (NOT a frozen strategy number)
 # =============================================================================
 # A labeled transaction "explains" a cash drift when their amounts agree within this. $1.00
-# absorbs sub-dollar rounding / commission slop, mirroring ledger.CASH_TOL. It decides
+# absorbs sub-dollar rounding / commission slop, mirroring sleeve_ledger.CASH_TOL. It decides
 # "same dollar figure within noise," never anything about allocation — rule #1 does not touch it.
 DRIFT_TOL = 1.0
 
@@ -318,7 +318,7 @@ class TriageOutcome(enum.Enum):
     LATCH = "latch"                          # caller must latch the account out
 
 
-def triage_reconcile(recon: "ledger.ReconResult", transactions: list, *,
+def triage_reconcile(recon: "sleeve_ledger.ReconResult", transactions: list, *,
                      is_eod: bool, tol: float = DRIFT_TOL) -> tuple:
     """Triage one account's §7.4 reconcile into a §12.1 operational decision. Returns
     `(TriageOutcome, reason)`. This function DECIDES (pure); the CALLER applies
@@ -389,7 +389,7 @@ def triage_reconcile(recon: "ledger.ReconResult", transactions: list, *,
             f"reconcile verdict {recon.verdict!r} with no classified drift — held for review")
 
 
-def fault_for_latch(recon: "ledger.ReconResult") -> FaultType:
+def fault_for_latch(recon: "sleeve_ledger.ReconResult") -> FaultType:
     """The FaultType a caller should latch with for a LATCH-outcome triage of `recon` (§12.3).
     Mirrors triage_reconcile's precedence: a hard position LEDGER_DRIFT (or an unattributable
     ALIEN, treated as a books-vs-reality position discrepancy) → FaultType.LEDGER_DRIFT; an

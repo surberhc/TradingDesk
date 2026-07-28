@@ -21,8 +21,8 @@ import pytest
 
 import domain
 from domain import Template
-import ledger
-from ledger import Instrument
+import sleeve_ledger
+from sleeve_ledger import Instrument
 import latch
 import capability
 from capability import AccountCapabilities

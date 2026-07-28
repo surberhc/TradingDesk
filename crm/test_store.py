@@ -19,8 +19,8 @@ import pytest
 
 import domain
 from domain import Template, AccountAssignment, AssignmentBook
-import ledger
-from ledger import Instrument, SleeveLedger, SleeveLedgerEntry
+import sleeve_ledger
+from sleeve_ledger import Instrument, SleeveLedger, SleeveLedgerEntry
 import latch
 from latch import Latch, LatchBook, FaultType, AlertType
 import brain
