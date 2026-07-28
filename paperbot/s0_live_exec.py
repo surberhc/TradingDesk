@@ -5,15 +5,20 @@ WHAT THIS IS
 ------------
 The desk's FIRST real-transmission path. Every other order path in this codebase is
 zero-transmit (paper on 4002, or read-only/PILOT_MODE on 4003). This one CAN transmit a
-real order on the funded, live-trading individual TEST account U5721712 on the Live-Trade
-Gateway (port 4003) — but only for a single, hard-capped "tiny test", and only when a
-human deliberately arms it. It exists to prove the review -> arm -> transmit path end to
-end with the smallest possible real order, not to trade the strategy.
+real order on the funded, live-trading TEST account U14438624 (the trust account) on the
+Live-Trade Gateway (port 4003) — but only for a single, hard-capped "tiny test", and only
+when a human deliberately arms it. It exists to prove the review -> arm -> transmit path end
+to end with the smallest possible real order, not to trade the strategy.
+
+NOTE (2026-07-28, Andrew-authorized): this executor was retargeted from S0's individual TEST
+account U5721712 to the trust account U14438624 because U5721712 is PDT-restricted (margin
+<$25k — the live order was rejected) while U14438624 is a funded >$25k margin account
+(PDT-clear). This deliberately overrides the earlier forbidden-trust-account pin. The
+single-account wall is unchanged in kind — only repointed.
 
 It REUSES the read-only pilot (s0_live_pilot_run.py) verbatim for the parts that decide
 WHAT to trade: strategy_target.current_target() -> rebalance_engine.plan_account() against
-U5721712 with live prices, filtered to the individual account (never the trust account
-U14438624). It reimplements no sizing. The ONLY thing it adds on top of the pilot is a
+the target account with live prices. It reimplements no sizing. The ONLY thing it adds on top of the pilot is a
 single, capped, marketable LIMIT built with order_router.build_marketable_limit and — only
 behind a non-bypassable gate — transmitted with order_router.place(armed=True).
 
@@ -22,7 +27,7 @@ candidate order, prints exactly what WOULD be transmitted, and sends nothing. To
 transmit, a human must line up ALL of:
   * the exact CLI token  --arm-i-understand  (sets armed=True; never defaulted/auto-set),
   * NO kill-switch sentinel present,
-  * the target account is EXACTLY U5721712 (never the trust account U14438624),
+  * the target account is EXACTLY U14438624 (the single allowed account; any other refused),
   * the single order is a BUY of a whitelisted symbol (USFR only),
   * qty <= MAX_TEST_SHARES (1) AND shares*limit <= MAX_TEST_NOTIONAL ($150),
   * the Gateway is physically ARMED (its Read-Only API toggle is OFF — measured live with
@@ -63,10 +68,17 @@ import s0_live_pilot_run as sp
 # ----------------------------------------------------------------------------------------
 # SAFETY CONSTANTS — enforced in CODE below (the docstring is not the wall).
 # ----------------------------------------------------------------------------------------
-# The ONLY account this executor may ever transmit on. Pinned to S0's individual live TEST
-# account; the trust account U14438624 (S8's) under the same 4003 login is FORBIDDEN.
-EXEC_ACCOUNT = s0_live.S0_LIVE_ACCOUNT          # "U5721712"
-FORBIDDEN_TRUST_ACCOUNT = "U14438624"           # S8's trust account — never this one
+# EXEC_ACCOUNT retargeted to the trust account U14438624 on 2026-07-28 by Andrew's EXPLICIT
+# authorization, to finish the live-transmit proof: S0's individual account U5721712 is
+# PDT-restricted (margin <$25k, the live order was rejected); U14438624 is funded >$25k
+# (PDT-clear). This deliberately overrides the prior forbidden-trust-account pin. The
+# single-account wall is PRESERVED — just repointed: the executor still refuses ANY account
+# other than this one. All other caps/gates (USFR-only, <=1 share, <=$150, arm token, kill
+# switch, gateway read-only probe, dedup) are UNCHANGED.
+EXEC_ACCOUNT = "U14438624"   # trust account — see 2026-07-28 override note below
+# The single account this executor may ever transmit on (the pin above). Any other account
+# — including S0's now-PDT-blocked individual account U5721712 — is refused.
+ALLOWED_ACCOUNT = "U14438624"
 
 # The ONLY symbol it may transmit (a single, liquid, ultra-short Treasury FRN ETF).
 TEST_SYMBOL_WHITELIST = {"USFR"}
@@ -101,15 +113,13 @@ def _kill_switch_present() -> bool:
 
 
 def _account_safety_ok() -> tuple[bool, str]:
-    """Constant-level account guard: EXEC_ACCOUNT must be EXACTLY S0's individual account
-    and must NEVER be the trust account. Read at call time so a test/monkeypatch of
-    EXEC_ACCOUNT is honored."""
-    if EXEC_ACCOUNT == FORBIDDEN_TRUST_ACCOUNT:
-        return False, (f"target account {EXEC_ACCOUNT} is the FORBIDDEN trust account "
-                       f"{FORBIDDEN_TRUST_ACCOUNT} — refusing.")
-    if EXEC_ACCOUNT != s0_live.S0_LIVE_ACCOUNT:
-        return False, (f"target account {EXEC_ACCOUNT} is not S0's individual account "
-                       f"{s0_live.S0_LIVE_ACCOUNT} — refusing.")
+    """Constant-level account guard: EXEC_ACCOUNT must be EXACTLY the single ALLOWED_ACCOUNT
+    (the trust account U14438624 per the 2026-07-28 override) and no other. Read at call time
+    so a test/monkeypatch of EXEC_ACCOUNT is honored. This is a hard single-account wall —
+    the account is merely repointed, not loosened."""
+    if EXEC_ACCOUNT != ALLOWED_ACCOUNT:
+        return False, (f"target account {EXEC_ACCOUNT} is not the single allowed account "
+                       f"{ALLOWED_ACCOUNT} — refusing.")
     return True, ""
 
 
@@ -216,7 +226,7 @@ def _safety_banner(armed: bool, kill: bool) -> None:
     print(f"# SAFETY STATE   armed={armed}   arm_token={'present' if armed else 'absent'}   "
           f"kill_switch={'PRESENT' if kill else 'absent'}")
     print(f"# account={EXEC_ACCOUNT}   gateway=Live-Trade port 4003   "
-          f"(NEVER the trust account {FORBIDDEN_TRUST_ACCOUNT})")
+          f"(single-account wall: refuses ANY account other than {ALLOWED_ACCOUNT})")
     print(f"# CAPS   symbols={sorted(TEST_SYMBOL_WHITELIST)}   max_shares={MAX_TEST_SHARES}   "
           f"max_notional=${MAX_TEST_NOTIONAL:,.0f}   max_orders/run={MAX_ORDERS_PER_RUN}")
     if permit_intent:

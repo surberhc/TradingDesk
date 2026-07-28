@@ -15,10 +15,13 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.22.0"
+VERSION = "0.23.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.23.0", "2026-07-28", "s0_live_exec retargeted to trust account U14438624 "
+                             "(Andrew-authorized; U5721712 PDT-blocked); single-account wall "
+                             "repointed, all other caps unchanged."),
     ("0.22.0", "2026-07-27", "S0 tiny-test REAL-TRANSMISSION path (Andrew-authorized): new "
                              "s0_live_exec.py — the desk's FIRST order path that can transmit a "
                              "real order, on the funded individual live TEST account U5721712 on "

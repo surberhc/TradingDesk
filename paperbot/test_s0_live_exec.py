@@ -9,10 +9,10 @@ so nothing can ever reach the wire. These tests pin the non-bypassable safety en
   3. caps: >1 share clamps to 1; a non-USFR symbol is never selected; >$150 notional refuses.
   4. gate: gateway still read-only -> refuse even when armed.
   5. gate: KILL_SWITCH present -> refuse.
-  6. gate: target account != U5721712 -> refuse.
+  6. gate: target account != U14438624 (the single allowed account) -> refuse.
   7. dedup: already_present != FRESH -> skip, no transmit.
   8. armed + all gates pass -> order_router.place called EXACTLY once with a single BUY LIMIT
-     USFR order, qty 1, account U5721712.
+     USFR order, qty 1, account U14438624.
 
 Run:
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_s0_live_exec.py -q
@@ -28,8 +28,8 @@ import config
 import order_router
 import s0_live_exec as ex
 
-ACCT = ex.EXEC_ACCOUNT                      # "U5721712"
-TRUST = ex.FORBIDDEN_TRUST_ACCOUNT          # "U14438624"
+ACCT = ex.EXEC_ACCOUNT                      # "U14438624" (trust account; retargeted 2026-07-28)
+OTHER = "U5721712"                          # a NON-target account — must be refused / ignored
 
 
 # --- leak guard ---------------------------------------------------------------------
@@ -119,10 +119,10 @@ def _wire_connections(monkeypatch, fake):
 
 
 def _armed_summary():
-    # Includes plenty of buying power + the trust/aggregate rows that MUST be ignored.
+    # Includes plenty of buying power + the other-account/aggregate rows that MUST be ignored.
     return [_summary_row(ACCT, "NetLiquidation", "100000"),
             _summary_row(ACCT, "BuyingPower", "100000"),
-            _summary_row(TRUST, "NetLiquidation", "999999"),
+            _summary_row(OTHER, "NetLiquidation", "999999"),
             _summary_row("All", "NetLiquidation", "888")]
 
 
@@ -227,17 +227,17 @@ def test_kill_switch_refuses(monkeypatch):
     assert config.DRY_RUN is True and config.READONLY is True
 
 
-# --- 6. gate: target account != U5721712 -> refuse ----------------------------------
+# --- 6. gate: target account != U14438624 (single allowed account) -> refuse ---------
 def test_wrong_account_refuses(monkeypatch):
     _patch_common(monkeypatch, plan_orders={"USFR": 1})
-    # Force the exec account to the FORBIDDEN trust account.
-    monkeypatch.setattr(ex, "EXEC_ACCOUNT", TRUST)
-    fake = _FakeIB([_summary_row(TRUST, "NetLiquidation", "100000"),
-                    _summary_row(TRUST, "BuyingPower", "100000")], [])
+    # Force the exec account to a NON-allowed account — the single-account wall must refuse it.
+    monkeypatch.setattr(ex, "EXEC_ACCOUNT", OTHER)
+    fake = _FakeIB([_summary_row(OTHER, "NetLiquidation", "100000"),
+                    _summary_row(OTHER, "BuyingPower", "100000")], [])
     _wire_connections(monkeypatch, fake)
     monkeypatch.setattr(order_router, "place",
                         lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("must NEVER transmit on the trust account")))
+                            AssertionError("must NEVER transmit on a non-target account")))
 
     rc = ex.main(armed=True)
 
@@ -307,6 +307,6 @@ def test_armed_all_gates_pass_transmits_one_order(monkeypatch):
     assert b.order.action == "BUY"                          # a BUY, never a SELL
     assert b.order.orderType == "LMT"                       # a LIMIT, never a market order
     assert float(b.order.totalQuantity) == 1.0             # qty 1
-    assert b.order.account == ACCT == "U5721712"           # the individual account only
+    assert b.order.account == ACCT == "U14438624"          # the single allowed account only
     assert captured["account_kw"] == ACCT
     assert b.order.lmtPrice <= ex.MAX_TEST_NOTIONAL         # within the notional cap for 1 sh
