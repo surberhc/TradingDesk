@@ -102,6 +102,23 @@ KILL_SWITCH = r"C:\TradingDesk-Local\AUTOTRADE_DISABLED"
 #     backstop — a good price for a whole-book deploy leg is well under half the account).
 MAX_ORDER_NOTIONAL_PCT_NLV = 0.50
 
+# DEPLOY ORDER-REF NAMESPACE. The tiny-test (s0_live_exec) builds its orderRef with the SAME
+# order_router._order_ref(account, as_of, side, symbol) format, so a one-off tiny-test BUY of
+# a symbol the deploy also buys (e.g. USFR) shares an identical ref — the deploy's pre-transmit
+# dedup gate then sees the tiny-test's fill and returns PARTIAL (not FRESH), false-blocking the
+# WHOLE all-or-nothing deploy. Appending this stable discriminator gives the deploy its own ref
+# namespace so its legs can't collide with the tiny-test (or with a normal rebalance), while a
+# genuine re-send of the SAME deploy leg is still caught (the dedup gate runs against this exact
+# namespaced ref). Applied identically in BOTH ref sites via _deploy_ref so they can't drift.
+DEPLOY_REF_TAG = "deploy"
+
+
+def _deploy_ref(account, as_of, side, symbol) -> str:
+    """The deploy-namespaced orderRef: the standard order_router ref plus the deploy tag. Used
+    identically by the dedup-check loop AND the build/place loop so the checked ref and the
+    transmitted ref are byte-identical."""
+    return f"{order_router._order_ref(account, as_of, side, symbol)}:{DEPLOY_REF_TAG}"
+
 
 def arm_requested(argv: list[str]) -> bool:
     """True ONLY if the exact arm token is present in argv — the single thing that sets
@@ -462,7 +479,7 @@ def _run_session(ib, target, *, armed: bool, conform: bool, armed_conn: bool,
                            "physically armed; a human must turn the Read-Only API toggle off")
     if armed and conform and armed_conn and not reasons:
         for l in legs:
-            ref = order_router._order_ref(account, target.as_of, l.side, l.symbol)
+            ref = _deploy_ref(account, target.as_of, l.side, l.symbol)
             dedup = order_router.already_present(ib, ref, l.qty)
             if dedup != order_router.LegState.FRESH:
                 reasons.append(f"dedup gate says {dedup} (not FRESH) for {l.side} "
@@ -493,7 +510,7 @@ def _run_session(ib, target, *, armed: bool, conform: bool, armed_conn: bool,
           f"leg(s), SELLS FIRST. ***")
     built: list = []
     for l in legs:
-        ref = order_router._order_ref(account, target.as_of, l.side, l.symbol)
+        ref = _deploy_ref(account, target.as_of, l.side, l.symbol)
         o = order_router.build_marketable_limit(
             l.symbol, l.side, l.qty, l.limit, account=account, order_ref=ref)
         contract = Stock(l.symbol, "SMART", "USD")

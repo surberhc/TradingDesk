@@ -356,3 +356,95 @@ def test_armed_conform_all_gates_pass_transmits(monkeypatch):
     assert any(b.symbol == "GDX" and b.order.action == "SELL"
                and float(b.order.totalQuantity) == 100.0 for b in built)
     assert captured["account_kw"] == ACCT
+
+
+# --- 12. deploy ref namespace: standard (tiny-test) ref present does NOT block -------
+def test_deploy_ref_namespace_not_blocked_by_standard_ref(monkeypatch):
+    """The confirmed 2026-07-28 bug: this morning's tiny-test (s0_live_exec) already placed a
+    BUY USFR on U14438624 with the STANDARD order_router._order_ref. The deploy must NOT
+    false-block: its legs use the :deploy-tagged ref, which is FRESH, so all-or-nothing
+    transmit proceeds. Proven by making already_present return PARTIAL for any ref that is NOT
+    :deploy-tagged (the tiny-test's ref) but FRESH for the :deploy-tagged deploy ref."""
+    plan = _fake_plan(orders={"VTI": 10, "USFR": 5}, alien_lines=[],
+                      investable=98_500.0, net_liq=100_000.0)
+    tgt = _fake_target(weights={"VTI": 0.8, "USFR": 0.2},
+                       prices={"VTI": 250.0, "USFR": 50.0})
+    _patch_common(monkeypatch, plan=plan, target=tgt)
+
+    seen_refs = []
+
+    def _dedup(ib, ref, qty, **k):
+        seen_refs.append(ref)
+        # standard tiny-test ref (no :deploy tag) is already present -> PARTIAL; the deploy's
+        # own :deploy-tagged ref is FRESH.
+        return (order_router.LegState.FRESH if ref.endswith(":" + dep.DEPLOY_REF_TAG)
+                else order_router.LegState.PARTIAL)
+
+    monkeypatch.setattr(order_router, "already_present", _dedup)
+
+    fake = _FakeIB(_summary(), [])
+    _wire_connections(monkeypatch, fake)
+
+    captured = {}
+
+    def _capture_place(ib, built, armed=False, **k):
+        captured["built"] = built
+        return {"transmitted": len(built), "logged": len(built),
+                "fills": [{"symbol": b.symbol, "status": "Filled", "filled": 1.0,
+                           "remaining": 0.0, "avgFillPrice": 1.0} for b in built]}
+
+    monkeypatch.setattr(order_router, "place", _capture_place)
+
+    rc = dep.main(armed=True, conform=True)
+
+    assert rc == 0
+    # the deploy transmitted despite the colliding standard ref being PARTIAL
+    assert "built" in captured
+    assert {b.symbol for b in captured["built"]} == {"VTI", "USFR"}
+    # every ref the dedup gate checked carried the :deploy namespace tag
+    assert seen_refs and all(r.endswith(":" + dep.DEPLOY_REF_TAG) for r in seen_refs)
+    # the transmitted orderRef matches the deploy-namespaced ref exactly (dedup ref == place ref)
+    assert all(b.order_ref.endswith(":" + dep.DEPLOY_REF_TAG) for b in captured["built"])
+
+
+# --- 13. deploy ref namespace: re-send protection intact ----------------------------
+def test_deploy_ref_namespace_blocks_own_resend(monkeypatch):
+    """Re-send protection unchanged: when the DEPLOY-tagged ref itself is already present
+    (a genuine re-run of the same deploy leg), the dedup gate still returns not-FRESH and the
+    all-or-nothing gate blocks the whole deploy -> preview only, nothing transmitted."""
+    plan = _fake_plan(orders={"VTI": 10, "USFR": 5}, alien_lines=[],
+                      investable=98_500.0, net_liq=100_000.0)
+    tgt = _fake_target(weights={"VTI": 0.8, "USFR": 0.2},
+                       prices={"VTI": 250.0, "USFR": 50.0})
+    _patch_common(monkeypatch, plan=plan, target=tgt)
+
+    def _dedup(ib, ref, qty, **k):
+        # the deploy-tagged ref is already present (prior deploy run) -> not FRESH -> block.
+        return (order_router.LegState.PARTIAL if ref.endswith(":" + dep.DEPLOY_REF_TAG)
+                else order_router.LegState.FRESH)
+
+    monkeypatch.setattr(order_router, "already_present", _dedup)
+
+    fake = _FakeIB(_summary(), [])
+    _wire_connections(monkeypatch, fake)
+    monkeypatch.setattr(order_router, "place",
+                        lambda *a, **k: (_ for _ in ()).throw(
+                            AssertionError("re-send of an already-present deploy ref must "
+                                           "transmit nothing")))
+
+    rc = dep.main(armed=True, conform=True)
+
+    assert rc == 0
+    assert config.DRY_RUN is True and config.READONLY is True
+
+
+# --- 14. the two ref sites are byte-identical (built via the one _deploy_ref helper) --
+def test_deploy_ref_format_and_single_source():
+    """_deploy_ref = the standard order_router ref + ':<DEPLOY_REF_TAG>'. Both the dedup-check
+    and the place() call build the ref through this one helper, so the checked ref and the
+    transmitted ref can never drift."""
+    as_of = pd.Timestamp("2026-07-01")
+    std = order_router._order_ref(ACCT, as_of, "BUY", "USFR")
+    tagged = dep._deploy_ref(ACCT, as_of, "BUY", "USFR")
+    assert tagged == std + ":" + dep.DEPLOY_REF_TAG
+    assert tagged.endswith(":deploy") and tagged != std

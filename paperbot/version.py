@@ -15,10 +15,14 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.24.0"
+VERSION = "0.24.1"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.24.1", "2026-07-28", "s0_live_deploy: give deploy orders their own :deploy ref "
+                             "namespace so the dedup gate no longer false-blocks on a "
+                             "collision with the one-off tiny-test (or normal rebalances); "
+                             "re-send protection unchanged."),
     ("0.24.0", "2026-07-28", "add s0_live_deploy.py -- full-account DEPLOY executor with "
                              "explicit --conform mode (liquidates non-S0 holdings to deploy "
                              "any book into the S0 GROWTH-tier target); armed+conform gated, "
