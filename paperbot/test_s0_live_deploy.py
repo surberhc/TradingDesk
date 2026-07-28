@@ -1,10 +1,11 @@
 """
 test_s0_live_deploy.py — offline unit tests for the S0 GROWTH full-account DEPLOY executor.
 
-ZERO real transmit. NO broker, NO gateway, NO network. The fake IB raises AssertionError if
-any order-placing method is touched, and order_router.place / already_present are mocked, so
-nothing can ever reach the wire. These tests pin the non-bypassable safety envelope:
-  1. preview (default) transmits nothing; order_router.place / ib.placeOrder NEVER called.
+ZERO real transmit. NO broker, NO gateway, NO network. The preview fake IB raises
+AssertionError if any order-placing method is touched; the transmit fake IB (_TxFakeIB) serves
+a mocked account and records placed/cancelled orders but reaches no wire. These tests pin the
+non-bypassable safety envelope AND the 2026-07-28 rebuild:
+  1. preview (default) transmits nothing; no placeOrder ever called.
   2. conform=False leaves ALIENs untouched (no liquidation legs; aliens returned for review).
   3. conform=True adds a full-liquidation SELL for each ALIEN holding.
   4. sells are sequenced BEFORE buys in the ordered leg list.
@@ -14,7 +15,13 @@ nothing can ever reach the wire. These tests pin the non-bypassable safety envel
   8. arm token required (and conform alone, without arming, transmits nothing).
   9. kill switch present -> preview only.
  10. whole-share rounding (fractional alien shares truncate; deltas stay integer).
- 11. armed + conform + all gates pass -> place called ONCE with the ordered (sells-first) list.
+ 11. TWO-PHASE: sells transmit before buys; buys funded from realized cash.
+ 12. TWO-PHASE cash gate: a short realized cash reduces/skips buys, never exceeding cash.
+ 13. _scale_buys_to_cash: whole-share, never exceeds cash*(1-buffer); 0 cash skips all.
+ 14. re-price loop: an unfilled straggler is cancelled + re-priced and, after the cap, reported.
+ 15. per-run ref: a re-fire (bought-then-sold; no working order) re-buys, but an identical
+     currently-WORKING order is NOT double-submitted.
+ 16. model pre-check: armed WITHOUT --model-clear hard-stops; WITH it, proceeds.
 
 Run:
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_s0_live_deploy.py -q
@@ -72,8 +79,15 @@ def _alien(symbol, shares):
     return SimpleNamespace(symbol=symbol, actual_shares=shares, status="ALIEN")
 
 
+def _open_order(symbol, side):
+    """An open-order row shaped like ib_async's reqAllOpenOrders() Trade (order + contract)."""
+    return SimpleNamespace(order=SimpleNamespace(action=side, orderRef="prior-run"),
+                           contract=SimpleNamespace(symbol=symbol))
+
+
 class _FakeIB:
-    """A fake IB that serves a filtered summary/positions and BLOWS UP on any transmit."""
+    """A fake IB that serves a filtered summary/positions and BLOWS UP on any transmit
+    (used by the PREVIEW tests to prove nothing reaches the wire)."""
     def __init__(self, summary_rows, position_rows):
         self._summary = summary_rows
         self._positions = position_rows
@@ -85,14 +99,81 @@ class _FakeIB:
     def positions(self):
         return self._positions
 
+    def reqAllOpenOrders(self):
+        return []
+
     def qualifyContracts(self, *a, **k):
         return list(a)
+
+    def sleep(self, *a, **k):
+        return None
 
     def disconnect(self):
         self.disconnected = True
 
     def placeOrder(self, *a, **k):
         raise AssertionError("ib.placeOrder must never be called by the deploy executor")
+
+
+class _FakeTrade:
+    """A placed-order stand-in with a controllable terminal/fill state."""
+    def __init__(self, contract, order, *, fill=True, filled=None):
+        self.contract = contract
+        self.order = order
+        q = float(order.totalQuantity)
+        if fill:
+            self.orderStatus = SimpleNamespace(
+                status="Filled", filled=q, remaining=0.0,
+                avgFillPrice=float(getattr(order, "lmtPrice", 0.0) or 0.0))
+            self._done = True
+        else:
+            f = float(filled or 0.0)
+            self.orderStatus = SimpleNamespace(status="Submitted", filled=f,
+                                               remaining=q - f, avgFillPrice=0.0)
+            self._done = False
+
+    def isDone(self):
+        return self._done
+
+
+class _TxFakeIB:
+    """Transmit-path fake IB: serves a mocked summary/positions/open-orders and RECORDS the
+    orders placed/cancelled. Fills every order except symbols in no_fill (which stay working,
+    to exercise the re-price loop). Reaches no real broker."""
+    def __init__(self, summary_rows, position_rows, *, open_orders=None, no_fill_symbols=None):
+        self._summary = summary_rows
+        self._positions = position_rows
+        self.open_orders = list(open_orders or [])
+        self.no_fill = set(no_fill_symbols or [])
+        self.placed = []       # every order object handed to placeOrder (transmit=True)
+        self.cancelled = []
+        self.disconnected = False
+
+    def accountSummary(self):
+        return self._summary
+
+    def positions(self):
+        return self._positions
+
+    def reqAllOpenOrders(self):
+        return list(self.open_orders)
+
+    def qualifyContracts(self, *a, **k):
+        return list(a)
+
+    def sleep(self, *a, **k):
+        return None
+
+    def placeOrder(self, contract, order):
+        self.placed.append(order)
+        fill = contract.symbol not in self.no_fill
+        return _FakeTrade(contract, order, fill=fill)
+
+    def cancelOrder(self, order):
+        self.cancelled.append(order)
+
+    def disconnect(self):
+        self.disconnected = True
 
 
 def _fake_plan(*, orders=None, alien_lines=None, investable=98_500.0, net_liq=100_000.0):
@@ -112,8 +193,10 @@ def _patch_common(monkeypatch, *, plan=None, target=None):
                         lambda *a, **k: (plan or _fake_plan()))
     monkeypatch.setattr(dep, "_kill_switch_present", lambda: False)
     monkeypatch.setattr(dep, "_probe_gateway_readonly", lambda ib, **k: False)
-    monkeypatch.setattr(order_router, "already_present",
-                        lambda ib, ref, qty, **k: order_router.LegState.FRESH)
+    # Best-effort model detection returns "no model" so it never blocks; the --model-clear
+    # human gate is exercised explicitly by the model tests.
+    monkeypatch.setattr(dep, "_detect_model_overlay",
+                        lambda ib, acct: (False, "no model detected (test)"))
 
 
 def _wire_connections(monkeypatch, fake):
@@ -121,9 +204,10 @@ def _wire_connections(monkeypatch, fake):
     monkeypatch.setattr(dep.s0_live, "connect_s0_live_armed", lambda *a, **k: fake)
 
 
-def _summary(net_liq="100000", buying_power="100000"):
+def _summary(net_liq="100000", buying_power="100000", total_cash="100000"):
     return [_summary_row(ACCT, "NetLiquidation", net_liq),
             _summary_row(ACCT, "BuyingPower", buying_power),
+            _summary_row(ACCT, "TotalCashValue", total_cash),
             _summary_row(OTHER, "NetLiquidation", "999999"),
             _summary_row("All", "NetLiquidation", "888")]
 
@@ -133,9 +217,6 @@ def test_preview_transmits_nothing(monkeypatch):
     _patch_common(monkeypatch)
     fake = _FakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("order_router.place must not run in preview")))
 
     rc = dep.main(armed=False, conform=True)   # conform on, NOT armed -> the proof run
 
@@ -149,10 +230,8 @@ def test_conform_false_leaves_aliens():
     plan = _fake_plan(orders={"VTI": 10}, alien_lines=[_alien("GDX", 100), _alien("SIL", 50)])
     legs, aliens_left, unpriceable = dep.build_deploy_legs(
         plan, quotes={}, prices={"VTI": 250.0, "GDX": 30.0, "SIL": 40.0}, conform=False)
-    # No alien liquidation legs.
     assert all(l.source != "alien_liquidation" for l in legs)
     assert not any(l.symbol in ("GDX", "SIL") for l in legs)
-    # ALIENs surfaced for review instead.
     assert {ln.symbol for ln in aliens_left} == {"GDX", "SIL"}
 
 
@@ -163,7 +242,7 @@ def test_conform_true_liquidates_aliens():
         plan, quotes={}, prices={"VTI": 250.0, "GDX": 30.0, "SIL": 40.0}, conform=True)
     liq = {l.symbol: l for l in legs if l.source == "alien_liquidation"}
     assert set(liq) == {"GDX", "SIL"}
-    assert liq["GDX"].side == "SELL" and liq["GDX"].qty == 100   # FULL share count
+    assert liq["GDX"].side == "SELL" and liq["GDX"].qty == 100
     assert liq["SIL"].side == "SELL" and liq["SIL"].qty == 50
     assert not aliens_left
 
@@ -176,50 +255,41 @@ def test_sells_before_buys():
         plan, quotes={},
         prices={"VTI": 250.0, "USFR": 50.0, "BIL": 91.0, "GDX": 30.0}, conform=True)
     sides = [l.side for l in legs]
-    # every SELL index precedes every BUY index
     last_sell = max((i for i, s in enumerate(sides) if s == "SELL"), default=-1)
     first_buy = min((i for i, s in enumerate(sides) if s == "BUY"), default=len(sides))
     assert last_sell < first_buy
-    # the alien liquidation is among the sells
     assert any(l.symbol == "GDX" and l.side == "SELL" for l in legs)
 
 
 # --- 5. total BUY notional > investable -> refuse -----------------------------------
 def test_total_buy_over_investable_refuses(monkeypatch):
-    # Two buys of 8,000 each = 16,000 total; investable only 10,000. Each < 50% NLV.
     plan = _fake_plan(orders={"VTI": 32, "RSP": 44}, alien_lines=[], investable=10_000.0)
     tgt = _fake_target(weights={"VTI": 0.5, "RSP": 0.5},
                        prices={"VTI": 250.0, "RSP": 181.8})
     _patch_common(monkeypatch, plan=plan, target=tgt)
-    fake = _FakeIB(_summary(), [])
+    fake = _TxFakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("must not transmit over the investable cap")))
 
-    rc = dep.main(armed=True, conform=True)
+    rc = dep.main(armed=True, conform=True, model_clear=True)
 
     assert rc == 0
+    assert fake.placed == []       # nothing transmitted over the investable cap
     assert config.DRY_RUN is True and config.READONLY is True
 
 
 # --- 6. a single order > 50% of NetLiq -> refuse ------------------------------------
 def test_per_order_over_half_netliq_refuses(monkeypatch):
-    # One BUY of 60,000 notional on a 100,000 NLV account -> > 50% cap. investable large
-    # enough that the total-buy cap is NOT what trips it.
     plan = _fake_plan(orders={"VTI": 1}, alien_lines=[], investable=98_500.0,
                       net_liq=100_000.0)
     tgt = _fake_target(weights={"VTI": 1.0}, prices={"VTI": 60_000.0})
     _patch_common(monkeypatch, plan=plan, target=tgt)
-    fake = _FakeIB(_summary(), [])
+    fake = _TxFakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("must not transmit a >50%-NLV single order")))
 
-    rc = dep.main(armed=True, conform=True)
+    rc = dep.main(armed=True, conform=True, model_clear=True)
 
     assert rc == 0
+    assert fake.placed == []
     assert config.DRY_RUN is True and config.READONLY is True
 
 
@@ -227,51 +297,47 @@ def test_per_order_over_half_netliq_refuses(monkeypatch):
 def test_wrong_account_refuses(monkeypatch):
     _patch_common(monkeypatch)
     monkeypatch.setattr(dep, "EXEC_ACCOUNT", OTHER)
-    fake = _FakeIB([_summary_row(OTHER, "NetLiquidation", "100000"),
-                    _summary_row(OTHER, "BuyingPower", "100000")], [])
+    fake = _TxFakeIB([_summary_row(OTHER, "NetLiquidation", "100000"),
+                      _summary_row(OTHER, "BuyingPower", "100000"),
+                      _summary_row(OTHER, "TotalCashValue", "100000")], [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("must NEVER transmit on a non-target account")))
 
-    rc = dep.main(armed=True, conform=True)
+    rc = dep.main(armed=True, conform=True, model_clear=True)
 
     assert rc == 0
+    assert fake.placed == []
     ok, _reason = dep._account_safety_ok()
     assert ok is False
     assert config.DRY_RUN is True and config.READONLY is True
 
 
-# --- 8. arm token required; conform alone does NOT transmit --------------------------
-def test_arm_token_required(monkeypatch):
+# --- 8. arm token / conform / model-clear flag parsing + conform alone transmits nothing --
+def test_flag_parsing_and_conform_alone(monkeypatch):
     assert dep.arm_requested(["--arm-i-understand"]) is True
     assert dep.arm_requested(["--conform"]) is False
     assert dep.conform_requested(["--conform"]) is True
     assert dep.conform_requested([]) is False
+    assert dep.model_clear_requested(["--model-clear"]) is True
+    assert dep.model_clear_requested([]) is False
 
     _patch_common(monkeypatch)
     fake = _FakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("conform without arming must transmit nothing")))
 
-    rc = dep.main(armed=False, conform=True)   # conform on, not armed
+    rc = dep.main(armed=False, conform=True, model_clear=True)   # conform on, not armed
 
     assert rc == 0
     assert config.DRY_RUN is True and config.READONLY is True
 
 
-# --- 8b. armed WITHOUT conform does NOT transmit (conform is a required gate) --------
+# --- 8b. armed WITHOUT conform does NOT transmit ------------------------------------
 def test_armed_without_conform_refuses(monkeypatch):
-    _patch_common(monkeypatch, plan=_fake_plan(orders={"VTI": 10}, alien_lines=[_alien("GDX", 100)]))
+    _patch_common(monkeypatch,
+                  plan=_fake_plan(orders={"VTI": 10}, alien_lines=[_alien("GDX", 100)]))
     fake = _FakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("armed without conform must transmit nothing")))
 
-    rc = dep.main(armed=True, conform=False)
+    rc = dep.main(armed=True, conform=False, model_clear=True)
 
     assert rc == 0
     assert config.DRY_RUN is True and config.READONLY is True
@@ -283,11 +349,8 @@ def test_kill_switch_forces_preview(monkeypatch):
     monkeypatch.setattr(dep, "_kill_switch_present", lambda: True)
     fake = _FakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("must not transmit with the kill switch on")))
 
-    rc = dep.main(armed=True, conform=True)
+    rc = dep.main(armed=True, conform=True, model_clear=True)
 
     assert rc == 0
     assert config.DRY_RUN is True and config.READONLY is True
@@ -295,13 +358,11 @@ def test_kill_switch_forces_preview(monkeypatch):
 
 # --- 10. whole-share rounding -------------------------------------------------------
 def test_whole_share_rounding():
-    # Fractional alien share count truncates toward 0 (never a fractional order).
     plan = _fake_plan(orders={"VTI": 10}, alien_lines=[_alien("GDX", 100.9)])
     legs, aliens_left, _ = dep.build_deploy_legs(
         plan, quotes={}, prices={"VTI": 250.0, "GDX": 30.0}, conform=True)
     liq = next(l for l in legs if l.symbol == "GDX")
-    assert liq.qty == 100 and isinstance(liq.qty, int)   # truncated, integer
-    # A sub-1-share alien can't be whole-share liquidated -> left for review.
+    assert liq.qty == 100 and isinstance(liq.qty, int)
     plan2 = _fake_plan(orders={"VTI": 10}, alien_lines=[_alien("SIL", 0.4)])
     legs2, aliens_left2, _ = dep.build_deploy_legs(
         plan2, quotes={}, prices={"VTI": 250.0, "SIL": 40.0}, conform=True)
@@ -309,142 +370,191 @@ def test_whole_share_rounding():
     assert {ln.symbol for ln in aliens_left2} == {"SIL"}
 
 
-# --- 11. armed + conform + all gates pass -> place called ONCE, sells first ----------
-def test_armed_conform_all_gates_pass_transmits(monkeypatch):
+# --- 11. TWO-PHASE: sells transmit before buys; buys funded from realized cash --------
+def test_two_phase_sells_before_buys_and_funded(monkeypatch):
     plan = _fake_plan(orders={"VTI": 10, "BIL": -3}, alien_lines=[_alien("GDX", 100)],
                       investable=98_500.0, net_liq=100_000.0)
     tgt = _fake_target(weights={"VTI": 0.8, "USFR": 0.2},
                        prices={"VTI": 250.0, "USFR": 50.0, "BIL": 91.0, "GDX": 30.0})
     _patch_common(monkeypatch, plan=plan, target=tgt)
-    # BIL (a plan sell) and GDX (an alien) are HELD — so they fall inside the priced universe
-    # (target weights + held positions), exactly as they would in a real book.
-    fake = _FakeIB(_summary(), [_pos_row(ACCT, "BIL", 3), _pos_row(ACCT, "GDX", 100)])
+    # Realized cash after the sells is ample (60k) -> buys fully funded, no scaling.
+    fake = _TxFakeIB(_summary(total_cash="60000"),
+                     [_pos_row(ACCT, "BIL", 3), _pos_row(ACCT, "GDX", 100)])
     _wire_connections(monkeypatch, fake)
 
-    captured = {}
-
-    def _capture_place(ib, built, armed=False, **k):
-        captured["armed"] = armed
-        captured["built"] = built
-        captured["account_kw"] = k.get("account")
-        captured["dry_run_at_place"] = config.DRY_RUN
-        captured["readonly_at_place"] = config.READONLY
-        return {"transmitted": len(built), "logged": len(built),
-                "fills": [{"symbol": b.symbol, "status": "Filled", "filled": 1.0,
-                           "remaining": 0.0, "avgFillPrice": 1.0} for b in built]}
-
-    monkeypatch.setattr(order_router, "place", _capture_place)
-
-    rc = dep.main(armed=True, conform=True)
+    rc = dep.main(armed=True, conform=True, model_clear=True)
 
     assert rc == 0
-    assert captured["armed"] is True
-    assert captured["dry_run_at_place"] is False and captured["readonly_at_place"] is False
     # flags restored after main() returns
     assert config.DRY_RUN is True and config.READONLY is True
-    built = captured["built"]
-    # legs: SELL BIL, SELL GDX (alien liquidation), BUY VTI -> all sells before the buy
-    actions = [b.order.action for b in built]
+    actions = [o.action for o in fake.placed]
+    # every SELL was placed before every BUY (two phases in order)
     last_sell = max(i for i, a in enumerate(actions) if a == "SELL")
     first_buy = min(i for i, a in enumerate(actions) if a == "BUY")
     assert last_sell < first_buy
-    # every order pinned to the single allowed account, LIMIT (never market)
-    for b in built:
-        assert b.order.account == ACCT == "U14438624"
-        assert b.order.orderType == "LMT"
-    # the alien GDX full-liquidation sell is present
-    assert any(b.symbol == "GDX" and b.order.action == "SELL"
-               and float(b.order.totalQuantity) == 100.0 for b in built)
-    assert captured["account_kw"] == ACCT
+    # the alien GDX full-liquidation sell (100 sh) is present
+    assert any(o.action == "SELL" and ":SELL:GDX:" in (o.orderRef or "")
+               and float(o.totalQuantity) == 100.0 for o in fake.placed)
+    # VTI buy fully funded at 10 shares (realized cash >> notional)
+    vti = [o for o in fake.placed if o.action == "BUY" and ":BUY:VTI:" in (o.orderRef or "")]
+    assert vti and float(vti[0].totalQuantity) == 10.0
+    # every order pinned to the single account, LIMIT, per-run ref (:deploy:<stamp>)
+    for o in fake.placed:
+        assert o.account == ACCT == "U14438624"
+        assert o.orderType == "LMT"
+        assert ":deploy:" in o.orderRef
+    # buy notional never exceeds realized cash
+    buy_notional = sum(float(o.totalQuantity) * float(o.lmtPrice)
+                       for o in fake.placed if o.action == "BUY")
+    assert buy_notional <= 60000.0
 
 
-# --- 12. deploy ref namespace: standard (tiny-test) ref present does NOT block -------
-def test_deploy_ref_namespace_not_blocked_by_standard_ref(monkeypatch):
-    """The confirmed 2026-07-28 bug: this morning's tiny-test (s0_live_exec) already placed a
-    BUY USFR on U14438624 with the STANDARD order_router._order_ref. The deploy must NOT
-    false-block: its legs use the :deploy-tagged ref, which is FRESH, so all-or-nothing
-    transmit proceeds. Proven by making already_present return PARTIAL for any ref that is NOT
-    :deploy-tagged (the tiny-test's ref) but FRESH for the :deploy-tagged deploy ref."""
-    plan = _fake_plan(orders={"VTI": 10, "USFR": 5}, alien_lines=[],
-                      investable=98_500.0, net_liq=100_000.0)
-    tgt = _fake_target(weights={"VTI": 0.8, "USFR": 0.2},
-                       prices={"VTI": 250.0, "USFR": 50.0})
+# --- 12. TWO-PHASE cash gate: short realized cash reduces buys, never exceeding cash ---
+def test_two_phase_short_cash_reduces_buys(monkeypatch):
+    # Plan wants BUY VTI x40 = $10,000, but only $4,000 of cash actually lands.
+    plan = _fake_plan(orders={"VTI": 40}, alien_lines=[], investable=98_500.0,
+                      net_liq=100_000.0)
+    tgt = _fake_target(weights={"VTI": 1.0}, prices={"VTI": 250.0})
     _patch_common(monkeypatch, plan=plan, target=tgt)
-
-    seen_refs = []
-
-    def _dedup(ib, ref, qty, **k):
-        seen_refs.append(ref)
-        # standard tiny-test ref (no :deploy tag) is already present -> PARTIAL; the deploy's
-        # own :deploy-tagged ref is FRESH.
-        return (order_router.LegState.FRESH if ref.endswith(":" + dep.DEPLOY_REF_TAG)
-                else order_router.LegState.PARTIAL)
-
-    monkeypatch.setattr(order_router, "already_present", _dedup)
-
-    fake = _FakeIB(_summary(), [])
+    fake = _TxFakeIB(_summary(total_cash="4000"), [])
     _wire_connections(monkeypatch, fake)
 
-    captured = {}
-
-    def _capture_place(ib, built, armed=False, **k):
-        captured["built"] = built
-        return {"transmitted": len(built), "logged": len(built),
-                "fills": [{"symbol": b.symbol, "status": "Filled", "filled": 1.0,
-                           "remaining": 0.0, "avgFillPrice": 1.0} for b in built]}
-
-    monkeypatch.setattr(order_router, "place", _capture_place)
-
-    rc = dep.main(armed=True, conform=True)
+    rc = dep.main(armed=True, conform=True, model_clear=True)
 
     assert rc == 0
-    # the deploy transmitted despite the colliding standard ref being PARTIAL
-    assert "built" in captured
-    assert {b.symbol for b in captured["built"]} == {"VTI", "USFR"}
-    # every ref the dedup gate checked carried the :deploy namespace tag
-    assert seen_refs and all(r.endswith(":" + dep.DEPLOY_REF_TAG) for r in seen_refs)
-    # the transmitted orderRef matches the deploy-namespaced ref exactly (dedup ref == place ref)
-    assert all(b.order_ref.endswith(":" + dep.DEPLOY_REF_TAG) for b in captured["built"])
+    buys = [o for o in fake.placed if o.action == "BUY"]
+    assert buys, "a scaled-down buy should still transmit"
+    total = sum(float(o.totalQuantity) * float(o.lmtPrice) for o in buys)
+    assert total <= 4000.0                       # NEVER exceeds realized cash — no negative
+    assert all(float(o.totalQuantity) < 40 for o in buys)   # reduced from the plan's 40
 
 
-# --- 13. deploy ref namespace: re-send protection intact ----------------------------
-def test_deploy_ref_namespace_blocks_own_resend(monkeypatch):
-    """Re-send protection unchanged: when the DEPLOY-tagged ref itself is already present
-    (a genuine re-run of the same deploy leg), the dedup gate still returns not-FRESH and the
-    all-or-nothing gate blocks the whole deploy -> preview only, nothing transmitted."""
-    plan = _fake_plan(orders={"VTI": 10, "USFR": 5}, alien_lines=[],
-                      investable=98_500.0, net_liq=100_000.0)
-    tgt = _fake_target(weights={"VTI": 0.8, "USFR": 0.2},
-                       prices={"VTI": 250.0, "USFR": 50.0})
-    _patch_common(monkeypatch, plan=plan, target=tgt)
+# --- 13. _scale_buys_to_cash: whole-share, bounded by cash*(1-buffer); 0 cash skips all ---
+def test_scale_buys_to_cash_never_exceeds():
+    NS = SimpleNamespace
+    buys = [NS(symbol="VTI", side="BUY", qty=40, limit=250.0, notional=40 * 250.0,
+               source="plan")]
+    scaled, adj = dep._scale_buys_to_cash(buys, 4000.0)
+    budget = 4000.0 * (1.0 - dep.CASH_SAFETY_BUFFER_PCT)
+    assert sum(l.notional for l in scaled) <= budget
+    assert scaled and scaled[0].qty < 40
+    assert adj and adj[0]["symbol"] == "VTI" and adj[0]["new_qty"] < 40
 
-    def _dedup(ib, ref, qty, **k):
-        # the deploy-tagged ref is already present (prior deploy run) -> not FRESH -> block.
-        return (order_router.LegState.PARTIAL if ref.endswith(":" + dep.DEPLOY_REF_TAG)
-                else order_router.LegState.FRESH)
 
-    monkeypatch.setattr(order_router, "already_present", _dedup)
+def test_scale_buys_to_cash_zero_cash_skips_all():
+    NS = SimpleNamespace
+    buys = [NS(symbol="VTI", side="BUY", qty=10, limit=250.0, notional=2500.0, source="plan")]
+    scaled, adj = dep._scale_buys_to_cash(buys, 0.0)
+    assert scaled == []
+    assert adj and adj[0]["new_qty"] == 0
 
-    fake = _FakeIB(_summary(), [])
+
+# --- 14. re-price loop: unfilled straggler cancelled + re-priced, then reported ------
+def test_transmit_phase_reprices_then_gives_up(monkeypatch):
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(dep, "REPRICE_AFTER_SEC", 0.0)     # re-price on the first poll
+    monkeypatch.setattr(dep, "POLL_SEC", 0.0)
+    monkeypatch.setattr(dep, "PHASE_TERMINAL_TIMEOUT_SEC", 0.15)
+    NS = SimpleNamespace
+    leg = NS(symbol="THIN", side="BUY", qty=5, limit=100.0, notional=500.0, source="plan")
+    ib = _TxFakeIB(_summary(), [], no_fill_symbols={"THIN"})   # THIN never fills
+
+    results = dep._transmit_phase(ib, [leg], account=ACCT, as_of=pd.Timestamp("2026-07-28"),
+                                  run_id="R1", phase_label="BUY", quotes={},
+                                  prices={"THIN": 100.0})
+
+    r = results[0]
+    assert r["reprices"] == dep.REPRICE_MAX_ATTEMPTS       # chased up to the cap
+    assert r["filled"] == 0.0
+    assert r["skipped"] is False and r["reason"]           # LOUD unfilled report
+    assert len(ib.cancelled) >= dep.REPRICE_MAX_ATTEMPTS   # cancelled on each re-price
+    # each re-place used a strictly-more-aggressive (higher, for a BUY) limit
+    limits = [float(o.lmtPrice) for o in ib.placed]
+    assert limits == sorted(limits) and limits[-1] > limits[0]
+
+
+# --- 15. per-run ref: re-fire re-buys (not blocked); working order NOT double-submitted --
+def test_transmit_phase_refire_places_when_no_working_order(monkeypatch):
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    NS = SimpleNamespace
+    # SPY was bought AND then manually sold earlier today; nothing is currently working.
+    leg = NS(symbol="SPY", side="BUY", qty=44, limit=500.0, notional=22000.0, source="plan")
+    ib = _TxFakeIB(_summary(), [], open_orders=[])
+
+    results = dep._transmit_phase(ib, [leg], account=ACCT, as_of=pd.Timestamp("2026-07-01"),
+                                  run_id="20260728T120000", phase_label="BUY", quotes={},
+                                  prices={"SPY": 500.0})
+
+    assert results[0]["skipped"] is False and results[0]["filled"] == 44.0
+    assert len(ib.placed) == 1                             # the re-buy proceeded
+    ref = ib.placed[0].orderRef
+    assert ":deploy:" in ref and ref.endswith("20260728T120000")   # per-run ref
+
+
+def test_transmit_phase_working_order_not_double_submitted(monkeypatch):
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    NS = SimpleNamespace
+    leg = NS(symbol="VTI", side="BUY", qty=10, limit=250.0, notional=2500.0, source="plan")
+    # An identical VTI BUY is already working at the broker (from any prior run).
+    ib = _TxFakeIB(_summary(), [], open_orders=[_open_order("VTI", "BUY")])
+
+    results = dep._transmit_phase(ib, [leg], account=ACCT, as_of=pd.Timestamp("2026-07-28"),
+                                  run_id="R2", phase_label="BUY", quotes={},
+                                  prices={"VTI": 250.0})
+
+    assert results[0]["skipped"] is True
+    assert ib.placed == []                                # never double-submitted
+
+
+# --- 16. model pre-check: armed WITHOUT --model-clear hard-stops; WITH it, proceeds ---
+def test_model_clear_required_hard_stops(monkeypatch):
+    _patch_common(monkeypatch, plan=_fake_plan(orders={"VTI": 10}, alien_lines=[]))
+    fake = _TxFakeIB(_summary(total_cash="60000"), [])
     _wire_connections(monkeypatch, fake)
-    monkeypatch.setattr(order_router, "place",
-                        lambda *a, **k: (_ for _ in ()).throw(
-                            AssertionError("re-send of an already-present deploy ref must "
-                                           "transmit nothing")))
 
-    rc = dep.main(armed=True, conform=True)
+    rc = dep.main(armed=True, conform=True, model_clear=False)   # NO model-clear affirmation
 
     assert rc == 0
+    assert fake.placed == []                              # hard-stopped, nothing transmitted
     assert config.DRY_RUN is True and config.READONLY is True
 
 
-# --- 14. the two ref sites are byte-identical (built via the one _deploy_ref helper) --
-def test_deploy_ref_format_and_single_source():
-    """_deploy_ref = the standard order_router ref + ':<DEPLOY_REF_TAG>'. Both the dedup-check
-    and the place() call build the ref through this one helper, so the checked ref and the
-    transmitted ref can never drift."""
+def test_model_clear_allows_transmit(monkeypatch):
+    _patch_common(monkeypatch, plan=_fake_plan(orders={"VTI": 10}, alien_lines=[]))
+    fake = _TxFakeIB(_summary(total_cash="60000"), [])
+    _wire_connections(monkeypatch, fake)
+
+    rc = dep.main(armed=True, conform=True, model_clear=True)
+
+    assert rc == 0
+    assert any(o.action == "BUY" and float(o.totalQuantity) == 10.0 for o in fake.placed)
+    assert config.DRY_RUN is True and config.READONLY is True
+
+
+# --- 17. detected IBKR model overlay refuses even WITH --model-clear -----------------
+def test_detected_model_overlay_refuses_despite_flag(monkeypatch):
+    _patch_common(monkeypatch, plan=_fake_plan(orders={"VTI": 10}, alien_lines=[]))
+    # Best-effort detection positively sees a non-empty modelCode -> refuse regardless.
+    monkeypatch.setattr(dep, "_detect_model_overlay", lambda ib, acct: (True, "Main"))
+    fake = _TxFakeIB(_summary(total_cash="60000"), [])
+    _wire_connections(monkeypatch, fake)
+
+    rc = dep.main(armed=True, conform=True, model_clear=True)
+
+    assert rc == 0
+    assert fake.placed == []                              # detected model blocks transmit
+    assert config.DRY_RUN is True and config.READONLY is True
+
+
+# --- 18. deploy ref format: base + :deploy, plus per-run stamp -----------------------
+def test_deploy_ref_format_and_per_run():
     as_of = pd.Timestamp("2026-07-01")
     std = order_router._order_ref(ACCT, as_of, "BUY", "USFR")
     tagged = dep._deploy_ref(ACCT, as_of, "BUY", "USFR")
     assert tagged == std + ":" + dep.DEPLOY_REF_TAG
     assert tagged.endswith(":deploy") and tagged != std
+    per_run = dep._deploy_ref(ACCT, as_of, "BUY", "USFR", "20260728T120000")
+    assert per_run == tagged + ":20260728T120000"

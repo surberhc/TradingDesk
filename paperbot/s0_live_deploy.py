@@ -12,8 +12,44 @@ alone). It is pinned to the trust account U14438624 on the Live-Trade Gateway (p
 the same account + gateway the tiny-test uses, and it reuses every one of the tiny-test's
 safety idioms verbatim.
 
-WHY A NEW MODE (--conform)
---------------------------
+2026-07-28 INCIDENT -> REBUILT SAFER (conductor #63 / log #145)
+---------------------------------------------------------------
+The first live deploy on U14438624 left the account ~$40k NEGATIVE. Root cause was in THIS
+executor's funding sequence: it transmitted ALL 15 legs at once — buying against the cash the
+sells were EXPECTED to raise, WITHOUT waiting for the sells to fill. One sell (BUCK ~$40k)
+CANCELLED (thin/stale quote, no re-price), so that cash never landed -> ~$115k of buys were
+committed against ~$76k of real cash -> the account went negative and had to be hand-traded
+out. Two other flaws surfaced: (a) a cancelled straggler was left as a hole instead of being
+re-priced/chased, and (b) a legitimate re-buy of a manually-sold symbol was dedup-BLOCKED
+because the ref was keyed on the monthly as_of date, so a bought-then-sold symbol still looked
+"already done". The account was also still inside IBKR model "Main" (98.8% allocated) which our
+sub-account read-only view CANNOT see. This rebuild fixes all four:
+
+  1. TWO-PHASE, CASH-GATED execution. Phase 1 transmits ONLY the sells (plan sells + conform
+     ALIEN liquidations) and WAITS for them to reach a terminal state. Between phases it
+     RE-READS the account's live TotalCashValue (realized cash, never the plan's expected
+     proceeds). Phase 2 sizes the buys to that ACTUAL cash — total BUY notional is held
+     <= available cash minus a small safety buffer, scaling down / skipping whole-share buys
+     if a sell fell short. Buying against money that has not arrived is now structurally
+     impossible.
+  2. RE-PRICE / chase stragglers. Any leg that has not filled within REPRICE_AFTER_SEC is
+     cancelled and re-placed at a MORE aggressive marketable limit (toward the far touch),
+     up to REPRICE_MAX_ATTEMPTS. A leg that still will not fill is left cancelled and reported
+     LOUDLY — never silently dropped.
+  3. PER-RUN order ref. The deploy ref now carries a per-run stamp, so a fresh run's legs can
+     never match a prior run's fills. Correctness comes from the ENGINE's delta-vs-current-
+     positions (plan.orders already reflects what is held), NOT from historical-fill dedup.
+     Double-submit protection is kept by a symbol+side check against currently WORKING/open
+     orders — so a still-live identical order is not duplicated, but a re-fire to complete the
+     remaining gap is allowed.
+  4. MODEL pre-check. A new REQUIRED --model-clear human affirmation gate: the operator must
+     affirm the target account is NOT allocated to any IBKR Model Portfolio. Without it the
+     armed deploy HARD-STOPS. A best-effort master-level detection also refuses if it can
+     positively see a non-empty modelCode — but that detection is unreliable from our
+     sub-account lane, so --model-clear is the load-bearing gate.
+
+WHY A --conform MODE
+--------------------
 rebalance_engine.plan_account marks a held symbol that is NOT in the S0 universe ALIEN and
 NEVER emits a sell for it (the correct default for an ongoing rebalance — a spinoff/rename is
 not churned into a taxable round-trip). That default is WRONG for a deliberate one-time
@@ -28,6 +64,7 @@ nothing. To actually transmit, a human must line up ALL of:
   * the exact CLI token  --arm-i-understand  (sets armed=True; never defaulted/auto-set),
   * the explicit  --conform  flag  (this executor is a conform-deploy tool; transmit requires
     it — separate from the arm token, BOTH required),
+  * the explicit  --model-clear  affirmation (target account divested from any IBKR model),
   * NO kill-switch sentinel present,
   * the target account is EXACTLY U14438624 (any other refused — single-account wall),
   * every leg whole-share, priced, and through order_router's HARD price guard,
@@ -35,7 +72,7 @@ nothing. To actually transmit, a human must line up ALL of:
     notional > 50% of NetLiq (fat-finger / bad-price catch),
   * the Gateway physically ARMED (Read-Only API toggle OFF — measured live with the
     zero-transmission cancel-a-fabricated-order probe), and
-  * the pre-transmit dedup gate (order_router.already_present) says EVERY leg is FRESH.
+  * no positively-detected IBKR model overlay.
 Miss ANY one and the run is a preview that transmits nothing and prints WHY.
 
 There is NO auto-arm, and nothing here is scheduled. A human runs it, reviews the preview,
@@ -45,7 +82,8 @@ Run — PREVIEW with the conform list (default; transmits nothing):
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe s0_live_deploy.py --conform
 
 Run — ARMED conform deploy (human-supervised; requires an armed Gateway + no kill switch):
-  C:\\TradingDesk-Local\\venv\\Scripts\\python.exe s0_live_deploy.py --conform --arm-i-understand
+  C:\\TradingDesk-Local\\venv\\Scripts\\python.exe s0_live_deploy.py --conform --model-clear \\
+      --arm-i-understand
 """
 from __future__ import annotations
 
@@ -53,6 +91,7 @@ import os
 import sys
 import threading
 import time
+from datetime import datetime
 
 from ib_async import Stock
 
@@ -90,6 +129,10 @@ ARM_TOKEN = "--arm-i-understand"
 # is a REQUIRED transmit gate (this executor is a conform-deploy tool; without it, transmit
 # nothing). Separate from the arm token — BOTH are required to liquidate + transmit.
 CONFORM_FLAG = "--conform"
+# The explicit model-clear affirmation — the operator affirms the target account is divested
+# from any IBKR Model Portfolio. REQUIRED to transmit (2026-07-28 incident: the account was
+# still in model "Main", invisible to our sub-account read-only lane). Load-bearing human gate.
+MODEL_CLEAR_FLAG = "--model-clear"
 
 # KILL SWITCH — same sentinel s0_live_exec / morning_execute_run honor. Mirrored as a literal
 # so this module pulls in none of their module-level state; if the file exists (any content)
@@ -102,22 +145,49 @@ KILL_SWITCH = r"C:\TradingDesk-Local\AUTOTRADE_DISABLED"
 #     backstop — a good price for a whole-book deploy leg is well under half the account).
 MAX_ORDER_NOTIONAL_PCT_NLV = 0.50
 
+# TWO-PHASE / RE-PRICE / CASH-GATE tuning (2026-07-28 rebuild). All bounded so a run always
+# terminates and never blocks on the wire.
+PHASE_TERMINAL_TIMEOUT_SEC = 90.0    # max wait for one phase's legs to reach terminal state
+REPRICE_AFTER_SEC = 18.0             # unfilled longer than this -> cancel + re-price (chase)
+REPRICE_MAX_ATTEMPTS = 3             # cap on cancel-replace re-prices per leg
+POLL_SEC = 1.0                       # phase poll cadence
+CASH_SETTLE_SEC = 3.0                # let streaming account values update after the sells fill
+# Keep a small slice of realized cash UNSPENT so rounding / a late fill can never tip negative.
+CASH_SAFETY_BUFFER_PCT = 0.01
+# Terminal order statuses (filled OR done-without-fill). Mirrors ib_async DoneStates + the
+# reject/inactive set order_router already treats as terminal.
+_TERMINAL_STATUSES = frozenset({
+    "Filled", "Cancelled", "ApiCancelled", "Inactive", "Rejected", "ValidationError",
+})
+
 # DEPLOY ORDER-REF NAMESPACE. The tiny-test (s0_live_exec) builds its orderRef with the SAME
 # order_router._order_ref(account, as_of, side, symbol) format, so a one-off tiny-test BUY of
-# a symbol the deploy also buys (e.g. USFR) shares an identical ref — the deploy's pre-transmit
-# dedup gate then sees the tiny-test's fill and returns PARTIAL (not FRESH), false-blocking the
-# WHOLE all-or-nothing deploy. Appending this stable discriminator gives the deploy its own ref
-# namespace so its legs can't collide with the tiny-test (or with a normal rebalance), while a
-# genuine re-send of the SAME deploy leg is still caught (the dedup gate runs against this exact
-# namespaced ref). Applied identically in BOTH ref sites via _deploy_ref so they can't drift.
+# a symbol the deploy also buys (e.g. USFR) shares an identical ref. The :deploy tag gives the
+# deploy its own ref namespace. On top of that, EACH RUN appends a per-run stamp (see
+# _deploy_ref's run_id): the 2026-07-28 incident showed a monthly-as_of ref cannot tell a
+# bought-then-sold symbol (net position back below target) needs re-buying — it looked "already
+# done". A per-run ref means a fresh run's legs never collide with ANY prior run's fills, so the
+# engine's delta-vs-current-positions is the sole source of truth for what to trade. Double-
+# submit protection is preserved separately by a symbol+side check against currently WORKING
+# orders (see _working_order_present), which is ref-INDEPENDENT and so still catches a live order
+# from a prior run.
 DEPLOY_REF_TAG = "deploy"
 
 
-def _deploy_ref(account, as_of, side, symbol) -> str:
-    """The deploy-namespaced orderRef: the standard order_router ref plus the deploy tag. Used
-    identically by the dedup-check loop AND the build/place loop so the checked ref and the
-    transmitted ref are byte-identical."""
-    return f"{order_router._order_ref(account, as_of, side, symbol)}:{DEPLOY_REF_TAG}"
+def _deploy_ref(account, as_of, side, symbol, run_id=None) -> str:
+    """The deploy-namespaced orderRef: the standard order_router ref plus the deploy tag, plus
+    a PER-RUN stamp when run_id is given. Used identically by the transmit path so the checked
+    ref and the transmitted ref are byte-identical. With run_id=None it yields the stable base
+    (back-compat / ref-format tests); a real run always passes the run stamp."""
+    base = f"{order_router._order_ref(account, as_of, side, symbol)}:{DEPLOY_REF_TAG}"
+    return f"{base}:{run_id}" if run_id else base
+
+
+def _run_id() -> str:
+    """A per-run identifier for the deploy ref. This is a normal on-demand process (not a
+    deterministic workflow), so reading the wall clock here is fine and is exactly what makes a
+    re-fire not collide with a prior run's fills."""
+    return datetime.now().strftime("%Y%m%dT%H%M%S")
 
 
 def arm_requested(argv: list[str]) -> bool:
@@ -130,6 +200,12 @@ def conform_requested(argv: list[str]) -> bool:
     """True ONLY if the exact --conform flag is present. Turns ALIEN holdings into
     liquidation SELLs AND is a required transmit gate."""
     return CONFORM_FLAG in argv
+
+
+def model_clear_requested(argv: list[str]) -> bool:
+    """True ONLY if the exact --model-clear affirmation is present. Required transmit gate:
+    the operator affirms the account is divested from any IBKR Model Portfolio."""
+    return MODEL_CLEAR_FLAG in argv
 
 
 def _kill_switch_present() -> bool:
@@ -189,10 +265,49 @@ def _probe_gateway_readonly(ib, timeout: int = 15) -> bool:
     return signal["readonly"]
 
 
+def _detect_model_overlay(ib, account) -> tuple[bool, str]:
+    """BEST-EFFORT IBKR Model Portfolio detection. Returns (detected_nonempty, detail).
+
+    2026-07-28 incident: the account was still allocated to IBKR model "Main" (98.8%), and our
+    sub-account READ-ONLY lane could NOT see the overlay — only the FA master can. So this is a
+    SECONDARY check; the --model-clear human affirmation is the load-bearing gate. We ask for
+    positions BY MODEL (reqPositionsMulti) and, if a non-empty modelCode comes back, refuse
+    regardless of the flag. FAIL-SOFT: any error / absent API surface -> (False, reason) so a
+    missing capability degrades to "rely on --model-clear", never a crash."""
+    try:
+        fn = getattr(ib, "reqPositionsMulti", None)
+        if fn is None:
+            return False, ("reqPositionsMulti unavailable on this connection — cannot detect a "
+                           "model from the sub-account lane; relying on --model-clear")
+        rows = fn(account, "") or []
+        codes = {str(getattr(r, "modelCode", "") or "").strip() for r in rows}
+        codes.discard("")
+        if codes:
+            return True, ",".join(sorted(codes))
+        return False, ("no non-empty modelCode returned (a sub-account read cannot positively "
+                       "confirm the master's overlay); relying on --model-clear")
+    except Exception as exc:
+        return False, (f"model detection failed ({type(exc).__name__}); relying on "
+                       f"--model-clear")
+
+
 def _buying_power(summary) -> float | None:
     """Best-effort BuyingPower off the (already account-FILTERED) accountSummary rows."""
     for row in summary:
         if getattr(row, "tag", None) == "BuyingPower":
+            try:
+                return float(row.value)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def _total_cash_value(summary) -> float | None:
+    """REALIZED cash (TotalCashValue) off the (already account-FILTERED) accountSummary rows.
+    This is the ground truth the between-phases buy sizing uses — never the plan's expected
+    sale proceeds. None if the tag is missing/unparseable (caller then FAILS CLOSED)."""
+    for row in summary:
+        if getattr(row, "tag", None) == "TotalCashValue":
             try:
                 return float(row.value)
             except (TypeError, ValueError):
@@ -224,6 +339,29 @@ def _leg_cap(side: str, symbol: str, quotes: dict, prices: dict) -> float | None
     if not (cap and cap == cap and cap > 0):
         return None
     return cap
+
+
+def _more_aggressive_cap(side: str, symbol: str, quotes: dict, base_limit: float,
+                         attempt: int) -> float:
+    """A MORE aggressive marketable cap for a re-price attempt: escalate ORDER_CAP_K by the
+    attempt number off the live quote (BUY chases up toward/over the ask, SELL down toward/
+    under the bid). Falls back to a directional bump off the previous limit when no quote is
+    available, and guarantees the new cap is strictly more aggressive than the previous one so
+    every re-price is real progress. Always positive; still passed through order_router's HARD
+    price guard when the order is built."""
+    k = config.ORDER_CAP_K * (attempt + 1)
+    q = quotes.get(symbol)
+    cap = live_quotes.marketable_cap(side, q, k=k) if q is not None else None
+    if not (cap and cap == cap and cap > 0):
+        bump = config.ORDER_CAP_K * (attempt + 1)
+        cap = base_limit * (1 + bump) if side == "BUY" else base_limit * (1 - bump)
+        cap = round(cap, 2)
+    # Guarantee monotonic aggressiveness relative to the previous limit.
+    if side == "BUY":
+        cap = max(cap, round(base_limit * 1.001, 2))
+    else:
+        cap = min(cap, round(base_limit * 0.999, 2))
+    return round(cap, 2)
 
 
 def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool):
@@ -290,35 +428,250 @@ def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool):
     return legs, aliens_left, unpriceable
 
 
-def _safety_banner(armed: bool, conform: bool, kill: bool) -> None:
-    permit_intent = armed and conform and not kill
+def _scale_buys_to_cash(buy_legs, available_cash: float, *,
+                        buffer_pct: float = CASH_SAFETY_BUFFER_PCT):
+    """Size the BUY legs to the REALIZED cash so the account can NEVER go negative.
+
+    Hard rule: sum(returned buy notional) <= available_cash * (1 - buffer_pct). Scaling is
+    WHOLE-SHARE — a proportional floor first, then a greedy per-share trim (from the most
+    expensive leg) to absorb rounding — so the invariant holds exactly. A leg trimmed to 0
+    shares is dropped (and reported).
+
+    Returns (scaled_legs, adjustments):
+      scaled_legs : the qty>0 buys to transmit (notional recomputed at the whole-share qty)
+      adjustments : [{symbol, orig_qty, new_qty}] for every leg whose qty was reduced/skipped
+    """
+    from types import SimpleNamespace
+    if not buy_legs:
+        return [], []
+    budget = max(0.0, float(available_cash) * (1.0 - buffer_pct))
+    total = sum(l.notional for l in buy_legs)
+    factor = 1.0 if (total <= budget or total <= 0) else (budget / total)
+
+    work = []
+    for l in buy_legs:
+        nq = int(l.qty * factor)             # floor to whole shares
+        work.append(SimpleNamespace(symbol=l.symbol, side=l.side, qty=nq, limit=l.limit,
+                                    notional=nq * l.limit, source=l.source, orig_qty=l.qty))
+
+    def running() -> float:
+        return sum(w.notional for w in work)
+
+    # Greedy per-share trim from the most expensive leg until we fit the budget exactly.
+    guard = 0
+    while running() > budget and any(w.qty > 0 for w in work):
+        w = max((w for w in work if w.qty > 0), key=lambda w: w.limit)
+        w.qty -= 1
+        w.notional = w.qty * w.limit
+        guard += 1
+        if guard > 5_000_000:                # pathological safety valve — never spin forever
+            break
+
+    scaled = [w for w in work if w.qty > 0]
+    adjustments = [{"symbol": w.symbol, "orig_qty": w.orig_qty, "new_qty": w.qty}
+                   for w in work if w.qty != w.orig_qty]
+    return scaled, adjustments
+
+
+def _working_order_present(ib, symbol: str, side: str) -> bool:
+    """True if the broker currently has a WORKING/open order for this EXACT symbol+side (any
+    orderRef). Double-submit protection that is ref-INDEPENDENT: with a per-run ref a prior
+    run's still-working order carries a DIFFERENT ref, so ref-keyed dedup would miss it — we
+    match on symbol+side against live open orders instead. FAILS CLOSED: any open-orders read
+    error -> treat as present (skip the leg) so we never double-submit blind."""
+    try:
+        open_trades = ib.reqAllOpenOrders()
+    except Exception as exc:
+        print(f"      ! open-orders read FAILED for {side} {symbol}: {type(exc).__name__}: "
+              f"{exc} -> treating as WORKING (skip; never double-submit blind).")
+        return True
+    for t in (open_trades or []):
+        o = getattr(t, "order", None) or t
+        c = getattr(t, "contract", None)
+        sym = getattr(c, "symbol", None)
+        act = getattr(o, "action", None)
+        if sym == symbol and act == side:
+            return True
+    return False
+
+
+def _trade_done(trade) -> bool:
+    """Terminal-state test for one placed order. Prefers ib_async Trade.isDone(); falls back to
+    the orderStatus.status against the terminal set."""
+    try:
+        return bool(trade.isDone())
+    except Exception:
+        st = getattr(trade, "orderStatus", None)
+        return getattr(st, "status", "") in _TERMINAL_STATUSES
+
+
+def _cum_filled(active: dict) -> float:
+    """Cumulative filled shares for a leg across any cancel/replace re-prices (fills on a
+    cancelled order are carried in filled_prior; the live trade's own fill is added on top)."""
+    st = getattr(active["trade"], "orderStatus", None)
+    live = float(getattr(st, "filled", 0.0) or 0.0)
+    return float(active.get("filled_prior", 0.0)) + live
+
+
+def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, prices):
+    """Transmit ONE phase's legs (all sells, or all buys), then WAIT for terminal state with
+    bounded straggler re-pricing. Returns a list of per-leg result dicts:
+      {symbol, side, requested, filled, status, reprices, skipped, reason}
+
+    Safety: honors order_router.transmit_guard (fails closed — transmits nothing unless the
+    guard is fully open); skips any leg that already has an identical WORKING order (no double-
+    submit); uses per-run refs; and cancels + re-prices an unfilled leg toward the far touch up
+    to REPRICE_MAX_ATTEMPTS, re-placing ONLY the still-unfilled remainder (never over-fills).
+    Any leg still unfilled at the phase timeout is cancelled and reported LOUDLY."""
+    results: list[dict] = []
+    if not legs:
+        print(f"    [{phase_label}] no legs.")
+        return results
+
+    permit, why = order_router.transmit_guard(armed=True)
+    if not permit:
+        # Fail closed — unreachable inside the armed flip, but NEVER transmit if the guard is
+        # not fully open.
+        print(f"    [{phase_label}] transmit_guard BLOCKED ({why}) — transmitting nothing.")
+        for l in legs:
+            results.append({"symbol": l.symbol, "side": l.side, "requested": l.qty,
+                            "filled": 0.0, "status": "BLOCKED", "reprices": 0,
+                            "skipped": True, "reason": f"transmit_guard {why}"})
+        return results
+
+    active: list[dict] = []
+    for l in legs:
+        if _working_order_present(ib, l.symbol, l.side):
+            print(f"    [{phase_label}] SKIP {l.side} {l.symbol}: an identical WORKING order is "
+                  f"already open — not double-submitting.")
+            results.append({"symbol": l.symbol, "side": l.side, "requested": l.qty,
+                            "filled": 0.0, "status": "SKIPPED_WORKING", "reprices": 0,
+                            "skipped": True, "reason": "identical working order open"})
+            continue
+        ref = _deploy_ref(account, as_of, l.side, l.symbol, run_id)
+        order = order_router.build_marketable_limit(
+            l.symbol, l.side, l.qty, l.limit, account=account, order_ref=ref)
+        contract = Stock(l.symbol, "SMART", "USD")
+        try:
+            ib.qualifyContracts(contract)   # read-only validation nicety
+        except Exception:
+            pass
+        order.transmit = True
+        trade = ib.placeOrder(contract, order)
+        print(f"    [{phase_label}] SENT {l.side} {l.symbol} x{l.qty} LIMIT {l.limit:,.2f} "
+              f"ref={ref}")
+        active.append({"leg": l, "trade": trade, "contract": contract, "order": order,
+                       "ref": ref, "limit": l.limit, "attempts": 0, "filled_prior": 0.0,
+                       "placed_at": time.time()})
+
+    # Poll to terminal with bounded straggler re-pricing.
+    deadline = time.time() + PHASE_TERMINAL_TIMEOUT_SEC
+    while time.time() < deadline:
+        if all(_trade_done(a["trade"]) for a in active):
+            break
+        ib.sleep(POLL_SEC)
+        for a in active:
+            if _trade_done(a["trade"]):
+                continue
+            if (time.time() - a["placed_at"] >= REPRICE_AFTER_SEC
+                    and a["attempts"] < REPRICE_MAX_ATTEMPTS):
+                l = a["leg"]
+                prior = _cum_filled(a)
+                remaining = int(l.qty - prior)
+                if remaining <= 0:
+                    continue                  # filled during the wait; nothing to re-price
+                a["attempts"] += 1
+                a["filled_prior"] = prior
+                new_cap = _more_aggressive_cap(l.side, l.symbol, quotes, a["limit"],
+                                               a["attempts"])
+                print(f"    [{phase_label}] RE-PRICE {l.side} {l.symbol} attempt "
+                      f"{a['attempts']}/{REPRICE_MAX_ATTEMPTS}: {a['limit']:,.2f} -> "
+                      f"{new_cap:,.2f} (chase far touch); cancel + replace remainder "
+                      f"x{remaining}.")
+                try:
+                    ib.cancelOrder(a["order"])
+                except Exception:
+                    pass
+                ib.sleep(POLL_SEC)            # let the cancel settle before re-placing
+                new_order = order_router.build_marketable_limit(
+                    l.symbol, l.side, remaining, new_cap, account=account, order_ref=a["ref"])
+                new_order.transmit = True
+                a["order"] = new_order
+                a["limit"] = new_cap
+                a["trade"] = ib.placeOrder(a["contract"], new_order)
+                a["placed_at"] = time.time()
+
+    for a in active:
+        l = a["leg"]
+        if not _trade_done(a["trade"]):
+            try:
+                ib.cancelOrder(a["order"])    # give up: cancel the straggler, report loudly
+            except Exception:
+                pass
+        st = getattr(a["trade"], "orderStatus", None)
+        filled = _cum_filled(a)
+        status = str(getattr(st, "status", "") or "")
+        reason = "" if filled >= l.qty else "UNFILLED remainder (chased to cap, gave up)"
+        results.append({"symbol": l.symbol, "side": l.side, "requested": l.qty,
+                        "filled": filled, "status": status, "reprices": a["attempts"],
+                        "skipped": False, "reason": reason})
+    return results
+
+
+def _report_phase(label: str, results) -> None:
+    """Print a phase's per-leg results and a LOUD summary of anything unfilled/skipped."""
+    if not results:
+        print(f"\n    {label} phase: no legs.")
+        return
+    print(f"\n    {label} phase results:")
+    flagged: list[dict] = []
+    for r in results:
+        line = (f"      {r['side']:4s} {r['symbol']:6s} requested={r['requested']:g} "
+                f"filled={r['filled']:g} status={r['status']} reprices={r['reprices']}")
+        if r.get("skipped"):
+            line += f"  SKIPPED ({r.get('reason', '')})"
+        print(line)
+        if r.get("skipped") or r["filled"] < r["requested"]:
+            flagged.append(r)
+    if flagged:
+        print(f"    !! {label} UNFILLED / SKIPPED legs (LOUD — needs human review):")
+        for r in flagged:
+            print(f"      -> {r['side']} {r['symbol']}: requested {r['requested']:g}, filled "
+                  f"{r['filled']:g} [{r['status']}] {r.get('reason', '')}")
+
+
+def _safety_banner(armed: bool, conform: bool, model_clear: bool, kill: bool) -> None:
+    permit_intent = armed and conform and model_clear and not kill
     print("\n" + "#" * 88)
     print(f"# SAFETY STATE   armed={armed}   arm_token={'present' if armed else 'absent'}   "
           f"conform={'ON' if conform else 'off'}   "
+          f"model_clear={'AFFIRMED' if model_clear else 'ABSENT'}   "
           f"kill_switch={'PRESENT' if kill else 'absent'}")
     print(f"# account={EXEC_ACCOUNT}   target=S0 {DEPLOY_VERSION} tier   "
           f"gateway=Live-Trade port 4003")
     print(f"#   (single-account wall: refuses ANY account other than {ALLOWED_ACCOUNT})")
     print(f"# CAPS   total BUY notional <= investable   per-order notional <= "
-          f"{MAX_ORDER_NOTIONAL_PCT_NLV*100:.0f}% of NetLiq   whole-share   price-guarded   "
-          f"dedup FRESH")
+          f"{MAX_ORDER_NOTIONAL_PCT_NLV*100:.0f}% of NetLiq   whole-share   price-guarded")
+    print(f"# EXECUTION   two-phase cash-gated (sells -> re-read TotalCashValue -> buys sized "
+          f"to REALIZED cash)   straggler re-price x{REPRICE_MAX_ATTEMPTS:.0f}")
     if permit_intent:
-        print("# *** ARMED + CONFORM INTENT: this run MAY liquidate non-S0 holdings and")
-        print("#     transmit a FULL deploy (sells first, then buys) on a FUNDED account IF")
+        print("# *** ARMED + CONFORM + MODEL-CLEAR INTENT: this run MAY liquidate non-S0")
+        print("#     holdings and transmit a TWO-PHASE cash-gated deploy on a FUNDED account IF")
         print("#     every remaining gate passes. Review the full order list below. ***")
     else:
         print("# PREVIEW: sizes + builds the full ordered order list and prints it —")
-        print("# transmits NOTHING (not armed, conform off, or kill switch present).")
+        print("# transmits NOTHING (not armed, conform off, model-clear absent, or kill switch).")
     print("#" * 88)
 
 
-def main(armed: bool = False, conform: bool = False, today: object = None) -> int:
-    """DEPLOY executor. PREVIEW by default; transmits the full deploy ONLY when armed AND
-    conform AND every gate passes. `today` is accepted for signature parity with the other
-    runners; the shared brain always runs to the most recent data date."""
+def main(armed: bool = False, conform: bool = False, model_clear: bool = False,
+         today: object = None) -> int:
+    """DEPLOY executor. PREVIEW by default; transmits the TWO-PHASE cash-gated deploy ONLY when
+    armed AND conform AND model_clear AND every gate passes. `today` is accepted for signature
+    parity with the other runners; the shared brain always runs to the most recent data date."""
     print("=" * 88)
-    print(f"S0 LIVE DEPLOY EXECUTOR ({DEPLOY_VERSION} tier) — preview by default, full "
-          f"conform deploy when armed   [{version.banner()}]")
+    print(f"S0 LIVE DEPLOY EXECUTOR ({DEPLOY_VERSION} tier) — preview by default, two-phase "
+          f"cash-gated conform deploy when armed   [{version.banner()}]")
     print("=" * 88)
 
     # [1] Compute the GROWTH target BEFORE connecting (fail fast on stale data; connect
@@ -334,15 +687,15 @@ def main(armed: bool = False, conform: bool = False, today: object = None) -> in
           f"price_date={target.price_date.date()}  ({len(target.weights)} holdings)")
 
     kill = _kill_switch_present()
-    permit_intent = armed and conform and not kill
+    permit_intent = armed and conform and model_clear and not kill
 
-    # [2] Safety banner — armed/conform/preview state, account, caps.
-    _safety_banner(armed, conform, kill)
+    # [2] Safety banner — armed/conform/model-clear/preview state, account, caps.
+    _safety_banner(armed, conform, model_clear, kill)
 
-    # [3] Connect. ARMED+CONFORM intent -> the transmit-capable lane (readonly=False,
-    # clientId s0_live_exec); otherwise the read-only pilot lane (readonly=True). A bare armed
-    # connection still transmits nothing on its own — only order_router.place(armed=True) does.
-    # Whole session in try/finally so it ALWAYS disconnects.
+    # [3] Connect. ARMED intent -> the transmit-capable lane (readonly=False, clientId
+    # s0_live_exec); otherwise the read-only pilot lane (readonly=True). A bare armed connection
+    # still transmits nothing on its own — only order_router.place(armed=True) does. Whole
+    # session in try/finally so it ALWAYS disconnects.
     if permit_intent:
         print("\n[3] Connecting ARMED (readonly=False) to the Live-Trade Gateway "
               "(port 4003)...")
@@ -365,7 +718,7 @@ def main(armed: bool = False, conform: bool = False, today: object = None) -> in
         armed_conn = False
 
     try:
-        return _run_session(ib, target, armed=armed, conform=conform,
+        return _run_session(ib, target, armed=armed, conform=conform, model_clear=model_clear,
                             armed_conn=armed_conn, kill=kill)
     finally:
         try:
@@ -375,8 +728,8 @@ def main(armed: bool = False, conform: bool = False, today: object = None) -> in
         print("Session closed.")
 
 
-def _run_session(ib, target, *, armed: bool, conform: bool, armed_conn: bool,
-                 kill: bool) -> int:
+def _run_session(ib, target, *, armed: bool, conform: bool, model_clear: bool,
+                 armed_conn: bool, kill: bool) -> int:
     account = EXEC_ACCOUNT
 
     # [4] Read + FILTER to EXEC_ACCOUNT (the login also exposes the individual account +
@@ -435,6 +788,8 @@ def _run_session(ib, target, *, armed: bool, conform: bool, armed_conn: bool,
               f"notional ~{l.notional:>12,.2f}  [{l.source}]  {note}")
     print(f"    TOTALS   sells ~{total_sell:,.2f}   buys ~{total_buy:,.2f}   "
           f"investable ~{plan.investable:,.2f}   NetLiq ~{net_liq:,.2f}")
+    print("    NOTE: buys will be RE-SIZED to REALIZED cash after the sells fill (two-phase); "
+          "the buy figures above are the pre-cash-gate plan.")
     if aliens_left:
         label = ("non-S0 ALIEN holdings that WOULD REMAIN — pass --conform to liquidate"
                  if not conform else
@@ -450,6 +805,12 @@ def _run_session(ib, target, *, armed: bool, conform: bool, armed_conn: bool,
     if not conform:
         reasons.append(f"conform intent absent (pass {CONFORM_FLAG}) — this DEPLOY executor "
                        f"requires it to liquidate + transmit")
+    if not model_clear:
+        reasons.append(f"model-clear affirmation absent (pass {MODEL_CLEAR_FLAG}) — refusing: "
+                       f"confirm the account is divested from any IBKR Model Portfolio, then "
+                       f"pass {MODEL_CLEAR_FLAG}. Our sub-account read-only lane CANNOT see a "
+                       f"model overlay (2026-07-28 incident: deployed while still in model "
+                       f"'Main'); this human affirmation is the load-bearing gate")
     if kill:
         reasons.append(f"KILL_SWITCH sentinel present ({KILL_SWITCH})")
     acct_ok, acct_reason = _account_safety_ok()
@@ -466,97 +827,125 @@ def _run_session(ib, target, *, armed: bool, conform: bool, armed_conn: bool,
             reasons.append(f"order {l.side} {l.symbol} x{l.qty} notional {l.notional:,.2f} "
                            f"> {MAX_ORDER_NOTIONAL_PCT_NLV*100:.0f}% of NetLiq "
                            f"({per_order_cap:,.2f})")
-    # Total-notional sanity cap: total BUY notional must not exceed investable.
+    # Total-notional sanity cap: total BUY notional must not exceed investable. (The two-phase
+    # cash gate re-sizes buys to realized cash at transmit time; this is the plan-level cap.)
     if total_buy > plan.investable:
         reasons.append(f"total BUY notional {total_buy:,.2f} > investable "
                        f"{plan.investable:,.2f} — would over-deploy / use margin")
 
     # Connection-dependent gates — only meaningful on the armed (4003 transmit) connection,
     # and only worth probing once the code-level gates above are clean.
-    if armed and conform and armed_conn and not reasons:
+    if armed and conform and model_clear and armed_conn and not reasons:
         if _probe_gateway_readonly(ib):
             reasons.append("Gateway is still READ-ONLY on 4003 (arming.probe idiom) — not "
                            "physically armed; a human must turn the Read-Only API toggle off")
-    if armed and conform and armed_conn and not reasons:
-        for l in legs:
-            ref = _deploy_ref(account, target.as_of, l.side, l.symbol)
-            dedup = order_router.already_present(ib, ref, l.qty)
-            if dedup != order_router.LegState.FRESH:
-                reasons.append(f"dedup gate says {dedup} (not FRESH) for {l.side} "
-                               f"{l.symbol} ref={ref}")
-    if armed and conform and armed_conn and not reasons:
+    if armed and conform and model_clear and armed_conn and not reasons:
+        detected, detail = _detect_model_overlay(ib, account)
+        if detected:
+            reasons.append(f"IBKR Model overlay POSITIVELY detected on {account}: "
+                           f"modelCode={detail} — refusing regardless of {MODEL_CLEAR_FLAG} "
+                           f"(2026-07-28 incident: a model-managed book must be divested first)")
+        else:
+            print(f"\n    model-overlay detection (best-effort): {detail}")
+    if armed and conform and model_clear and armed_conn and not reasons:
         bp_ok, bp_reason = _buying_power_ok(summary, total_buy)
         if not bp_ok:
             reasons.append(bp_reason)
 
-    permit = armed and conform and armed_conn and not kill and not reasons
+    permit = (armed and conform and model_clear and armed_conn and not kill and not reasons)
 
-    # [9] Report + (only if permitted) transmit the full deploy (sells first).
+    # [9] Report + (only if permitted) transmit the two-phase cash-gated deploy.
     if not permit:
         primary = ("not armed" if not armed
                    else "conform off" if not conform
+                   else "model-clear absent" if not model_clear
                    else "kill switch present" if kill
                    else (reasons[0] if reasons else "gate not satisfied"))
         print("\n[9] TRANSMISSION BLOCKED — PREVIEW ONLY. Reason(s):")
         for r in reasons:
             print(f"      - {r}")
-        print(f"\n    WOULD TRANSMIT {len(legs)} leg(s) (sells first, then buys) on "
-              f"{account}. Nothing was transmitted.")
+        print(f"\n    WOULD TRANSMIT {len(legs)} leg(s) (two-phase: sells first, then buys "
+              f"sized to realized cash) on {account}. Nothing was transmitted.")
         print(f"\nTRANSMISSION BLOCKED — {primary}. Nothing transmitted.")
         return 0
 
-    # --- ARMED + CONFORM + every gate passed: build the ordered orders and transmit them. ---
-    print(f"\n[9] *** ARMED + CONFORM and all gates passed: transmitting {len(legs)} deploy "
-          f"leg(s), SELLS FIRST. ***")
-    built: list = []
-    for l in legs:
-        ref = _deploy_ref(account, target.as_of, l.side, l.symbol)
-        o = order_router.build_marketable_limit(
-            l.symbol, l.side, l.qty, l.limit, account=account, order_ref=ref)
-        contract = Stock(l.symbol, "SMART", "USD")
-        try:
-            ib.qualifyContracts(contract)   # read-only validation nicety
-        except Exception:
-            pass
-        built.append(order_router.BuiltOrder(l.symbol, contract, o, ref))
+    # --- ARMED + CONFORM + MODEL-CLEAR + every gate passed: TWO-PHASE cash-gated transmit. ---
+    run_id = _run_id()
+    sell_legs = [l for l in legs if l.side == "SELL"]
+    buy_legs = [l for l in legs if l.side == "BUY"]
+    print(f"\n[9] *** ARMED + CONFORM + MODEL-CLEAR — TWO-PHASE CASH-GATED DEPLOY (run "
+          f"{run_id}). Phase 1 sells -> re-read realized cash -> phase 2 buys sized to that "
+          f"cash. ***")
 
     # IN-PROCESS safety-flag flip — THIS PROCESS ONLY (mirrors s0_live_exec exactly).
-    # order_router.transmit_guard fails CLOSED while config.DRY_RUN or config.READONLY is
-    # True (the committed desk-wide defaults). We flip both to False in memory ONLY, place,
-    # then RESTORE in a finally so the flip can never leak past place(). UNREACHABLE unless
-    # `permit` is True (below the `if not permit: return` guard). The `built` list is ordered
-    # sells-first, so place() transmits the sells before the buys.
+    # order_router.transmit_guard fails CLOSED while config.DRY_RUN or config.READONLY is True
+    # (the committed desk-wide defaults). We flip both to False in memory ONLY, run BOTH phases,
+    # then RESTORE in a finally so the flip can never leak past the transmit. UNREACHABLE unless
+    # `permit` is True (above the `if not permit: return` guard).
     prev_readonly = config.READONLY
     prev_dry_run = config.DRY_RUN
     try:
         config.READONLY = False
         config.DRY_RUN = False
-        res = order_router.place(ib, built, armed=True, account=account,
-                                 context="s0_live_deploy_conform")
+
+        # PHASE 1 — SELLS (raise cash), wait for terminal, re-price stragglers.
+        print(f"\n    PHASE 1 — SELLS ({len(sell_legs)} leg(s)): transmit, then WAIT for "
+              f"terminal state (fill/cancel) before sizing any buy.")
+        sell_results = _transmit_phase(ib, sell_legs, account=account, as_of=target.as_of,
+                                       run_id=run_id, phase_label="SELL", quotes=quotes,
+                                       prices=prices)
+
+        # BETWEEN PHASES — RE-READ realized cash. NEVER trust the plan's expected proceeds; a
+        # cancelled sell (the 2026-07-28 BUCK failure) means that cash never landed.
+        ib.sleep(CASH_SETTLE_SEC)             # let streaming account values catch up to fills
+        fresh_summary = s0_live.filter_account_summary(ib.accountSummary(), account=account)
+        available_cash = _total_cash_value(fresh_summary)
+        if available_cash is None:
+            print("\n    !! Could not read realized TotalCashValue after the sells — FAIL "
+                  "CLOSED: transmitting NO buys (never buy against unverified cash).")
+            available_cash = 0.0
+        else:
+            print(f"\n    Realized available cash (TotalCashValue, fresh read): "
+                  f"{available_cash:,.2f}. Buys sized to THIS — never expected proceeds.")
+
+        # PHASE 2 — size buys to realized cash (whole-share; can NEVER go negative), transmit.
+        scaled_buys, adjustments = _scale_buys_to_cash(buy_legs, available_cash)
+        placed_buy_notional = sum(l.notional for l in scaled_buys)
+        budget = max(0.0, available_cash * (1.0 - CASH_SAFETY_BUFFER_PCT))
+        if adjustments:
+            print("    BUYS REDUCED / SKIPPED to fit realized cash (short proceeds -> never "
+                  "negative):")
+            for adj in adjustments:
+                verb = "SKIP  " if adj["new_qty"] == 0 else "REDUCE"
+                print(f"      {verb} {adj['symbol']}: {adj['orig_qty']} -> {adj['new_qty']} "
+                      f"shares")
+        # HARD invariant — the load-bearing anti-negative check.
+        assert placed_buy_notional <= budget + 1e-6, (
+            f"cash-gate invariant violated: buy notional {placed_buy_notional} > budget "
+            f"{budget}")
+        print(f"\n    PHASE 2 — BUYS ({len(scaled_buys)} leg(s), total notional "
+              f"{placed_buy_notional:,.2f} <= cash budget {budget:,.2f}): transmit.")
+        buy_results = _transmit_phase(ib, scaled_buys, account=account, as_of=target.as_of,
+                                      run_id=run_id, phase_label="BUY", quotes=quotes,
+                                      prices=prices)
     finally:
         config.READONLY = prev_readonly
         config.DRY_RUN = prev_dry_run
-    fills = res.get("fills", []) if isinstance(res, dict) else []
-    print("\n    Result:")
-    for f in fills:
-        print(f"      {f.get('symbol'):6s} {f.get('status')}  filled={f.get('filled')}  "
-              f"remaining={f.get('remaining')}  @ {f.get('avgFillPrice')}")
-    if not fills:
-        print("      (no fill readback returned)")
-    skipped = res.get("skipped", []) if isinstance(res, dict) else []
-    for s in skipped:
-        print(f"      SKIPPED {s.get('symbol')} ref={s.get('order_ref')} "
-              f"state={s.get('state')}")
-    print("\nDone. ARMED conform deploy complete — review the fills above and DISARM the "
+
+    # Consolidated result — LOUD on anything unfilled/skipped in either phase.
+    _report_phase("SELL", sell_results)
+    _report_phase("BUY", buy_results)
+    print("\nDone. Two-phase cash-gated deploy complete — review the fills above and DISARM the "
           "Gateway when finished.")
     return 0
 
 
 def cli(argv: list[str] | None = None) -> int:
-    """CLI entry: --arm-i-understand sets armed=True; --conform sets conform=True. BOTH are
-    required to actually liquidate + transmit."""
+    """CLI entry: --arm-i-understand sets armed=True; --conform sets conform=True; --model-clear
+    sets model_clear=True. ALL THREE are required to actually liquidate + transmit."""
     argv = sys.argv[1:] if argv is None else argv
-    return main(armed=arm_requested(argv), conform=conform_requested(argv))
+    return main(armed=arm_requested(argv), conform=conform_requested(argv),
+                model_clear=model_clear_requested(argv))
 
 
 if __name__ == "__main__":
