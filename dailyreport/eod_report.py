@@ -82,6 +82,41 @@ def _is_fresh(date_str) -> bool:
         return False
     return str(date_str) >= EXPECTED_SESSION_STR
 
+
+# Some macro inputs publish on a lag, so "last session" is the WRONG freshness bar
+# for them. FRED's ICE BofA HY OAS (BAMLH0A0HYM2) posts next-business-day and, at
+# this report's 21:00 CT slot, routinely sits 1-2 trading days behind the session.
+# Verified 2026-07-28: FRED's OWN latest value was 2026-07-24 while the warehouse
+# held exactly 2026-07-24 -- fully synced to source -- yet the same-session bar flagged
+# it "stale" every night (19 nights running). Allow a per-input trading-day lag so
+# only a GENUINE break (falling further behind FRED's own cadence) alarms. VIX (CBOE,
+# same-day) stays at 0. Keyed by the manifest key used in build_s0_data.
+_MACRO_MAX_LAG_SESSIONS = {"_hy_oas": 3, "_vix": 0}
+
+
+def _fresh_floor_str(max_lag_sessions: int) -> str:
+    """YYYYMMDD of the OLDEST last_date still counted fresh: EXPECTED_SESSION stepped
+    back `max_lag_sessions` trading days (0 -> EXPECTED_SESSION itself). Degrades to
+    EXPECTED_SESSION_STR if the market calendar is unavailable."""
+    d = EXPECTED_SESSION
+    try:
+        from connections import market_calendar as _mc
+        for _ in range(max(0, max_lag_sessions)):
+            d = _mc.last_trading_day(d, inclusive=False)
+    except Exception:
+        return EXPECTED_SESSION_STR
+    return d.strftime("%Y%m%d")
+
+
+def _is_fresh_lagged(date_str, max_lag_sessions: int) -> bool:
+    """Like _is_fresh but tolerant of a known publication lag: fresh if the date is
+    within `max_lag_sessions` trading days of the expected session. lag 0 == _is_fresh."""
+    if not date_str:
+        return False
+    if max_lag_sessions <= 0:
+        return _is_fresh(date_str)
+    return str(date_str) >= _fresh_floor_str(max_lag_sessions)
+
 # status -> (dot color, label). Severity order used for the overall headline.
 DOT = {"ok": "#22c55e", "info": "#3b82f6", "stale": "#9ca3af",
        "partial": "#fbbf24", "warn": "#f59e0b", "fail": "#ef4444"}
@@ -303,7 +338,9 @@ def build_s0_data():
                 continue
             last_date = info.get("last_date", "")
             qc = info.get("qc_flags") or []
-            fresh = _is_fresh(last_date.replace("-", "")) if last_date else False
+            fresh = (_is_fresh_lagged(last_date.replace("-", ""),
+                                      _MACRO_MAX_LAG_SESSIONS.get(key, 0))
+                     if last_date else False)
             row_val = (f"{last_date}  ({info.get('source', '?')})"
                        f"{'  QC:' + str(qc) if qc else ''}")
             if not fresh:
@@ -617,8 +654,14 @@ def main() -> bool:
             data_status=s0_data_sec.get("status"))
         _build_s0_regime_with_data_status.__name__ = "build_s0_regime"
         s0_regime_sec = _run_section(_build_s0_regime_with_data_status)
-        account_sec = _run_section(build_account)
-        sections = [s0_regime_sec, s0_data_sec, account_sec]
+        # account_monitor section DE-LISTED 2026-07-28: AccountMonitorDaily is
+        # deliberately paused (gateway quarantine since 2026-07-08, "don't re-enable
+        # without Andrew" pin). A paused-on-purpose job was rendering "stale" every
+        # night and dragging the whole digest to warn/fail -- a false alarm, not a
+        # data failure. Re-add `account_sec` here (build_account is retained below)
+        # when the monitor is revived / folded into the CRM per-account loop
+        # (CRM_DESIGN groups_brain.md 12.2/12.3).
+        sections = [s0_regime_sec, s0_data_sec]
         overall = _overall(sections)
         html = render_html(sections, overall)
         subject = f"Trading Desk EOD — {TODAY.strftime('%b %d')} — {overall.upper()}"

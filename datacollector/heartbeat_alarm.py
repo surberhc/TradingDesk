@@ -322,11 +322,14 @@ DEADLINE_JOBS: list[dict] = [
      "deadline_hhmm_fallback": (20, 0), "deadline_buffer_min": 15,
      "task_name": "GexDailyBuild",
      "market_dependent": True},
-    {"name": "account_monitor", "label": "account-cashflow monitor",
-     "status_file": _STATUS_DIR / "account_monitor.json",
-     "deadline_hhmm_fallback": (21, 30), "deadline_buffer_min": 15,
-     "task_name": "AccountMonitorDaily",
-     "market_dependent": True},
+    # account_monitor DE-LISTED 2026-07-28: AccountMonitorDaily is deliberately paused
+    # (gateway quarantine); a paused job was false-paging nightly after its 21:30 deadline.
+    # Re-add this entry when the monitor is revived. See eod_report.py main() for the paired change.
+    # {"name": "account_monitor", "label": "account-cashflow monitor",
+    #  "status_file": _STATUS_DIR / "account_monitor.json",
+    #  "deadline_hhmm_fallback": (21, 30), "deadline_buffer_min": 15,
+    #  "task_name": "AccountMonitorDaily",
+    #  "market_dependent": True},
 ]
 
 
