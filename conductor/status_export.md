@@ -29,6 +29,9 @@
 > - (#20) [S8 / British IC] S8: which single template (if any) should a bot run -- still undecided
 > - (#44) [S8 / British IC] Decide: keep S8 live-trade gateway (4003) running continuously to cut 2FA from daily to ~weekly
 
+### 2026-07-28 (crm-direction) — #61 decision: keep as tracked to-do (do with CRM build), not now
+Andrew 2026-07-28 chose option A: leave #61 (fold account_monitor into the CRM per-account monitoring/latch loop) as a tracked dependency, executed WHEN the CRM per-account read->decide->latch loop is built -- no standalone work today. The false-alarm problem is already resolved (de-listed from alerters this morning); the tool is paused and harmless. #61 stays OPEN as the tracked reminder. Not starting a CRM per-account-loop build now (option B declined).
+
 ### 2026-07-28 (strategy-review) — Closed #6: keep defensive.py missing-factor = worst-percentile (fillna(0.0)) as-is
 Reviewed with Andrew 2026-07-28, decision: KEEP AS-IS. In strategies/parts/defensive.py:96, a candidate missing a factor that day (e.g. no 6-month return) is scored via pct.fillna(0.0) -> below last place on that factor, so thin-history assets rank low and are rarely picked. Concrete impact is tiny and historical: of the 8 DEFENSIVE_ASSETS, only SGOV (inception 2020-05-28) is new enough to have ever tripped it -- benched for its first ~6 months in 2020 in favor of older cash funds (BIL/SHY); all 8 now have 6+ yrs history so it no longer fires unless a brand-new defensive ETF is added. Benching a fund genuinely too new to evaluate is the conservative, curve-fit-preventing default (rule #1). No code change; not a bug -- a design tradeoff, reviewed and kept.
 
