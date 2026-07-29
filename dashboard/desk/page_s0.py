@@ -1,36 +1,30 @@
-"""page_s0.py — the rebuilt desk's Strategy 0 page. READ-ONLY.
+"""page_s0.py — the rebuilt desk's Strategy 0 page. READ-ONLY, MODEL-DRIVEN.
 
-Strategy 0 (Adaptive All-Weather Core) is the ONE strategy that is actually
-live-paper-tested. This page PORTS the correct, read-only implementations from the
-old dashboard (dashboard/app.py) — the paper-account read + drift vs target +
-rebalance PLAN preview, the validated backtest metrics for the 3 versions, and the
-live-paper NAV vs backtest-model performance curve — and re-dresses them in the new
-theme with full plain-English labels (the owner is a non-coder).
+Strategy 0 (Adaptive All-Weather Core) is the desk's all-weather core. This page
+LEADS with the current regime read and the model's Daily / Month-to-date /
+Year-to-date performance for the three client versions (Conservative / Balanced /
+Growth). Everything is computed from end-of-day data through the VALIDATED backtest
+engine — the exact code path the strategy itself uses (rule #1: never a separate,
+curve-fit copy). There is NO broker connection anywhere on this page: no gateway, no
+live paper account, no order, no arm, no transmit.
 
-WHAT THIS NEVER DOES (the read-only contract, identical to app.py):
-  * The only broker path is ibkr_paper.connect(readonly=True, launch=False) with a
-    SHORT timeout — a session that physically cannot transmit, that never boots the
-    gateway. It only reads (managedAccounts / accountSummary / positions / reconcile)
-    and calls rebalance_run.build_preview, which is a PURE build-only planner: no order
-    objects are created, nothing is armed, nothing is transmitted. Every connection is
-    disconnected in a finally block.
-  * No order_router.place/arm, no ib.placeOrder, no replaceFA, no file writes.
-  * The backtest is the VALIDATED run_backtest, reused as-is (rule #1: the paperbot
-    never re-implements strategy or performance math — one shared, validated code
-    path, never curve-fit, never drifted).
+RULE #1 (never curve-fit): every regime threshold, band, gate, and allowance shown
+here is IMPORTED from the frozen strategy config (`strategies.config`) — never
+hardcoded or invented. The live regime score is READ from the nightly-published
+status file; it is not recomputed here.
 
-IMPORT DISCIPLINE (critical): module-top imports are CHEAP only (stdlib, pandas,
-streamlit, theme, and nav_history — which is pure: it only reads a local CSV via its
-pure `config` data module). Every heavy/broker import — accounts, config,
-strategy_target, rebalance_run, reconcile, connections.ibkr_paper, and the backtester
-`bt`/`mt` — is LAZY (inside the function that needs it), exactly as app.py does, so
-importing this module never opens a socket and never runs a backtest.
+IMPORT DISCIPLINE: module-top imports are CHEAP only (stdlib, pandas, streamlit,
+theme). Every heavy import — the frozen `strategies.config`, the backtester `bt`/`mt`,
+and `strategy_target` — is LAZY (inside the function that needs it), so importing this
+module opens no socket and runs no backtest.
 """
 from __future__ import annotations
 
 import contextlib
 import io
+import json
 import sys
+from datetime import date
 from pathlib import Path
 
 import pandas as pd
@@ -39,7 +33,7 @@ import streamlit as st
 import theme
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
-# Same sys.path bootstrap app.py uses. This module lives at
+# Same sys.path bootstrap app.py / desk_app.py use. This module lives at
 # dashboard/desk/page_s0.py, so the repo root is parents[2].
 REPO = Path(__file__).resolve().parents[2]
 for _sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport",
@@ -47,23 +41,55 @@ for _sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport
     _p = REPO / _sub
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
-# connections is a namespace package one level deeper (matches app.py).
 _conn = REPO / "connections"
 if str(_conn) not in sys.path:
     sys.path.insert(0, str(_conn))
 
-# nav_history is PURE — it only reads a local CSV through the pure `config` data
-# module; importing it opens no socket and runs no backtest. Safe at module top.
-import nav_history  # noqa: E402
-
 BACKTEST_OUTPUT = REPO / "backtester" / "output"
 BACKTEST_VERSIONS = ("Conservative", "Balanced", "Growth")
 
-# Plain-English gloss for each headline backtest metric (the owner is a non-coder).
+# The nightly-published live regime read + the dashboard's own score-history log.
+S0_REGIME_JSON = Path(
+    r"C:\TradingDesk-Local\state\dailyreport\status\s0_regime.json")
+SCORE_HISTORY_CSV = Path(
+    r"C:\TradingDesk-Local\state\desk_dashboard\s0_score_history.csv")
+
+# Plain-English name + colour tier for each regime bucket (spelled out, no shorthand).
+REGIME_PLAIN = {
+    "RiskOn": "Risk-On",
+    "RiskOnNarrowing": "Risk-On narrowing",
+    "Caution": "Caution",
+    "Defensive": "Defensive",
+    "CapitalPreservation": "Capital preservation",
+}
+REGIME_TIER = {
+    "RiskOn": "good", "RiskOnNarrowing": "good",
+    "Caution": "warn",
+    "Defensive": "bad", "CapitalPreservation": "bad",
+}
+
+# Display-only colour grade for the regime ladder (green -> red). These tint the
+# ladder rungs; they are NOT strategy knobs — they steer no decision, only the eye.
+REGIME_LADDER_COLOR = {
+    "RiskOn": "#3fb950",            # strong green (most aggressive)
+    "RiskOnNarrowing": "#a3c93a",   # yellow-green
+    "Caution": "#d29922",           # amber
+    "Defensive": "#db6d28",         # orange
+    "CapitalPreservation": "#f85149",  # red (most defensive)
+}
+
+
+def _hex_rgba(hexc: str, alpha: float) -> str:
+    """'#3fb950' + alpha -> 'rgba(r,g,b,alpha)' (display tint helper)."""
+    h = hexc.lstrip("#")
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    return f"rgba({r},{g},{b},{alpha})"
+
+# Plain-English gloss for each headline backtest metric (demoted to the details expander).
 METRIC_LABELS = {
     "CAGR": "Compound annual growth rate (CAGR)",
     "Max drawdown": "Maximum drawdown (worst peak-to-trough drop)",
-    "Calmar": "Calmar ratio (annual growth ÷ worst drawdown — higher is better)",
+    "Calmar": "Calmar ratio (annual growth / worst drawdown — higher is better)",
     "Sortino": "Sortino ratio (return per unit of downside risk — higher is better)",
     "Down capture vs SPY":
         "Down-capture vs the S&P 500 (how much of the market's losses it takes)",
@@ -74,60 +100,74 @@ _RISK_METRICS = {"Max drawdown", "Down capture vs SPY"}
 
 
 # =========================================================================== #
-# Home P&L tile summary — SLOW / monthly-style (S0 barely moves in a month).  #
+# The validated model — run ONCE per version (cached 1h), reused everywhere.   #
+# =========================================================================== #
+@st.cache_data(ttl=3600, show_spinner="Running the model (validated engine, cached 1 hour)...")
+def _model_result(version: str) -> dict:
+    """Run the VALIDATED run_backtest once per version (cached 1h) and return the
+    pieces this page needs: the model NAV series, the benchmark NAV frame (SPY /
+    60/40 / T-bills / strategy), and the latest target stock exposure. Read-only
+    compute — the exact code path the strategy uses, touches no broker."""
+    from src import backtest as bt
+    from strategies import config as scfg
+    with contextlib.redirect_stdout(io.StringIO()):
+        res = bt.run_backtest(version=version, end=None)
+    # Latest target book's equity-sleeve weight = current target stock exposure.
+    latest_w = res["weights"].iloc[-1]
+    eq_tickers = set(scfg.EQUITY_CORE) | set(scfg.SECTORS)
+    exposure = float(latest_w[[t for t in latest_w.index if t in eq_tickers]].sum())
+    return {"nav": res["nav"], "bench": res["benchmark_navs"], "exposure": exposure}
+
+
+def _period_returns(nav: pd.Series) -> tuple:
+    """(daily, month-to-date, year-to-date) simple returns from a daily NAV series.
+    MTD baselines to the last value on/before the final trading day of the prior
+    month; YTD baselines to the last value on/before Dec 31 of the prior year."""
+    nav = nav.dropna()
+    if len(nav) < 2:
+        return (None, None, None, None, None)  # last date carried for callers
+    latest_date = nav.index[-1]
+    latest = float(nav.iloc[-1])
+    daily = latest / float(nav.iloc[-2]) - 1.0
+
+    month_start = latest_date.replace(day=1)
+    prior_month = nav[nav.index < month_start]
+    mtd = latest / float(prior_month.iloc[-1]) - 1.0 if len(prior_month) else None
+
+    year_start = latest_date.replace(month=1, day=1)
+    prior_year = nav[nav.index < year_start]
+    ytd = latest / float(prior_year.iloc[-1]) - 1.0 if len(prior_year) else None
+    return (daily, mtd, ytd, latest_date, month_start)
+
+
+# =========================================================================== #
+# Home P&L tile summary — now model-driven (month-to-date), keys unchanged.    #
 # =========================================================================== #
 def s0_pnl_summary() -> dict:
-    """A slow, monthly-style P&L summary of the live paper Strategy 0 accounts for
-    the home P&L tile — S0 is an end-of-day strategy, so value moves gradually.
-
-    Sums the live paper net-liquidation value across all accounts per tracked date
-    (nav_history.csv, written by the read-only account monitor) and returns the
-    month-to-date percent change (or since-tracking-start when only one month exists).
-
-    Returns {"change_pct": float|None, "since": str|None, "as_of": str|None,
-    "note": str}. Degrades to an honest "not enough history yet" note when fewer
-    than two tracked dates exist (live paper tracking started 2026-07-07). No broker
-    call — reads a local CSV only."""
+    """Month-to-date summary of the Strategy 0 MODEL (Balanced version) for the home
+    P&L tile. Computed from the validated backtest NAV (end-of-day data) — no broker
+    call, no paper account. Returns the SAME keys the home tile expects:
+    {"change_pct": float|None, "since": str|None, "as_of": str|None, "note": str},
+    where change_pct is a PERCENT (e.g. +0.4 => "+0.4% month-to-date")."""
     slow = ("Strategy 0 is a slow, end-of-day strategy — value moves gradually, "
             "so small month-to-date moves are normal.")
     try:
-        hist = nav_history.load_history()
+        nav = _model_result("Balanced")["nav"]
+        daily, mtd, ytd, as_of_date, month_start = _period_returns(nav)
     except Exception:
         return {"change_pct": None, "since": None, "as_of": None,
-                "note": "Performance history could not be read right now. " + slow}
+                "note": "Model performance could not be computed right now. " + slow}
 
-    if hist is None or hist.empty:
+    if mtd is None or as_of_date is None:
         return {"change_pct": None, "since": None, "as_of": None,
-                "note": ("Not enough history yet — Strategy 0 performance tracking "
-                         "started 2026-07-07; check back after a few sessions. " + slow)}
+                "note": "Not enough model history this month yet. " + slow}
 
-    hist = hist.dropna(subset=["net_liq"])
-    # Sum the live paper net-liquidation value across every account, per date.
-    totals = hist.groupby("date")["net_liq"].sum().sort_index()
-
-    if totals.shape[0] < 2:
-        only = str(totals.index[0]) if totals.shape[0] else None
-        return {"change_pct": None, "since": only, "as_of": only,
-                "note": ("Not enough history yet — need at least two tracked days to "
-                         "show a change. " + slow)}
-
-    as_of = str(totals.index[-1])
-    as_of_month = as_of[:7]  # "YYYY-MM"
-    # Month-to-date: the first tracked date in the same calendar month as the latest
-    # date. Fall back to since-tracking-start when the current month has only one date.
-    month_dates = [str(d) for d in totals.index if str(d)[:7] == as_of_month]
-    if len(month_dates) >= 2:
-        since = month_dates[0]
-        scope = "month to date"
-    else:
-        since = str(totals.index[0])
-        scope = "since tracking started"
-
-    start_val = float(totals.loc[since])
-    end_val = float(totals.loc[as_of])
-    change_pct = (end_val / start_val - 1.0) * 100.0 if start_val else None
-    return {"change_pct": change_pct, "since": since, "as_of": as_of,
-            "note": f"Change in total paper value {scope}. " + slow}
+    return {
+        "change_pct": mtd * 100.0,
+        "since": month_start.date().isoformat(),
+        "as_of": as_of_date.date().isoformat(),
+        "note": "Month-to-date change in the Strategy 0 model (Balanced). " + slow,
+    }
 
 
 # =========================================================================== #
@@ -139,9 +179,9 @@ def _render_gate_card() -> None:
             "Real-money transmission",
             "bad",  # colour only: red = the wall is deliberately closed
             "OFF — deliberately gated",
-            "Strategy 0 runs on the paper account. A real order only ever transmits "
-            "behind an explicit, armed, human decision — the sacred "
-            "review -> arm -> transmit gate. Nothing on this page places, arms, or "
+            "Strategy 0 runs on the model. A real order only ever transmits behind an "
+            "explicit, armed, human decision — the sacred review -> arm -> transmit "
+            "gate. Nothing on this page connects to a broker, places, arms, or "
             "transmits anything.",
         ),
         unsafe_allow_html=True,
@@ -149,40 +189,320 @@ def _render_gate_card() -> None:
 
 
 # =========================================================================== #
-# Backtests — the VALIDATED run_backtest, reused as-is (never re-derived).     #
+# Regime — READ the live score, IMPORT the frozen bands, log the score trend.  #
 # =========================================================================== #
-@st.cache_data(ttl=3600, show_spinner="Computing backtest metrics (validated engine)...")
-def _backtest_metrics() -> pd.DataFrame:
-    """Run the VALIDATED run_backtest once per version (cached 1h) and pull the
-    headline metrics via the backtester's own metrics.compute_metrics. Read-only
-    compute — the exact code path the strategy/paperbot use; touches no broker.
-    Ported verbatim from app.py::backtest_metrics."""
-    from src import backtest as bt
-    from src import metrics as mt
-
-    rows = {}
-    for v in BACKTEST_VERSIONS:
-        # Silence the engine's own prints so they don't pollute the UI.
-        with contextlib.redirect_stdout(io.StringIO()):
-            res = bt.run_backtest(version=v, end=None)
-            table = mt.compute_metrics(res["benchmark_navs"])
-        col = "strategy"
-        rows[v] = {m: (table.loc[m, col] if m in table.index else float("nan"))
-                   for m in _HEADLINE_METRICS}
-    return pd.DataFrame(rows).T  # versions as rows
+def _read_live_regime() -> dict | None:
+    """Read the nightly-published live regime score (never recompute it here)."""
+    try:
+        data = json.loads(S0_REGIME_JSON.read_text())
+        m = data.get("metrics", {})
+        as_of = str(m.get("as_of", ""))
+        return {
+            "score": float(m["score"]),
+            "raw_regime": m.get("raw_regime"),
+            "confirmed_regime": m.get("confirmed_regime"),
+            "as_of": as_of,
+        }
+    except Exception:
+        return None
 
 
-@st.cache_data(ttl=3600, show_spinner="Running backtest curve for performance comparison...")
-def _backtest_strategy_curve(version_str: str) -> pd.Series:
-    """The validated run_backtest()'s own 'strategy' NAV series for one version —
-    reused as-is (no re-derived performance math) to compare against the live paper
-    NAV. Ported verbatim from app.py::_backtest_strategy_curve."""
-    from src import backtest as bt
-    with contextlib.redirect_stdout(io.StringIO()):
-        res = bt.run_backtest(version=version_str, end=None)
-    return res["nav"]
+def _as_of_iso(as_of: str) -> str | None:
+    """'20260728' -> '2026-07-28'."""
+    if len(as_of) == 8 and as_of.isdigit():
+        return f"{as_of[:4]}-{as_of[4:6]}-{as_of[6:8]}"
+    return as_of or None
 
 
+def _log_and_read_score_history(as_of_iso: str, score: float) -> pd.DataFrame:
+    """Append today's (date, score) to the dashboard's own history CSV — idempotent
+    per date — and return the full history sorted by date. This is the dashboard's
+    file, safe to write; it changes no strategy knob."""
+    try:
+        SCORE_HISTORY_CSV.parent.mkdir(parents=True, exist_ok=True)
+        if SCORE_HISTORY_CSV.exists():
+            hist = pd.read_csv(SCORE_HISTORY_CSV, dtype={"date": str})
+        else:
+            hist = pd.DataFrame(columns=["date", "score"])
+        if as_of_iso and as_of_iso not in set(hist.get("date", [])):
+            new_row = pd.DataFrame([{"date": as_of_iso, "score": score}])
+            hist = new_row if hist.empty else pd.concat([hist, new_row],
+                                                        ignore_index=True)
+            hist = hist.drop_duplicates(subset=["date"]).sort_values("date")
+            hist.to_csv(SCORE_HISTORY_CSV, index=False)
+        else:
+            hist = hist.drop_duplicates(subset=["date"]).sort_values("date")
+        return hist.reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame(columns=["date", "score"])
+
+
+def _score_trend(hist: pd.DataFrame) -> str | None:
+    """Plain-English recent trend from >=2 dated score points, or None if too few.
+    (Display-only trend; NOT a regime gate, so its tolerance is cosmetic, not a
+    frozen config value.)"""
+    if hist is None or len(hist) < 2:
+        return None
+    recent = hist["score"].astype(float)
+    change = float(recent.iloc[-1]) - float(recent.iloc[0])
+    if change > 0.5:
+        return ("score rising (coming out of a drawdown — the health bands are "
+                "expanding up)")
+    if change < -0.5:
+        return "score falling (heading toward a drawdown)"
+    return "score steady"
+
+
+def _score_heading(hist: pd.DataFrame, reg: dict, order_desc: list,
+                   cross_pts: float) -> str:
+    """Plain-English heading arrow ('if it closed today, we'd ...'), driven by the
+    dashboard's own accumulating score history + the frozen dead-zone. order_desc is
+    the ladder order TOP->BOTTOM (most-aggressive first). Display-only."""
+    confirmed = reg["confirmed_regime"] or reg["raw_regime"]
+    cur_plain = REGIME_PLAIN.get(confirmed, confirmed)
+    idx = order_desc.index(confirmed) if confirmed in order_desc else -1
+    higher = order_desc[idx - 1] if idx > 0 else None            # more aggressive (above)
+    lower = order_desc[idx + 1] if 0 <= idx < len(order_desc) - 1 else None  # below
+
+    if hist is None or len(hist) < 2:
+        return ("\u2192 Holding today \u2014 the heading arrow appears once a few "
+                "nightly scores accumulate. If it closed here today, we'd stay in "
+                f"{cur_plain}.")
+
+    scores = hist["score"].astype(float)
+    change = float(scores.iloc[-1]) - float(scores.iloc[-2])  # latest vs prior point
+    if change >= cross_pts and higher is not None:
+        return (f"\u2191 Heading up \u2014 moving toward {REGIME_PLAIN.get(higher, higher)} "
+                f"(recovering). If it closed here today, we'd be climbing out of "
+                f"{cur_plain}.")
+    if change <= -cross_pts and lower is not None:
+        return (f"\u2193 Heading down \u2014 drifting toward {REGIME_PLAIN.get(lower, lower)}. "
+                f"If it closed here today, we'd be sliding out of {cur_plain}.")
+    return (f"\u2192 Holding \u2014 comfortably inside {cur_plain}. If it closed here "
+            f"today, we'd stay in {cur_plain}.")
+
+
+def _render_regime_ladder(reg: dict, scfg, hist: pd.DataFrame) -> None:
+    """The 5-rung regime LADDER: most-aggressive at TOP -> most-defensive at BOTTOM,
+    colour-graded green->red, current rung highlighted with the live score marked, plus
+    a heading arrow. Order is DERIVED from the frozen REGIME_BANDS score floors."""
+    bands = scfg.REGIME_BANDS
+    score = reg["score"]
+    confirmed = reg["confirmed_regime"] or reg["raw_regime"]
+    cross_pts = scfg.REGIME_MIN_THRESHOLD_CROSS
+
+    # TOP->BOTTOM = score floor DESCENDING (derived, never hardcoded order).
+    order_desc = sorted(bands, key=lambda r: bands[r]["score"][0], reverse=True)
+
+    as_of_iso = _as_of_iso(reg["as_of"]) or reg["as_of"]
+    heading = _score_heading(hist, reg, order_desc, cross_pts)
+
+    # --- Header line + heading arrow.
+    header = (
+        f'<div style="margin:.2rem 0 .55rem 0">'
+        f'<span style="font-size:15px;font-weight:650;color:{theme.TEXT}">'
+        f'Where the market is right now</span>'
+        f'<span style="font-size:11.5px;color:{theme.MUTED};margin-left:.5rem">'
+        f'as of {theme._esc(as_of_iso)}</span>'
+        f'<div style="font-size:12.5px;color:{theme.TEXT};margin-top:.25rem">'
+        f'{theme._esc(heading)}</div>'
+        f'</div>'
+    )
+
+    # --- The ladder rungs (top = most aggressive, bottom = most defensive).
+    rungs = []
+    for name in order_desc:
+        s_lo, s_hi = bands[name]["score"]
+        e_lo, e_hi = bands[name]["equity"]
+        plain = REGIME_PLAIN.get(name, name)
+        color = REGIME_LADDER_COLOR.get(name, theme.MUTED)
+        is_cur = (name == confirmed)
+
+        if is_cur:
+            fill = _hex_rgba(color, 0.22)
+            border = f"1px solid {color}"
+            accent = f"5px solid {color}"
+            opacity = "1"
+            name_weight = "800"
+            marker = (
+                f'<div style="margin-left:auto;white-space:nowrap;font-size:12.5px;'
+                f'font-weight:700;color:{color}">\u25cf Current \u2014 score '
+                f'{score:.1f}</div>'
+            )
+        else:
+            fill = _hex_rgba(color, 0.06)
+            border = f"1px solid {theme.BORDER}"
+            accent = f"5px solid {_hex_rgba(color, 0.45)}"
+            opacity = "0.62"
+            name_weight = "550"
+            marker = ""
+
+        rungs.append(
+            f'<div style="display:flex;align-items:center;gap:.7rem;'
+            f'background:{fill};border:{border};border-left:{accent};'
+            f'border-radius:10px;padding:.55rem .85rem;margin-bottom:.4rem;'
+            f'opacity:{opacity}">'
+            f'<span style="flex:0 0 12px;width:12px;height:12px;border-radius:50%;'
+            f'background:{color}"></span>'
+            f'<div style="min-width:0">'
+            f'<div style="font-size:14px;font-weight:{name_weight};color:{theme.TEXT}">'
+            f'{theme._esc(plain)}</div>'
+            f'<div style="font-size:11.5px;color:{theme.MUTED};margin-top:.1rem">'
+            f'score {s_lo:.0f}\u2013{s_hi:.0f} &middot; '
+            f'stocks {e_lo * 100:.0f}\u2013{e_hi * 100:.0f}%</div>'
+            f'</div>{marker}</div>'
+        )
+
+    st.markdown(header + "".join(rungs), unsafe_allow_html=True)
+
+
+def _render_regime_banner() -> dict | None:
+    """The shared regime section: a 5-rung colour-graded LADDER (most-aggressive top ->
+    most-defensive bottom) with the current rung highlighted and the live score marked,
+    a heading arrow, and the cushion-to-next-lower-band supporting line. Returns the
+    regime dict (so the version cards can reuse score/confirmed) or None if the read
+    failed."""
+    from strategies import config as scfg
+
+    reg = _read_live_regime()
+    if reg is None:
+        st.warning("The nightly regime read could not be found \u2014 the regime banner "
+                   "will light up after the next end-of-day publish.")
+        return None
+
+    score = reg["score"]
+    confirmed = reg["confirmed_regime"] or reg["raw_regime"]
+    bands = scfg.REGIME_BANDS
+    plain = REGIME_PLAIN.get(confirmed, confirmed)
+
+    # --- Log tonight's score, read back the accumulating history, draw the ladder.
+    as_of_iso = _as_of_iso(reg["as_of"])
+    hist = _log_and_read_score_history(as_of_iso, score)
+    _render_regime_ladder(reg, scfg, hist)
+
+    # --- Cushion to the next-LOWER band floor, from published score + frozen floors.
+    order = sorted(bands, key=lambda r: bands[r]["score"][0])  # low -> high
+    cur_floor = bands[confirmed]["score"][0]
+    cushion = score - cur_floor
+    idx = order.index(confirmed)
+    drop_pts = scfg.REGIME_IMMEDIATE_DROP_POINTS
+    cross_pts = scfg.REGIME_MIN_THRESHOLD_CROSS
+    rule = (f"(the model de-risks immediately on a {drop_pts:.0f}-point drop and needs "
+            f"a decisive {cross_pts:.0f}-point move to change buckets)")
+    if idx > 0:
+        lower = order[idx - 1]
+        cushion_line = (f"{cushion:.0f} points of cushion before it would step down to "
+                        f"{REGIME_PLAIN.get(lower, lower)}. {rule}")
+    else:
+        cushion_line = (f"Already at the most defensive bucket ({plain}). {rule}")
+
+    st.markdown(theme.card("How much room before the regime changes",
+                           theme._esc(cushion_line)),
+                unsafe_allow_html=True)
+    return reg
+
+
+# =========================================================================== #
+# The three version cards — PERFORMANCE first, then regime posture.            #
+# =========================================================================== #
+def _pct_span(x) -> str:
+    if x is None or (isinstance(x, float) and pd.isna(x)):
+        return f'<span style="color:{theme.MUTED}">not available yet</span>'
+    c = theme.TIER["good"]["c"] if x >= 0 else theme.TIER["bad"]["c"]
+    return f'<span style="color:{c};font-weight:650">{x * 100:+.2f}%</span>'
+
+
+def _perf_block(label: str, x) -> str:
+    return (
+        f'<div style="min-width:96px">'
+        f'<div style="font-size:11px;color:{theme.MUTED}">{theme._esc(label)}</div>'
+        f'<div style="font-size:1.15rem;margin-top:.1rem">{_pct_span(x)}</div>'
+        f'</div>'
+    )
+
+
+def _render_version_cards(reg: dict | None) -> None:
+    from strategies import config as scfg
+
+    st.markdown(theme.section("The three versions — performance, then regime posture"),
+                unsafe_allow_html=True)
+    st.caption("Model performance is computed from end-of-day data through the "
+               "validated backtest engine (the same code the strategy uses). Today = "
+               "the last day's move; Month to date and Year to date baseline to the "
+               "prior month-end and prior year-end.")
+
+    score = reg["score"] if reg else None
+    gate_map = scfg.REENTRY_STAGE4_SCORE
+    plain_regime = (REGIME_PLAIN.get(reg["confirmed_regime"], reg["confirmed_regime"])
+                    if reg else None)
+
+    cols = st.columns(3)
+    for col, v in zip(cols, BACKTEST_VERSIONS):
+        with col:
+            try:
+                res = _model_result(v)
+            except Exception as exc:
+                st.error(f"{v}: model could not be computed ({type(exc).__name__}).")
+                continue
+            daily, mtd, ytd, _, _ = _period_returns(res["nav"])
+            bench = res["bench"]
+            spy = bench["SPY"] if "SPY" in bench else None
+            b6040 = bench["60/40"] if "60/40" in bench else None
+            _, spy_mtd, spy_ytd, _, _ = (_period_returns(spy) if spy is not None
+                                         else (None, None, None, None, None))
+            _, b_mtd, b_ytd, _, _ = (_period_returns(b6040) if b6040 is not None
+                                     else (None, None, None, None, None))
+
+            # --- Performance headline (leads the card) ---
+            perf = (
+                f'<div style="font-size:11.5px;color:{theme.MUTED};font-weight:600;'
+                f'margin-bottom:.35rem">MODEL PERFORMANCE</div>'
+                f'<div style="display:flex;gap:.9rem;flex-wrap:wrap">'
+                + _perf_block("Today", daily)
+                + _perf_block("Month to date", mtd)
+                + _perf_block("Year to date", ytd)
+                + '</div>'
+            )
+
+            # --- Compare vs the market ---
+            compare = (
+                f'<div style="font-size:11.5px;color:{theme.MUTED};margin-top:.55rem">'
+                f'vs S&amp;P 500: {_pct_span(spy_mtd)} MTD &middot; '
+                f'{_pct_span(spy_ytd)} YTD &nbsp;|&nbsp; '
+                f'vs 60/40: {_pct_span(b_mtd)} MTD &middot; {_pct_span(b_ytd)} YTD</div>'
+            )
+
+            # --- Regime posture for THIS version ---
+            exposure = res.get("exposure")
+            exp_txt = (f"Current target stock exposure: {exposure * 100:.0f}% of the "
+                       f"portfolio." if exposure is not None else
+                       "Target stock exposure: not available.")
+            gate = gate_map.get(v)
+            if score is not None and gate is not None:
+                if score >= gate:
+                    gate_txt = (f"Re-enters full risk at score {gate:.0f} — currently "
+                                f"{score:.0f}, so already above.")
+                else:
+                    gate_txt = (f"Re-enters full risk at score {gate:.0f} — currently "
+                                f"{score:.0f}, so {gate - score:.0f} points below.")
+            else:
+                gate_txt = (f"Re-enters full risk at score {gate:.0f} (live score "
+                            f"unavailable)." if gate is not None else "")
+            regime_line = (f"Shared regime: {plain_regime}. " if plain_regime else "")
+
+            posture = (
+                f'<div style="font-size:12px;color:{theme.TEXT};margin-top:.6rem;'
+                f'padding-top:.5rem;border-top:1px solid {theme.BORDER}">'
+                f'{theme._esc(regime_line + exp_txt)}<br>{theme._esc(gate_txt)}</div>'
+            )
+
+            st.markdown(theme.card(v, perf + compare + posture),
+                        unsafe_allow_html=True)
+
+
+# =========================================================================== #
+# Collapsed details — the OLD headline metrics, demoted off the card face.     #
+# =========================================================================== #
 def _fmt_metric(metric: str, raw) -> str:
     if pd.isna(raw):
         return "—"
@@ -199,44 +519,37 @@ def _metric_tier(metric: str, raw) -> str:
     return "good" if raw >= 0 else "bad"
 
 
-def _render_backtests() -> None:
-    st.markdown(theme.section("Backtest results — the 3 Strategy 0 versions"), unsafe_allow_html=True)
-    st.caption("Computed live from the validated backtest engine (the same code the "
-               "strategy itself uses — never a separate, curve-fit copy). The three "
-               "versions are progressively more aggressive: Conservative, Balanced, "
-               "Growth. Cached for one hour.")
+def _render_details() -> None:
+    st.markdown(theme.section("Full risk & return details (backtest engine)"),
+                unsafe_allow_html=True)
+    st.caption("The deeper risk metrics for each version, computed from the same "
+               "validated engine. Cached for one hour.")
 
-    if st.button("Recompute metrics (cached 1 hour)"):
-        _backtest_metrics.clear()
+    from src import metrics as mt
 
-    try:
-        df = _backtest_metrics()
-    except Exception as exc:
-        st.error(f"Could not compute backtest metrics: {exc}")
-        df = None
-
-    if df is not None:
-        for v in BACKTEST_VERSIONS:
-            if v not in df.index:
+    for v in BACKTEST_VERSIONS:
+        with st.expander(f"{v} — CAGR, drawdown, Calmar, Sortino, down-capture"):
+            try:
+                bench = _model_result(v)["bench"]
+                table = mt.compute_metrics(bench)
+            except Exception as exc:
+                st.error(f"Could not compute metrics: {exc}")
                 continue
-            st.markdown(f"**{v}**")
-            row = df.loc[v]
             mcols = st.columns(len(_HEADLINE_METRICS))
             for mc, metric in zip(mcols, _HEADLINE_METRICS):
-                raw = row[metric]
+                raw = table.loc[metric, "strategy"] if metric in table.index else float("nan")
                 with mc:
                     st.markdown(
-                        theme.status_card(
-                            METRIC_LABELS[metric],
-                            _metric_tier(metric, raw),
-                            _fmt_metric(metric, raw),
-                        ),
-                        unsafe_allow_html=True,
-                    )
-        st.caption("Green = favourable. Red = drawdown / down-capture, where a deeper "
-                   "(more negative) number is worse.")
+                        theme.status_card(METRIC_LABELS[metric],
+                                          _metric_tier(metric, raw),
+                                          _fmt_metric(metric, raw)),
+                        unsafe_allow_html=True)
+            st.caption("Green = favourable. Red = drawdown / down-capture, where a "
+                       "deeper (more negative) number is worse.")
 
-    st.markdown(theme.section("Full backtest reports (rich, interactive charts)"), unsafe_allow_html=True)
+    # Keep the existing interactive HTML backtest-report download links.
+    st.markdown(theme.section("Full backtest reports (rich, interactive charts)"),
+                unsafe_allow_html=True)
     st.caption("Generated by the backtester. Download to open the full interactive report.")
     from datetime import datetime as _dt
     for v in BACKTEST_VERSIONS:
@@ -252,227 +565,18 @@ def _render_backtests() -> None:
 
 
 # =========================================================================== #
-# Performance vs model — live paper NAV vs the validated backtest curve.       #
-# =========================================================================== #
-def _render_performance() -> None:
-    """Live paper NAV (summed per version) vs the validated backtest's own NAV curve
-    for the same version and window, both rebased to 100 at the first tracked date.
-    Ported from app.py::render_performance. Reads the local nav_history.csv only — no
-    broker call — and degrades to a plain message until >=2 tracked dates exist (live
-    paper tracking started 2026-07-07, no backfill possible before that)."""
-    st.markdown(theme.section("How the live paper account is tracking vs the model"), unsafe_allow_html=True)
-    st.caption("The live paper net-liquidation value (added up across accounts of the "
-               "same version) vs the validated backtest's own value for the same "
-               "version and window — both rebased to 100 at the first tracked day, so "
-               "the lines start together and you can watch them diverge. There is no "
-               "history before the live paper test started on 2026-07-07.")
-
-    hist = nav_history.load_history()
-
-    if hist.empty or hist["date"].nunique() < 2:
-        first_date = hist["date"].min() if not hist.empty else None
-        if first_date:
-            st.info(f"Performance tracking started {first_date} — check back after a "
-                    "few sessions accumulate.")
-        else:
-            st.info("Performance tracking has not recorded any sessions yet — check "
-                    "back after the account monitor's next cycle.")
-        return
-
-    start_date = hist["date"].min()
-    end_date = hist["date"].max()
-
-    import plotly.graph_objects as go
-
-    plotted_any = False
-    for v in BACKTEST_VERSIONS:
-        v_hist = hist[hist["version"] == v]
-        if v_hist.empty:
-            continue
-        paper_nav = v_hist.groupby("date")["net_liq"].sum().sort_index()
-        if len(paper_nav) < 2 or paper_nav.iloc[0] == 0:
-            continue
-        paper_rebased = paper_nav / paper_nav.iloc[0] * 100.0
-
-        try:
-            bt_curve = _backtest_strategy_curve(v)
-            bt_window = bt_curve.loc[start_date:end_date]
-        except Exception as exc:
-            st.caption(f"{v}: could not load backtest curve ({type(exc).__name__})")
-            continue
-        if bt_window.empty:
-            st.caption(f"{v}: the backtest curve has no data in the tracked window yet.")
-            continue
-        bt_rebased = bt_window / bt_window.iloc[0] * 100.0
-
-        fig = go.Figure()
-        fig.add_trace(go.Scatter(x=paper_rebased.index, y=paper_rebased.values,
-                                  mode="lines", name="Live paper account"))
-        fig.add_trace(go.Scatter(x=bt_rebased.index, y=bt_rebased.values,
-                                  mode="lines", name="Backtest (model)"))
-        fig.update_layout(
-            title=f"{v} — rebased to 100 at {start_date}",
-            height=280, margin=dict(l=10, r=10, t=40, b=10),
-            legend=dict(orientation="h", yanchor="bottom", y=1.02),
-            paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color=theme.TEXT),
-        )
-        st.plotly_chart(fig, use_container_width=True, key=f"s0_perf_{v}")
-        plotted_any = True
-
-    if not plotted_any:
-        st.info("Not enough per-version history yet to draw the comparison.")
-
-
-# =========================================================================== #
-# Accounts — read-only paper read + drift vs target + rebalance PLAN preview.  #
-# =========================================================================== #
-def _connect_readonly_short(timeout: int = 6):
-    """Connect read-only with a SHORT timeout. Never launches the gateway (weekend
-    safety) so a down gateway fails fast instead of trying to boot it. Returns the IB
-    handle or raises. Ported verbatim from app.py."""
-    from connections import ibkr_paper
-    # readonly=True -> the session physically cannot transmit. launch=False -> no boot.
-    return ibkr_paper.connect("paperbot_accounts", readonly=True, launch=False,
-                              timeout=timeout)
-
-
-def _render_accounts() -> None:
-    st.markdown(theme.section("Live paper accounts (read-only)"), unsafe_allow_html=True)
-    st.caption("Display only — there are no controls anywhere on this page. The gateway "
-               "is offline on weekends and outside market hours; this panel degrades "
-               "gracefully with an offline notice rather than hanging.")
-
-    go_read = st.button("Read live paper accounts (read-only)")
-    if not go_read:
-        st.info("Press the button for a short, read-only gateway read. If the gateway "
-                "is down (weekend / feed down) you'll see an offline notice rather than "
-                "a hang. Nothing is ever placed, armed, or transmitted.")
-        return
-
-    import accounts as acc_mod
-    import strategy_target
-    import rebalance_run
-
-    ib = None
-    try:
-        with st.spinner("Connecting to the paper gateway (read-only, short timeout)..."):
-            ib = _connect_readonly_short(timeout=6)
-    except Exception as exc:
-        st.error("Gateway offline — live account data unavailable (weekend / feed "
-                 "down). It will light up during market hours.")
-        st.caption(f"(connect failed fast: {type(exc).__name__})")
-        return
-
-    try:
-        with st.spinner("Reading account structure (read-only)..."):
-            infos = acc_mod.discover(ib)
-        if not infos:
-            st.warning("Gateway connected but reported no managed accounts.")
-            return
-
-        # --- Account table (columns spelled out in full) ---
-        rows = []
-        for i in sorted(infos, key=lambda x: (not x.is_master, x.number)):
-            rows.append({
-                "Account number": i.number,
-                "Account type": i.kind,
-                "Net liquidation value (total account value)": f"${i.net_liq:,.0f}",
-                "Cash balance": f"${i.total_cash:,.0f}",
-                "Number of positions held": i.n_positions,
-                "Funded?": "yes" if i.funded else "no",
-                "Strategy version":
-                    i.version or ("(advisor / master account)" if i.is_master
-                                  else "NOT ENROLLED"),
-            })
-        st.markdown("**Accounts**")
-        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
-
-        warns = acc_mod.reconcile_enrollment(infos)
-        if warns:
-            for w in warns:
-                st.warning(w)
-        else:
-            st.success("Enrollment clean — every enrolled account is visible, valid, "
-                       "and funded.")
-
-        # --- Drift vs target, per enrolled + funded client ---
-        st.markdown("**Drift from target — per enrolled account**")
-        clients = [i for i in infos if i.enrolled and i.funded and not i.is_master]
-        if not clients:
-            st.caption("No enrolled + funded client accounts.")
-        else:
-            import reconcile as recon
-            targets_cache: dict = {}
-            for info in sorted(clients, key=lambda x: x.number):
-                if info.version not in targets_cache:
-                    with st.spinner(f"Computing the {info.version} target..."):
-                        targets_cache[info.version] = strategy_target.current_target(
-                            version=info.version)
-                tgt = targets_cache[info.version]
-                positions = {p.contract.symbol: p.position
-                             for p in ib.positions(info.number) if p.position != 0}
-                lines = recon.reconcile(tgt, info.net_liq, positions)
-                drift_rows = [{
-                    "Holding (symbol)": ln.symbol,
-                    "Alignment status": ln.status,
-                    "Target weight": f"{ln.target_weight * 100:.1f}%",
-                    "Actual weight": f"{ln.actual_weight * 100:.1f}%",
-                    "Drift from target (percentage points)":
-                        f"{ln.drift_weight * 100:+.1f}%",
-                } for ln in lines if ln.target_weight > 0 or ln.actual_shares != 0]
-                aligned = all(ln.status == "MATCHED" for ln in lines)
-                pill = theme.pill(
-                    "Aligned with target" if aligned else "Drifting from target",
-                    "good" if aligned else "warn")
-                with st.expander(f"{info.number}  [{info.version}] — "
-                                 f"{'aligned' if aligned else 'drift present'}"):
-                    st.markdown(pill, unsafe_allow_html=True)
-                    st.dataframe(pd.DataFrame(drift_rows),
-                                 use_container_width=True, hide_index=True)
-
-            # --- Rebalance PLAN preview (build-only; transmits nothing) ---
-            st.markdown("**Rebalance plan — review only (nothing is built, armed, or sent)**")
-            account_inputs = []
-            for info in sorted(clients, key=lambda x: x.number):
-                positions = {p.contract.symbol: p.position
-                             for p in ib.positions(info.number) if p.position != 0}
-                tgt = targets_cache[info.version]
-                prices = {s: float(tgt.prices.get(s, float("nan")))
-                          for s in tgt.prices.index}
-                account_inputs.append({
-                    "account": info.number, "version": info.version,
-                    "net_liq": info.net_liq, "positions": positions, "prices": prices})
-            # build_preview PRINTS its report; capture it for display. PURE/build-only —
-            # no order objects, nothing armed, nothing transmitted.
-            buf = io.StringIO()
-            with contextlib.redirect_stdout(buf):
-                rebalance_run.build_preview(account_inputs, targets_cache)
-            st.code(buf.getvalue() or "(no plan output)", language="text")
-            st.caption("This is the SHAPE of a rebalance only. No order objects are "
-                       "created, nothing is armed, nothing is transmitted.")
-    except Exception as exc:
-        st.error(f"Read failed: {exc}")
-    finally:
-        if ib is not None:
-            try:
-                ib.disconnect()
-            except Exception:
-                pass
-
-
-# =========================================================================== #
-# Page entry point.                                                            #
+# Page entry point.                                                           #
 # =========================================================================== #
 def render_s0_full() -> None:
-    """Render the full Strategy 0 page: the real-money gate card, the validated
-    backtest metrics + reports, the live-paper-vs-model performance curve, and the
-    read-only paper-account read with drift + rebalance plan preview."""
+    """Render the full Strategy 0 page: the real-money gate card, the shared regime
+    banner (live score + frozen bands + cushion + trend), the three version cards led
+    by Daily / Month-to-date / Year-to-date model performance with regime posture, and
+    a collapsed details section. Model-driven and broker-free throughout."""
     st.subheader("Strategy 0 — Adaptive All-Weather Core")
-    st.caption("The one strategy that is actually live-paper-tested. Everything here "
-               "is read-only.")
+    st.caption("The desk's all-weather core. Everything here is read-only and computed "
+               "from the end-of-day model — no broker, no live account.")
 
     _render_gate_card()
-    _render_backtests()
-    _render_performance()
-    _render_accounts()
+    reg = _render_regime_banner()
+    _render_version_cards(reg)
+    _render_details()
