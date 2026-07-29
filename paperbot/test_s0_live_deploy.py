@@ -21,7 +21,8 @@ non-bypassable safety envelope AND the 2026-07-28 rebuild:
  14. re-price loop: an unfilled straggler is cancelled + re-priced and, after the cap, reported.
  15. per-run ref: a re-fire (bought-then-sold; no working order) re-buys, but an identical
      currently-WORKING order is NOT double-submitted.
- 16. model pre-check: armed WITHOUT --model-clear hard-stops; WITH it, proceeds.
+ 16. armed + conform transmits the two-phase deploy (no model gate — removed 2026-07-29,
+     owner manages model divestment manually).
 
 Run:
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_s0_live_deploy.py -q
@@ -193,10 +194,6 @@ def _patch_common(monkeypatch, *, plan=None, target=None):
                         lambda *a, **k: (plan or _fake_plan()))
     monkeypatch.setattr(dep, "_kill_switch_present", lambda: False)
     monkeypatch.setattr(dep, "_probe_gateway_readonly", lambda ib, **k: False)
-    # Best-effort model detection returns "no model" so it never blocks; the --model-clear
-    # human gate is exercised explicitly by the model tests.
-    monkeypatch.setattr(dep, "_detect_model_overlay",
-                        lambda ib, acct: (False, "no model detected (test)"))
 
 
 def _wire_connections(monkeypatch, fake):
@@ -270,7 +267,7 @@ def test_total_buy_over_investable_refuses(monkeypatch):
     fake = _TxFakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=True, model_clear=True)
+    rc = dep.main(armed=True, conform=True)
 
     assert rc == 0
     assert fake.placed == []       # nothing transmitted over the investable cap
@@ -286,7 +283,7 @@ def test_per_order_over_half_netliq_refuses(monkeypatch):
     fake = _TxFakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=True, model_clear=True)
+    rc = dep.main(armed=True, conform=True)
 
     assert rc == 0
     assert fake.placed == []
@@ -302,7 +299,7 @@ def test_wrong_account_refuses(monkeypatch):
                       _summary_row(OTHER, "TotalCashValue", "100000")], [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=True, model_clear=True)
+    rc = dep.main(armed=True, conform=True)
 
     assert rc == 0
     assert fake.placed == []
@@ -311,20 +308,18 @@ def test_wrong_account_refuses(monkeypatch):
     assert config.DRY_RUN is True and config.READONLY is True
 
 
-# --- 8. arm token / conform / model-clear flag parsing + conform alone transmits nothing --
+# --- 8. arm token / conform flag parsing + conform alone transmits nothing -----------
 def test_flag_parsing_and_conform_alone(monkeypatch):
     assert dep.arm_requested(["--arm-i-understand"]) is True
     assert dep.arm_requested(["--conform"]) is False
     assert dep.conform_requested(["--conform"]) is True
     assert dep.conform_requested([]) is False
-    assert dep.model_clear_requested(["--model-clear"]) is True
-    assert dep.model_clear_requested([]) is False
 
     _patch_common(monkeypatch)
     fake = _FakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=False, conform=True, model_clear=True)   # conform on, not armed
+    rc = dep.main(armed=False, conform=True)   # conform on, not armed
 
     assert rc == 0
     assert config.DRY_RUN is True and config.READONLY is True
@@ -337,7 +332,7 @@ def test_armed_without_conform_refuses(monkeypatch):
     fake = _FakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=False, model_clear=True)
+    rc = dep.main(armed=True, conform=False)
 
     assert rc == 0
     assert config.DRY_RUN is True and config.READONLY is True
@@ -350,7 +345,7 @@ def test_kill_switch_forces_preview(monkeypatch):
     fake = _FakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=True, model_clear=True)
+    rc = dep.main(armed=True, conform=True)
 
     assert rc == 0
     assert config.DRY_RUN is True and config.READONLY is True
@@ -382,7 +377,7 @@ def test_two_phase_sells_before_buys_and_funded(monkeypatch):
                      [_pos_row(ACCT, "BIL", 3), _pos_row(ACCT, "GDX", 100)])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=True, model_clear=True)
+    rc = dep.main(armed=True, conform=True)
 
     assert rc == 0
     # flags restored after main() returns
@@ -419,7 +414,7 @@ def test_two_phase_short_cash_reduces_buys(monkeypatch):
     fake = _TxFakeIB(_summary(total_cash="4000"), [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=True, model_clear=True)
+    rc = dep.main(armed=True, conform=True)
 
     assert rc == 0
     buys = [o for o in fake.placed if o.action == "BUY"]
@@ -509,47 +504,20 @@ def test_transmit_phase_working_order_not_double_submitted(monkeypatch):
     assert ib.placed == []                                # never double-submitted
 
 
-# --- 16. model pre-check: armed WITHOUT --model-clear hard-stops; WITH it, proceeds ---
-def test_model_clear_required_hard_stops(monkeypatch):
+# --- 16. armed + conform transmits (no model gate — removed 2026-07-29) --------------
+def test_armed_conform_transmits(monkeypatch):
     _patch_common(monkeypatch, plan=_fake_plan(orders={"VTI": 10}, alien_lines=[]))
     fake = _TxFakeIB(_summary(total_cash="60000"), [])
     _wire_connections(monkeypatch, fake)
 
-    rc = dep.main(armed=True, conform=True, model_clear=False)   # NO model-clear affirmation
-
-    assert rc == 0
-    assert fake.placed == []                              # hard-stopped, nothing transmitted
-    assert config.DRY_RUN is True and config.READONLY is True
-
-
-def test_model_clear_allows_transmit(monkeypatch):
-    _patch_common(monkeypatch, plan=_fake_plan(orders={"VTI": 10}, alien_lines=[]))
-    fake = _TxFakeIB(_summary(total_cash="60000"), [])
-    _wire_connections(monkeypatch, fake)
-
-    rc = dep.main(armed=True, conform=True, model_clear=True)
+    rc = dep.main(armed=True, conform=True)
 
     assert rc == 0
     assert any(o.action == "BUY" and float(o.totalQuantity) == 10.0 for o in fake.placed)
     assert config.DRY_RUN is True and config.READONLY is True
 
 
-# --- 17. detected IBKR model overlay refuses even WITH --model-clear -----------------
-def test_detected_model_overlay_refuses_despite_flag(monkeypatch):
-    _patch_common(monkeypatch, plan=_fake_plan(orders={"VTI": 10}, alien_lines=[]))
-    # Best-effort detection positively sees a non-empty modelCode -> refuse regardless.
-    monkeypatch.setattr(dep, "_detect_model_overlay", lambda ib, acct: (True, "Main"))
-    fake = _TxFakeIB(_summary(total_cash="60000"), [])
-    _wire_connections(monkeypatch, fake)
-
-    rc = dep.main(armed=True, conform=True, model_clear=True)
-
-    assert rc == 0
-    assert fake.placed == []                              # detected model blocks transmit
-    assert config.DRY_RUN is True and config.READONLY is True
-
-
-# --- 18. deploy ref format: base + :deploy, plus per-run stamp -----------------------
+# --- 17. deploy ref format: base + :deploy, plus per-run stamp -----------------------
 def test_deploy_ref_format_and_per_run():
     as_of = pd.Timestamp("2026-07-01")
     std = order_router._order_ref(ACCT, as_of, "BUY", "USFR")

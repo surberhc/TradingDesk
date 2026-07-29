@@ -42,11 +42,11 @@ sub-account read-only view CANNOT see. This rebuild fixes all four:
      Double-submit protection is kept by a symbol+side check against currently WORKING/open
      orders — so a still-live identical order is not duplicated, but a re-fire to complete the
      remaining gap is allowed.
-  4. MODEL pre-check. A new REQUIRED --model-clear human affirmation gate: the operator must
-     affirm the target account is NOT allocated to any IBKR Model Portfolio. Without it the
-     armed deploy HARD-STOPS. A best-effort master-level detection also refuses if it can
-     positively see a non-empty modelCode — but that detection is unreliable from our
-     sub-account lane, so --model-clear is the load-bearing gate.
+
+NOTE (2026-07-29): the 2026-07-28 rebuild also added a --model-clear affirmation gate and a
+best-effort IBKR model-overlay detection. Both were REMOVED per the account owner's explicit
+direction — he manages model divestment manually, and the check was unwanted friction. All
+other deploy safety gates below are unchanged.
 
 WHY A --conform MODE
 --------------------
@@ -64,15 +64,13 @@ nothing. To actually transmit, a human must line up ALL of:
   * the exact CLI token  --arm-i-understand  (sets armed=True; never defaulted/auto-set),
   * the explicit  --conform  flag  (this executor is a conform-deploy tool; transmit requires
     it — separate from the arm token, BOTH required),
-  * the explicit  --model-clear  affirmation (target account divested from any IBKR model),
   * NO kill-switch sentinel present,
   * the target account is EXACTLY U14438624 (any other refused — single-account wall),
   * every leg whole-share, priced, and through order_router's HARD price guard,
   * total BUY notional <= investable (never over-deploy / no margin), AND no single order's
-    notional > 50% of NetLiq (fat-finger / bad-price catch),
+    notional > 50% of NetLiq (fat-finger / bad-price catch), and
   * the Gateway physically ARMED (Read-Only API toggle OFF — measured live with the
-    zero-transmission cancel-a-fabricated-order probe), and
-  * no positively-detected IBKR model overlay.
+    zero-transmission cancel-a-fabricated-order probe).
 Miss ANY one and the run is a preview that transmits nothing and prints WHY.
 
 There is NO auto-arm, and nothing here is scheduled. A human runs it, reviews the preview,
@@ -82,7 +80,7 @@ Run — PREVIEW with the conform list (default; transmits nothing):
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe s0_live_deploy.py --conform
 
 Run — ARMED conform deploy (human-supervised; requires an armed Gateway + no kill switch):
-  C:\\TradingDesk-Local\\venv\\Scripts\\python.exe s0_live_deploy.py --conform --model-clear \\
+  C:\\TradingDesk-Local\\venv\\Scripts\\python.exe s0_live_deploy.py --conform \\
       --arm-i-understand
 """
 from __future__ import annotations
@@ -129,10 +127,6 @@ ARM_TOKEN = "--arm-i-understand"
 # is a REQUIRED transmit gate (this executor is a conform-deploy tool; without it, transmit
 # nothing). Separate from the arm token — BOTH are required to liquidate + transmit.
 CONFORM_FLAG = "--conform"
-# The explicit model-clear affirmation — the operator affirms the target account is divested
-# from any IBKR Model Portfolio. REQUIRED to transmit (2026-07-28 incident: the account was
-# still in model "Main", invisible to our sub-account read-only lane). Load-bearing human gate.
-MODEL_CLEAR_FLAG = "--model-clear"
 
 # KILL SWITCH — same sentinel s0_live_exec / morning_execute_run honor. Mirrored as a literal
 # so this module pulls in none of their module-level state; if the file exists (any content)
@@ -202,12 +196,6 @@ def conform_requested(argv: list[str]) -> bool:
     return CONFORM_FLAG in argv
 
 
-def model_clear_requested(argv: list[str]) -> bool:
-    """True ONLY if the exact --model-clear affirmation is present. Required transmit gate:
-    the operator affirms the account is divested from any IBKR Model Portfolio."""
-    return MODEL_CLEAR_FLAG in argv
-
-
 def _kill_switch_present() -> bool:
     """True if the AUTOTRADE_DISABLED sentinel exists -> force preview-only."""
     return os.path.exists(KILL_SWITCH)
@@ -263,32 +251,6 @@ def _probe_gateway_readonly(ib, timeout: int = 15) -> bool:
         # Could not measure the Gateway state -> treat as read-only (refuse to transmit).
         return True
     return signal["readonly"]
-
-
-def _detect_model_overlay(ib, account) -> tuple[bool, str]:
-    """BEST-EFFORT IBKR Model Portfolio detection. Returns (detected_nonempty, detail).
-
-    2026-07-28 incident: the account was still allocated to IBKR model "Main" (98.8%), and our
-    sub-account READ-ONLY lane could NOT see the overlay — only the FA master can. So this is a
-    SECONDARY check; the --model-clear human affirmation is the load-bearing gate. We ask for
-    positions BY MODEL (reqPositionsMulti) and, if a non-empty modelCode comes back, refuse
-    regardless of the flag. FAIL-SOFT: any error / absent API surface -> (False, reason) so a
-    missing capability degrades to "rely on --model-clear", never a crash."""
-    try:
-        fn = getattr(ib, "reqPositionsMulti", None)
-        if fn is None:
-            return False, ("reqPositionsMulti unavailable on this connection — cannot detect a "
-                           "model from the sub-account lane; relying on --model-clear")
-        rows = fn(account, "") or []
-        codes = {str(getattr(r, "modelCode", "") or "").strip() for r in rows}
-        codes.discard("")
-        if codes:
-            return True, ",".join(sorted(codes))
-        return False, ("no non-empty modelCode returned (a sub-account read cannot positively "
-                       "confirm the master's overlay); relying on --model-clear")
-    except Exception as exc:
-        return False, (f"model detection failed ({type(exc).__name__}); relying on "
-                       f"--model-clear")
 
 
 def _buying_power(summary) -> float | None:
@@ -640,12 +602,11 @@ def _report_phase(label: str, results) -> None:
                   f"{r['filled']:g} [{r['status']}] {r.get('reason', '')}")
 
 
-def _safety_banner(armed: bool, conform: bool, model_clear: bool, kill: bool) -> None:
-    permit_intent = armed and conform and model_clear and not kill
+def _safety_banner(armed: bool, conform: bool, kill: bool) -> None:
+    permit_intent = armed and conform and not kill
     print("\n" + "#" * 88)
     print(f"# SAFETY STATE   armed={armed}   arm_token={'present' if armed else 'absent'}   "
           f"conform={'ON' if conform else 'off'}   "
-          f"model_clear={'AFFIRMED' if model_clear else 'ABSENT'}   "
           f"kill_switch={'PRESENT' if kill else 'absent'}")
     print(f"# account={EXEC_ACCOUNT}   target=S0 {DEPLOY_VERSION} tier   "
           f"gateway=Live-Trade port 4003")
@@ -655,20 +616,19 @@ def _safety_banner(armed: bool, conform: bool, model_clear: bool, kill: bool) ->
     print(f"# EXECUTION   two-phase cash-gated (sells -> re-read TotalCashValue -> buys sized "
           f"to REALIZED cash)   straggler re-price x{REPRICE_MAX_ATTEMPTS:.0f}")
     if permit_intent:
-        print("# *** ARMED + CONFORM + MODEL-CLEAR INTENT: this run MAY liquidate non-S0")
+        print("# *** ARMED + CONFORM INTENT: this run MAY liquidate non-S0")
         print("#     holdings and transmit a TWO-PHASE cash-gated deploy on a FUNDED account IF")
         print("#     every remaining gate passes. Review the full order list below. ***")
     else:
         print("# PREVIEW: sizes + builds the full ordered order list and prints it —")
-        print("# transmits NOTHING (not armed, conform off, model-clear absent, or kill switch).")
+        print("# transmits NOTHING (not armed, conform off, or kill switch present).")
     print("#" * 88)
 
 
-def main(armed: bool = False, conform: bool = False, model_clear: bool = False,
-         today: object = None) -> int:
+def main(armed: bool = False, conform: bool = False, today: object = None) -> int:
     """DEPLOY executor. PREVIEW by default; transmits the TWO-PHASE cash-gated deploy ONLY when
-    armed AND conform AND model_clear AND every gate passes. `today` is accepted for signature
-    parity with the other runners; the shared brain always runs to the most recent data date."""
+    armed AND conform AND every gate passes. `today` is accepted for signature parity with the
+    other runners; the shared brain always runs to the most recent data date."""
     print("=" * 88)
     print(f"S0 LIVE DEPLOY EXECUTOR ({DEPLOY_VERSION} tier) — preview by default, two-phase "
           f"cash-gated conform deploy when armed   [{version.banner()}]")
@@ -687,10 +647,10 @@ def main(armed: bool = False, conform: bool = False, model_clear: bool = False,
           f"price_date={target.price_date.date()}  ({len(target.weights)} holdings)")
 
     kill = _kill_switch_present()
-    permit_intent = armed and conform and model_clear and not kill
+    permit_intent = armed and conform and not kill
 
-    # [2] Safety banner — armed/conform/model-clear/preview state, account, caps.
-    _safety_banner(armed, conform, model_clear, kill)
+    # [2] Safety banner — armed/conform/preview state, account, caps.
+    _safety_banner(armed, conform, kill)
 
     # [3] Connect. ARMED intent -> the transmit-capable lane (readonly=False, clientId
     # s0_live_exec); otherwise the read-only pilot lane (readonly=True). A bare armed connection
@@ -718,7 +678,7 @@ def main(armed: bool = False, conform: bool = False, model_clear: bool = False,
         armed_conn = False
 
     try:
-        return _run_session(ib, target, armed=armed, conform=conform, model_clear=model_clear,
+        return _run_session(ib, target, armed=armed, conform=conform,
                             armed_conn=armed_conn, kill=kill)
     finally:
         try:
@@ -728,7 +688,7 @@ def main(armed: bool = False, conform: bool = False, model_clear: bool = False,
         print("Session closed.")
 
 
-def _run_session(ib, target, *, armed: bool, conform: bool, model_clear: bool,
+def _run_session(ib, target, *, armed: bool, conform: bool,
                  armed_conn: bool, kill: bool) -> int:
     account = EXEC_ACCOUNT
 
@@ -805,12 +765,6 @@ def _run_session(ib, target, *, armed: bool, conform: bool, model_clear: bool,
     if not conform:
         reasons.append(f"conform intent absent (pass {CONFORM_FLAG}) — this DEPLOY executor "
                        f"requires it to liquidate + transmit")
-    if not model_clear:
-        reasons.append(f"model-clear affirmation absent (pass {MODEL_CLEAR_FLAG}) — refusing: "
-                       f"confirm the account is divested from any IBKR Model Portfolio, then "
-                       f"pass {MODEL_CLEAR_FLAG}. Our sub-account read-only lane CANNOT see a "
-                       f"model overlay (2026-07-28 incident: deployed while still in model "
-                       f"'Main'); this human affirmation is the load-bearing gate")
     if kill:
         reasons.append(f"KILL_SWITCH sentinel present ({KILL_SWITCH})")
     acct_ok, acct_reason = _account_safety_ok()
@@ -835,30 +789,21 @@ def _run_session(ib, target, *, armed: bool, conform: bool, model_clear: bool,
 
     # Connection-dependent gates — only meaningful on the armed (4003 transmit) connection,
     # and only worth probing once the code-level gates above are clean.
-    if armed and conform and model_clear and armed_conn and not reasons:
+    if armed and conform and armed_conn and not reasons:
         if _probe_gateway_readonly(ib):
             reasons.append("Gateway is still READ-ONLY on 4003 (arming.probe idiom) — not "
                            "physically armed; a human must turn the Read-Only API toggle off")
-    if armed and conform and model_clear and armed_conn and not reasons:
-        detected, detail = _detect_model_overlay(ib, account)
-        if detected:
-            reasons.append(f"IBKR Model overlay POSITIVELY detected on {account}: "
-                           f"modelCode={detail} — refusing regardless of {MODEL_CLEAR_FLAG} "
-                           f"(2026-07-28 incident: a model-managed book must be divested first)")
-        else:
-            print(f"\n    model-overlay detection (best-effort): {detail}")
-    if armed and conform and model_clear and armed_conn and not reasons:
+    if armed and conform and armed_conn and not reasons:
         bp_ok, bp_reason = _buying_power_ok(summary, total_buy)
         if not bp_ok:
             reasons.append(bp_reason)
 
-    permit = (armed and conform and model_clear and armed_conn and not kill and not reasons)
+    permit = (armed and conform and armed_conn and not kill and not reasons)
 
     # [9] Report + (only if permitted) transmit the two-phase cash-gated deploy.
     if not permit:
         primary = ("not armed" if not armed
                    else "conform off" if not conform
-                   else "model-clear absent" if not model_clear
                    else "kill switch present" if kill
                    else (reasons[0] if reasons else "gate not satisfied"))
         print("\n[9] TRANSMISSION BLOCKED — PREVIEW ONLY. Reason(s):")
@@ -869,11 +814,11 @@ def _run_session(ib, target, *, armed: bool, conform: bool, model_clear: bool,
         print(f"\nTRANSMISSION BLOCKED — {primary}. Nothing transmitted.")
         return 0
 
-    # --- ARMED + CONFORM + MODEL-CLEAR + every gate passed: TWO-PHASE cash-gated transmit. ---
+    # --- ARMED + CONFORM + every gate passed: TWO-PHASE cash-gated transmit. ---
     run_id = _run_id()
     sell_legs = [l for l in legs if l.side == "SELL"]
     buy_legs = [l for l in legs if l.side == "BUY"]
-    print(f"\n[9] *** ARMED + CONFORM + MODEL-CLEAR — TWO-PHASE CASH-GATED DEPLOY (run "
+    print(f"\n[9] *** ARMED + CONFORM — TWO-PHASE CASH-GATED DEPLOY (run "
           f"{run_id}). Phase 1 sells -> re-read realized cash -> phase 2 buys sized to that "
           f"cash. ***")
 
@@ -941,11 +886,10 @@ def _run_session(ib, target, *, armed: bool, conform: bool, model_clear: bool,
 
 
 def cli(argv: list[str] | None = None) -> int:
-    """CLI entry: --arm-i-understand sets armed=True; --conform sets conform=True; --model-clear
-    sets model_clear=True. ALL THREE are required to actually liquidate + transmit."""
+    """CLI entry: --arm-i-understand sets armed=True; --conform sets conform=True. BOTH are
+    required to actually liquidate + transmit."""
     argv = sys.argv[1:] if argv is None else argv
-    return main(armed=arm_requested(argv), conform=conform_requested(argv),
-                model_clear=model_clear_requested(argv))
+    return main(armed=arm_requested(argv), conform=conform_requested(argv))
 
 
 if __name__ == "__main__":

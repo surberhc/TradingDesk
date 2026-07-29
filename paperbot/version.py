@@ -15,10 +15,21 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.25.0"
+VERSION = "0.25.1"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.25.1", "2026-07-29", "s0_live_deploy: removed the --model-clear affirmation gate and "
+                             "IBKR model-overlay detection — model divestment is handled "
+                             "manually by the account owner (explicit direction; the check was "
+                             "unwanted friction). All other deploy safety gates unchanged "
+                             "(single-account wall U14438624, --arm-i-understand + --conform "
+                             "both required, live gateway read-only arming probe, two-phase "
+                             "cash-gate, straggler re-price, per-run ref, <=50% NetLiq per-order "
+                             "cap, total-buy<=investable, buying-power check, kill switch, "
+                             "in-process READONLY/DRY_RUN flip in try/finally, preview-by-"
+                             "default). Rule #1 clean: no strategy/regime/band/sizing value "
+                             "touched. NOTHING transmitted editing or testing it (fully mocked)."),
     ("0.25.0", "2026-07-28", "s0_live_deploy REBUILT SAFER after the 2026-07-28 first live "
                              "deploy went ~$40k NEGATIVE (conductor #63 / log #145). Four "
                              "order-affecting fixes: (1) TWO-PHASE CASH-GATED execution — "
