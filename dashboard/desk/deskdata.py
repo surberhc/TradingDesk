@@ -55,41 +55,56 @@ def _is_market_hours(now: datetime | None = None) -> bool:
 # --------------------------------------------------------------------------- #
 @st.cache_data(ttl=15)
 def gateway_status() -> list[dict]:
-    """The 3 IBKR gateways as plain-English up/down rows. TCP probe only."""
-    now = datetime.now(tz=CT_ZONE)
-    weekend = _is_weekend(now)
+    """The 3 IBKR gateways as short one-word status rows. TCP probe only.
 
-    def _row(port: int, label: str, down_reason: str) -> dict:
-        up = _port_open("127.0.0.1", port)
-        return {
-            "port": port,
-            "label": label,
-            "up": up,
-            "tier": "good" if up else "bad",
-            "phrase": ("Connected and responding" if up else down_reason),
-        }
+    The owner's model: a gateway that isn't in use right now isn't an error — it's
+    just staged. So up is always "Connected" (green); a down market-data or paper
+    gateway is "Waiting" (grey, the normal resting state); and only the live TRADING
+    gateway goes "Not connected" (red) when it's down DURING the pilot session
+    (weekday market hours) — the one case where we actually need it.
+    """
+    # --- 4001 Live market-data gateway: staged when down, never an alarm. ---
+    data_up = _port_open("127.0.0.1", 4001)
+    live_data = {
+        "port": 4001,
+        "label": "Live market-data gateway (port 4001)",
+        "up": data_up,
+        "tier": "good" if data_up else "unknown",
+        "phrase": "Connected" if data_up else "Waiting",
+        "context": "used for the evening data pulls",
+    }
 
-    live_data = _row(
-        4001, "Live market-data gateway (port 4001)",
-        "Not responding — used for the evening data pulls",
-    )
-    if weekend:
-        paper_down = "Not responding — expected outside market hours / on weekends"
-    elif _is_market_hours(now):
-        paper_down = "Not responding — should be up now (weekday market hours)"
+    # --- 4002 Paper trading gateway: staged when down, never an alarm. ---
+    paper_up = _port_open("127.0.0.1", 4002)
+    paper = {
+        "port": 4002,
+        "label": "Paper trading gateway (port 4002)",
+        "up": paper_up,
+        "tier": "good" if paper_up else "unknown",
+        "phrase": "Connected" if paper_up else "Waiting",
+        "context": "only used when we run the paper account",
+    }
+
+    # --- 4003 Live trading gateway: the only one that can go red when down. ---
+    trade_up = _port_open("127.0.0.1", 4003)
+    if trade_up:
+        trade_tier, trade_phrase = "good", "Connected"
+        trade_context = "the S8 pilot's live connection"
+    elif _is_market_hours():
+        trade_tier, trade_phrase = "bad", "Not connected"
+        trade_context = ("the S8 pilot's live connection — expected up "
+                         "during the session")
     else:
-        paper_down = "Not responding — expected outside market hours"
-    paper = _row(4002, "Paper trading gateway (port 4002)", paper_down)
-    # A down paper gateway outside market hours is expected, not a red alarm.
-    if not paper["up"] and (weekend or not _is_market_hours(now)):
-        paper["tier"] = "unknown"
-
-    live_trade = _row(
-        4003, "Live trading gateway (port 4003)",
-        "Not responding — expected when the S8 pilot session is closed",
-    )
-    if not live_trade["up"]:
-        live_trade["tier"] = "unknown"
+        trade_tier, trade_phrase = "unknown", "Waiting"
+        trade_context = "the S8 pilot's live connection"
+    live_trade = {
+        "port": 4003,
+        "label": "Live trading gateway (port 4003)",
+        "up": trade_up,
+        "tier": trade_tier,
+        "phrase": trade_phrase,
+        "context": trade_context,
+    }
 
     return [live_data, paper, live_trade]
 
@@ -269,12 +284,17 @@ def retired_tasks() -> list[dict]:
 # --------------------------------------------------------------------------- #
 # 3. Data freshness.                                                           #
 # --------------------------------------------------------------------------- #
-FRESHNESS_FILES: list[tuple[str, str]] = [
-    ("tiingo", "Strategy 0 stock prices (Tiingo end-of-day)"),
-    ("s0_regime", "Strategy 0 market-regime signal"),
-    ("gex", "Dealer gamma-exposure feature build"),
-    ("forward", "Options end-of-day data (Interactive Brokers)"),
-    ("eod_report", "Nightly status email"),
+FRESHNESS_FILES: list[tuple[str, str, str]] = [
+    ("tiingo", "Strategy 0 stock prices (Tiingo end-of-day)",
+     "pulls nightly at 7:00 & 8:45 PM Central"),
+    ("s0_regime", "Strategy 0 market-regime signal",
+     "updates nightly at 9:00 PM Central"),
+    ("gex", "Dealer gamma-exposure feature build",
+     "builds nightly at 7:30 PM Central"),
+    ("forward", "Options end-of-day data (Interactive Brokers)",
+     "pulls nightly at 5:30 PM Central"),
+    ("eod_report", "Nightly status email",
+     "sends nightly at 9:00 PM Central"),
 ]
 
 _MONTHS = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul",
@@ -325,18 +345,18 @@ def data_freshness() -> list[dict]:
     today = datetime.now(tz=CT_ZONE).replace(tzinfo=None)
     weekday = today.weekday()  # Mon=0
     rows: list[dict] = []
-    for job, label in FRESHNESS_FILES:
+    for job, label, schedule in FRESHNESS_FILES:
         js = _read_status_json(job)
         if not js:
             rows.append({
-                "label": label, "tier": "bad",
+                "label": label, "tier": "bad", "schedule": schedule,
                 "phrase": "No status file found — this feed has not reported",
             })
             continue
         d = _parse_date(js.get("date")) or _parse_date(js.get("ts"))
         if d is None:
             rows.append({
-                "label": label, "tier": "unknown",
+                "label": label, "tier": "unknown", "schedule": schedule,
                 "phrase": "Reported, but with no readable date",
             })
             continue
@@ -362,7 +382,7 @@ def data_freshness() -> list[dict]:
         else:
             age_word = f"{age} days ago"
         rows.append({
-            "label": label, "tier": tier,
+            "label": label, "tier": tier, "schedule": schedule,
             "phrase": f"Updated {_fmt_date(d)} ({age_word})",
         })
     return rows
