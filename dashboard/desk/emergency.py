@@ -40,29 +40,76 @@ except Exception:  # pragma: no cover - eventlog may not exist yet
     record_event = None  # type: ignore
 
 
-def _emit(event: str, **fields) -> None:
-    """Record an event if a logger exists, tolerating any signature it chose.
+def _plain_message(event: str, fields: dict) -> str:
+    """A full, non-technical sentence describing an emergency-control event, for the
+    durable event log (PLAIN-ENGLISH RULE #1). If the caller already supplied a
+    finished sentence in ``message``, that wins."""
+    if fields.get("message"):
+        return str(fields["message"])
+    which = fields.get("which")
+    label = _which_label(which) if which else "the desk"
+    if event == "emergency_halt_requested":
+        n = len(fields.get("tasks") or [])
+        procs = (" and force-stop its running programs"
+                 if fields.get("kills_processes") else "")
+        return (f"Emergency HALT requested for {label}: stopping and turning off "
+                f"{n} scheduled task(s){procs}. No broker was contacted and no order "
+                f"was sent.")
+    if event == "emergency_halt_action":
+        outcome = "succeeded" if fields.get("ok") else "did not fully complete"
+        target = fields.get("target", "a task")
+        return (f"Emergency halt step for {label} on '{target}' {outcome}. "
+                f"No order was sent.")
+    if event == "emergency_halt_completed":
+        outcome = "fully completed" if fields.get("ok") else "only partly completed"
+        return (f"Emergency HALT of {label} {outcome} across "
+                f"{fields.get('actions', 0)} action(s). Nothing was transmitted to "
+                f"any broker.")
+    if event == "emergency_flatten_preview":
+        return (f"Viewed the emergency get-flat preview for {label}. Nothing was "
+                f"closed and no order was sent — there are no live positions to "
+                f"flatten today.")
+    if event == "emergency_flatten_blocked":
+        return (f"An emergency get-flat was requested for {label} but it is not armed "
+                f"— nothing was closed and no order was sent (there are no live "
+                f"positions to flatten today).")
+    return f"Emergency control event '{event}' for {label}."
 
-    Fully guarded: a missing logger, a different call shape, or an error inside
-    the logger can NEVER interfere with an emergency halt. We try the most likely
-    calling conventions in turn and give up silently."""
+
+def _severity_for(event: str, fields: dict) -> str:
+    """Map an emergency event to the event log's colour tier (good/warn/bad/info)."""
+    if event in ("emergency_halt_action", "emergency_halt_completed"):
+        return "good" if fields.get("ok") else "bad"
+    if event == "emergency_halt_requested":
+        return "warn"
+    return "info"
+
+
+def _emit(event: str, **fields) -> None:
+    """Record an emergency-control event to the durable event store.
+
+    Calls ``eventlog.record_event`` with its REAL signature
+    ``record_event(ts, source, category, message, severity, day)`` — the category
+    is the machine event name, the message is a full plain-English sentence.
+
+    Fully guarded: a missing logger or any error inside it can NEVER interfere with
+    an emergency halt. (Historical note: this used to guess four wrong call shapes,
+    all of which raised TypeError, so emergency actions were silently NOT logged —
+    conductor #67. Fixed 2026-07-29.)"""
     if record_event is None:
         return
-    fields = {"module": "emergency", "ts": datetime.now().isoformat(timespec="seconds"),
-              **fields}
-    for attempt in (
-        lambda: record_event(event, **fields),          # record_event(event, **meta)
-        lambda: record_event(event, fields),            # record_event(event, detail_dict)
-        lambda: record_event(event=event, **fields),    # record_event(event=..., **meta)
-        lambda: record_event(event),                    # record_event(event)
-    ):
-        try:
-            attempt()
-            return
-        except TypeError:
-            continue
-        except Exception:
-            return
+    ts = fields.pop("ts", None) or datetime.now().isoformat(timespec="seconds")
+    fields.pop("module", None)
+    try:
+        record_event(
+            ts=ts,
+            source="Emergency controls",
+            category=event,
+            message=_plain_message(event, fields),
+            severity=_severity_for(event, fields),
+        )
+    except Exception:
+        return
 
 
 # --------------------------------------------------------------------------- #
