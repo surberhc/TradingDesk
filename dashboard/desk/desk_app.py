@@ -49,6 +49,7 @@ T.inject_theme()
 # Page modules (cheap at import — heavy/broker imports inside them are lazy) and
 # the persistent emergency control strip.
 import emergency
+import page_control_plane
 import page_feeds
 import page_history
 import page_research
@@ -76,6 +77,8 @@ pages = [
     st.Page(page_history.render_history, title="History & Event Log", icon="📜"),
     st.Page(page_s0.render_s0_full,
             title="Strategy 0 — Adaptive All-Weather Core", icon="📈"),
+    st.Page(page_control_plane.render_control_plane,
+            title="Control Plane — S0 rebalance (preview)", icon="🎛️"),
     st.Page(page_s8.render_s8_full,
             title="Strategy 8 — British Iron Condor (0DTE)", icon="🎯"),
     st.Page(page_research.render_research_full, title="Research shelf", icon="🔬"),
