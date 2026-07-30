@@ -33,6 +33,7 @@ import config
 import order_router
 import safe_execute as se
 import strategy_target
+from connections import gateway_probe
 
 ACCT = "U14438624"
 OTHER = "U5721712"
@@ -403,3 +404,85 @@ def test_armed_session_busy_refuse_propagates_and_never_flips_flags(monkeypatch,
         with se.armed_session(purpose="t", client_id=7, gateway_lock_on_busy="refuse"):
             pass  # unreachable — the lock refuses before the body runs
     assert config.READONLY is True and config.DRY_RUN is True
+
+
+# --- 10. the ONE shared gateway read-only probe (connections.gateway_probe) ----------
+# The consolidated, port-parameterized, zero-transmission probe that both arming (4002) and
+# safe_execute (4003) now delegate to. A fake IB fires ONE error code back through errorEvent
+# when the fabricated orderId is "cancelled" (nothing ever transmits), or fires none to prove
+# the fail-closed / raise-on-indeterminate paths.
+class _ProbeFakeIB:
+    """Minimal fake IB for the shared probe: errorEvent supports +=/-=, and cancelOrder
+    synchronously invokes every registered handler with `reply` (errorCode, errorString).
+    reply=None -> no signal (the indeterminate/timeout path)."""
+    def __init__(self, reply):
+        self._reply = reply
+        self._handlers = []
+        self.cancelled = []
+        self.client = SimpleNamespace(
+            getReqId=lambda: 9999,
+            cancelOrder=self._cancel)
+        self.errorEvent = self  # so `ib.errorEvent += h` reaches __iadd__ below
+
+    # errorEvent += / -= handler
+    def __iadd__(self, handler):
+        self._handlers.append(handler)
+        return self
+
+    def __isub__(self, handler):
+        if handler in self._handlers:
+            self._handlers.remove(handler)
+        return self
+
+    def _cancel(self, oid, manualCancelTime):
+        self.cancelled.append(oid)
+        if self._reply is not None:
+            code, text = self._reply
+            for h in list(self._handlers):
+                h(oid, code, text)
+
+    def sleep(self, *a, **k):
+        return None
+
+
+def test_shared_probe_readonly_code_321_returns_true():
+    ib = _ProbeFakeIB((321, "The API interface is currently in Read-Only mode."))
+    assert gateway_probe.probe_api_readonly(ib, port=4003) is True
+    assert ib.cancelled == [9999]              # a fabricated id was cancelled; nothing rested
+
+
+def test_shared_probe_readonly_by_message_returns_true():
+    # No 321, but the message names read-only mode -> still read-only (blocked).
+    ib = _ProbeFakeIB((0, "Order rejected — read only mode"))
+    assert gateway_probe.probe_api_readonly(ib, port=4002) is True
+
+
+def test_shared_probe_write_enabled_10147_returns_false():
+    ib = _ProbeFakeIB((10147, "OrderId 9999 that needs to be cancelled is not found."))
+    assert gateway_probe.probe_api_readonly(ib, port=4003) is False
+
+
+def test_shared_probe_write_enabled_10148_or_message_returns_false():
+    ib = _ProbeFakeIB((10148, "OrderId 9999 that needs to be cancelled can not be cancelled."))
+    assert gateway_probe.probe_api_readonly(ib, port=4003) is False
+
+
+def test_shared_probe_no_signal_fails_closed_to_true():
+    # No error ever comes back within the timeout -> FAIL CLOSED to read-only (refuse).
+    ib = _ProbeFakeIB(None)
+    assert gateway_probe.probe_api_readonly(ib, port=4003, timeout=0) is True
+
+
+def test_shared_probe_no_signal_raises_when_raise_on_indeterminate():
+    # The arm/disarm verify path: no decisive signal must fail LOUDLY, not silently "locked".
+    ib = _ProbeFakeIB(None)
+    with pytest.raises(RuntimeError):
+        gateway_probe.probe_api_readonly(ib, port=4002, timeout=0,
+                                         raise_on_indeterminate=True)
+
+
+def test_shared_probe_detaches_its_error_handler():
+    # The handler is added for the probe and removed after (no leak onto the caller's ib).
+    ib = _ProbeFakeIB((10147, "not found"))
+    gateway_probe.probe_api_readonly(ib, port=4003)
+    assert ib._handlers == []

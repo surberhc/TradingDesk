@@ -15,10 +15,27 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.27.1"
+VERSION = "0.28.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.28.0", "2026-07-30", "consolidate the two gateway read-only probes into one "
+                             "port-parameterized probe_api_readonly (arming 4002 + safe_execute "
+                             "4003); zero-transmission technique unchanged; final §2.2 item of "
+                             "#64. The cancel-a-fabricated-order idiom now lives ONCE in "
+                             "connections/gateway_probe.py (neutral low layer -> no import "
+                             "cycle; connections never imports paperbot). arming.probe_api_readonly "
+                             "keeps its exact public contract — opens its own paper-4002 "
+                             "connection (clientId 39, readonly=False), delegates the technique, "
+                             "and still RAISES on no-signal (raise_on_indeterminate=True) so "
+                             "disarm's verify never silently claims 'locked' on an unmeasurable "
+                             "line. safe_execute._probe_gateway_readonly is now a thin same-named "
+                             "wrapper (port=4003, fail-closed True) so execute_plan + the "
+                             "Control-Plane gateway_arm_probe keep importing it unchanged. "
+                             "Order-affecting (touches the live-trade arm probe idiom) but "
+                             "behavior-preserving: full paperbot suite green (516 -> 523, +7 "
+                             "shared-probe tests; zero regressions). Rule #1 clean: no strategy/"
+                             "regime/band/sizing value touched. NOTHING transmitted."),
     ("0.27.1", "2026-07-30", "rebalance_execute adopts safe_execute.armed_session "
                              "(flip-and-restore-in-finally; flags no longer leak to process "
                              "exit); gateway_lock + FA-backup unchanged; safety banner moved "

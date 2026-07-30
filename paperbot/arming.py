@@ -62,12 +62,11 @@ import json
 import os
 import re
 import subprocess
-import threading
 import time
 
 from ib_async import IB
 
-from connections import clientids, ibkr_paper
+from connections import clientids, gateway_probe, ibkr_paper
 
 CONFIG_INI = r"C:\IBC\config.ini"
 _VERIFY_CLIENT_ID = clientids.get("paperbot_arm_verify")  # 39
@@ -203,60 +202,31 @@ def restart_gateway() -> bool:
 # Verification probe — distinguishes read-only vs armed WITHOUT transmitting
 # --------------------------------------------------------------------------- #
 def probe_api_readonly(timeout: int = 15) -> bool:
-    """Return True if the live Gateway API is READ-ONLY (transmission BLOCKED),
+    """Return True if the live PAPER Gateway API is READ-ONLY (transmission BLOCKED),
     False if it is WRITE-ENABLED (transmission allowed). Raises RuntimeError if it
     cannot get a definitive signal.
 
-    Zero-transmission: connects readonly=False and asks the Gateway to cancel an
-    orderId that was never placed, via the RAW client call (the high-level
-    ib.cancelOrder is blocked client-side for unknown ids and never reaches TWS).
-    No order is ever sent or rested. The Gateway's reply is decisive (verified live):
-      * Read-Only API -> code 321, "The API interface is currently in Read-Only mode."
-                         -> returns True.
-      * Write-enabled -> "OrderId ... not found / cannot be cancelled" (10147/10148)
-                         -> returns False.
+    Opens its OWN paper-4002 connection (readonly=False so the *connection* is
+    write-capable; the gateway-level Read-Only API checkbox is what we actually measure),
+    then delegates the ZERO-TRANSMISSION cancel-a-fabricated-order technique to the ONE
+    shared probe (connections.gateway_probe.probe_api_readonly). No order is ever sent or
+    rested. The public signature + connect/disconnect + raise-on-no-signal behavior are
+    UNCHANGED — arm()/disarm()/verify and morning_execute_run see the same contract as
+    before (raise_on_indeterminate=True preserves the loud UNVERIFIED failure, which
+    disarm's verify relies on to never silently claim 'locked' on an unmeasurable line).
     """
     ib = IB()
-    signal: dict[str, bool] = {}
-    got = threading.Event()
-
-    def on_error(reqId, errorCode, errorString, *_):
-        msg = (errorString or "").lower()
-        if "read-only mode" in msg or "read only mode" in msg or errorCode == 321:
-            signal["readonly"] = True
-            got.set()
-        elif errorCode in (10147, 10148) or "not found" in msg or "cannot be cancelled" in msg:
-            signal["readonly"] = False
-            got.set()
-
     try:
-        # readonly=False so the *connection* is write-capable; the gateway-level
-        # Read-Only API checkbox is the thing we're actually measuring.
         ib.connect(ibkr_paper.HOST, ibkr_paper.PAPER_PORT, clientId=_VERIFY_CLIENT_ID,
                    readonly=False, timeout=timeout)
-        ib.errorEvent += on_error
-        # Fresh in-range orderId the server will treat as an unknown live order.
-        # Raw client.cancelOrder reaches TWS; it transmits nothing (no order exists).
-        oid = ib.client.getReqId()
-        ib.client.cancelOrder(oid, "")
-        deadline = time.time() + timeout
-        while not got.is_set() and time.time() < deadline:
-            ib.sleep(0.2)
+        return gateway_probe.probe_api_readonly(
+            ib, port=ibkr_paper.PAPER_PORT, timeout=timeout,
+            raise_on_indeterminate=True)
     finally:
-        try:
-            ib.errorEvent -= on_error
-        except Exception:
-            pass
         try:
             ib.disconnect()
         except Exception:
             pass
-
-    if "readonly" not in signal:
-        raise RuntimeError(
-            "arm-verify: could NOT determine the Gateway's Read-Only API state "
-            "(no decisive error returned within timeout). Treat as UNVERIFIED.")
-    return signal["readonly"]
 
 
 # --------------------------------------------------------------------------- #

@@ -28,13 +28,13 @@ There is no third (auto) mode.
 
 SCOPE NOTE (Phase 2 only)
 -------------------------
-This increment MOVES the s0_live_deploy execution logic into the shared engine. It does NOT
-yet unify with rebalance_execute's arm gate or consolidate arming.probe — those are separate
-later increments (spec §2.2). See the TODO(safe-execute) markers.
+This increment MOVES the s0_live_deploy execution logic into the shared engine. The
+rebalance_execute arm-gate unification (armed_session) and the arming.probe consolidation
+(the gateway read-only probe now lives once in connections.gateway_probe; this module keeps
+a thin same-named wrapper) are DONE (spec §2.2).
 """
 from __future__ import annotations
 
-import threading
 import time
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
@@ -43,10 +43,16 @@ from types import SimpleNamespace
 
 from ib_async import Stock
 
+from connections import gateway_probe
+
 import config
 import live_quotes
 import order_router
 import s0_live
+
+# The live-trade Gateway port this executor transmits on. Contextual only — passed to the
+# shared probe for its log/error messages; the actual connection is opened by the caller.
+LIVE_TRADE_PORT = 4003
 
 # ----------------------------------------------------------------------------------------
 # EXECUTION MODES — PREVIEW (transmit nothing) or ARMED (transmit iff the full gate passes).
@@ -194,49 +200,18 @@ def account_wall_ok(account: str, allowed_accounts) -> tuple[bool, str]:
 
 
 # ========================================================================================
-# GATEWAY READ-ONLY PROBE (moved verbatim). TODO(safe-execute): consolidate with arming.probe
-# into ONE port-parameterized probe (spec §2.2) — arming.py is 4002, this is the 4003 gate.
+# GATEWAY READ-ONLY PROBE — now the ONE shared, port-parameterized probe (consolidated with
+# arming's, spec §2.2 item 2, conductor #64). Kept as a thin, same-named wrapper so execute_plan
+# and the Control-Plane probe (dashboard/desk/gateway_arm_probe.py, via s0_live_deploy's
+# re-export) keep importing `_probe_gateway_readonly` unchanged; the ZERO-TRANSMISSION technique
+# lives once in connections.gateway_probe.
 # ========================================================================================
 def _probe_gateway_readonly(ib, timeout: int = 15) -> bool:
     """Return True if the OPEN live-trade (4003) connection's Gateway is READ-ONLY
-    (transmission physically BLOCKED), False if it is WRITE-ENABLED (armed).
-
-    Mirrors arming.probe_api_readonly's ZERO-TRANSMISSION technique EXACTLY (identical to
-    s0_live_exec._probe_gateway_readonly) — attach an error handler, ask the Gateway (via the
-    RAW client call) to cancel a fabricated, never-placed orderId, and read the decisive
-    reply:
-      * Read-Only API -> code 321 / "read-only mode"                     -> True  (blocked)
-      * Write-enabled -> 10147/10148 / "not found"/"cannot be cancelled" -> False (armed)
-    No order is ever placed or rested. FAILS CLOSED: no decisive signal -> True (refuse)."""
-    signal: dict[str, bool] = {}
-    got = threading.Event()
-
-    def on_error(reqId, errorCode, errorString, *_):
-        msg = (errorString or "").lower()
-        if "read-only mode" in msg or "read only mode" in msg or errorCode == 321:
-            signal["readonly"] = True
-            got.set()
-        elif (errorCode in (10147, 10148) or "not found" in msg
-              or "cannot be cancelled" in msg):
-            signal["readonly"] = False
-            got.set()
-
-    ib.errorEvent += on_error
-    try:
-        oid = ib.client.getReqId()
-        ib.client.cancelOrder(oid, "")   # transmits nothing; no such order exists
-        deadline = time.time() + timeout
-        while not got.is_set() and time.time() < deadline:
-            ib.sleep(0.2)
-    finally:
-        try:
-            ib.errorEvent -= on_error
-        except Exception:
-            pass
-    if "readonly" not in signal:
-        # Could not measure the Gateway state -> treat as read-only (refuse to transmit).
-        return True
-    return signal["readonly"]
+    (transmission physically BLOCKED), False if it is WRITE-ENABLED (armed). Thin wrapper over
+    the shared connections.gateway_probe.probe_api_readonly — same zero-transmission cancel-a-
+    fabricated-order technique, same FAIL-CLOSED default (no decisive signal -> True/refuse)."""
+    return gateway_probe.probe_api_readonly(ib, port=LIVE_TRADE_PORT, timeout=timeout)
 
 
 # ========================================================================================
