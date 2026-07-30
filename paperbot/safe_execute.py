@@ -36,6 +36,7 @@ from __future__ import annotations
 
 import threading
 import time
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
@@ -598,6 +599,45 @@ def _report_phase(label: str, results) -> None:
 
 
 # ========================================================================================
+# THE ONE ARM GATE — armed_session (spec §2.2, conductor #64 Step 1). BOTH the deploy engine
+# (execute_plan, now) and rebalance_execute (Step 2) arm through THIS single code path.
+# ========================================================================================
+@contextmanager
+def armed_session(*, purpose, client_id, gateway_lock_on_busy=None, fa_backup_ib=None):
+    """The ONE arm gate: flip config.READONLY/DRY_RUN False IN-PROCESS behind the gate and
+    RESTORE them in a finally — the enablement can NEVER outlive the block (spec §4 #4).
+    Optionally, for the rebalance/FA path: acquire gateway_lock for the whole block
+    (gateway_lock_on_busy not None), and expose an FA GROUPS replaceFA XML backup helper.
+    Yields a small handle with .fa_backup_path (set only if a backup is taken via
+    sess.backup_fa_groups(ib)). On GatewayBusyRefuse the lock context propagates it (the
+    caller catches, as today) and the flags are never left flipped."""
+    prev_ro, prev_dry = config.READONLY, config.DRY_RUN
+    sess = SimpleNamespace(fa_backup_path="")
+    stack = ExitStack()
+    try:
+        if gateway_lock_on_busy is not None:
+            from gateway_lock import gateway_lock  # lazy: only the FA/rebalance path needs it
+            stack.enter_context(gateway_lock(purpose=purpose, client_id=client_id,
+                                             on_busy=gateway_lock_on_busy))
+        config.READONLY = False
+        config.DRY_RUN = False
+
+        def _do_fa_backup(ib):
+            # Take the FA GROUPS backup at the CALLER'S chosen point (byte-identical timing to
+            # today's step [7]); records the path on the handle. Import lazily to avoid a hard
+            # dep for the deploy path. The actual backup fn lives in rebalance_execute today —
+            # in Step 2 the caller passes a bound backup fn; for Step 1 (deploy) it's unused.
+            raise NotImplementedError("FA backup is wired by the rebalance caller in Step 2")
+        sess.backup_fa_groups = _do_fa_backup
+
+        yield sess
+    finally:
+        config.READONLY = prev_ro
+        config.DRY_RUN = prev_dry
+        stack.close()   # releases gateway_lock via its own __exit__ (normal + exception)
+
+
+# ========================================================================================
 # THE PRIMITIVE — execute_plan: leg build [7], pre-flight gate [8], two-phase transmit [9].
 # ========================================================================================
 def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
@@ -742,15 +782,13 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
 
     # IN-PROCESS safety-flag flip — THIS PROCESS ONLY (mirrors s0_live_exec exactly).
     # order_router.transmit_guard fails CLOSED while config.DRY_RUN or config.READONLY is True
-    # (the committed desk-wide defaults). We flip both to False in memory ONLY, run BOTH phases,
-    # then RESTORE in a finally so the flip can never leak past the transmit. UNREACHABLE unless
-    # `permit` is True (above the `if not permit: return` guard).
-    prev_readonly = config.READONLY
-    prev_dry_run = config.DRY_RUN
-    try:
-        config.READONLY = False
-        config.DRY_RUN = False
-
+    # (the committed desk-wide defaults). armed_session flips both to False in memory ONLY, runs
+    # BOTH phases, then RESTORES in a finally so the flip can never leak past the transmit.
+    # UNREACHABLE unless `permit` is True (above the `if not permit: return` guard). Deploy passes
+    # gateway_lock_on_busy=None: its branch decision (permit) is computed from explicit inputs
+    # ABOVE, and it is serialized by the physical 4003 gateway arming, not the 4002 mutex.
+    with armed_session(purpose="safe_execute_deploy", client_id=None,
+                       gateway_lock_on_busy=None):
         # PHASE 1 — SELLS (raise cash), wait for terminal, re-price stragglers.
         print(f"\n    PHASE 1 — SELLS ({len(sell_legs)} leg(s)): transmit, then WAIT for "
               f"terminal state (fill/cancel) before sizing any buy.")
@@ -791,9 +829,6 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
         buy_results = _transmit_phase(ib, scaled_buys, account=account, as_of=target.as_of,
                                       run_id=run_id, phase_label="BUY", quotes=quotes,
                                       prices=prices)
-    finally:
-        config.READONLY = prev_readonly
-        config.DRY_RUN = prev_dry_run
 
     # Consolidated result — LOUD on anything unfilled/skipped in either phase.
     _report_phase("SELL", sell_results)

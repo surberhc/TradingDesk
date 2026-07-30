@@ -15,10 +15,13 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.26.0"
+VERSION = "0.27.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.27.0", "2026-07-30", "shared armed_session arm-gate context manager; deploy engine "
+                             "(execute_plan) adopts it; behavior-preserving (flags still "
+                             "flip-and-restore); Step 1 of arm-gate unification #64"),
     ("0.26.0", "2026-07-30", "SHARED SAFE EXECUTION ENGINE extracted (Production Rebalance "
                              "Control Plane, conductor #64/#66, spec §2/§7 Phase 2). New "
                              "paperbot/safe_execute.py exposes ONE reusable primitive "

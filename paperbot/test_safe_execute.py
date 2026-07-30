@@ -322,3 +322,84 @@ def test_invalid_mode_raises():
     req = _request(plan=_plan(orders={"VTI": 10}), target=_target(), armed=False)
     with pytest.raises(ValueError):
         se.execute_plan(req, mode="AUTO", ib=_NoTxIB())
+
+
+# --- 9. armed_session — the ONE arm gate (spec §2.2, conductor #64 Step 1) -----------
+def test_armed_session_flips_both_flags_and_restores_on_normal_exit(monkeypatch):
+    # Prior committed defaults (both True) -> flipped False inside -> restored True on exit.
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    with se.armed_session(purpose="t", client_id=None) as sess:
+        assert config.READONLY is False and config.DRY_RUN is False
+        assert sess.fa_backup_path == ""                 # no backup taken on the deploy path
+    assert config.READONLY is True and config.DRY_RUN is True
+
+
+def test_armed_session_restores_to_prior_values_not_hardcoded_true(monkeypatch):
+    # Restores the CAPTURED prior values, not a hardcoded True: prove with a mixed prior.
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    with se.armed_session(purpose="t", client_id=None):
+        assert config.READONLY is False and config.DRY_RUN is False
+    assert config.READONLY is False and config.DRY_RUN is True
+
+
+def test_armed_session_restores_both_flags_when_body_raises(monkeypatch):
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    with pytest.raises(RuntimeError):
+        with se.armed_session(purpose="t", client_id=None):
+            assert config.READONLY is False and config.DRY_RUN is False
+            raise RuntimeError("boom")
+    # the enablement can NEVER outlive the block, even on an exception
+    assert config.READONLY is True and config.DRY_RUN is True
+
+
+def test_armed_session_fa_backup_seam_is_step2(monkeypatch):
+    # Step 1: the FA-backup helper is only a seam; the deploy path never calls it.
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    with se.armed_session(purpose="t", client_id=None) as sess:
+        with pytest.raises(NotImplementedError):
+            sess.backup_fa_groups(object())
+
+
+def test_armed_session_acquires_and_releases_gateway_lock(monkeypatch, tmp_path):
+    # With gateway_lock_on_busy set and the lock FREE: it acquires for the whole block and
+    # releases on exit. Redirect the lock file to a temp path (real _GatewayLock logic).
+    import gateway_lock as gl
+    lock_file = tmp_path / "gateway.lock"
+    real = gl.gateway_lock
+    monkeypatch.setattr(gl, "gateway_lock",
+                        lambda **kw: real(lock_path=str(lock_file), **kw))
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    with se.armed_session(purpose="t", client_id=7, gateway_lock_on_busy="refuse"):
+        assert lock_file.exists()                        # held for the whole block
+        assert config.READONLY is False and config.DRY_RUN is False
+    assert not lock_file.exists()                        # released on exit
+    assert config.READONLY is True and config.DRY_RUN is True
+
+
+def test_armed_session_busy_refuse_propagates_and_never_flips_flags(monkeypatch, tmp_path):
+    # A LIVE, non-stale holder already owns the lock -> GatewayBusyRefuse propagates AND the
+    # flags are never flipped (the lock is acquired BEFORE the flip; on refuse the flip is
+    # never reached and the finally leaves the priors intact).
+    import json
+    import os
+    import time as _time
+    import gateway_lock as gl
+    lock_file = tmp_path / "gateway.lock"
+    lock_file.write_text(json.dumps({
+        "pid": os.getpid(), "client_id": 99, "purpose": "other-holder",
+        "acquired_ts": _time.time(), "heartbeat_ts": _time.time()}))
+    real = gl.gateway_lock
+    monkeypatch.setattr(gl, "gateway_lock",
+                        lambda **kw: real(lock_path=str(lock_file), wait_secs=0.05,
+                                          poll_interval=0.01, **kw))
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    with pytest.raises(gl.GatewayBusyRefuse):
+        with se.armed_session(purpose="t", client_id=7, gateway_lock_on_busy="refuse"):
+            pass  # unreachable — the lock refuses before the body runs
+    assert config.READONLY is True and config.DRY_RUN is True
