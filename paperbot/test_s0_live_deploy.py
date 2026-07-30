@@ -37,6 +37,7 @@ import pytest
 import config
 import order_router
 import s0_live_deploy as dep
+import safe_execute as se               # the gate/probe/tuning constants MOVED here (Phase 2)
 
 ACCT = dep.EXEC_ACCOUNT                     # "U14438624" (trust account, PDT-clear)
 OTHER = "U5721712"                          # a NON-target account — must be refused
@@ -193,7 +194,8 @@ def _patch_common(monkeypatch, *, plan=None, target=None):
     monkeypatch.setattr(dep.rebalance_engine, "plan_account",
                         lambda *a, **k: (plan or _fake_plan()))
     monkeypatch.setattr(dep, "_kill_switch_present", lambda: False)
-    monkeypatch.setattr(dep, "_probe_gateway_readonly", lambda ib, **k: False)
+    # The gateway read-only probe moved to safe_execute (Phase 2); the engine calls it there.
+    monkeypatch.setattr(se, "_probe_gateway_readonly", lambda ib, **k: False)
 
 
 def _wire_connections(monkeypatch, fake):
@@ -448,9 +450,11 @@ def test_scale_buys_to_cash_zero_cash_skips_all():
 def test_transmit_phase_reprices_then_gives_up(monkeypatch):
     monkeypatch.setattr(config, "READONLY", False)
     monkeypatch.setattr(config, "DRY_RUN", False)
-    monkeypatch.setattr(dep, "REPRICE_AFTER_SEC", 0.0)     # re-price on the first poll
-    monkeypatch.setattr(dep, "POLL_SEC", 0.0)
-    monkeypatch.setattr(dep, "PHASE_TERMINAL_TIMEOUT_SEC", 0.15)
+    # The two-phase tuning constants moved to safe_execute (Phase 2); _transmit_phase reads
+    # them there, so patch them at their new home.
+    monkeypatch.setattr(se, "REPRICE_AFTER_SEC", 0.0)      # re-price on the first poll
+    monkeypatch.setattr(se, "POLL_SEC", 0.0)
+    monkeypatch.setattr(se, "PHASE_TERMINAL_TIMEOUT_SEC", 0.15)
     NS = SimpleNamespace
     leg = NS(symbol="THIN", side="BUY", qty=5, limit=100.0, notional=500.0, source="plan")
     ib = _TxFakeIB(_summary(), [], no_fill_symbols={"THIN"})   # THIN never fills
