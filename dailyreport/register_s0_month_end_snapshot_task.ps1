@@ -1,57 +1,54 @@
 <#
-    register_s0_month_end_notice_task.ps1  --  register the S0MonthEndNotice task (Job B).
+    register_s0_month_end_snapshot_task.ps1  --  register the S0MonthEndSnapshot task (Job A).
 
     *** NOT RUN BY THE BUILD THAT CREATED IT. ***
-    Andrew owns scheduling. This script exists so registration is written down
-    rather than improvised; nothing registered it for you. Run it yourself, from
-    an ELEVATED shell, when you want the notice on a schedule:
+    Andrew owns scheduling. This script exists so registration is written down rather than
+    improvised; nothing registered it for you. Run it yourself, from an ELEVATED shell, when
+    you want the snapshot on a schedule:
 
       (a) Win+X -> "Terminal (Admin)" -> accept the UAC prompt, then:
               powershell -ExecutionPolicy Bypass -File
-                  "C:\TradingDesk\dailyreport\register_s0_month_end_notice_task.ps1"
+                  "C:\TradingDesk\dailyreport\register_s0_month_end_snapshot_task.ps1"
 
       (b) From any existing (non-elevated) shell -- pops UAC for you:
               Start-Process powershell -Verb RunAs -ArgumentList '-NoExit',
                   '-ExecutionPolicy','Bypass','-File',
-                  'C:\TradingDesk\dailyreport\register_s0_month_end_notice_task.ps1'
+                  'C:\TradingDesk\dailyreport\register_s0_month_end_snapshot_task.ps1'
 
     WHAT IT REGISTERS (idempotent -- unregisters then re-registers):
-      S0MonthEndNotice -> run_s0_month_end_notice.cmd   (Job B: EXACT trade/no-trade verdict)
-        Trigger : weekly, Mon-Fri at 19:15 local (~7:15pm CT), StartWhenAvailable.
-                  19:15 CT is AFTER the ~7pm Tiingo close-data pull, so Job B computes the
-                  target on the FINAL close. It loads Job A's close-time holdings snapshot
-                  (S0MonthEndSnapshot, ~2:50pm CT) and emails an exact verdict. The script
-                  self-checks the trading calendar and only emails on Strategy 0's month-end
-                  SIGNAL day (last trading day of the month), so a plain weekday trigger is
-                  correct -- it does nothing the other ~20 evenings a month and exits 0.
+      S0MonthEndSnapshot -> run_s0_month_end_snapshot.cmd
+        Trigger : weekly, Mon-Fri at 14:50 local (~2:50pm CT), StartWhenAvailable.
+                  14:50 CT is BEFORE the ~3:05pm CT live-trading Gateway teardown, so the
+                  read-only holdings snapshot can still connect. The script self-checks the
+                  trading calendar and only snapshots on Strategy 0's month-end SIGNAL day
+                  (last trading day of the month), so a plain weekday trigger is correct --
+                  it does nothing the other ~20 weekdays a month and exits 0.
         Logon   : Password (run whether-logged-on) so it survives logoff.
         Instances: IgnoreNew -- a re-fire while one is running is a safe no-op.
 
-    NOTE: this REPLACES the earlier "rebalance due" heads-up behavior of S0MonthEndNotice
-    with the exact-verdict Job B (the pair's second half). Register S0MonthEndSnapshot
-    (Job A, register_s0_month_end_snapshot_task.ps1) too, or Job B will always email the
-    fail-honest "could not read holdings at close" notice.
+    IMPORTANT -- GATEWAY / LOGON CAVEAT: Job A needs the live-trading Gateway (port 4003) up
+    to read the account, and the Gateway itself is brought up under Andrew's interactive
+    login (see the S8 morning bring-up). If the desk's task principals run only when Andrew
+    is logged on (Interactive), this snapshot inherits that same limitation -- it can only
+    capture holdings while the Gateway is running. If the Gateway is down at 14:50, Job A
+    writes an honest FAILED marker and the evening Job B emails "could not read holdings at
+    close" rather than guessing a verdict.
 
-    LOGON CAVEAT: Job B itself connects to no gateway (it reads Job A's JSON + runs the
-    offline planner), but it depends on Job A having captured holdings while the Gateway was
-    up. If the desk's task principals only run when Andrew is logged on (Interactive), that
-    limitation lives on Job A, not here.
+    This task is INFORMATIONAL + READ-ONLY. It connects READ-ONLY (readonly=True) to read
+    positions + NetLiquidation; it builds no order and transmits nothing. Reverse it any time
+    with:  Unregister-ScheduledTask -TaskName S0MonthEndSnapshot -Confirm:$false
 
-    This task is INFORMATIONAL + READ-ONLY -- it emails the owner a heads-up. Job B touches
-    NO order path, reads NO account live, connects to NO gateway. Reverse it any time with a
-    plain:  Unregister-ScheduledTask -TaskName S0MonthEndNotice -Confirm:$false
+    Your password is never hardcoded: it is prompted for (Get-Credential) and passed straight
+    to Register-ScheduledTask.
 
-    Your password is never hardcoded: it is prompted for (Get-Credential) and passed
-    straight to Register-ScheduledTask.
-
-    VERIFY-DON'T-CLAIM: this script asserts the task actually exists with the
-    expected trigger/principal after registering, and exits non-zero if not.
+    VERIFY-DON'T-CLAIM: this script asserts the task actually exists with the expected
+    trigger/principal after registering, and exits non-zero if not.
 #>
 
 $ErrorActionPreference = 'Stop'
 
-$TaskName = 'S0MonthEndNotice'
-$Launcher = Join-Path $PSScriptRoot 'run_s0_month_end_notice.cmd'
+$TaskName = 'S0MonthEndSnapshot'
+$Launcher = Join-Path $PSScriptRoot 'run_s0_month_end_snapshot.cmd'
 
 # --- 0. Elevation self-check ------------------------------------------------
 $isAdmin = ([Security.Principal.WindowsPrincipal] `
@@ -71,14 +68,14 @@ if (-not (Test-Path $Launcher)) {
 Write-Host "Enter the Windows password for $env:USERDOMAIN\$env:USERNAME"
 Write-Host "(needed so the task runs whether-logged-on; it is never written to disk)."
 $cred = Get-Credential -UserName "$env:USERDOMAIN\$env:USERNAME" `
-                       -Message 'Password for the S0MonthEndNotice scheduled task'
+                       -Message 'Password for the S0MonthEndSnapshot scheduled task'
 
 # --- 2. Build + register ----------------------------------------------------
 $action = New-ScheduledTaskAction -Execute $Launcher
 
 $trigger = New-ScheduledTaskTrigger -Weekly `
     -DaysOfWeek Monday,Tuesday,Wednesday,Thursday,Friday `
-    -At 7:15PM
+    -At 2:50PM
 
 $settings = New-ScheduledTaskSettingsSet `
     -StartWhenAvailable `
@@ -88,7 +85,7 @@ $settings = New-ScheduledTaskSettingsSet `
     -DontStopIfGoingOnBatteries
 
 $task = New-ScheduledTask -Action $action -Trigger $trigger -Settings $settings `
-                          -Description 'Job B of the S0 month-end EXACT verdict: evening trade/no-trade email. Runs weekday evenings 19:15 (after the ~7pm Tiingo pull); loads Job A''s close-time holdings snapshot, computes the target on final close data, and emails "TRADE tomorrow - N leg(s)" / "NO trade tomorrow" / (fail-honest) "could not read holdings at close". The script self-checks the NYSE calendar and only emails on Strategy 0''s month-end signal day (last trading day of the month). Informational + read-only -- no order path, no live gateway/account read (reads Job A''s JSON + runs the offline planner).'
+                          -Description 'Job A of the S0 month-end EXACT verdict: close-time holdings snapshot. Runs weekday ~14:50 CT (before the ~3:05pm live-trading Gateway teardown); the script self-checks the NYSE calendar and only snapshots on Strategy 0''s month-end signal day (last trading day of the month). READ-ONLY (readonly=True): reads positions + NetLiquidation from port 4003 and writes an off-repo JSON; builds no order, transmits nothing.'
 
 if (Get-ScheduledTask -TaskName $TaskName -ErrorAction SilentlyContinue) {
     Write-Host "Existing $TaskName found -- unregistering before re-register."
@@ -118,7 +115,7 @@ if ($check.Principal.LogonType -ne 'Password') {
 Write-Host ""
 Write-Host "VERIFIED: $TaskName registered." -ForegroundColor Green
 Write-Host "  Action  : $Launcher"
-Write-Host "  Triggers: weekly Mon-Fri 19:15 (StartWhenAvailable)"
+Write-Host "  Triggers: weekly Mon-Fri 14:50 (StartWhenAvailable)"
 Write-Host "  Logon   : Password (runs whether-logged-on)"
 Write-Host ""
 Write-Host "Reverse any time with:"

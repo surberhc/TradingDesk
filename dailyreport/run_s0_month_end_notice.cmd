@@ -1,17 +1,21 @@
 @echo off
 REM ===========================================================================
-REM  run_s0_month_end_notice.cmd - once-a-month S0 rebalance heads-up email.
+REM  run_s0_month_end_notice.cmd - Job B: S0 month-end EXACT trade/no-trade verdict.
 REM
 REM  Launcher for the S0MonthEndNotice scheduled task (runs every weekday evening
-REM  ~18:30 CT, after the cash close; Andrew registers the task himself -- this
-REM  build deliberately does NOT register any task). The script self-checks the
-REM  NYSE trading calendar and emails ONLY on Strategy 0's month-end rebalance
-REM  SIGNAL day (the last trading day of the month); every other evening it does
-REM  nothing and exits 0.
+REM  ~19:15 CT, AFTER the ~7pm Tiingo close-data pull; Andrew registers the task
+REM  himself -- this build deliberately does NOT register any task). The script
+REM  self-checks the NYSE trading calendar and emails ONLY on Strategy 0's month-end
+REM  rebalance SIGNAL day (the last trading day of the month); every other evening it
+REM  does nothing and exits 0.
 REM
-REM  This is an INFORMATIONAL email to the owner only. It touches NO order path,
-REM  reads NO account, connects to NO gateway -- pure calendar/model decision,
-REM  reusing the existing EOD mailer (dailyreport\mailer.py). Not order-affecting.
+REM  On the signal day it loads Job A's close-time holdings snapshot, computes S0's
+REM  target on the final close data, sizes the plan, and emails one of three exact
+REM  verdicts: "TRADE tomorrow - N leg(s)", "NO trade tomorrow", or (fail-honest)
+REM  "could not read holdings at close". INFORMATIONAL + READ-ONLY: Job B connects to
+REM  NO gateway and reads NO account live -- it only reads the JSON snapshot and runs
+REM  the pure offline planner, reusing the existing EOD mailer (dailyreport\mailer.py).
+REM  It transmits nothing and touches no order path. Not order-affecting.
 REM ===========================================================================
 
 set "VENV_PY=C:\TradingDesk-Local\venv\Scripts\python.exe"
