@@ -384,9 +384,11 @@ def _render_preview_result(stdout: str, stderr: str) -> None:
 
 
 def _render_step1() -> None:
-    """Step 1 — build and review the read-only preview. ALWAYS visible. Shows a persistent
-    per-step status (from session state, even on reruns) above the preview button, then
-    runs the executor in PREVIEW mode when the button is pressed. Transmits nothing."""
+    """Step 1 — build and review the read-only preview. ALWAYS visible. Runs the executor
+    in PREVIEW mode when the button is pressed, then renders a persistent per-step status
+    (from session state, even on reruns) BELOW the button+handler — so on the same run
+    where a preview is built, the status card reads the just-stored state and correctly
+    shows 'done' instead of lagging until the next rerun. Transmits nothing."""
     st.markdown(theme.section("Step 1 — Review what would trade (read-only)"),
                 unsafe_allow_html=True)
     st.caption(
@@ -396,36 +398,40 @@ def _render_step1() -> None:
         f"arm token or conform flag is ever passed from this page."
     )
 
-    # Persistent per-step status — reflects session state EVEN ON RERUNS, so the operator
-    # always sees whether Step 1 is done, not just in the run where they pressed the button.
-    last = st.session_state.get("cp_last_preview")
-    if last:
-        st.markdown(
-            theme.status_card(
-                "Step 1 status",
-                "good",
-                "Step 1 done — plan reviewed",
-                f"You reviewed a preview built at "
-                f"{last.get('built_at_str', '—')}: {last.get('n_legs', '—')} leg(s), "
-                f"sells {last.get('sells', '—')}, buys {last.get('buys', '—')}. Rebuild "
-                f"it if it's stale.",
-            ),
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            theme.status_card(
-                "Step 1 status",
-                "warn",
-                "Step 1 not done yet",
-                "Click 'Build read-only preview' to see exactly what would trade. Nothing "
-                "transmits — this only reads the account.",
-            ),
-            unsafe_allow_html=True,
-        )
+    def _render_step1_status() -> None:
+        """Persistent per-step status — reflects session state EVEN ON RERUNS, so the
+        operator always sees whether Step 1 is done. Rendered AFTER the button+handler so
+        a just-built preview (which sets cp_last_preview in the same run) shows as done
+        immediately, not one rerun late."""
+        last = st.session_state.get("cp_last_preview")
+        if last:
+            st.markdown(
+                theme.status_card(
+                    "Step 1 status",
+                    "good",
+                    "Step 1 done — plan reviewed",
+                    f"You reviewed a preview built at "
+                    f"{last.get('built_at_str', '—')}: {last.get('n_legs', '—')} leg(s), "
+                    f"sells {last.get('sells', '—')}, buys {last.get('buys', '—')}. Rebuild "
+                    f"it if it's stale.",
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            st.markdown(
+                theme.status_card(
+                    "Step 1 status",
+                    "warn",
+                    "Step 1 not done yet",
+                    "Click 'Build read-only preview' to see exactly what would trade. "
+                    "Nothing transmits — this only reads the account.",
+                ),
+                unsafe_allow_html=True,
+            )
 
     if not st.button("Build read-only preview (reads the live-trade gateway)"):
         st.caption("The preview runs only when you press the button above.")
+        _render_step1_status()
         return
 
     if not os.path.exists(VENV_PYTHON) or not _DEPLOY_SCRIPT.exists():
@@ -439,6 +445,7 @@ def _render_step1() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _render_step1_status()
         return
 
     try:
@@ -463,6 +470,7 @@ def _render_step1() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _render_step1_status()
         return
     except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
         st.markdown(
@@ -475,11 +483,13 @@ def _render_step1() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _render_step1_status()
         return
 
     _render_preview_result(stdout, stderr)
     _store_last_preview(stdout)  # bind the arm/execute step to THIS reviewed preview
     _audit_preview()  # best-effort durable audit; never breaks the page
+    _render_step1_status()  # now reads the just-stored preview → shows "done" same run
 
 
 # =========================================================================== #
