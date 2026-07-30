@@ -61,6 +61,12 @@ _DEPLOY_SCRIPT = REPO / "paperbot" / "s0_live_deploy.py"
 _DEPLOY_CWD = REPO / "paperbot"
 _PREVIEW_TIMEOUT_SEC = 150
 
+# The standalone read-only, zero-transmission 4003 armed-state probe (its own script so no
+# broker socket ever opens inside this Streamlit process). Shelled out from Step 2 below.
+_ARM_PROBE_SCRIPT = REPO / "dashboard" / "desk" / "gateway_arm_probe.py"
+_ARM_PROBE_CWD = REPO / "dashboard" / "desk"
+_ARM_PROBE_TIMEOUT_SEC = 45
+
 
 # =========================================================================== #
 # Broker-free Strategy 0 Growth target — cached 1h (validated engine).         #
@@ -512,6 +518,111 @@ def _classify_execute_output(stdout: str, stderr: str) -> str:
     return "error"
 
 
+def _render_arm_probe() -> None:
+    """Convenience CHECK of the port-4003 Gateway's armed state — a button that shells out
+    to the standalone read-only, zero-transmission probe (gateway_arm_probe.py) and SHOWS
+    armed / not-armed / unreachable. This is a read-only convenience only: the executor
+    still independently measures the Gateway and is the enforced wall. No socket opens in
+    this Streamlit process; the probe places and transmits NOTHING.
+
+    The probe prints exactly one uppercase token (READONLY / ARMED / UNREACHABLE) on its
+    LAST stdout line. Any failure is a plain-English 'bad' card — never a crash."""
+    if not st.button("Check whether the 4003 Gateway is armed",
+                     key="cp_arm_probe_btn"):
+        return
+
+    if not os.path.exists(VENV_PYTHON) or not _ARM_PROBE_SCRIPT.exists():
+        st.markdown(
+            theme.status_card(
+                "Gateway armed-state check",
+                "bad",
+                "Could not run the armed-state check",
+                "The probe script or its Python could not be found on this machine. "
+                "Nothing was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    try:
+        with st.spinner("Checking the port-4003 Gateway's armed state (read-only, "
+                        "transmits nothing)…"):
+            proc = subprocess.run(
+                [VENV_PYTHON, str(_ARM_PROBE_SCRIPT)],
+                cwd=str(_ARM_PROBE_CWD),
+                capture_output=True,
+                text=True,
+                timeout=_ARM_PROBE_TIMEOUT_SEC,
+            )
+        stdout, stderr = proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        st.markdown(
+            theme.status_card(
+                "Gateway armed-state check",
+                "bad",
+                "Timed out reaching the 4003 Gateway",
+                "The armed-state check did not finish in time. The live-trade Gateway "
+                "(port 4003) may be down or not logged in. Nothing was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
+        st.markdown(
+            theme.status_card(
+                "Gateway armed-state check",
+                "bad",
+                "Could not run the armed-state check",
+                f"Could not reach the live-trade Gateway (port 4003) to check "
+                f"({type(exc).__name__}) — is it up and logged in? Nothing was "
+                f"transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Parse the LAST non-empty stdout line for the token.
+    token = ""
+    for line in reversed((stdout or "").splitlines()):
+        if line.strip():
+            token = line.strip().upper()
+            break
+
+    if token == "ARMED":
+        st.markdown(
+            theme.status_card(
+                "Gateway armed-state check",
+                "warn",
+                "Armed — Read-Only API is OFF; the Gateway can transmit",
+                "Armed — Read-Only API is OFF; the Gateway can transmit. Only arm it right "
+                "before you Execute, and disarm right after.",
+            ),
+            unsafe_allow_html=True,
+        )
+    elif token == "READONLY":
+        st.markdown(
+            theme.status_card(
+                "Gateway armed-state check",
+                "good",
+                "Not armed — Read-Only API is ON; nothing can transmit",
+                "Not armed — Read-Only API is ON; nothing can transmit. Uncheck it in TWS "
+                "only when you are ready to Execute.",
+            ),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.markdown(
+            theme.status_card(
+                "Gateway armed-state check",
+                "bad",
+                "Could not reach the 4003 Gateway to check",
+                "Could not reach the 4003 Gateway to check — is it up and logged in? "
+                "Nothing was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+
+
 def _render_step2() -> bool:
     """Step 2 — arm the Gateway by hand & type the account id to confirm. ALWAYS visible.
     Returns whether the typed account id matches PREVIEW_ACCOUNT (the confirm gate). Arms
@@ -520,25 +631,30 @@ def _render_step2() -> bool:
     st.markdown(theme.section("Step 2 — Arm the Gateway (by hand) and confirm"),
                 unsafe_allow_html=True)
 
-    # Gateway armed-state. arming.probe_api_readonly is pinned to the PAPER gateway
-    # (ibkr_paper.PAPER_PORT / paper client-id) and exposes NO port-4003 probe, so there
-    # is no cleanly reusable, zero-transmission 4003 probe to shell out to. Per the build
-    # rule we DO NOT invent inline socket code — we omit the live probe and instead render
-    # a prominent, plain-English instruction that the Gateway must be armed by hand.
+    # The physical Gateway arm is a human act in TWS this app cannot perform — that
+    # instruction card stays. As a CONVENIENCE, a button below shells out to a standalone
+    # read-only, zero-transmission probe (gateway_arm_probe.py) that SHOWS the Gateway's
+    # armed state. The probe is a convenience check, NOT a replacement for the human arm or
+    # the executor's own measurement — the executor still independently measures the Gateway
+    # at Execute time and is the enforced wall.
     st.markdown(
         theme.status_card(
-            "You must arm the Gateway by hand — this app cannot check it",
+            "You arm the Gateway by hand in TWS — the check below is a convenience",
             "warn",
             "Uncheck 'Read-Only API' on the port 4003 Gateway in TWS before you Execute",
-            "This app does not probe the live-trade Gateway's armed state. Before you "
-            "press Execute, make sure YOU have unchecked 'Read-Only API' "
-            "(Configure > Settings > API > Settings) on the port 4003 live-trade Gateway "
-            "in TWS. If it is still checked (Read-Only ON), the Execute run transmits "
-            "NOTHING and reports that it was blocked — the executor measures the Gateway "
-            "itself and refuses. When you are finished, re-check that box to disarm.",
+            "The physical arm is a human act: before you press Execute, make sure YOU have "
+            "unchecked 'Read-Only API' (Configure > Settings > API > Settings) on the "
+            "port 4003 live-trade Gateway in TWS. If it is still checked (Read-Only ON), "
+            "the Execute run transmits NOTHING and reports that it was blocked — the "
+            "executor measures the Gateway itself and refuses. When you are finished, "
+            "re-check that box to disarm. Use the button below to CHECK the current state "
+            "(read-only; it transmits nothing) — it does not arm anything.",
         ),
         unsafe_allow_html=True,
     )
+
+    # Convenience armed-state check — read-only subprocess, transmits nothing.
+    _render_arm_probe()
 
     # Typed confirmation — mirrors emergency.py's exact-word confirm guard. ALWAYS visible.
     st.caption("This is the deliberate human gate. Type the exact account id to confirm "
