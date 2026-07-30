@@ -1,24 +1,25 @@
-"""page_control_plane.py — the desk's Control Plane page. READ-ONLY PREVIEW (Phase 1).
+"""page_control_plane.py — the desk's Control Plane page for Strategy 0 rebalancing.
 
-This is the FIRST, deliberately-minimal slice of the in-app Control Plane
-(docs/PRODUCTION_REBALANCE_CONTROL_PLANE.md, Phase 1). It shows what Strategy 0
-(Growth tier) would trade on the funded trust account U14438624 to conform to its
-target — computed READ-ONLY. It places NOTHING, arms NOTHING, and transmits NOTHING.
-
-There is NO arm control and NO execute button here, on purpose. A real order will
-only ever transmit later, behind the sacred, human-armed review -> arm -> transmit
-gate — a separate, deliberately-later step that this page does not touch.
-
-Two read-only reads live here:
+The in-app Control Plane (docs/PRODUCTION_REBALANCE_CONTROL_PLANE.md). It surfaces, for
+the funded trust account U14438624, three things top to bottom:
   * the broker-FREE Strategy 0 Growth target (via strategy_target.current_target),
-    computed through the validated backtest engine — needs no gateway; and
-  * on an explicit button press, a preview of the actual rebalance plan, produced by
-    running the hardened paperbot executor (s0_live_deploy.py) with NO arguments —
-    which is the executor's PREVIEW mode: it sizes + prints the order list and
-    transmits nothing. We NEVER pass its arm/conform tokens from this page.
+    computed through the validated backtest engine — needs no gateway;
+  * an on-demand READ-ONLY rebalance preview, produced by running the hardened paperbot
+    executor (s0_live_deploy.py) with NO arguments (its PREVIEW mode: it sizes + prints
+    the order list and transmits nothing); and
+  * a gated ARM + EXECUTE step that CAN transmit a real rebalance order — but only behind
+    the sacred review -> arm -> transmit gate.
 
-IMPORT DISCIPLINE (mirrors page_s0.py): module-top imports are CHEAP only (stdlib,
-pandas, streamlit, theme). Every heavy import — strategy_target, eventlog — is LAZY
+TRANSMISSION IS DELIBERATE AND HUMAN-GATED. The Execute button is inert until the operator
+has (a) built and reviewed a preview and (b) typed the account id to confirm; AND the
+operator must physically arm the port-4003 Gateway by hand in TWS (uncheck Read-Only API)
+— an act no software here performs. Execute shells out to the UNCHANGED s0_live_deploy
+executor, which is itself fail-closed: it refuses to transmit unless the Gateway is
+physically armed and its own caps / kill-switch / single-account gates all pass. Nothing
+here transmits on its own, on a schedule, or from the AI.
+
+IMPORT DISCIPLINE (mirrors page_s0.py): module-top imports are CHEAP only (stdlib, pandas,
+streamlit, theme). Every heavy import — strategy_target, eventlog, investable — is LAZY
 (inside the function that needs it), and the executor is invoked as a SUBPROCESS, so
 importing this module opens no socket and runs no backtest.
 """
@@ -87,14 +88,14 @@ def _render_gate_card() -> None:
     st.markdown(
         theme.status_card(
             "Real-money transmission",
-            "bad",  # colour only: red = the wall is deliberately closed
-            "OFF — deliberately gated",
-            "This page only previews and audits — it connects to no broker to place "
-            "anything, and it holds no arm control and no execute button. A real order "
-            "only ever transmits behind the sacred review -> arm -> transmit wall: a "
-            "human reviews the plan, arms the Gateway by hand, and makes an explicit, "
-            "gated transmit decision. Those arm and execute controls are a separate, "
-            "later, human-gated step that this first version does not include.",
+            "warn",  # amber: capable, but only behind the deliberate human gate
+            "Possible here — only behind the review -> arm -> transmit gate",
+            "This page CAN transmit a real Strategy 0 rebalance order — but ONLY when you "
+            "review the preview, physically arm the port-4003 Gateway by hand in TWS "
+            "(uncheck Read-Only API), type the account id to confirm, and press Execute. It "
+            "never transmits on its own, on a schedule, or from the AI, and the executor "
+            "independently refuses unless the Gateway is physically armed. Until you do all "
+            "of that, nothing is placed, armed, or sent.",
         ),
         unsafe_allow_html=True,
     )
@@ -106,8 +107,9 @@ def _render_gate_card() -> None:
 def _render_target_panel() -> None:
     st.markdown(theme.section("Strategy 0 Growth target (broker-free model)"),
                 unsafe_allow_html=True)
-    st.caption("What the Strategy 0 Growth model wants to hold right now, as a share of "
-               "the portfolio. Computed read-only through the validated backtest engine "
+    st.caption("What the Strategy 0 Growth deployment target wants to hold right now, as a "
+               "share of the portfolio — INCLUDING the standing cash reserve the engine "
+               "holds back. Computed read-only through the validated backtest engine "
                "(the same code the strategy uses) — no broker, no live account.")
     try:
         data = _growth_target()
@@ -130,14 +132,43 @@ def _render_target_panel() -> None:
         st.info("The model returned no target holdings this time. Nothing was transmitted.")
         return
 
+    # The raw model book normalizes to ~100% across RISK holdings with NO cash line, but
+    # the deployment engine holds back a standing cash reserve (investable.buffer_pct());
+    # see investable.compute_investable / cash_line. Surface that here so the DISPLAYED
+    # book matches what actually deploys and sums to exactly 100% (risk lines scaled by
+    # (1 - buffer) + a synthetic CASH line at `buffer`). This is READOUT ONLY — it sizes
+    # nothing and places nothing. Defensive: any failure falls back to the raw book so a
+    # readout helper can never crash the page.
+    buffer = None
+    display_weights = dict(weights)
+    try:
+        import investable
+        buffer = investable.buffer_pct()
+        display_weights = {t: f * (1.0 - buffer) for t, f in weights.items()}
+        display_weights["CASH"] = buffer
+    except Exception:  # noqa: BLE001 — a readout helper must never crash the page
+        buffer = None
+        display_weights = dict(weights)
+
     rows = []
-    for ticker, frac in sorted(weights.items(), key=lambda kv: kv[1], reverse=True):
+    for ticker, frac in sorted(display_weights.items(), key=lambda kv: kv[1], reverse=True):
         pct_html = (f'<span style="color:{theme.TEXT};font-weight:650">'
                     f'{frac * 100:.2f}%</span>')
-        rows.append(theme.row(ticker, pct_html, meta="target share of the portfolio"))
+        if buffer is not None and ticker == "CASH":
+            meta = (f"reserved cash — held to cover monthly fees "
+                    f"(standing {buffer * 100:.1f}% reserve)")
+        else:
+            meta = "target share of the portfolio"
+        rows.append(theme.row(ticker, pct_html, meta=meta))
     st.markdown("".join(rows), unsafe_allow_html=True)
-    st.caption(f"Target as of {data.get('as_of', '—')} · prices as of "
-               f"{data.get('price_date', '—')}. Weights sum to roughly 100%.")
+    if buffer is not None:
+        st.caption(f"Target as of {data.get('as_of', '—')} · prices as of "
+                   f"{data.get('price_date', '—')}. Includes the standing "
+                   f"{buffer * 100:.1f}% cash reserve (held to pay monthly fees); the book "
+                   f"sums to 100%.")
+    else:
+        st.caption(f"Target as of {data.get('as_of', '—')} · prices as of "
+                   f"{data.get('price_date', '—')}. Weights sum to roughly 100%.")
 
 
 # =========================================================================== #
@@ -225,6 +256,34 @@ def _audit_preview() -> None:
             severity="info",
         )
     except Exception:  # noqa: BLE001 — audit is best-effort
+        pass
+
+
+def _store_last_preview(stdout: str) -> None:
+    """Bind the arm/execute controls to the LAST reviewed read-only preview. Parses the
+    executor's PREVIEW stdout into a compact, plain summary + a wall-clock timestamp and
+    stores it in session state under ``cp_last_preview``. Never raises — a parse miss
+    simply yields a sparser summary; the executor recomputes authoritatively at fire time
+    regardless, so this is a review-binding aid, not the source of truth."""
+    try:
+        parsed = _parse_preview(stdout or "")
+        n_legs = len(parsed.get("legs") or [])
+        total_sell = parsed.get("total_sell")
+        total_buy = parsed.get("total_buy")
+        sells = f"${total_sell:,.2f}" if total_sell is not None else "—"
+        buys = f"${total_buy:,.2f}" if total_buy is not None else "—"
+        now = datetime.now()
+        st.session_state["cp_last_preview"] = {
+            "built_at": now,                       # datetime — used for the 30-min age check
+            "built_at_str": now.strftime("%H:%M"),
+            "n_legs": n_legs,
+            "sells": sells,
+            "buys": buys,
+            "account": parsed.get("account") or PREVIEW_ACCOUNT,
+            "net_liq": parsed.get("net_liq"),
+            "summary": f"{n_legs} leg(s), sells {sells}, buys {buys}",
+        }
+    except Exception:  # noqa: BLE001 — binding is best-effort; never break the preview
         pass
 
 
@@ -382,24 +441,297 @@ def _render_plan_preview() -> None:
         return
 
     _render_preview_result(stdout, stderr)
+    _store_last_preview(stdout)  # bind the arm/execute step to THIS reviewed preview
     _audit_preview()  # best-effort durable audit; never breaks the page
+
+
+# =========================================================================== #
+# ARM + EXECUTE — the deliberate human gate on top of the executor's own wall. #
+# The executor (s0_live_deploy.py) is fail-closed: it transmits ONLY when the  #
+# 4003 Gateway is physically armed AND its own caps/kill-switch/single-account #
+# gates all pass. This UI is the human review -> arm -> transmit gate on top;  #
+# it fires no order itself, it shells out to that executor.                    #
+# =========================================================================== #
+def _arm_execute_audit(category: str, message: str, severity: str) -> None:
+    """Best-effort durable audit for an arm/execute action. Lazily imports the event log
+    and swallows ALL errors — auditing must never break (or block) the page."""
+    try:
+        from eventlog import record_event
+        record_event(
+            ts=datetime.now().isoformat(timespec="seconds"),
+            source="Control Plane",
+            category=category,
+            message=message,
+            severity=severity,
+        )
+    except Exception:  # noqa: BLE001 — audit is best-effort
+        pass
+
+
+def _classify_execute_output(stdout: str, stderr: str) -> str:
+    """Classify the executor's real-run output into 'filled' | 'blocked' | 'error'.
+    'filled' wins when the two-phase completion line is present; otherwise any block
+    marker means nothing transmitted; anything else is an unexpected error."""
+    combined = ((stdout or "") + "\n" + (stderr or "")).lower()
+    if "two-phase cash-gated deploy complete" in combined:
+        return "filled"
+    block_markers = ("transmission blocked", "read-only", "not armed", "would transmit")
+    if any(mk in combined for mk in block_markers):
+        return "blocked"
+    return "error"
+
+
+def _render_arm_execute() -> None:
+    st.markdown(theme.section("Arm and execute the rebalance (real order)"),
+                unsafe_allow_html=True)
+
+    # (1) Plain-English explanation of the review -> arm -> transmit gate.
+    st.markdown(
+        theme.status_card(
+            "How a real order transmits here",
+            "warn",
+            "Review, then arm by hand, then transmit — three deliberate steps",
+            "First you REVIEW the read-only preview above. Then you ARM the live-trade "
+            "Gateway by hand in TWS — you uncheck 'Read-Only API' on the port 4003 "
+            "Gateway; this app cannot do that for you, it is a physical human act in the "
+            "TWS window. Then you TYPE the account id below to confirm, and only then may "
+            "you press Execute. Even after all of that, the executor still checks the "
+            "Gateway itself and refuses to transmit anything unless the Gateway is "
+            "physically armed — so an unarmed Gateway means nothing is sent, and it says "
+            "so.",
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # (2) Plan-binding — REQUIRE a reviewed preview to exist first.
+    last = st.session_state.get("cp_last_preview")
+    if not last:
+        st.info("Build and review the read-only preview above first. The arm and execute "
+                "controls appear only after you have a preview to arm against.")
+        return
+
+    st.markdown(
+        theme.card(
+            "You are arming against a reviewed preview",
+            f"You are arming against the preview built at "
+            f"{theme._esc(str(last.get('built_at_str', '—')))} — "
+            f"{theme._esc(str(last.get('summary', '—')))}.",
+        ),
+        unsafe_allow_html=True,
+    )
+    built_at = last.get("built_at")
+    try:
+        stale = bool(built_at) and (datetime.now() - built_at).total_seconds() > 30 * 60
+    except Exception:  # noqa: BLE001 — a bad timestamp must not break the page
+        stale = False
+    if stale:
+        st.markdown(
+            theme.status_card(
+                "This preview is more than 30 minutes old",
+                "warn",
+                "Consider rebuilding the preview",
+                "The preview you are arming against is over 30 minutes old, so prices and "
+                "the account may have moved. You may still proceed — the executor "
+                "recomputes the plan authoritatively from live data at the moment it "
+                "fires, so what actually transmits is always freshly sized — but "
+                "rebuilding the read-only preview first lets you review current numbers.",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    # (3) Gateway armed-state. arming.probe_api_readonly is pinned to the PAPER gateway
+    # (ibkr_paper.PAPER_PORT / paper client-id) and exposes NO port-4003 probe, so there
+    # is no cleanly reusable, zero-transmission 4003 probe to shell out to. Per the build
+    # rule we DO NOT invent inline socket code — we omit the live probe and instead render
+    # a prominent, plain-English instruction that the Gateway must be armed by hand.
+    st.markdown(
+        theme.status_card(
+            "You must arm the Gateway by hand — this app cannot check it",
+            "warn",
+            "Uncheck 'Read-Only API' on the port 4003 Gateway in TWS before you Execute",
+            "This app does not probe the live-trade Gateway's armed state. Before you "
+            "press Execute, make sure YOU have unchecked 'Read-Only API' "
+            "(Configure > Settings > API > Settings) on the port 4003 live-trade Gateway "
+            "in TWS. If it is still checked (Read-Only ON), the Execute run transmits "
+            "NOTHING and reports that it was blocked — the executor measures the Gateway "
+            "itself and refuses. When you are finished, re-check that box to disarm.",
+        ),
+        unsafe_allow_html=True,
+    )
+
+    # (4) Typed confirmation — mirrors emergency.py's exact-word confirm guard.
+    st.caption("This is the deliberate human gate. Type the exact account id to confirm "
+               "you have reviewed the preview and armed the Gateway.")
+    confirm_val = st.text_input(
+        f"Type the account id {PREVIEW_ACCOUNT} to confirm",
+        value="", key="cp_execute_confirm",
+        placeholder=f"type {PREVIEW_ACCOUNT} here",
+    )
+    confirmed = confirm_val.strip() == PREVIEW_ACCOUNT
+
+    # (5) EXECUTE — disabled unless a reviewed preview exists AND the account id is typed.
+    can_press = bool(last) and confirmed
+    pressed = st.button(
+        "Transmit the S0 rebalance to IBKR (real order)",
+        key="cp_execute_btn",
+        disabled=not can_press,
+        use_container_width=True,
+    )
+    if not can_press:
+        missing = []
+        if not last:
+            missing.append("build and review the read-only preview above")
+        if not confirmed:
+            missing.append(f"type the account id {PREVIEW_ACCOUNT} exactly in the box above")
+        st.caption("The Execute button is off until you " + " and ".join(missing) +
+                   ". Nothing can be transmitted until then.")
+        return
+
+    if not pressed:
+        return
+
+    # --- Pressed AND both gates satisfied. This is the ONLY place the arm/conform tokens
+    # are ever constructed — never as module constants, never in rendered text. ---
+    if not os.path.exists(VENV_PYTHON) or not _DEPLOY_SCRIPT.exists():
+        st.markdown(
+            theme.status_card(
+                "Execute", "bad", "Could not start the executor",
+                "The executor or its Python could not be found on this machine. Nothing "
+                "was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Guarded audit BEFORE running.
+    _arm_execute_audit(
+        category="control_plane_execute_fired",
+        message=("Operator armed and fired the S0 rebalance for account U14438624 "
+                 "(typed confirm + reviewed preview). The executor transmits only if the "
+                 "4003 Gateway is physically armed."),
+        severity="warn",
+    )
+
+    # Tokens built ONLY here, inside the guarded, gated handler.
+    arm_token = "--arm-i-" + "understand"
+    conform_flag = "--" + "conform"
+    try:
+        with st.spinner("Transmitting the S0 rebalance to the live-trade Gateway "
+                        "(port 4003) — this runs the two-phase cash-gated deploy…"):
+            proc = subprocess.run(
+                [VENV_PYTHON, str(_DEPLOY_SCRIPT), arm_token, conform_flag],
+                cwd=str(_DEPLOY_CWD),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        stdout, stderr = proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        _arm_execute_audit(
+            category="control_plane_execute_result",
+            message=("The S0 rebalance execute run timed out before the executor "
+                     "reported a result; the Gateway may be down. Transmission state is "
+                     "unconfirmed — verify in TWS."),
+            severity="bad",
+        )
+        st.markdown(
+            theme.status_card(
+                "Execute", "bad", "Timed out before the executor reported back",
+                "The execute run did not finish in time. The live-trade Gateway "
+                "(port 4003) may be down or not logged in. Check the account and open "
+                "orders in TWS to confirm state before trying again.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
+        _arm_execute_audit(
+            category="control_plane_execute_result",
+            message=(f"The S0 rebalance execute run failed to start or crashed "
+                     f"({type(exc).__name__}). Nothing was confirmed transmitted — "
+                     f"verify in TWS."),
+            severity="bad",
+        )
+        st.markdown(
+            theme.status_card(
+                "Execute", "bad", "Couldn't run the executor",
+                f"Couldn't run the executor ({type(exc).__name__}) — the live-trade "
+                f"Gateway (port 4003) may be down. Nothing was confirmed transmitted; "
+                f"check the account in TWS.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    # Top-line status card from the executor's own output.
+    verdict = _classify_execute_output(stdout, stderr)
+    if verdict == "filled":
+        st.markdown(
+            theme.status_card(
+                "Execute", "good", "The rebalance was transmitted and filled",
+                "The rebalance was transmitted and filled — review the fills below and "
+                "DISARM the Gateway (re-check 'Read-Only API' on the port 4003 Gateway in "
+                "TWS) now that you are finished.",
+            ),
+            unsafe_allow_html=True,
+        )
+        result_msg = ("The S0 rebalance for account U14438624 was transmitted and the "
+                      "two-phase cash-gated deploy completed. Review fills and disarm the "
+                      "Gateway.")
+        result_sev = "good"
+    elif verdict == "blocked":
+        st.markdown(
+            theme.status_card(
+                "Execute", "warn", "Nothing was transmitted — the Gateway was not armed",
+                "Nothing was transmitted — the Gateway was not armed (or a safety gate "
+                "blocked it). Arm the 4003 Gateway in TWS (uncheck 'Read-Only API') and "
+                "try again.",
+            ),
+            unsafe_allow_html=True,
+        )
+        result_msg = ("The S0 rebalance execute run transmitted NOTHING — the 4003 "
+                      "Gateway was not armed or a safety gate blocked it.")
+        result_sev = "warn"
+    else:
+        st.markdown(
+            theme.status_card(
+                "Execute", "bad", "The executor returned an unexpected result",
+                "The executor did not report either a completed deploy or a clean block. "
+                "Read the full log below carefully and verify the account and open orders "
+                "in TWS before doing anything else.",
+            ),
+            unsafe_allow_html=True,
+        )
+        result_msg = ("The S0 rebalance execute run returned an UNEXPECTED result "
+                      "(neither completed nor a clean block) — verify in TWS.")
+        result_sev = "bad"
+
+    # Reuse the existing preview-result renderer for the leg/summary view + raw log.
+    _render_preview_result(stdout, stderr)
+
+    # Guarded result audit.
+    _arm_execute_audit(category="control_plane_execute_result",
+                       message=result_msg, severity=result_sev)
 
 
 # =========================================================================== #
 # Page entry point.                                                           #
 # =========================================================================== #
 def render_control_plane() -> None:
-    """Render the Control Plane page (Phase 1, read-only): the real-money gate card, the
-    broker-free Strategy 0 Growth target, and an on-demand read-only rebalance plan
-    preview. Places, arms, and transmits NOTHING; holds no arm or execute control."""
-    st.subheader("Control Plane — Strategy 0 rebalance (read-only preview)")
+    """Render the Control Plane page: the real-money gate card, the broker-free Strategy 0
+    Growth target, an on-demand read-only rebalance preview, and the gated ARM + EXECUTE
+    step. Everything is read-only until the operator deliberately arms (physical gateway
+    arm in TWS + typed confirm) and presses Execute, which shells out to the unchanged
+    s0_live_deploy executor; nothing transmits on its own."""
+    st.subheader("Control Plane — Strategy 0 rebalance")
     st.caption(
-        f"This page shows what Strategy 0 (Growth) would trade on account "
-        f"{PREVIEW_ACCOUNT} to conform to its target, computed read-only. In this first "
-        f"version it places, arms, and transmits NOTHING. A real order will only ever "
-        f"transmit later, behind the explicit, human-armed review -> arm -> transmit gate."
+        f"Shows what Strategy 0 (Growth) would trade on account {PREVIEW_ACCOUNT} to conform "
+        f"to its target. The target and preview are read-only and transmit nothing; a real "
+        f"order transmits only behind the human review -> arm -> transmit gate below "
+        f"(physical gateway arm in TWS + typed confirm)."
     )
 
     _render_gate_card()
     _render_target_panel()
     _render_plan_preview()
+    _render_arm_execute()
