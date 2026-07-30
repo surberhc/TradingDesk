@@ -15,10 +15,21 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.28.0"
+VERSION = "0.28.1"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.28.1", "2026-07-30", "s0_live_exec adopts the shared connections.gateway_probe "
+                             "(folds the third probe copy; closes #70); read-only, "
+                             "behavior-preserving. s0_live_exec._probe_gateway_readonly is now a "
+                             "thin same-named wrapper over gateway_probe.probe_api_readonly "
+                             "(port=4003, fail-closed True) — the SAME delegation "
+                             "safe_execute._probe_gateway_readonly uses — so the "
+                             "cancel-a-fabricated-order idiom lives in ONE place and the tiny-test "
+                             "executor's arm gate keeps its exact caller/signature. Now-unused "
+                             "threading/time imports dropped. Zero-transmission: full paperbot "
+                             "suite green (523; zero regressions). Rule #1 clean: no strategy/"
+                             "regime/band/sizing value touched. NOTHING transmitted."),
     ("0.28.0", "2026-07-30", "consolidate the two gateway read-only probes into one "
                              "port-parameterized probe_api_readonly (arming 4002 + safe_execute "
                              "4003); zero-transmission technique unchanged; final §2.2 item of "

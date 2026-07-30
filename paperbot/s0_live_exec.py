@@ -48,10 +48,10 @@ from __future__ import annotations
 
 import os
 import sys
-import threading
-import time
 
 from ib_async import Stock
+
+from connections import gateway_probe
 
 import config
 import live_quotes
@@ -100,6 +100,11 @@ KILL_SWITCH = r"C:\TradingDesk-Local\AUTOTRADE_DISABLED"
 # clientId used by the armed transmit connection (see connect_s0_live_armed -> "s0_live_exec"
 # = 58). Preview sizing uses the read-only pilot lane (s0_live_pilot = 57).
 
+# The live-trade Gateway port this executor transmits on. Contextual only — passed to the
+# shared read-only probe for its log/error messages; the actual connection is opened by
+# s0_live.connect_s0_live_armed / connect_s0_live.
+LIVE_TRADE_PORT = 4003
+
 
 def arm_requested(argv: list[str]) -> bool:
     """True ONLY if the exact arm token is present in argv — the single thing that sets
@@ -125,49 +130,12 @@ def _account_safety_ok() -> tuple[bool, str]:
 
 def _probe_gateway_readonly(ib, timeout: int = 15) -> bool:
     """Return True if the OPEN live-trade (4003) connection's Gateway is READ-ONLY
-    (transmission physically BLOCKED), False if it is WRITE-ENABLED (armed).
-
-    Mirrors arming.probe_api_readonly's ZERO-TRANSMISSION technique EXACTLY — attach an
-    error handler, ask the Gateway (via the RAW client call) to cancel a fabricated,
-    never-placed orderId, and read the decisive reply:
-      * Read-Only API -> code 321 / "read-only mode"                 -> True  (blocked)
-      * Write-enabled -> 10147/10148 / "not found"/"cannot be cancelled" -> False (armed)
-    No order is ever placed or rested. FAILS CLOSED: no decisive signal -> True (refuse).
-
-    Why not call arming.probe_api_readonly() directly: that function is PAPER-4002-only — it
-    hardcodes ibkr_paper.PAPER_PORT and the paper clientId 39 and cannot be pointed at the
-    4003 Gateway we actually transmit on without editing arming.py (off-limits). So its idiom
-    is reused here against the already-open 4003 connection, which is the correct physical
-    human wall for THIS Gateway."""
-    signal: dict[str, bool] = {}
-    got = threading.Event()
-
-    def on_error(reqId, errorCode, errorString, *_):
-        msg = (errorString or "").lower()
-        if "read-only mode" in msg or "read only mode" in msg or errorCode == 321:
-            signal["readonly"] = True
-            got.set()
-        elif (errorCode in (10147, 10148) or "not found" in msg
-              or "cannot be cancelled" in msg):
-            signal["readonly"] = False
-            got.set()
-
-    ib.errorEvent += on_error
-    try:
-        oid = ib.client.getReqId()
-        ib.client.cancelOrder(oid, "")   # transmits nothing; no such order exists
-        deadline = time.time() + timeout
-        while not got.is_set() and time.time() < deadline:
-            ib.sleep(0.2)
-    finally:
-        try:
-            ib.errorEvent -= on_error
-        except Exception:
-            pass
-    if "readonly" not in signal:
-        # Could not measure the Gateway state -> treat as read-only (refuse to transmit).
-        return True
-    return signal["readonly"]
+    (transmission physically BLOCKED), False if it is WRITE-ENABLED (armed). Thin wrapper over
+    the shared connections.gateway_probe.probe_api_readonly — same zero-transmission cancel-a-
+    fabricated-order technique, same FAIL-CLOSED default (no decisive signal -> True/refuse) —
+    the SAME delegation safe_execute._probe_gateway_readonly uses, so there is truly one
+    gateway read-only probe idiom on the desk."""
+    return gateway_probe.probe_api_readonly(ib, port=LIVE_TRADE_PORT, timeout=timeout)
 
 
 def _buying_power(summary) -> float | None:
