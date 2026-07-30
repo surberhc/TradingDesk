@@ -189,13 +189,18 @@ def _run_id() -> str:
 # ========================================================================================
 def account_wall_ok(account: str, allowed_accounts) -> tuple[bool, str]:
     """Hard account wall: `account` must be one of `allowed_accounts` and no other. For the
-    single-account deploy wall this is EXACTLY the s0_live_deploy check (and reason string).
-    Read at call time so a test/monkeypatch of the account is honored."""
+    single-account deploy wall this is EXACTLY the s0_live_deploy check (and reason string);
+    for a multi-account roster the reason names the enrolled execution roster instead. Only
+    the WORDING generalizes — the logic/return contract is unchanged. Read at call time so a
+    test/monkeypatch of the account is honored."""
     allowed = list(allowed_accounts)
     if account not in allowed:
-        allowed_str = allowed[0] if len(allowed) == 1 else "/".join(map(str, allowed))
-        return False, (f"target account {account} is not the single allowed account "
-                       f"{allowed_str} — refusing.")
+        if len(allowed) == 1:
+            return False, (f"target account {account} is not the single allowed account "
+                           f"{allowed[0]} — refusing.")
+        roster_str = "{" + ", ".join(map(str, allowed)) + "}"
+        return False, (f"target account {account} is not in the enrolled execution roster "
+                       f"{roster_str} — refusing.")
     return True, ""
 
 
