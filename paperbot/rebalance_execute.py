@@ -267,7 +267,8 @@ def _net_liq(summary, account: str):
 
 
 def execute_armed(armed: bool, only_account: str | None = None,
-                  only_tier: str | None = None) -> int:
+                  only_tier: str | None = None,
+                  token_present: bool | None = None) -> int:
     """The Monday path. Connects NON-read-only pinned to a DU sub, discovers live state,
     builds the plan, resolves groups fail-closed, runs risk guards, and (only if the gate
     fully permits) writes each tier group's ContractsOrShares and places its block, one at
@@ -276,34 +277,63 @@ def execute_armed(armed: bool, only_account: str | None = None,
     Optional SCOPE (only_account / only_tier): narrows the routes the loop acts on AFTER
     build_plan. Default (both None) = full enrolled fleet, identical to before. Scoping
     applies in BOTH the dry-review and armed paths and composes with — never bypasses —
-    the arm gate."""
-    permit, why = gate_state(armed)
-    targets = rebalance_run._targets_by_version()
-    print("\n[1] Tier models:")
-    for v, t in targets.items():
-        print(f"    {v:13s} as_of={t.as_of.date()}  ({len(t.weights)} holdings)")
+    the arm gate.
 
-    # GATEWAY LOCK (Slice 3): acquire the single-process Gateway mutex BEFORE connecting and
-    # hold it across the ENTIRE armed flow (connect -> replaceFA -> place blocks one at a time
-    # -> reconcile -> disconnect). The heartbeat thread keeps the lease alive through a
-    # legitimately long laddered execution. This is the transmit-capable path, so it INSISTS:
-    # on_busy="refuse" waits a short bounded time then REFUSES — naming the holder — and ABORTS
-    # BEFORE any connect, FA-config write, or order build. Never transmit into a contended
-    # Gateway. The context manager releases on normal exit AND on exception.
-    try:
-        with gateway_lock(purpose="rebalance_execute",
-                          client_id=clientids.get("paperbot_rebalance_exec"),
-                          on_busy="refuse"):
-            return _run_armed_session(armed, only_account, only_tier, permit, why, targets)
-    except GatewayBusyRefuse as busy:
-        holder = busy.holder or {}
-        print(f"\n[2] REFUSING to start the armed execute — gateway held by "
-              f"{holder.get('purpose')} pid {holder.get('pid')} clientId "
-              f"{holder.get('client_id')} since "
-              f"{holder.get('acquired_at') or holder.get('acquired_ts')}. No connection "
-              f"opened, NO orders built, nothing transmitted, no FA config written, no "
-              f"replaceFA. Re-run once the holder finishes.")
-        return 2
+    ARM-GATE UNIFICATION (Step 2, spec §2.2, conductor #64): when `armed`, the WHOLE
+    permit-compute -> armed body -> ledger span runs inside safe_execute.armed_session. Its
+    __enter__ flips config.READONLY/DRY_RUN False IN-PROCESS *before* `permit` is computed —
+    so an armed run correctly takes the transmit branch, never the dry one — and its finally
+    RESTORES both AFTER _ledger, so the flip can no longer leak to process exit (it used to be
+    set in main() with no restore). The dry path (armed False) never enters armed_session and
+    keeps its exact prior no-flip behavior. gateway_lock_on_busy=None: armed_session does
+    flip-and-restore ONLY; the existing outer gateway_lock below is kept EXACTLY as-is."""
+    from contextlib import nullcontext
+
+    from safe_execute import armed_session
+
+    if token_present is None:
+        token_present = armed   # real flow: main() sets armed = token_present (always equal)
+
+    arm_ctx = (armed_session(purpose="rebalance_execute",
+                             client_id=clientids.get("paperbot_rebalance_exec"),
+                             gateway_lock_on_busy=None)
+               if armed else nullcontext())
+    with arm_ctx:
+        # SAFETY BANNER — printed INSIDE arm_ctx so it reads the FLIPPED flags. For an armed
+        # run armed_session.__enter__ has already set READONLY/DRY_RUN False, so the banner
+        # honestly says "ARMED EXECUTOR: this run CAN transmit"; for a dry run (nullcontext,
+        # no flip) it reads True/True -> "DRY-RUN review". It used to print in main() BEFORE
+        # the flip (Step 2 relocated the flip into here), so an armed run's banner lied.
+        _safety_banner(armed, token_present)
+        # Inside armed_session (when armed) READONLY/DRY_RUN are ALREADY flipped, so this
+        # `permit` is the ARMED-vs-DRY branch decision computed on the flipped flags.
+        permit, why = gate_state(armed)
+        targets = rebalance_run._targets_by_version()
+        print("\n[1] Tier models:")
+        for v, t in targets.items():
+            print(f"    {v:13s} as_of={t.as_of.date()}  ({len(t.weights)} holdings)")
+
+        # GATEWAY LOCK (Slice 3): acquire the single-process Gateway mutex BEFORE connecting and
+        # hold it across the ENTIRE armed flow (connect -> replaceFA -> place blocks one at a time
+        # -> reconcile -> disconnect). The heartbeat thread keeps the lease alive through a
+        # legitimately long laddered execution. This is the transmit-capable path, so it INSISTS:
+        # on_busy="refuse" waits a short bounded time then REFUSES — naming the holder — and ABORTS
+        # BEFORE any connect, FA-config write, or order build. Never transmit into a contended
+        # Gateway. The context manager releases on normal exit AND on exception.
+        try:
+            with gateway_lock(purpose="rebalance_execute",
+                              client_id=clientids.get("paperbot_rebalance_exec"),
+                              on_busy="refuse"):
+                return _run_armed_session(armed, only_account, only_tier, permit, why, targets)
+        except GatewayBusyRefuse as busy:
+            holder = busy.holder or {}
+            print(f"\n[2] REFUSING to start the armed execute — gateway held by "
+                  f"{holder.get('purpose')} pid {holder.get('pid')} clientId "
+                  f"{holder.get('client_id')} since "
+                  f"{holder.get('acquired_at') or holder.get('acquired_ts')}. No connection "
+                  f"opened, NO orders built, nothing transmitted, no FA config written, no "
+                  f"replaceFA. Re-run once the holder finishes.")
+            return 2
 
 
 def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | None,
@@ -625,16 +655,18 @@ def main(argv: list[str] | None = None) -> int:
     print("=" * 92)
 
     token_present = arm_requested(argv)
-    # CONDITION (4): only the exact token authorizes flipping the in-process safety flags.
-    # We flip READONLY/DRY_RUN in memory ONLY (config on disk stays True/True), exactly
-    # like live_fill_test.py. armed=True is set ONLY alongside the token — never defaulted.
+    # CONDITION (4): only the exact token authorizes arming. armed=True is set ONLY alongside
+    # the token — never defaulted. The in-process safety-flag FLIP (READONLY/DRY_RUN -> False,
+    # config on disk stays True/True) now happens INSIDE execute_armed via
+    # safe_execute.armed_session, which RESTORES both in a finally — so the flip can no longer
+    # leak past the run to process exit (arm-gate unification Step 2, spec §2.2, conductor #64).
     armed = False
     if token_present:
-        config.READONLY = False
-        config.DRY_RUN = False
         armed = True   # condition (3): a human passed the arm token = armed
 
-    _safety_banner(armed, token_present)
+    # NOTE: the safety banner is printed INSIDE execute_armed (after the in-process flag flip),
+    # so an armed run's banner reflects the transmit-capable state. It used to print here, before
+    # the Step-2 flip relocation, and therefore misreported an armed run as read-only/DRY-RUN.
 
     # Optional SCOPE — narrows the run to one account/tier. FAIL CLOSED on a bad value.
     try:
@@ -656,7 +688,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"    {ARM_TOKEN}")
 
     try:
-        return execute_armed(armed, only_account=only_account, only_tier=only_tier)
+        return execute_armed(armed, only_account=only_account, only_tier=only_tier,
+                             token_present=token_present)
     except KeyboardInterrupt:
         print("\nInterrupted — disarm the gateway (arming.disarm()) if you armed it.")
         return 130

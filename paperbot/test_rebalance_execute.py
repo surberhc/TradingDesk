@@ -402,3 +402,168 @@ def test_fa_block_marketable_does_not_touch_direct_or_scope(monkeypatch):
     q = _quote()
     caps = rx._ladder_caps("BUY", q)
     assert caps["marketable_limit"] == live_quotes.marketable_cap("BUY", q)
+
+
+# --- ARM-GATE UNIFICATION (Step 2, #64): armed_session flips BEFORE the branch decision and
+# --- RESTORES the flags AFTER the ledger write (flip-and-restore-in-finally). --------------
+def test_armed_session_flips_before_permit_and_restores_after_ledger(monkeypatch):
+    """An armed, offline/mocked execute_armed proves the Step-2 refactor's contract:
+      (a) the ARMED branch is taken — `permit` handed to the armed body is True — i.e. the
+          in-process flag flip happened BEFORE the branch decision;
+      (b) `_ledger` records mode REBALANCE_EXEC_ARMED with the gate dict showing
+          readonly=False / dry_run=False (the flip is LIVE when the ledger row is written);
+      (c) config.READONLY / config.DRY_RUN are RESTORED to their prior True values AFTER the
+          run — the flip can no longer leak past the batch to process exit.
+    The gateway lock and the whole _run_armed_session body are stubbed offline (no broker, no
+    order, nothing transmitted); only the arm-gate wrapping is exercised."""
+    import ledger
+    import rebalance_run as rr
+
+    # Prior committed-safe posture (the on-disk default the flip must restore to).
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+
+    # Stub the tier-model load so no real strategy data is needed.
+    import pandas as pd
+    fake_t = SimpleNamespace(as_of=pd.Timestamp("2026-06-30"),
+                             weights=pd.Series({"SPY": 1.0}),
+                             prices=pd.Series({"SPY": 100.0}))
+    monkeypatch.setattr(rr, "_targets_by_version", lambda: {"Balanced": fake_t})
+
+    # Neutralize the gateway lock — this is the SAME seam the gateway_lock suite patches, and it
+    # is UNCHANGED by Step 2 (the outer lock stayed in rebalance_execute). Yield a dummy holder.
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _free_lock(*_a, **_k):
+        yield {"purpose": "test-free-lock"}
+    monkeypatch.setattr(rx, "gateway_lock", _free_lock)
+
+    # Capture the audit-ledger record the run writes.
+    captured: dict = {}
+    monkeypatch.setattr(ledger, "record_run", lambda rec: captured.update(rec))
+
+    # Spy the armed body: record the `permit` it is handed and the LIVE flag state at that
+    # moment, then write the REAL ledger record (so the gate dict reflects the flipped flags).
+    seen: dict = {}
+
+    def _fake_body(armed, only_account, only_tier, permit, why, targets):
+        seen["permit"] = permit
+        seen["readonly_live"] = config.READONLY
+        seen["dry_run_live"] = config.DRY_RUN
+        rx._ledger(armed, [], [], [], "", halted=False, halt_reason="")
+        return 0
+    monkeypatch.setattr(rx, "_run_armed_session", _fake_body)
+
+    rc = rx.execute_armed(armed=True)
+
+    # (a) flip happened BEFORE the permit/branch decision -> armed branch (permit True).
+    assert rc == 0
+    assert seen["permit"] is True
+    assert seen["readonly_live"] is False and seen["dry_run_live"] is False
+    # (b) ledger row labeled ARMED with the flipped gate.
+    assert captured["mode"] == "REBALANCE_EXEC_ARMED"
+    assert captured["gate"]["readonly"] is False
+    assert captured["gate"]["dry_run"] is False
+    assert captured["gate"]["permitted"] is True
+    # (c) flags RESTORED after the run — the flip-and-restore improvement.
+    assert config.READONLY is True
+    assert config.DRY_RUN is True
+
+
+def test_dry_run_never_enters_armed_session_no_flip(monkeypatch):
+    """The mirror guarantee: an UNARMED run must NOT flip the flags at all (it never enters
+    armed_session). permit is False (dry branch), the ledger row is REBALANCE_EXEC_DRYRUN, and
+    the flags are the committed defaults throughout and after."""
+    import ledger
+    import rebalance_run as rr
+
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+
+    import pandas as pd
+    fake_t = SimpleNamespace(as_of=pd.Timestamp("2026-06-30"),
+                             weights=pd.Series({"SPY": 1.0}),
+                             prices=pd.Series({"SPY": 100.0}))
+    monkeypatch.setattr(rr, "_targets_by_version", lambda: {"Balanced": fake_t})
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _free_lock(*_a, **_k):
+        yield {"purpose": "test-free-lock"}
+    monkeypatch.setattr(rx, "gateway_lock", _free_lock)
+
+    captured: dict = {}
+    monkeypatch.setattr(ledger, "record_run", lambda rec: captured.update(rec))
+
+    seen: dict = {}
+
+    def _fake_body(armed, only_account, only_tier, permit, why, targets):
+        seen["permit"] = permit
+        seen["readonly_live"] = config.READONLY
+        seen["dry_run_live"] = config.DRY_RUN
+        rx._ledger(armed, [], [], [], "", halted=False, halt_reason="")
+        return 0
+    monkeypatch.setattr(rx, "_run_armed_session", _fake_body)
+
+    rc = rx.execute_armed(armed=False)
+
+    assert rc == 0
+    assert seen["permit"] is False                      # dry branch (never armed)
+    assert seen["readonly_live"] is True and seen["dry_run_live"] is True   # NO flip
+    assert captured["mode"] == "REBALANCE_EXEC_DRYRUN"
+    assert config.READONLY is True and config.DRY_RUN is True
+
+
+# --- BANNER HONESTY: the safety banner prints INSIDE execute_armed (after the flip), so an
+# --- armed run's banner reflects the transmit-capable state; a dry run's stays "DRY-RUN". --
+def _offline_execute(monkeypatch):
+    """Wire the SAME offline seams the Step-2 tests use (tier models + free gateway lock +
+    stubbed armed body), so execute_armed runs end-to-end with no broker/order/ledger side
+    effects. Callers set the flag posture and call rx.execute_armed(...)."""
+    import ledger
+    import rebalance_run as rr
+
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+
+    import pandas as pd
+    fake_t = SimpleNamespace(as_of=pd.Timestamp("2026-06-30"),
+                             weights=pd.Series({"SPY": 1.0}),
+                             prices=pd.Series({"SPY": 100.0}))
+    monkeypatch.setattr(rr, "_targets_by_version", lambda: {"Balanced": fake_t})
+
+    from contextlib import contextmanager
+
+    @contextmanager
+    def _free_lock(*_a, **_k):
+        yield {"purpose": "test-free-lock"}
+    monkeypatch.setattr(rx, "gateway_lock", _free_lock)
+
+    monkeypatch.setattr(ledger, "record_run", lambda rec: None)
+
+    def _fake_body(armed, only_account, only_tier, permit, why, targets):
+        return 0
+    monkeypatch.setattr(rx, "_run_armed_session", _fake_body)
+
+
+def test_armed_banner_says_can_transmit(monkeypatch, capsys):
+    """An ARMED run's banner is printed INSIDE execute_armed AFTER the in-process flip, so it
+    honestly reports the transmit-capable state — not the pre-flip READONLY/DRY_RUN=True."""
+    _offline_execute(monkeypatch)
+    rc = rx.execute_armed(armed=True)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "ARMED EXECUTOR: this run CAN transmit" in out
+    assert "DRY-RUN review" not in out
+
+
+def test_dry_run_banner_says_dry_review(monkeypatch, capsys):
+    """An UNARMED run never flips the flags, so its banner still reads DRY-RUN review."""
+    _offline_execute(monkeypatch)
+    rc = rx.execute_armed(armed=False)
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "DRY-RUN review" in out
+    assert "ARMED EXECUTOR: this run CAN transmit" not in out

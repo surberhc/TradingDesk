@@ -15,10 +15,16 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.27.0"
+VERSION = "0.27.1"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.27.1", "2026-07-30", "rebalance_execute adopts safe_execute.armed_session "
+                             "(flip-and-restore-in-finally; flags no longer leak to process "
+                             "exit); gateway_lock + FA-backup unchanged; safety banner moved "
+                             "into execute_armed so an armed run's banner reflects the "
+                             "flipped/transmit-capable state (it read pre-flip flags after the "
+                             "Step-2 flip relocation); Step 2 of arm-gate unification #64"),
     ("0.27.0", "2026-07-30", "shared armed_session arm-gate context manager; deploy engine "
                              "(execute_plan) adopts it; behavior-preserving (flags still "
                              "flip-and-restore); Step 1 of arm-gate unification #64"),
