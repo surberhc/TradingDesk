@@ -130,7 +130,20 @@ _MARKET_CLOSE_CT = (15, 0)
 # collector exits CLEANLY (logged message + nonzero rc) so a Task Scheduler restart-on-
 # failure can retry — never a raw uncaught traceback. Mid-session drops keep the existing
 # reconnect path; this bounded wait is startup-only.
-STARTUP_DATA_WAIT_SECS = 600.0   # ~10 min bounded startup window for live SPX data
+#
+# Window sizing (WHY 40 min, not 10): the collector's Scheduled Task fires at 08:06 Central,
+# 24 min BEFORE the 08:30 CT market open. A ~10-min window gave up at ~08:16 with rc=2 —
+# before live SPX data ever started flowing — and Task Scheduler then paints that run red
+# for the whole day (the ONE long-running successful instance doesn't post its rc=0 until
+# its end-of-day teardown, so the early failure is the only rc the pane sees until then).
+# A 40-min window lets that single startup instance stay connected and waiting THROUGH the
+# open, latch the first valid SPX spot, and run all day. This window is intentionally sized
+# to span the pre-open warmup gap and MUST stay > (open − task start time) = 08:30 − 08:06 =
+# 24 min. NOTE: this wait sits DOWNSTREAM of the bounded connect-retry (s8_startup), so a
+# longer window does NOT delay detection of a genuinely-down gateway — that's a separate
+# upstream path.
+STARTUP_DATA_WAIT_SECS = 2400.0  # ~40 min startup window: spans the pre-open warmup gap so
+                                 # the 08:06 CT launch waits through the 08:30 CT open
 STARTUP_DATA_POLL_SECS = 15.0    # re-check for a valid live SPX spot every ~15s
 
 # Substrings that mark an IBKR "too many market-data lines" style error (matched
