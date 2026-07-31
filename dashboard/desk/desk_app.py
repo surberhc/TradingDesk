@@ -10,6 +10,7 @@ Multipage app via st.navigation / st.Page (function-page callables). A persisten
 guarded emergency control strip (Halt + inert Flatten) renders at the TOP of every
 page, before the page body runs, wrapped so a bar error can never take the app down:
   1. Desk Pulse (home)                        — pulse.render_pulse
+  2. Action Center (propose-and-arm inbox)     — page_action_center.render_action_center
   2. Feeds & Connections                      — page_feeds.render_feeds
   3. History & Event Log                       — page_history.render_history
   4. Strategy 0 — Adaptive All-Weather Core    — page_s0.render_s0_full
@@ -49,6 +50,7 @@ T.inject_theme()
 # Page modules (cheap at import — heavy/broker imports inside them are lazy) and
 # the persistent emergency control strip.
 import emergency
+import page_action_center
 import page_control_plane
 import page_feeds
 import page_history
@@ -71,8 +73,17 @@ except Exception as exc:  # noqa: BLE001 — the bar must never crash the app
         "never places or transmits any order."
     )
 
+# Action Center unread badge — a cheap SQLite count; wrapped so it can never break nav.
+try:
+    import action_center
+    _ac_unread = action_center.unread_count()
+except Exception:  # noqa: BLE001 — the badge must never take the app down
+    _ac_unread = 0
+_ac_title = "Action Center" + (f" ({_ac_unread})" if _ac_unread else "")
+
 pages = [
     st.Page(pulse.render_pulse, title="Desk Pulse", icon="🩺", default=True),
+    st.Page(page_action_center.render_action_center, title=_ac_title, icon="🔔"),
     st.Page(page_feeds.render_feeds, title="Feeds & Connections", icon="📡"),
     st.Page(page_history.render_history, title="History & Event Log", icon="📜"),
     st.Page(page_s0.render_s0_full,
