@@ -1,19 +1,18 @@
 """page_control_plane.py — the desk's Control Plane page for Strategy 0 rebalancing.
 
 The in-app Control Plane (docs/PRODUCTION_REBALANCE_CONTROL_PLANE.md). It surfaces, for
-the funded trust account U14438624, three things top to bottom:
-  * the broker-FREE Strategy 0 Growth target (via strategy_target.current_target),
-    computed through the validated backtest engine — needs no gateway;
+the funded trust account U14438624, three things:
+  * a scannable VERDICT (what would trade) + tiles read from the last reviewed preview;
   * an on-demand READ-ONLY rebalance preview, produced by running the hardened paperbot
     executor (s0_live_deploy.py) with NO arguments (its PREVIEW mode: it sizes + prints
     the order list and transmits nothing); and
-  * a gated ARM + EXECUTE step that CAN transmit a real rebalance order — but only behind
+  * a gated ARM + SEND step that CAN transmit a real rebalance order — but only behind
     the sacred review -> arm -> transmit gate.
 
-TRANSMISSION IS DELIBERATE AND HUMAN-GATED. The Execute button is inert until the operator
-has (a) built and reviewed a preview and (b) typed the account id to confirm; AND the
+TRANSMISSION IS DELIBERATE AND HUMAN-GATED. The Send button is inert until the operator
+has (a) built and reviewed a FRESH preview and (b) typed the account id to confirm; AND the
 operator must physically arm the port-4003 Gateway by hand in TWS (uncheck Read-Only API)
-— an act no software here performs. Execute shells out to the UNCHANGED s0_live_deploy
+— an act no software here performs. Send shells out to the UNCHANGED s0_live_deploy
 executor, which is itself fail-closed: it refuses to transmit unless the Gateway is
 physically armed and its own caps / kill-switch / single-account gates all pass. Nothing
 here transmits on its own, on a schedule, or from the AI.
@@ -22,6 +21,12 @@ IMPORT DISCIPLINE (mirrors page_s0.py): module-top imports are CHEAP only (stdli
 streamlit, theme). Every heavy import — strategy_target, eventlog, investable — is LAZY
 (inside the function that needs it), and the executor is invoked as a SUBPROCESS, so
 importing this module opens no socket and runs no backtest.
+
+PRESENTATION NOTE (2026-07-31): this file was re-laid-out into a scannable verdict/tiles +
+3-column send rail. The gate LOGIC is unchanged — every subprocess call, token construction,
+audit call, freshness check, and the confirm/arm/send guard is byte-identical to before; only
+how those are DISPLAYED changed. The transmit path lives in _run_execute_and_render(), whose
+body is the verbatim old Step-3 handler.
 """
 from __future__ import annotations
 
@@ -119,26 +124,6 @@ def _growth_target() -> dict:
         "as_of": tgt.as_of.date().isoformat(),
         "price_date": tgt.price_date.date().isoformat(),
     }
-
-
-# =========================================================================== #
-# Real-money gate card — the sacred review -> arm -> transmit wall, plain.     #
-# =========================================================================== #
-def _render_gate_card() -> None:
-    st.markdown(
-        theme.status_card(
-            "Real-money transmission",
-            "warn",  # amber: capable, but only behind the deliberate human gate
-            "Possible here — only behind the review -> arm -> transmit gate",
-            "This page CAN transmit a real Strategy 0 rebalance order — but ONLY when you "
-            "review the preview, physically arm the port-4003 Gateway by hand in TWS "
-            "(uncheck Read-Only API), type the account id to confirm, and press Execute. It "
-            "never transmits on its own, on a schedule, or from the AI, and the executor "
-            "independently refuses unless the Gateway is physically armed. Until you do all "
-            "of that, nothing is placed, armed, or sent.",
-        ),
-        unsafe_allow_html=True,
-    )
 
 
 # =========================================================================== #
@@ -329,7 +314,10 @@ def _store_last_preview(stdout: str) -> None:
 
 def _render_leg_table(legs: list[dict]) -> None:
     """Render the ordered leg list as a clean table: Side / Symbol / Shares / Limit
-    price / Notional."""
+    price / Notional. SELL rows are tinted the 'bad' (red) tier colour and BUY rows the
+    'good' (green) tier colour so the sell-first / then-buy flow reads at a glance. Colour
+    is presentation only — the leg data itself is unchanged; any Styler failure falls back
+    to the plain table so a cosmetic helper can never break the page."""
     df = pd.DataFrame([
         {
             "Side": l["side"],
@@ -340,7 +328,20 @@ def _render_leg_table(legs: list[dict]) -> None:
         }
         for l in legs
     ])
-    st.dataframe(df, hide_index=True, use_container_width=True)
+
+    def _side_color(val: object) -> str:
+        v = str(val).upper()
+        if v == "SELL":
+            return f"color: {theme.TIER['bad']['c']}; font-weight: 650"
+        if v == "BUY":
+            return f"color: {theme.TIER['good']['c']}; font-weight: 650"
+        return ""
+
+    try:
+        styled = df.style.map(_side_color, subset=["Side"])
+        st.dataframe(styled, hide_index=True, use_container_width=True)
+    except Exception:  # noqa: BLE001 — styling is cosmetic; fall back to the plain table
+        st.dataframe(df, hide_index=True, use_container_width=True)
 
 
 def _render_preview_result(stdout: str, stderr: str) -> None:
@@ -417,74 +418,118 @@ def _render_preview_result(stdout: str, stderr: str) -> None:
         st.code((stdout or "") + (("\n" + stderr) if stderr else ""), language=None)
 
 
-def _render_step1() -> None:
-    """Step 1 — build and review the read-only preview. ALWAYS visible. Runs the executor
-    in PREVIEW mode when the button is pressed, then renders a persistent per-step status
-    (from session state, even on reruns) BELOW the button+handler — so on the same run
-    where a preview is built, the status card reads the just-stored state and correctly
-    shows 'done' instead of lagging until the next rerun. Transmits nothing."""
-    st.markdown(theme.section("Step 1 — Review what would trade (read-only)"),
-                unsafe_allow_html=True)
-    st.caption(
-        f"Runs the hardened Strategy 0 executor in its PREVIEW mode (no arguments) to "
-        f"read account {PREVIEW_ACCOUNT} on the live-trade Gateway and size the exact "
-        f"rebalance it would trade. This reads the Gateway but transmits NOTHING — no "
-        f"arm token or conform flag is ever passed from this page."
-    )
+# =========================================================================== #
+# Verdict + tiles — the scannable top-of-page summary, read from session.      #
+# =========================================================================== #
+def _render_verdict_and_tiles() -> None:
+    """The at-a-glance top row: a wide VERDICT card + two tiles (account value, last
+    checked). Pure display — it only READS st.session_state['cp_last_preview'] (the summary
+    _store_last_preview bound) and the freshness helper. It builds nothing and transmits
+    nothing."""
+    last = st.session_state.get("cp_last_preview")
+    age_secs, fresh = _preview_freshness()
+    c1, c2, c3 = st.columns([2, 1, 1])
 
-    def _render_step1_status() -> None:
-        """Persistent per-step status — reflects session state EVEN ON RERUNS, so the
-        operator always sees whether Step 1 is done. Rendered AFTER the button+handler so
-        a just-built preview (which sets cp_last_preview in the same run) shows as done
-        immediately, not one rerun late."""
-        last = st.session_state.get("cp_last_preview")
-        if last:
-            age_secs, fresh = _preview_freshness()
-            if fresh:
-                st.markdown(
-                    theme.status_card(
-                        "Step 1 status",
-                        "good",
-                        "Step 1 done — plan reviewed",
-                        f"You reviewed a preview built at "
-                        f"{last.get('built_at_str', '—')}: {last.get('n_legs', '—')} leg(s), "
-                        f"sells {last.get('sells', '—')}, buys {last.get('buys', '—')}. "
-                        f"Rebuild it if it's stale.",
-                    ),
-                    unsafe_allow_html=True,
-                )
-            else:
-                mins = int((age_secs or 0) // 60)
-                st.markdown(
-                    theme.status_card(
-                        "Step 1 status",
-                        "warn",
-                        "Step 1 preview expired — rebuild it",
-                        f"The preview you reviewed is about {mins} minute(s) old, past the "
-                        f"{int(PREVIEW_FRESHNESS_SECS // 60)}-minute freshness window, so it "
-                        f"has expired. Click 'Build read-only preview' again to refresh it "
-                        f"before you can Execute — the account or prices may have moved. "
-                        f"Nothing has transmitted.",
-                    ),
-                    unsafe_allow_html=True,
-                )
-        else:
+    with c1:
+        if not isinstance(last, dict):
             st.markdown(
                 theme.status_card(
-                    "Step 1 status",
-                    "warn",
-                    "Step 1 not done yet",
-                    "Click 'Build read-only preview' to see exactly what would trade. "
-                    "Nothing transmits — this only reads the account.",
+                    "Rebalance status", "info",
+                    "Not checked yet — press Build below",
+                    "No read-only preview has been built this session yet. Use Step 1 "
+                    "(Review) in the send rail below to see exactly what would trade. "
+                    "Nothing has transmitted.",
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            n_legs = last.get("n_legs") or 0
+            checked = last.get("built_at_str", "—")
+            if n_legs and n_legs > 0:
+                headline = f"{n_legs} trade(s) to rebalance"
+                base = (f"About {last.get('sells', '—')} to sell then "
+                        f"{last.get('buys', '—')} to buy · checked {checked}.")
+                if fresh:
+                    st.markdown(
+                        theme.status_card("Rebalance status", "info", headline, base),
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        theme.status_card(
+                            "Rebalance status", "warn",
+                            f"{headline} — preview expired",
+                            base + " This preview has expired; rebuild it before you send.",
+                        ),
+                        unsafe_allow_html=True,
+                    )
+            else:
+                st.markdown(
+                    theme.status_card(
+                        "Rebalance status", "good",
+                        "In line — nothing to trade",
+                        f"As of the {checked} check the account already matches the "
+                        f"Strategy 0 Growth target — there is nothing to trade. Nothing "
+                        f"has transmitted.",
+                    ),
+                    unsafe_allow_html=True,
+                )
+
+    with c2:
+        net_liq = last.get("net_liq") if isinstance(last, dict) else None
+        nl_str = (f"${net_liq:,.0f}" if isinstance(net_liq, (int, float)) else "—")
+        st.markdown(
+            theme.card(
+                "Account value",
+                f'<span style="color:{theme.TEXT};font-weight:650">{theme._esc(nl_str)}</span>',
+                f"Net liquidation value of account {PREVIEW_ACCOUNT} at the last check.",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with c3:
+        if not isinstance(last, dict):
+            st.markdown(
+                theme.card("Last checked",
+                           f'<span style="color:{theme.MUTED}">—</span>',
+                           "No preview has been built yet this session."),
+                unsafe_allow_html=True,
+            )
+        elif fresh:
+            st.markdown(
+                theme.card(
+                    "Last checked",
+                    f'<span style="color:{theme.TIER["good"]["c"]};font-weight:650">'
+                    f'{theme._esc(str(last.get("built_at_str", "—")))} · fresh</span>',
+                    f"Still within the {int(PREVIEW_FRESHNESS_SECS // 60)}-minute freshness "
+                    f"window — good to arm from.",
+                ),
+                unsafe_allow_html=True,
+            )
+        else:
+            mins = int((age_secs or 0) // 60)
+            st.markdown(
+                theme.card(
+                    "Last checked",
+                    f'<span style="color:{theme.TIER["warn"]["c"]};font-weight:650">'
+                    f'{theme._esc(str(last.get("built_at_str", "—")))} · expired</span>',
+                    f"About {mins} minute(s) old, over the "
+                    f"{int(PREVIEW_FRESHNESS_SECS // 60)}-minute window — rebuild before you "
+                    f"send.",
                 ),
                 unsafe_allow_html=True,
             )
 
-    if not st.button("Build read-only preview (reads the live-trade gateway)"):
-        st.caption("The preview runs only when you press the button above.")
-        _render_step1_status()
-        return
 
+# =========================================================================== #
+# Read-only preview run — the byte-identical old Step-1 handler body.          #
+# =========================================================================== #
+def _run_preview_and_render() -> None:
+    """Run the hardened S0 executor in PREVIEW mode (no args) and render the plan. This is
+    the byte-identical body of the old Step-1 handler — same existence check, same
+    subprocess call, same _render_preview_result / _store_last_preview / _audit_preview — the
+    only change is that the surrounding per-step status cards were lifted out into the
+    verdict tiles + the Step-1 freshness pill. Transmits nothing."""
     if not os.path.exists(VENV_PYTHON) or not _DEPLOY_SCRIPT.exists():
         st.markdown(
             theme.status_card(
@@ -496,7 +541,6 @@ def _render_step1() -> None:
             ),
             unsafe_allow_html=True,
         )
-        _render_step1_status()
         return
 
     try:
@@ -521,7 +565,6 @@ def _render_step1() -> None:
             ),
             unsafe_allow_html=True,
         )
-        _render_step1_status()
         return
     except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
         st.markdown(
@@ -534,17 +577,15 @@ def _render_step1() -> None:
             ),
             unsafe_allow_html=True,
         )
-        _render_step1_status()
         return
 
     _render_preview_result(stdout, stderr)
     _store_last_preview(stdout)  # bind the arm/execute step to THIS reviewed preview
     _audit_preview()  # best-effort durable audit; never breaks the page
-    _render_step1_status()  # now reads the just-stored preview → shows "done" same run
 
 
 # =========================================================================== #
-# ARM + EXECUTE — the deliberate human gate on top of the executor's own wall. #
+# ARM + SEND — the deliberate human gate on top of the executor's own wall.    #
 # The executor (s0_live_deploy.py) is fail-closed: it transmits ONLY when the  #
 # 4003 Gateway is physically armed AND its own caps/kill-switch/single-account #
 # gates all pass. This UI is the human review -> arm -> transmit gate on top;  #
@@ -579,19 +620,15 @@ def _classify_execute_output(stdout: str, stderr: str) -> str:
     return "error"
 
 
-def _render_arm_probe() -> None:
-    """Convenience CHECK of the port-4003 Gateway's armed state — a button that shells out
-    to the standalone read-only, zero-transmission probe (gateway_arm_probe.py) and SHOWS
-    armed / not-armed / unreachable. This is a read-only convenience only: the executor
-    still independently measures the Gateway and is the enforced wall. No socket opens in
-    this Streamlit process; the probe places and transmits NOTHING.
+def _run_arm_probe_and_render() -> None:
+    """Run the standalone read-only, zero-transmission 4003 armed-state probe
+    (gateway_arm_probe.py) and SHOW armed / not-armed / unreachable. This is the byte-
+    identical body of the old _render_arm_probe (only the leading button was lifted into the
+    send rail). No socket opens in this Streamlit process; the probe places and transmits
+    NOTHING.
 
     The probe prints exactly one uppercase token (READONLY / ARMED / UNREACHABLE) on its
     LAST stdout line. Any failure is a plain-English 'bad' card — never a crash."""
-    if not st.button("Check whether the 4003 Gateway is armed",
-                     key="cp_arm_probe_btn"):
-        return
-
     if not os.path.exists(VENV_PYTHON) or not _ARM_PROBE_SCRIPT.exists():
         st.markdown(
             theme.status_card(
@@ -684,128 +721,13 @@ def _render_arm_probe() -> None:
         )
 
 
-def _render_step2() -> bool:
-    """Step 2 — arm the Gateway by hand & type the account id to confirm. ALWAYS visible.
-    Returns whether the typed account id matches PREVIEW_ACCOUNT (the confirm gate). Arms
-    nothing itself: the physical Gateway arm is a human act in TWS this app cannot perform
-    or probe."""
-    st.markdown(theme.section("Step 2 — Arm the Gateway (by hand) and confirm"),
-                unsafe_allow_html=True)
-
-    # The physical Gateway arm is a human act in TWS this app cannot perform — that
-    # instruction card stays. As a CONVENIENCE, a button below shells out to a standalone
-    # read-only, zero-transmission probe (gateway_arm_probe.py) that SHOWS the Gateway's
-    # armed state. The probe is a convenience check, NOT a replacement for the human arm or
-    # the executor's own measurement — the executor still independently measures the Gateway
-    # at Execute time and is the enforced wall.
-    st.markdown(
-        theme.status_card(
-            "You arm the Gateway by hand in TWS — the check below is a convenience",
-            "warn",
-            "Uncheck 'Read-Only API' on the port 4003 Gateway in TWS before you Execute",
-            "The physical arm is a human act: before you press Execute, make sure YOU have "
-            "unchecked 'Read-Only API' (Configure > Settings > API > Settings) on the "
-            "port 4003 live-trade Gateway in TWS. If it is still checked (Read-Only ON), "
-            "the Execute run transmits NOTHING and reports that it was blocked — the "
-            "executor measures the Gateway itself and refuses. When you are finished, "
-            "re-check that box to disarm. Use the button below to CHECK the current state "
-            "(read-only; it transmits nothing) — it does not arm anything.",
-        ),
-        unsafe_allow_html=True,
-    )
-
-    # Convenience armed-state check — read-only subprocess, transmits nothing.
-    _render_arm_probe()
-
-    # Typed confirmation — mirrors emergency.py's exact-word confirm guard. ALWAYS visible.
-    st.caption("This is the deliberate human gate. Type the exact account id to confirm "
-               "you have reviewed the preview and armed the Gateway.")
-    confirm_val = st.text_input(
-        f"Type the account id {PREVIEW_ACCOUNT} to confirm",
-        value="", key="cp_execute_confirm",
-        placeholder=f"type {PREVIEW_ACCOUNT} here",
-    )
-    confirmed = confirm_val.strip() == PREVIEW_ACCOUNT
-
-    if confirmed:
-        st.markdown(
-            theme.status_card(
-                "Step 2 confirm status",
-                "good",
-                "Account id confirmed",
-                f"You typed {PREVIEW_ACCOUNT}. Combined with a physically armed Gateway in "
-                f"TWS, the confirm gate for Step 3 is cleared.",
-            ),
-            unsafe_allow_html=True,
-        )
-    else:
-        st.markdown(
-            theme.status_card(
-                "Step 2 confirm status",
-                "warn",
-                f"Type the account id {PREVIEW_ACCOUNT} to confirm",
-                f"Type the account id {PREVIEW_ACCOUNT} exactly in the box above to clear "
-                f"the confirm gate. Until then Execute stays disabled.",
-            ),
-            unsafe_allow_html=True,
-        )
-    return confirmed
-
-
-def _render_step3(preview_fresh: bool, confirmed: bool,
-                  preview_age_secs: float | None = None) -> None:
-    """Step 3 — transmit the rebalance. The Execute button is ALWAYS rendered (never
-    hidden), just disabled until BOTH prerequisites hold (a FRESH, un-expired preview was
-    reviewed this session AND the account id is typed). A reviewed preview that has aged past
-    PREVIEW_FRESHNESS_SECS is treated as EXPIRED (decision D): Execute is disabled and the
-    operator must rebuild the preview first. The pressed-handler below is unchanged and
-    unreachable until then. Below the button is an always-visible plain-English checklist of
-    the two gate items plus the physical-arm reminder."""
-    st.markdown(theme.section("Step 3 — Transmit the rebalance"),
-                unsafe_allow_html=True)
-
-    # A reviewed-but-expired preview: loud notice + Execute stays disabled until rebuilt.
-    if preview_age_secs is not None and not preview_fresh:
-        st.markdown(
-            theme.status_card(
-                "Preview expired",
-                "warn",
-                f"Rebuild the preview — it's about {int(preview_age_secs // 60)} minute(s) old",
-                f"For safety, the preview you arm from must be under "
-                f"{int(PREVIEW_FRESHNESS_SECS // 60)} minutes old (decision D freshness "
-                f"policy). Go back to Step 1 and build a fresh read-only preview — the "
-                f"account or prices may have moved since. Nothing has transmitted.",
-            ),
-            unsafe_allow_html=True,
-        )
-
-    can_press = preview_fresh and confirmed
-    pressed = st.button(
-        "Transmit the S0 rebalance to IBKR (real order)",
-        key="cp_execute_btn",
-        disabled=not can_press,
-        use_container_width=True,
-    )
-
-    # Always-visible plain-English checklist of the two gate items + the physical-arm note.
-    if preview_fresh:
-        step1_mark = "✓ done"
-    elif preview_age_secs is not None:
-        step1_mark = (f"• expired — your reviewed preview is about "
-                      f"{int(preview_age_secs // 60)} minute(s) old; rebuild it above "
-                      f"(it must be under {int(PREVIEW_FRESHNESS_SECS // 60)} minutes old)")
-    else:
-        step1_mark = "• not yet — build the preview above"
-    step2_mark = ("✓ done" if confirmed
-                  else f"• not yet — type {PREVIEW_ACCOUNT} above")
-    st.markdown(
-        f"- Step 1 — reviewed a preview: {step1_mark}\n"
-        f"- Step 2 — typed the account id: {step2_mark}\n"
-        f"- Even with both ✓, nothing transmits unless the port 4003 Gateway is physically "
-        f"armed in TWS ('Read-Only API' unchecked) — the executor measures it and refuses "
-        f"otherwise."
-    )
-
+def _run_execute_and_render(can_press: bool, pressed: bool) -> None:
+    """The transmit path — BYTE-IDENTICAL to the old Step-3 handler from the guard onward:
+    same `if not can_press or not pressed: return` gate, same executor-existence check, same
+    guarded audit, same arm_token/conform_flag construction, same subprocess.run invocation
+    of s0_live_deploy with those tokens, same timeouts, same result classification + audits.
+    Only the section header / expiry notice / button / checklist that used to precede this
+    block were moved out into the send rail; this handler's logic is unchanged."""
     # The pressed-handler is unreachable until BOTH prerequisites hold. (When the button is
     # disabled, `pressed` is already False; this guard is the belt-and-suspenders backstop.)
     if not can_press or not pressed:
@@ -936,28 +858,164 @@ def _render_step3(preview_fresh: bool, confirmed: bool,
 
 
 # =========================================================================== #
-# Page entry point.                                                           #
+# Page entry point — scannable verdict/tiles + 3-column send rail.             #
 # =========================================================================== #
 def render_control_plane() -> None:
-    """Render the Control Plane page: the real-money gate card, the broker-free Strategy 0
-    Growth target, an on-demand read-only rebalance preview, and the gated ARM + EXECUTE
-    step. Everything is read-only until the operator deliberately arms (physical gateway
-    arm in TWS + typed confirm) and presses Execute, which shells out to the unchanged
-    s0_live_deploy executor; nothing transmits on its own."""
-    st.subheader("Control Plane — Strategy 0 rebalance")
+    """Render the Control Plane page: a scannable VERDICT + tiles read from the last
+    reviewed preview, a collapsible full target book, and a 3-column send rail
+    (Review / Arm / Send). Everything is read-only until the operator deliberately refreshes
+    a preview, physically arms the port-4003 Gateway in TWS, types the account id, and
+    presses Send — which shells out to the unchanged s0_live_deploy executor. Nothing
+    transmits on its own, on a schedule, or from the AI."""
+    st.subheader("Strategy 0 — Rebalance")
     st.caption(
-        f"Shows what Strategy 0 (Growth) would trade on account {PREVIEW_ACCOUNT} to conform "
-        f"to its target. The target and preview are read-only and transmit nothing; a real "
-        f"order transmits only behind the human review -> arm -> transmit gate below "
-        f"(physical gateway arm in TWS + typed confirm)."
+        f"What Strategy 0 (Growth) would trade on account {PREVIEW_ACCOUNT} to conform to "
+        f"its target. Read-only until you deliberately refresh a preview, arm the gateway by "
+        f"hand in TWS, type the account id, and press Send."
     )
 
-    _render_gate_card()
-    _render_target_panel()
+    # Reserve the top slots first so a preview built lower in the send rail can fill the
+    # verdict tiles + the plan detail up here in the same run (Streamlit containers render in
+    # place but can be written to later in the code).
+    verdict_slot = st.container()
+    plan_slot = st.container()
 
-    st.markdown(theme.section("Rebalance this account — three deliberate steps"),
+    # The full broker-free target book — collapsed so it no longer dominates the page.
+    with st.expander("Show the full target book"):
+        _render_target_panel()
+
+    # --- SEND RAIL: three deliberate steps, side by side ------------------------- #
+    st.markdown(theme.section("Send the rebalance — three deliberate steps"),
                 unsafe_allow_html=True)
-    _render_step1()
-    confirmed = _render_step2()
+    cols = st.columns(3)
+
+    # Step 1 · Review — the build button. Its handler runs BELOW (into plan_slot) before
+    # freshness is computed, mirroring the original order (Step 1 ran before _preview_freshness).
+    with cols[0]:
+        st.markdown(theme.section("Step 1 · Review"), unsafe_allow_html=True)
+        st.caption("Build a read-only preview of exactly what would trade. Reads the "
+                   "gateway; transmits nothing.")
+        pressed_build = st.button("Build read-only preview (reads the live-trade gateway)")
+
+    if pressed_build:
+        with plan_slot:
+            _run_preview_and_render()
+
+    # Freshness now reflects any just-built preview.
     preview_age_secs, preview_fresh = _preview_freshness()
-    _render_step3(preview_fresh, confirmed, preview_age_secs)
+    has_preview = isinstance(st.session_state.get("cp_last_preview"), dict)
+    with cols[0]:
+        if not has_preview:
+            st.markdown(theme.pill("No preview yet — press Build", "unknown"),
+                        unsafe_allow_html=True)
+        elif preview_fresh:
+            st.markdown(
+                theme.pill(f"Preview fresh (under {int(PREVIEW_FRESHNESS_SECS // 60)} min)",
+                           "good"),
+                unsafe_allow_html=True)
+        else:
+            _mins = int((preview_age_secs or 0) // 60)
+            st.markdown(
+                theme.pill(f"Preview expired ({_mins} min old) — rebuild it", "warn"),
+                unsafe_allow_html=True)
+
+    # Step 2 · Arm — the armed-state check button + the typed-confirm gate. The physical arm
+    # is a human act in TWS; the button only CHECKS state (read-only, transmits nothing).
+    with cols[1]:
+        st.markdown(theme.section("Step 2 · Arm"), unsafe_allow_html=True)
+        st.caption("Uncheck 'Read-Only API' on the port-4003 Gateway in TWS by hand, then "
+                   "type the account id to confirm you reviewed the preview and armed it.")
+        pressed_arm = st.button("Check whether the 4003 Gateway is armed",
+                                key="cp_arm_probe_btn")
+        confirm_val = st.text_input(
+            f"Type the account id {PREVIEW_ACCOUNT} to confirm",
+            value="", key="cp_execute_confirm",
+            placeholder=f"type {PREVIEW_ACCOUNT} here",
+        )
+        confirmed = confirm_val.strip() == PREVIEW_ACCOUNT
+        if confirmed:
+            st.markdown(theme.pill("Account id confirmed", "good"), unsafe_allow_html=True)
+        else:
+            st.markdown(theme.pill(f"Type {PREVIEW_ACCOUNT} to confirm", "warn"),
+                        unsafe_allow_html=True)
+
+    # Armed-state check result renders full width below the rail.
+    arm_slot = st.container()
+    if pressed_arm:
+        with arm_slot:
+            _run_arm_probe_and_render()
+
+    # Step 3 · Send — the Execute button. Same key, same disabled condition
+    # (preview_fresh AND confirmed), same guarded handler; only the label reads "Send".
+    with cols[2]:
+        st.markdown(theme.section("Step 3 · Send"), unsafe_allow_html=True)
+        can_press = preview_fresh and confirmed
+        pressed = st.button(
+            "Send order to IBKR",
+            key="cp_execute_btn",
+            disabled=not can_press,
+            use_container_width=True,
+        )
+        if preview_fresh:
+            step1_mark = "✓ fresh preview reviewed"
+        elif preview_age_secs is not None:
+            step1_mark = (f"• expired — rebuild the preview "
+                          f"({int(preview_age_secs // 60)} min old)")
+        else:
+            step1_mark = "• not yet — build the preview"
+        step2_mark = ("✓ account id typed" if confirmed
+                      else f"• not yet — type {PREVIEW_ACCOUNT}")
+        st.markdown(
+            f"- {step1_mark}\n"
+            f"- {step2_mark}\n"
+            f"- Even with both ✓, nothing sends unless the port-4003 Gateway is physically "
+            f"armed in TWS ('Read-Only API' unchecked) — the executor measures it and "
+            f"refuses otherwise."
+        )
+
+    # The transmit handler renders full width below the rail. Its guard/gate/token/subprocess
+    # logic is byte-identical to the old Step-3 handler; it returns immediately unless BOTH
+    # gates hold and the button was pressed.
+    send_slot = st.container()
+    with send_slot:
+        _run_execute_and_render(can_press, pressed)
+
+    # Now fill the reserved top slots from the (possibly just-updated) session state.
+    with verdict_slot:
+        _render_verdict_and_tiles()
+
+    # --- Safety line + the full gate prose (moved here from the old top gate card). ------ #
+    st.caption(
+        "Nothing sends until you refresh the preview, arm the gateway by hand in TWS "
+        "(uncheck 'Read-Only API'), type the account id, and press Send."
+    )
+    with st.expander("How the safety gate works"):
+        st.markdown(
+            theme.status_card(
+                "Real-money transmission",
+                "warn",  # amber: capable, but only behind the deliberate human gate
+                "Possible here — only behind the review -> arm -> transmit gate",
+                "This page CAN transmit a real Strategy 0 rebalance order — but ONLY when you "
+                "review the preview, physically arm the port-4003 Gateway by hand in TWS "
+                "(uncheck Read-Only API), type the account id to confirm, and press Execute. It "
+                "never transmits on its own, on a schedule, or from the AI, and the executor "
+                "independently refuses unless the Gateway is physically armed. Until you do all "
+                "of that, nothing is placed, armed, or sent.",
+            ),
+            unsafe_allow_html=True,
+        )
+        st.markdown(
+            theme.status_card(
+                "You arm the Gateway by hand in TWS — the check is a convenience",
+                "warn",
+                "Uncheck 'Read-Only API' on the port 4003 Gateway in TWS before you Execute",
+                "The physical arm is a human act: before you press Send, make sure YOU have "
+                "unchecked 'Read-Only API' (Configure > Settings > API > Settings) on the "
+                "port 4003 live-trade Gateway in TWS. If it is still checked (Read-Only ON), "
+                "the Send run transmits NOTHING and reports that it was blocked — the "
+                "executor measures the Gateway itself and refuses. When you are finished, "
+                "re-check that box to disarm. The 'Check whether the 4003 Gateway is armed' "
+                "button is read-only (it transmits nothing) — it does not arm anything.",
+            ),
+            unsafe_allow_html=True,
+        )
