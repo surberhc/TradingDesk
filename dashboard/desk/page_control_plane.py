@@ -67,6 +67,40 @@ _ARM_PROBE_SCRIPT = REPO / "dashboard" / "desk" / "gateway_arm_probe.py"
 _ARM_PROBE_CWD = REPO / "dashboard" / "desk"
 _ARM_PROBE_TIMEOUT_SEC = 45
 
+# --- Reviewed-preview freshness / expiry (decision D, 2026-07-31) -----------------
+# The operator reviews a read-only preview (Step 1), physically arms the gateway in TWS,
+# then Executes (Step 3). The executor ALWAYS recomputes the order live against current
+# cash/quotes at fire time, so what transmits is never the stale preview's numbers. But the
+# human REVIEW must still be current: a preview reviewed long ago (the account or prices may
+# have moved since) should not be the basis for an arm. So a reviewed preview EXPIRES after
+# this window and must be rebuilt (regenerated) before Execute re-enables — the in-app
+# enforcement of the propose-and-arm freshness policy. This only ever TIGHTENS the gate; it
+# never enables a transmit the existing preview+confirm gate would have blocked.
+PREVIEW_FRESHNESS_SECS = 1800.0  # 30 min: a reviewed preview older than this must be rebuilt
+
+
+def _freshness_of(built_at, now: datetime,
+                  window_secs: float = PREVIEW_FRESHNESS_SECS) -> tuple[float | None, bool]:
+    """Pure freshness decision — unit-testable without Streamlit. Returns (age_secs,
+    is_fresh). A None/unparseable built_at -> (None, False). Fresh iff age <= window (a small
+    negative age from clock skew is treated as fresh)."""
+    if built_at is None:
+        return (None, False)
+    try:
+        age = (now - built_at).total_seconds()
+    except Exception:  # noqa: BLE001 — a bad timestamp is simply "not fresh"
+        return (None, False)
+    return (age, age <= window_secs)
+
+
+def _preview_freshness(now: datetime | None = None) -> tuple[float | None, bool]:
+    """(age_secs, is_fresh) for the LAST reviewed preview in session state. Reads
+    cp_last_preview['built_at'] (a datetime set by _store_last_preview); no preview -> (None,
+    False)."""
+    last = st.session_state.get("cp_last_preview")
+    built_at = last.get("built_at") if isinstance(last, dict) else None
+    return _freshness_of(built_at, now or datetime.now())
+
 
 # =========================================================================== #
 # Broker-free Strategy 0 Growth target — cached 1h (validated engine).         #
@@ -405,18 +439,35 @@ def _render_step1() -> None:
         immediately, not one rerun late."""
         last = st.session_state.get("cp_last_preview")
         if last:
-            st.markdown(
-                theme.status_card(
-                    "Step 1 status",
-                    "good",
-                    "Step 1 done — plan reviewed",
-                    f"You reviewed a preview built at "
-                    f"{last.get('built_at_str', '—')}: {last.get('n_legs', '—')} leg(s), "
-                    f"sells {last.get('sells', '—')}, buys {last.get('buys', '—')}. Rebuild "
-                    f"it if it's stale.",
-                ),
-                unsafe_allow_html=True,
-            )
+            age_secs, fresh = _preview_freshness()
+            if fresh:
+                st.markdown(
+                    theme.status_card(
+                        "Step 1 status",
+                        "good",
+                        "Step 1 done — plan reviewed",
+                        f"You reviewed a preview built at "
+                        f"{last.get('built_at_str', '—')}: {last.get('n_legs', '—')} leg(s), "
+                        f"sells {last.get('sells', '—')}, buys {last.get('buys', '—')}. "
+                        f"Rebuild it if it's stale.",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            else:
+                mins = int((age_secs or 0) // 60)
+                st.markdown(
+                    theme.status_card(
+                        "Step 1 status",
+                        "warn",
+                        "Step 1 preview expired — rebuild it",
+                        f"The preview you reviewed is about {mins} minute(s) old, past the "
+                        f"{int(PREVIEW_FRESHNESS_SECS // 60)}-minute freshness window, so it "
+                        f"has expired. Click 'Build read-only preview' again to refresh it "
+                        f"before you can Execute — the account or prices may have moved. "
+                        f"Nothing has transmitted.",
+                    ),
+                    unsafe_allow_html=True,
+                )
         else:
             st.markdown(
                 theme.status_card(
@@ -701,16 +752,34 @@ def _render_step2() -> bool:
     return confirmed
 
 
-def _render_step3(preview_exists: bool, confirmed: bool) -> None:
+def _render_step3(preview_fresh: bool, confirmed: bool,
+                  preview_age_secs: float | None = None) -> None:
     """Step 3 — transmit the rebalance. The Execute button is ALWAYS rendered (never
-    hidden), just disabled until BOTH prerequisites hold (a preview was built this session
-    AND the account id is typed). The pressed-handler below is unchanged and unreachable
-    until then. Below the button is an always-visible plain-English checklist of the two
-    gate items plus the physical-arm reminder."""
+    hidden), just disabled until BOTH prerequisites hold (a FRESH, un-expired preview was
+    reviewed this session AND the account id is typed). A reviewed preview that has aged past
+    PREVIEW_FRESHNESS_SECS is treated as EXPIRED (decision D): Execute is disabled and the
+    operator must rebuild the preview first. The pressed-handler below is unchanged and
+    unreachable until then. Below the button is an always-visible plain-English checklist of
+    the two gate items plus the physical-arm reminder."""
     st.markdown(theme.section("Step 3 — Transmit the rebalance"),
                 unsafe_allow_html=True)
 
-    can_press = preview_exists and confirmed
+    # A reviewed-but-expired preview: loud notice + Execute stays disabled until rebuilt.
+    if preview_age_secs is not None and not preview_fresh:
+        st.markdown(
+            theme.status_card(
+                "Preview expired",
+                "warn",
+                f"Rebuild the preview — it's about {int(preview_age_secs // 60)} minute(s) old",
+                f"For safety, the preview you arm from must be under "
+                f"{int(PREVIEW_FRESHNESS_SECS // 60)} minutes old (decision D freshness "
+                f"policy). Go back to Step 1 and build a fresh read-only preview — the "
+                f"account or prices may have moved since. Nothing has transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    can_press = preview_fresh and confirmed
     pressed = st.button(
         "Transmit the S0 rebalance to IBKR (real order)",
         key="cp_execute_btn",
@@ -719,8 +788,14 @@ def _render_step3(preview_exists: bool, confirmed: bool) -> None:
     )
 
     # Always-visible plain-English checklist of the two gate items + the physical-arm note.
-    step1_mark = ("✓ done" if preview_exists
-                  else "• not yet — build the preview above")
+    if preview_fresh:
+        step1_mark = "✓ done"
+    elif preview_age_secs is not None:
+        step1_mark = (f"• expired — your reviewed preview is about "
+                      f"{int(preview_age_secs // 60)} minute(s) old; rebuild it above "
+                      f"(it must be under {int(PREVIEW_FRESHNESS_SECS // 60)} minutes old)")
+    else:
+        step1_mark = "• not yet — build the preview above"
     step2_mark = ("✓ done" if confirmed
                   else f"• not yet — type {PREVIEW_ACCOUNT} above")
     st.markdown(
@@ -884,5 +959,5 @@ def render_control_plane() -> None:
                 unsafe_allow_html=True)
     _render_step1()
     confirmed = _render_step2()
-    preview_exists = bool(st.session_state.get("cp_last_preview"))
-    _render_step3(preview_exists, confirmed)
+    preview_age_secs, preview_fresh = _preview_freshness()
+    _render_step3(preview_fresh, confirmed, preview_age_secs)
