@@ -97,6 +97,7 @@ def test_requests_one_per_tradeable_account_with_field_mapping():
     assert ra.target is targets["Conservative"]
     assert ra.allowed_accounts == ROSTER
     assert ra.conform is False                             # ongoing rebalance, NOT a deploy
+    assert ra.purpose == se.PURPOSE_REBALANCE              # ongoing rebalance lane
     assert ra.armed is False and ra.kill is False
     assert ra.run_id is None
     assert ra.net_liq == crm["plans"][0].net_liq
@@ -135,9 +136,10 @@ def test_preview_crm_legs_match_orders_and_transmit_nothing():
         # PREVIEW transmits nothing: no armed transmit ran, no fills recorded.
         assert res.status == se.STATUS_PREVIEW_ONLY
         assert res.sell_results == [] and res.buy_results == []
-        # conform=False + not armed -> these reasons are EXPECTED on a preview.
+        # REBALANCE lane + not armed -> "not armed" is expected; "conform intent absent" is
+        # NOT emitted (the rebalance lane does not require conform).
         assert any("not armed" in r for r in res.reasons)
-        assert any("conform intent absent" in r for r in res.reasons)
+        assert not any("conform intent absent" in r for r in res.reasons)
 
     # legs are the plan's non-zero orders as (symbol, side, qty), sells before buys.
     legs_a = {(l.symbol, l.side, l.qty) for l in results[0].legs}

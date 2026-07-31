@@ -12,17 +12,17 @@ HARD BOUNDARY — PREVIEW ONLY, this slice:
   * Builds and transmits NOTHING. `requests_from_crm_plan` is a pure field-mapping loop;
     `preview_crm` runs execute_plan in MODE_PREVIEW with no `ib`, which sizes + builds the
     ordered leg list and runs the gate but sends nothing.
-  * Changes NO gate logic. Requests are built with conform=False (an ONGOING rebalance is not
+  * Requests are built with purpose=REBALANCE and conform=False (an ONGOING rebalance is not
     a full-account DEPLOY, so it must NOT carry the deploy executor's liquidate-and-conform
-    intent) and, by default, armed=False. With conform=False the PREVIEW's blocked-reasons
-    WILL include "conform intent absent" and "not armed" — that is EXPECTED and CORRECT for a
-    preview: the leg list of what WOULD trade is still produced and returned on each
-    ExecutionResult. Suppressing those reasons is the DEFERRED order-affecting step (spec §7
-    Step 3), OUT OF SCOPE here.
+    intent) and, by default, armed=False. On the REBALANCE lane the engine does NOT require
+    conform, so "conform intent absent" is NOT a blocked reason; a PREVIEW's reasons still
+    include "not armed" (default armed=False) — expected and correct for a preview. The leg
+    list of what WOULD trade is produced and returned on each ExecutionResult regardless.
   * The account wall is the human-blessed roster (roster.enrolled_roster()), passed in as
     `roster` — never derived from the planner output.
 
-No version.py bump: these are pure additions with no transmit-path behavior change.
+This module still only drives PREVIEW here; requests carry purpose=REBALANCE so the shared
+engine's ongoing-rebalance lane applies (the version bump for that lane lives in version.py).
 """
 from __future__ import annotations
 
@@ -30,6 +30,7 @@ from safe_execute import (
     ExecutionCaps,
     ExecutionRequest,
     MODE_PREVIEW,
+    PURPOSE_REBALANCE,
     execute_plan,
 )
 
@@ -85,6 +86,7 @@ def requests_from_crm_plan(crm_result, *, targets, quotes, prices, roster,
             summary=summaries.get(plan.account, []),
             armed=armed,
             kill=kill,
+            purpose=PURPOSE_REBALANCE,   # ongoing rebalance lane — does NOT require conform
         ))
     return requests
 
@@ -95,9 +97,9 @@ def preview_crm(crm_result, *, targets, quotes, prices, roster) -> list:
 
     Each result carries the ordered candidate leg list (`.legs`, sells before buys) and the
     collected blocked reasons (`.reasons`). PREVIEW transmits NOTHING (no `ib` is passed).
-    NOTE: with conform=False the reasons WILL include "conform intent absent" and "not
-    armed" — expected and correct for a preview; the would-trade leg list is still produced.
-    Pure: build requests, run the pure PREVIEW gate, return results."""
+    NOTE: on the REBALANCE lane "conform intent absent" is NOT a reason; the reasons still
+    include "not armed" — expected and correct for a preview; the would-trade leg list is
+    still produced. Pure: build requests, run the pure PREVIEW gate, return results."""
     requests = requests_from_crm_plan(
         crm_result, targets=targets, quotes=quotes, prices=prices, roster=roster)
     return [execute_plan(req, mode=MODE_PREVIEW) for req in requests]

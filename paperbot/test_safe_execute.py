@@ -486,3 +486,138 @@ def test_shared_probe_detaches_its_error_handler():
     ib = _ProbeFakeIB((10147, "not found"))
     gateway_probe.probe_api_readonly(ib, port=4003)
     assert ib._handlers == []
+
+
+# ====================================================================================
+# 11. DEPLOY-vs-REBALANCE purpose (#…) + self-computed per-account margin pre-flight (#57)
+# ====================================================================================
+def _rebalance_request(*, plan, target, armed, kill=False, account=ACCT, allowed=None,
+                       caps=None, net_liq=100_000.0, summary=None):
+    """A REBALANCE-purpose request (conform=False by nature — the ongoing lane)."""
+    return se.ExecutionRequest(
+        account=account, strategy_version="Growth", plan=plan, target=target,
+        quotes={}, prices=dict(target.prices), allowed_accounts=allowed or [ACCT],
+        caps=caps or _caps(), conform=False, run_id=None, net_liq=net_liq,
+        summary=summary if summary is not None else _summary(), armed=armed, kill=kill,
+        purpose=se.PURPOSE_REBALANCE)
+
+
+def _typed_summary(rows):
+    """Build accountSummary rows for arbitrary (tag, value) pairs on the target account."""
+    return [_row(ACCT, tag, val) for tag, val in rows]
+
+
+# --- DEPLOY parity: purpose defaults to DEPLOY; conform=False still blocks identically ---
+def test_deploy_default_purpose_conform_false_still_blocks_conform_reason():
+    req = _request(plan=_plan(orders={"VTI": 10}, alien_lines=[]), target=_target(),
+                   armed=True, conform=False)
+    assert req.purpose == se.PURPOSE_DEPLOY                 # default — byte-identical intent
+    ib = _TxFakeIB(_summary())
+    res = se.execute_plan(req, mode=se.MODE_ARMED, ib=ib)
+    assert res.status == se.STATUS_BLOCKED                  # blocked exactly as before
+    assert ib.placed == []
+    assert any("conform intent absent" in r for r in res.reasons)
+
+
+def test_deploy_conform_true_preview_no_conform_reason_and_legs_unchanged():
+    plan = _plan(orders={"VTI": 10, "USFR": 5, "BIL": -3}, alien_lines=[_alien("GDX", 100)])
+    req = _request(plan=plan, target=_target(), armed=False, conform=True)
+    res = se.execute_plan(req, mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    assert res.status == se.STATUS_PREVIEW_ONLY
+    assert not any("conform intent absent" in r for r in res.reasons)
+    # Same ordered legs as the pre-change build (sells first incl. alien liquidation, then buys).
+    assert any(l.symbol == "GDX" and l.source == "alien_liquidation" for l in res.legs)
+    legs = {(l.symbol, l.side, l.qty) for l in res.legs}
+    assert legs == {("BIL", "SELL", 3), ("GDX", "SELL", 100),
+                    ("VTI", "BUY", 10), ("USFR", "BUY", 5)}
+
+
+# --- REBALANCE lane: no conform reason; preview transmits nothing; armed clean transmits ---
+def test_rebalance_preview_no_conform_reason_transmits_nothing():
+    plan = _plan(orders={"VTI": 10, "BIL": -3}, alien_lines=[_alien("GDX", 100)])
+    req = _rebalance_request(plan=plan, target=_target(), armed=False)
+    res = se.execute_plan(req, mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    assert res.status == se.STATUS_PREVIEW_ONLY
+    assert res.sell_results == [] and res.buy_results == []
+    assert not any("conform intent absent" in r for r in res.reasons)   # rebalance needs no conform
+    assert any("not armed" in r for r in res.reasons)                   # still preview-blocked
+    # conform=False -> alien GDX is NOT liquidated (no GDX leg); it's reported in aliens_left.
+    assert not any(l.symbol == "GDX" for l in res.legs)
+    assert any(getattr(ln, "symbol", None) == "GDX" for ln in res.aliens_left)
+
+
+def test_rebalance_armed_clean_path_permit_true_transmits(monkeypatch):
+    monkeypatch.setattr(se, "_probe_gateway_readonly", lambda ib, **k: False)
+    req = _rebalance_request(plan=_plan(orders={"VTI": 10}, alien_lines=[]),
+                             target=_target(), armed=True,
+                             summary=_summary(total_cash="60000"))
+    ib = _TxFakeIB(_summary(total_cash="60000"))
+    res = se.execute_plan(req, mode=se.MODE_ARMED, ib=ib)
+    assert res.status == se.STATUS_COMPLETE
+    assert res.reasons == []                                # every gate clean -> permit was True
+    assert any(o.action == "BUY" and float(o.totalQuantity) == 10.0 for o in ib.placed)
+    assert config.DRY_RUN is True and config.READONLY is True   # flip-and-restore held
+
+
+# --- margin gate: TRUST unlevered allows (ZERO reasons); levered CASH refuses ---
+def test_margin_preflight_ok_trust_unlevered_allows_zero_reasons():
+    # The live trust shape: AccountType=TRUST, BuyingPower > NetLiq. Unlevered exposure ~0.985.
+    trust = _typed_summary([("AccountType", "TRUST"), ("NetLiquidation", "117000"),
+                            ("BuyingPower", "378000"), ("TotalCashValue", "117000"),
+                            ("ExcessLiquidity", "90000")])
+    plan = _plan(orders={"VTI": 10}, investable=98_500.0, net_liq=100_000.0)
+    ok, reason = se._margin_preflight_ok(trust, 100_000.0, 2_500.0, plan, _target())
+    assert ok is True and reason == ""
+
+
+def test_margin_preflight_refuses_levered_on_cash_account():
+    cash = _typed_summary([("AccountType", "CASH"), ("NetLiquidation", "100000"),
+                           ("BuyingPower", "100000"), ("ExcessLiquidity", "0")])
+    plan = _plan(orders={"VTI": 10}, investable=150_000.0, net_liq=100_000.0)   # 1.5x exposure
+    ok, reason = se._margin_preflight_ok(cash, 100_000.0, 2_500.0, plan, _target())
+    assert ok is False
+    assert "margin pre-flight REFUSED" in reason
+    assert "1.5000x" in reason                              # the intended levered exposure
+
+
+def test_margin_preflight_ok_unlevered_on_empty_summary_allows():
+    # Fail-open on a thin/unreadable summary for the UNLEVERED path (matches _buying_power_ok).
+    plan = _plan(orders={"VTI": 10}, investable=98_500.0, net_liq=100_000.0)
+    ok, reason = se._margin_preflight_ok([], 100_000.0, 2_500.0, plan, _target())
+    assert ok is True and reason == ""
+
+
+# --- gate only tightens: it ADDS a reason for a levered armed run, and NEVER removes one ---
+def test_margin_gate_blocks_levered_armed_rebalance(monkeypatch):
+    # Armed, all code-gates clean, gateway write-enabled, but a genuinely levered plan on a CASH
+    # account -> the margin gate ADDS a refusal and the run is BLOCKED (equal-or-stricter).
+    monkeypatch.setattr(se, "_probe_gateway_readonly", lambda ib, **k: False)
+    cash = _typed_summary([("AccountType", "CASH"), ("NetLiquidation", "100000"),
+                           ("BuyingPower", "100000"), ("TotalCashValue", "100000"),
+                           ("ExcessLiquidity", "0")])
+    plan = _plan(orders={"VTI": 10}, alien_lines=[], investable=150_000.0, net_liq=100_000.0)
+    req = _rebalance_request(plan=plan, target=_target(weights={"VTI": 1.0},
+                                                       prices={"VTI": 250.0}),
+                             armed=True, summary=cash)
+    ib = _TxFakeIB(cash)
+    res = se.execute_plan(req, mode=se.MODE_ARMED, ib=ib)
+    assert res.status == se.STATUS_BLOCKED
+    assert ib.placed == []
+    assert any("margin pre-flight REFUSED" in r for r in res.reasons)
+
+
+def test_margin_gate_never_loosens_already_blocked_run():
+    # A run already blocked (not armed) with a levered plan stays BLOCKED — the margin gate is
+    # guarded by `not reasons` and so can only ever ADD, never clear, a blocking reason.
+    plan = _plan(orders={"VTI": 10}, alien_lines=[], investable=150_000.0, net_liq=100_000.0)
+    req = _rebalance_request(plan=plan, target=_target(), armed=False)
+    res = se.execute_plan(req, mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    assert res.status == se.STATUS_PREVIEW_ONLY
+    assert any("not armed" in r for r in res.reasons)      # pre-existing block persists
+
+
+def test_invalid_purpose_raises():
+    req = _request(plan=_plan(orders={"VTI": 10}), target=_target(), armed=False)
+    req.purpose = "SOMETHING_ELSE"
+    with pytest.raises(ValueError):
+        se.execute_plan(req, mode=se.MODE_PREVIEW, ib=_NoTxIB())

@@ -15,10 +15,42 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.28.1"
+VERSION = "0.29.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.29.0", "2026-07-31", "safe_execute: DEPLOY-vs-REBALANCE purpose + self-computed "
+                             "per-account MARGIN pre-flight (#57). (1) ExecutionRequest gains a "
+                             "trailing `purpose` field (default PURPOSE_DEPLOY): DEPLOY is the "
+                             "first-deploy lane that REQUIRES conform to transmit (liquidate "
+                             "aliens + fully conform); REBALANCE is the ongoing lane that does "
+                             "NOT require conform (trims to target, leaves non-target holdings in "
+                             "aliens_left). execute_plan derives conform_required=(purpose==DEPLOY) "
+                             "and purpose_ok=(conform if conform_required else True), and the two "
+                             "connection-dependent guards + the permit now key on purpose_ok "
+                             "instead of a hardcoded conform. For purpose=DEPLOY purpose_ok==conform, "
+                             "so the S0 single-account DEPLOY path is BYTE-IDENTICAL — proven by the "
+                             "unchanged DEPLOY suite (armed/preview/caps/idempotency) staying green "
+                             "plus explicit conform-false-blocks / conform-true-clean parity tests. "
+                             "This fixes the bug where an ongoing REBALANCE (conform=False by "
+                             "nature) could NEVER transmit. crm_execute now tags its multi-account "
+                             "rebalance requests purpose=REBALANCE (still PREVIEW-only here). (2) New "
+                             "_margin_preflight_ok gate (reuses s4_risk.margin_preflight) runs right "
+                             "after the buying-power check on the armed lane: computes intended "
+                             "post-trade risk exposure = plan.investable/NAV (the strategy's own "
+                             "risk ceiling; ~0.985 for a fully-invested S0 book, structurally <=1.0 "
+                             "since investable can't exceed NAV without borrow) against a hard "
+                             "leverage_cap=1.0 (S0/rebalance accounts are UNLEVERED). HARD INVARIANT: "
+                             "for exposure<=1.0 it adds ZERO reasons on ANY account type — incl. the "
+                             "trust U14438624 (AccountType=TRUST, BuyingPower>NetLiq) — and fails "
+                             "OPEN on a thin/empty summary (unlevered branch never reads BP/type), "
+                             "matching _buying_power_ok. It fails CLOSED and refuses ONLY a genuinely "
+                             "levered (exposure>1.0) request on a cash/unknown/thin-BP account. The "
+                             "gate is equal-or-stricter: guarded by `not reasons`, it can only ADD a "
+                             "block, never clear one. Order-affecting (adds one new transmit lane + "
+                             "one new blocking gate) but S0 DEPLOY behavior unchanged. Rule #1 clean: "
+                             "no strategy/regime/band/sizing value touched. NOTHING transmitted "
+                             "(fully mocked; full paperbot suite green)."),
     ("0.28.1", "2026-07-30", "s0_live_exec adopts the shared connections.gateway_probe "
                              "(folds the third probe copy; closes #70); read-only, "
                              "behavior-preserving. s0_live_exec._probe_gateway_readonly is now a "

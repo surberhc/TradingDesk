@@ -49,6 +49,7 @@ import config
 import live_quotes
 import order_router
 import s0_live
+import s4_risk
 
 # The live-trade Gateway port this executor transmits on. Contextual only — passed to the
 # shared probe for its log/error messages; the actual connection is opened by the caller.
@@ -59,6 +60,14 @@ LIVE_TRADE_PORT = 4003
 # ----------------------------------------------------------------------------------------
 MODE_PREVIEW = "PREVIEW"
 MODE_ARMED = "ARMED"
+
+# ----------------------------------------------------------------------------------------
+# EXECUTION PURPOSE — DEPLOY (first-deploy: liquidate aliens + fully conform) vs REBALANCE
+# (ongoing lane: trim to target, leave non-target holdings). DEPLOY requires `conform` to
+# transmit; REBALANCE does not. There is no third purpose.
+# ----------------------------------------------------------------------------------------
+PURPOSE_DEPLOY = "DEPLOY"
+PURPOSE_REBALANCE = "REBALANCE"
 
 # Terminal ExecutionResult statuses.
 STATUS_PREVIEW_ONLY = "PREVIEW_ONLY"
@@ -143,6 +152,11 @@ class ExecutionRequest:
     summary: list = field(default_factory=list)   # filtered accountSummary rows (BuyingPower gate)
     armed: bool = False
     kill: bool = False
+    # DEPLOY (default) requires `conform` to transmit — the first-deploy lane that liquidates
+    # aliens and fully conforms the book. REBALANCE is the ongoing lane that does NOT require
+    # conform: it trims to target and leaves non-target holdings (reported in aliens_left).
+    # LAST field with a default so every existing positional/keyword construction is unchanged.
+    purpose: str = PURPOSE_DEPLOY
 
 
 @dataclass
@@ -254,6 +268,42 @@ def _buying_power_ok(summary, notional: float) -> tuple[bool, str]:
     if bp is not None and bp < notional:
         return False, (f"buying power {bp:,.2f} < total BUY notional {notional:,.2f} — "
                        f"refusing.")
+    return True, ""
+
+
+def _margin_preflight_ok(summary, net_liq, total_buy, plan, target) -> tuple[bool, str]:
+    """Self-computed per-account MARGIN pre-flight (#57), reusing s4_risk.margin_preflight.
+
+    Computes the account's intended POST-TRADE risk exposure as a FRACTION of NAV from the
+    plan's investable — the strategy's OWN risk-deployment ceiling, (NAV - reserve) *
+    (1 - cash_reserve_pct). For an UNLEVERED S0 book that is ~0.985 (fully invested minus the
+    ~1.5% buffer) and is STRUCTURALLY <= 1.0 (investable can never exceed NAV without borrow).
+    Using the ceiling is the conservative choice: it never UNDER-states exposure, so a genuinely
+    levered book can't slip through, while an unlevered book stays at/below 1.0.
+
+    leverage_cap is 1.0: every account routed here (S0 / ongoing rebalance) is UNLEVERED — no
+    borrowing permitted. (A future per-account profile could raise this cap for a deliberately
+    levered strategy; for now all such accounts are held to 1.0.)
+
+    HARD INVARIANT: for exposure <= 1.0 this returns (True, "") on ANY account type. margin_
+    preflight's unlevered branch never reads BuyingPower/AccountType, so a thin/empty summary
+    AND the trust account U14438624 (AccountType='TRUST', BuyingPower > NetLiq) both pass with
+    ZERO reasons added — matching _buying_power_ok's fail-open-on-unreadable stance. It fails
+    CLOSED only on a genuinely levered (exposure > 1.0) request that cannot confirm margin
+    capacity (cash/unknown account, thin BP), exactly like s4_risk.margin_preflight.
+
+    Returns (True, "") when the run may proceed; (False, reason) when it must be refused.
+    `total_buy`/`target` are accepted for signature completeness / future per-account profiles."""
+    nav = float(net_liq or 0.0)
+    investable = float(getattr(plan, "investable", 0.0) or 0.0)
+    # Intended post-trade risk exposure as a fraction of NAV. nav<=0 is already blocked upstream
+    # by the per-order cap (which runs before this gate), so this guard only avoids a divide-by-
+    # zero on a pathological summary; a 0.0 exposure then trivially clears the unlevered branch.
+    exposure = (investable / nav) if nav > 0 else 0.0
+    pf = s4_risk.margin_preflight(summary, nav=nav, exposure=exposure, leverage_cap=1.0)
+    if not pf.ok:
+        return False, (f"margin pre-flight REFUSED (intended exposure {exposure:.4f}x of NAV, "
+                       f"leverage_cap 1.0): " + "; ".join(pf.reasons))
     return True, ""
 
 
@@ -638,6 +688,16 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     armed = req.armed
     conform = req.conform
     kill = req.kill
+    # PURPOSE — DEPLOY (default) requires conform to transmit; REBALANCE does not. Validate
+    # like `mode` above. `conform_required` is True ONLY for DEPLOY, so `purpose_ok` collapses
+    # to exactly `conform` on the DEPLOY path (byte-identical to the pre-change gate) and is
+    # unconditionally True on the REBALANCE path (which trims to target without conform).
+    purpose = getattr(req, "purpose", PURPOSE_DEPLOY)
+    if purpose not in (PURPOSE_DEPLOY, PURPOSE_REBALANCE):
+        raise ValueError(f"purpose must be {PURPOSE_DEPLOY!r} or {PURPOSE_REBALANCE!r}, "
+                         f"got {purpose!r}")
+    conform_required = (purpose == PURPOSE_DEPLOY)
+    purpose_ok = (conform if conform_required else True)
     # armed_conn: connected on the armed (transmit-capable) lane. By construction the caller
     # picks the ARMED lane iff permit_intent (armed AND conform AND not kill) held, so mode
     # ARMED <=> armed_conn (identical to s0_live_deploy's main()).
@@ -687,7 +747,7 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     reasons: list[str] = []
     if not armed:
         reasons.append("not armed (default preview; pass --arm-i-understand to arm)")
-    if not conform:
+    if conform_required and not conform:
         reasons.append(f"conform intent absent (pass {_CONFORM_FLAG_HINT}) — this DEPLOY "
                        f"executor requires it to liquidate + transmit")
     if kill:
@@ -718,16 +778,25 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
 
     # Connection-dependent gates — only meaningful on the armed (4003 transmit) connection,
     # and only worth probing once the code-level gates above are clean.
-    if armed and conform and armed_conn and not reasons:
+    if armed and purpose_ok and armed_conn and not reasons:
         if _probe_gateway_readonly(ib):
             reasons.append("Gateway is still READ-ONLY on 4003 (arming.probe idiom) — not "
                            "physically armed; a human must turn the Read-Only API toggle off")
-    if armed and conform and armed_conn and not reasons:
+    if armed and purpose_ok and armed_conn and not reasons:
         bp_ok, bp_reason = _buying_power_ok(summary, total_buy)
         if not bp_ok:
             reasons.append(bp_reason)
+    # Self-computed per-account MARGIN pre-flight (#57): refuse a genuinely levered request on
+    # an account that cannot carry it. Same guard shape as the buying-power check above (only
+    # probed once the code-level gates are clean, on the armed transmit lane). For an unlevered
+    # S0 plan (exposure <= 1.0) this adds ZERO reasons on ANY account type — see
+    # _margin_preflight_ok's HARD invariant.
+    if armed and purpose_ok and armed_conn and not reasons:
+        mg_ok, mg_reason = _margin_preflight_ok(summary, net_liq, total_buy, plan, target)
+        if not mg_ok:
+            reasons.append(mg_reason)
 
-    permit = (armed and conform and armed_conn and not kill and not reasons)
+    permit = (armed and purpose_ok and armed_conn and not kill and not reasons)
 
     result = ExecutionResult(status=STATUS_PREVIEW_ONLY, legs=legs, reasons=reasons,
                              aliens_left=aliens_left, unpriceable=unpriceable, rc=0)
@@ -735,7 +804,7 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     # [9] Report + (only if permitted) transmit the two-phase cash-gated deploy.
     if not permit:
         primary = ("not armed" if not armed
-                   else "conform off" if not conform
+                   else "conform off" if (conform_required and not conform)
                    else "kill switch present" if kill
                    else (reasons[0] if reasons else "gate not satisfied"))
         print("\n[9] TRANSMISSION BLOCKED — PREVIEW ONLY. Reason(s):")
