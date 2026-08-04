@@ -9,13 +9,15 @@ PILOT_MODE (conductor #3/#41) reflect genuine account state — real NetLiquidat
 positions, real margin — not the simulated paper account.
 
 CONNECTION TARGET — the live-TRADING Gateway (connections.ibkr_live_trade, port 4003), the
-SAME gateway S8's live pilot uses. Its login covers TWO individual live-trading TEST
-accounts:
-  * U14438624 — the TRUST account — S8's pilot account (livebot/s8_config.py). NOT ours.
-  * U5721712  — the INDIVIDUAL account — S0's pilot account. THIS is S0_LIVE_ACCOUNT.
-S0 must only ever read U5721712 and must never touch the trust account, so every read here
-is filtered to S0_LIVE_ACCOUNT (see filter_account_summary / filter_positions), mirroring
-livebot/s8_runner.filter_account_summary.
+SAME gateway S8's live pilot uses. Its login covers TWO live-trading accounts:
+  * U14438624 — the funded TRUST account — S0's real-money execution account. On 2026-07-28
+    S0 execution was retargeted to U14438624, and on 2026-07-29 it was conformed to S0
+    Growth. THIS is S0_LIVE_ACCOUNT. (S8's live cycle does not trade a sub-account — its
+    s8_config.ACCOUNT is informational-only — so U14438624 is not "S8's" account.)
+  * U5721712  — the INDIVIDUAL account — S0's RETIRED former pilot account. It held ~$957
+    and is PDT-blocked under $25k; no longer traded.
+S0 reads only U14438624, so every read here is filtered to S0_LIVE_ACCOUNT (see
+filter_account_summary / filter_positions), mirroring livebot/s8_runner.filter_account_summary.
 
 ZERO-TRANSMIT, two independent walls (identical posture to the S8 pilot):
   1. PRIMARY, load-bearing: PILOT_MODE=True (hardcoded) in paperbot/morning_execute_run.py.
@@ -34,10 +36,11 @@ from __future__ import annotations
 
 from connections import ibkr_live_trade
 
-# The individual live-trading TEST account, in Andrew's name, chosen 2026-07-27 as S0's
-# live-pilot account. The trust account U14438624 under the same 4003 login is S8's —
-# never read or touch it from the S0 lane.
-S0_LIVE_ACCOUNT = "U5721712"
+# The funded TRUST account, S0's real-money execution account: S0 execution was retargeted
+# to U14438624 on 2026-07-28 and conformed to S0 Growth on 2026-07-29. The former individual
+# pilot account U5721712 under the same 4003 login is now RETIRED (held ~$957, PDT-blocked
+# under $25k). U14438624 is not "S8's" — S8's live cycle trades no sub-account.
+S0_LIVE_ACCOUNT = "U14438624"
 
 
 def connect_s0_live(launch: bool = False, timeout: int = 10):
@@ -64,11 +67,11 @@ def connect_s0_live_armed(timeout: int = 10):
 def filter_account_summary(summary, account: str = S0_LIVE_ACCOUNT):
     """Keep only the accountSummary rows for `account` (default S0_LIVE_ACCOUNT).
 
-    The 4003 live-trade login exposes MORE THAN ONE managed account (S0's individual
-    account U5721712, S8's trust account U14438624, plus an aggregate 'All' scope), so an
+    The 4003 live-trade login exposes MORE THAN ONE managed account (S0's execution account
+    U14438624, the retired individual account U5721712, plus an aggregate 'All' scope), so an
     unfiltered ib.accountSummary() blends them. Filtering to S0's account first makes any
-    downstream read (NetLiq, margin) deterministic and guarantees the S0 lane never reads
-    the trust account's numbers. Mirrors livebot/s8_runner.filter_account_summary.
+    downstream read (NetLiq, margin) deterministic and guarantees the S0 lane reads only its
+    own execution account's numbers. Mirrors livebot/s8_runner.filter_account_summary.
 
     A dict {tag: value} already represents a single account and is returned unchanged.
     """
@@ -82,6 +85,6 @@ def filter_positions(positions, account: str = S0_LIVE_ACCOUNT):
 
     Same rationale as filter_account_summary: the 4003 login exposes multiple accounts, so
     ib.positions()/ib.portfolio() return rows for all of them. S0 reconciles only its own
-    individual account U5721712 and must never see the trust account's holdings.
+    execution account U14438624 and never reads the retired account's holdings.
     """
     return [p for p in positions if getattr(p, "account", None) == account]

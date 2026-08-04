@@ -3,12 +3,12 @@ test_s0_live.py — offline unit tests for the S0 read-only LIVE-PILOT connectio
 
 NO broker, NO real gateway, NO network. Proves the zero-transmit plumbing guarantees for
 Slice 1 of the S0 live pilot:
-  * S0_LIVE_ACCOUNT is the INDIVIDUAL account U5721712, and is NOT the trust/S8 account
-    U14438624.
+  * S0_LIVE_ACCOUNT is the funded execution account U14438624 (retargeted 2026-07-28,
+    conformed to S0 Growth 2026-07-29), and is NOT the retired individual account U5721712.
   * connect_s0_live() connects READ-ONLY (readonly is identity True, never False) under the
     "s0_live_pilot" consumer id, with launch defaulting False and passing through.
   * filter_account_summary / filter_positions pin every read to S0_LIVE_ACCOUNT, so the S0
-    lane can never read the trust account's rows.
+    lane reads only its own execution account's rows.
   * the two new clientIds (s0_live_pilot=57, s0_live_exec=58) are registered, differ from
     the S8 ids, and introduce no collision into the registry.
 
@@ -25,13 +25,13 @@ import s0_live
 from connections import clientids
 
 
-# --- account pin: individual U5721712, never the trust/S8 account ------------------
-def test_s0_live_account_is_the_individual_account():
-    assert s0_live.S0_LIVE_ACCOUNT == "U5721712"
+# --- account pin: funded execution account U14438624, never the retired account -----
+def test_s0_live_account_is_the_execution_account():
+    assert s0_live.S0_LIVE_ACCOUNT == "U14438624"
 
 
-def test_s0_live_account_is_not_the_trust_s8_account():
-    assert s0_live.S0_LIVE_ACCOUNT != "U14438624"
+def test_s0_live_account_is_not_the_retired_individual_account():
+    assert s0_live.S0_LIVE_ACCOUNT != "U5721712"
 
 
 # --- connect_s0_live is READ-ONLY, never readonly=False ----------------------------
@@ -85,17 +85,17 @@ def _row(account, tag="NetLiquidation", value="0"):
 
 def test_filter_account_summary_keeps_only_s0_account():
     rows = [
-        _row("U5721712", "NetLiquidation", "100"),
-        _row("U14438624", "NetLiquidation", "999"),   # trust/S8 — must be dropped
-        _row("All", "NetLiquidation", "1099"),         # aggregate — must be dropped
-        _row("U5721712", "BuyingPower", "50"),
+        _row("U14438624", "NetLiquidation", "100"),
+        _row("U5721712", "NetLiquidation", "999"),      # retired account — must be dropped
+        _row("All", "NetLiquidation", "1099"),          # aggregate — must be dropped
+        _row("U14438624", "BuyingPower", "50"),
     ]
 
     kept = s0_live.filter_account_summary(rows)
 
     assert len(kept) == 2
-    assert {r.account for r in kept} == {"U5721712"}
-    assert all(r.account != "U14438624" for r in kept)
+    assert {r.account for r in kept} == {"U14438624"}
+    assert all(r.account != "U5721712" for r in kept)
 
 
 def test_filter_account_summary_returns_dict_unchanged():
@@ -111,17 +111,17 @@ def _pos(account, symbol="SPY", qty=1):
 
 def test_filter_positions_keeps_only_s0_account():
     positions = [
-        _pos("U5721712", "SPY", 10),
-        _pos("U14438624", "SPX", 5),   # trust/S8 — must be dropped
+        _pos("U14438624", "SPY", 10),
+        _pos("U5721712", "SPX", 5),     # retired account — must be dropped
         _pos("All", "AGG", 1),          # aggregate — must be dropped
-        _pos("U5721712", "BIL", 3),
+        _pos("U14438624", "BIL", 3),
     ]
 
     kept = s0_live.filter_positions(positions)
 
     assert len(kept) == 2
-    assert {p.account for p in kept} == {"U5721712"}
-    assert all(p.account != "U14438624" for p in kept)
+    assert {p.account for p in kept} == {"U14438624"}
+    assert all(p.account != "U5721712" for p in kept)
 
 
 # --- clientId registry: new ids registered, distinct from S8, no collision ---------

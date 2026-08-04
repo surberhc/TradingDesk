@@ -72,6 +72,19 @@ _ARM_PROBE_SCRIPT = REPO / "dashboard" / "desk" / "gateway_arm_probe.py"
 _ARM_PROBE_CWD = REPO / "dashboard" / "desk"
 _ARM_PROBE_TIMEOUT_SEC = 45
 
+# --- BATCH REBALANCE (multi-account, roster-scoped) ------------------------------
+# The transmit-capable multi-account executor, invoked as a SUBPROCESS (no broker socket ever
+# opens in this Streamlit process — same discipline as the single-account lane). No args =
+# PREVIEW (sizes every roster account + prints margin pre-flight, transmits nothing); the arm
+# token runs the per-account two-phase cash-gated rebalance behind the same fail-closed gate.
+_BATCH_SCRIPT = REPO / "paperbot" / "batch_rebalance_execute.py"
+_BATCH_CWD = REPO / "paperbot"
+_BATCH_PREVIEW_TIMEOUT_SEC = 300     # reads + sizes EVERY roster account
+_BATCH_EXECUTE_TIMEOUT_SEC = 600     # per-account two-phase transmit across the roster
+# The deliberate typed confirmation for the batch send (the single-account rail types the
+# account id; the batch spans the whole roster, so it types this fixed phrase instead).
+BATCH_CONFIRM_PHRASE = "REBALANCE ALL"
+
 # --- Reviewed-preview freshness / expiry (decision D, 2026-07-31) -----------------
 # The operator reviews a read-only preview (Step 1), physically arms the gateway in TWS,
 # then Executes (Step 3). The executor ALWAYS recomputes the order live against current
@@ -858,6 +871,609 @@ def _run_execute_and_render(can_press: bool, pressed: bool) -> None:
 
 
 # =========================================================================== #
+# WHOLE-BOOK OUT-OF-SPEC READ (read-only, all roster accounts).                #
+# =========================================================================== #
+# This extends the page beyond the single pinned account (PREVIEW_ACCOUNT) with a
+# READ-ONLY, multi-account out-of-spec surface built from the CRM roster view
+# (v_tradingdesk_roster) and the frozen rebalance engine. It reuses the exact
+# crm_execute.preview_crm posture — the UNCHANGED pure rebalance_engine.build_plan, with no
+# `ib` and armed=False — so it builds and transmits NOTHING. It shares no state with, and
+# touches none of, the gated single-account Send rail above.
+@st.cache_resource(show_spinner="Running the frozen desk model (validated engine)…")
+def _target_for(version: str):
+    """The frozen desk model target for one version, as a strategy_target.Target. Cached as a
+    resource (non-serialisable object, and the backtest is expensive) so a whole-book scan
+    runs the engine once per distinct version. Broker-free."""
+    import strategy_target
+    return strategy_target.current_target(version=version)
+
+
+def _scan_whole_book() -> dict:
+    """Read the whole blessed roster + latest holdings from the CRM (read-only role) and run
+    the frozen engine to get every account's in-spec / out-of-spec verdict + would-trade legs.
+
+    Returns the crm_outofspec.scan_out_of_spec dict plus a 'built_at' stamp, or a dict with an
+    'error' key if the CRM is not configured/reachable. Builds and transmits NOTHING."""
+    import crm_roster
+    import crm_outofspec
+
+    if not crm_roster.is_configured():
+        return {"error": "not_configured"}
+    try:
+        rows = crm_roster.fetch_roster(advisor_name=None)  # whole book; filter in-app
+        holdings = crm_roster.fetch_holdings_latest([r["account_id"] for r in rows])
+    except crm_roster.CrmRosterUnavailable as exc:
+        return {"error": str(exc)}
+
+    # Build a target per DISTINCT model present; drop rows whose model has no frozen target.
+    versions = sorted({(r.get("model") or "") for r in rows if r.get("model")})
+    targets: dict = {}
+    bad_versions: list[str] = []
+    for v in versions:
+        try:
+            targets[v] = _target_for(v)
+        except Exception as exc:  # noqa: BLE001 — a model with no validated engine is skipped
+            bad_versions.append(f"{v} ({exc})")
+    rows = [r for r in rows if (r.get("model") or "") in targets]
+
+    scan = crm_outofspec.scan_out_of_spec(rows, holdings, targets)
+    scan["built_at_str"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    scan["bad_versions"] = bad_versions
+    return scan
+
+
+def _render_whole_book_outofspec() -> None:
+    """The read-only whole-book out-of-spec panel: a Scan button, summary tiles, an
+    advisor/model filter, and a per-account verdict table with the would-trade legs.
+    Read-only end to end — nothing is armed, placed, or transmitted."""
+    st.markdown(theme.section("Whole-book out-of-spec read (read-only, all accounts)"),
+                unsafe_allow_html=True)
+    st.caption(
+        "Every blessed account across the book, checked against the desk's frozen model with "
+        "the SAME pure engine the single-account preview uses (crm_execute.preview_crm "
+        "posture: no broker, armed=False — it builds and transmits nothing). Reads the CRM "
+        "roster view and the latest holdings snapshot; places, arms, and sends nothing."
+    )
+
+    if st.button("Scan the whole book (read-only)", key="cp_wholebook_scan"):
+        with st.spinner("Reading the CRM roster + holdings and running the frozen engine "
+                        "(read-only)…"):
+            st.session_state["cp_wholebook"] = _scan_whole_book()
+
+    scan = st.session_state.get("cp_wholebook")
+    if not isinstance(scan, dict):
+        st.info("Press 'Scan the whole book' to read every account's out-of-spec verdict. "
+                "Read-only — nothing is placed, armed, or transmitted.")
+        return
+
+    if scan.get("error") == "not_configured":
+        st.warning(
+            "The CRM connection is not wired yet. Andrew must set the `TRADINGDESK_CRM_DSN` "
+            "environment variable to the read-only role's connection string (the "
+            "`tradingdesk_readonly` Postgres role) before this whole-book read can run. No "
+            "credential is stored in code; nothing here transmits."
+        )
+        return
+    if scan.get("error"):
+        st.error(f"Could not read the CRM roster (read-only): {scan['error']}")
+        return
+
+    verdicts = scan.get("verdicts", [])
+    skipped = scan.get("skipped", [])
+
+    # Filters (operate in-memory on the already-scanned book — no re-query, no re-run).
+    advisors = sorted({(v.get("advisor_name") or "— unassigned —") for v in verdicts})
+    models = sorted({(v.get("version") or "") for v in verdicts})
+    fc1, fc2, fc3 = st.columns([2, 1, 1])
+    with fc1:
+        adv_pick = st.selectbox("Advisor", ["(whole book)"] + advisors, index=0,
+                                key="cp_wb_advisor")
+    with fc2:
+        model_pick = st.selectbox("Model", ["(all)"] + models, index=0, key="cp_wb_model")
+    with fc3:
+        only_oos = st.checkbox("Out-of-spec only", value=True, key="cp_wb_oos_only")
+
+    def _keep(v: dict) -> bool:
+        if adv_pick != "(whole book)" and (v.get("advisor_name") or "— unassigned —") != adv_pick:
+            return False
+        if model_pick != "(all)" and (v.get("version") or "") != model_pick:
+            return False
+        if only_oos and not v.get("out_of_spec"):
+            return False
+        return True
+
+    shown = [v for v in verdicts if _keep(v)]
+    scoped = [v for v in verdicts
+              if (adv_pick == "(whole book)"
+                  or (v.get("advisor_name") or "— unassigned —") == adv_pick)
+              and (model_pick == "(all)" or (v.get("version") or "") == model_pick)]
+    n_oos = sum(1 for v in scoped if v.get("out_of_spec"))
+
+    t1, t2, t3 = st.columns(3)
+    t1.metric("Accounts in scope", len(scoped))
+    t2.metric("Out of spec", n_oos)
+    t3.metric("In spec", len(scoped) - n_oos)
+    st.caption(f"Scanned {scan.get('n_accounts', 0)} funded accounts across the book · "
+               f"{scan.get('n_out_of_spec', 0)} out of spec · checked "
+               f"{scan.get('built_at_str', '—')}. "
+               + (f"{len(skipped)} unfunded/no-snapshot accounts skipped. " if skipped else "")
+               + "Read-only — nothing transmitted.")
+    if scan.get("bad_versions"):
+        st.caption("Models with no frozen engine target (skipped): "
+                   + ", ".join(scan["bad_versions"]))
+
+    if not shown:
+        st.success("No accounts match the current filter"
+                   + (" (nothing out of spec in scope)." if only_oos else "."))
+    else:
+        table = [{
+            "Account": v["account"],
+            "Advisor": v.get("advisor_name") or "—",
+            "Entity": v.get("entity") or "—",
+            "Model": v.get("version") or "—",
+            "Verdict": "OUT OF SPEC" if v["out_of_spec"] else "in spec",
+            "NetLiq": round(float(v.get("net_liq") or 0.0), 2),
+            "Positions": v.get("n_positions", 0),
+            "Would-trade legs": v.get("n_legs", 0),
+            "Alien": v.get("n_alien", 0),
+        } for v in shown]
+        st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+
+        # Per-account would-trade legs (the conform plan), collapsed.
+        with st.expander(f"Show the would-trade legs for the {len(shown)} shown account(s)"):
+            for v in shown:
+                if not v.get("legs"):
+                    continue
+                st.markdown(f"**{v['account']}** · {v.get('advisor_name') or '—'} · "
+                            f"{v.get('version') or '—'} — {v['n_legs']} leg(s)")
+                st.dataframe(pd.DataFrame(v["legs"]), hide_index=True,
+                             use_container_width=True)
+
+
+# =========================================================================== #
+# BATCH REBALANCE — the multi-account, roster-scoped review -> arm -> transmit  #
+# rail. It shells out to the UNCHANGED batch_rebalance_execute.py executor,     #
+# modelled exactly on the single-account U14438624 rail above: PREVIEW by       #
+# default (sizes every roster account, transmits nothing), and a gated ARM +    #
+# SEND that runs the per-account two-phase cash-gated rebalance ONLY behind the  #
+# same review -> arm -> transmit gate (fresh preview + typed confirm + a         #
+# physically armed 4003 Gateway). Execution is sandboxed to roster.enrolled_     #
+# roster() by the executor itself (the account wall); nothing here widens it.    #
+# =========================================================================== #
+# BATCH-ACCOUNT line: "    BATCH-ACCOUNT account=U... version=Growth status=... legs=3
+#                       sells=2 buys=1 margin_preflight_ok=True"
+_RE_BATCH_ACCT = re.compile(
+    r"BATCH-ACCOUNT\s+account=(\S+)\s+version=(\S+)\s+status=(\S+)\s+legs=(\d+)\s+"
+    r"sells=(\d+)\s+buys=(\d+)\s+margin_preflight_ok=(\w+)")
+# BATCH-SUMMARY line: "    BATCH-SUMMARY roster=2 out_of_spec=1 in_spec=1 skipped=0
+#                       total_legs=3 total_sells=... total_buys=..."
+_RE_BATCH_SUMMARY = re.compile(
+    r"BATCH-SUMMARY\s+roster=(\d+)\s+out_of_spec=(\d+)\s+in_spec=(\d+)\s+skipped=(\d+)\s+"
+    r"total_legs=(\d+)\s+total_sells=([\d\.]+)\s+total_buys=([\d\.]+)")
+_RE_BATCH_ARMED_COMPLETE = re.compile(r"BATCH ARMED COMPLETE", re.IGNORECASE)
+_RE_BATCH_BLOCKED = re.compile(r"BATCH TRANSMISSION BLOCKED|PREVIEW ONLY", re.IGNORECASE)
+
+
+def _parse_batch_preview(stdout: str) -> dict:
+    """Best-effort structured view of the batch executor's stdout. NEVER raises — every field
+    is optional and the caller falls back to the raw log. Returns keys: accounts (list of
+    per-account dicts), summary (dict or None), transmission_blocked (bool)."""
+    out: dict = {"accounts": [], "summary": None, "transmission_blocked": False}
+    try:
+        for line in stdout.splitlines():
+            m = _RE_BATCH_ACCT.search(line)
+            if m:
+                out["accounts"].append({
+                    "account": m.group(1),
+                    "version": m.group(2),
+                    "status": m.group(3),
+                    "legs": int(m.group(4)),
+                    "sells": int(m.group(5)),
+                    "buys": int(m.group(6)),
+                    "margin_preflight_ok": m.group(7) == "True",
+                })
+        sm = _RE_BATCH_SUMMARY.search(stdout)
+        if sm:
+            out["summary"] = {
+                "roster": int(sm.group(1)),
+                "out_of_spec": int(sm.group(2)),
+                "in_spec": int(sm.group(3)),
+                "skipped": int(sm.group(4)),
+                "total_legs": int(sm.group(5)),
+                "total_sells": _fmt_num(sm.group(6)),
+                "total_buys": _fmt_num(sm.group(7)),
+            }
+        out["transmission_blocked"] = bool(_RE_BATCH_BLOCKED.search(stdout))
+    except Exception:  # noqa: BLE001 — parsing is best-effort; raw log is source of truth
+        pass
+    return out
+
+
+def _store_batch_last_preview(stdout: str) -> None:
+    """Bind the batch arm/send controls to the LAST reviewed batch preview. Stores a compact
+    summary + a wall-clock timestamp under ``cp_batch_last_preview`` (the freshness key). Never
+    raises — the executor recomputes authoritatively at fire time regardless."""
+    try:
+        parsed = _parse_batch_preview(stdout or "")
+        sm = parsed.get("summary") or {}
+        now = datetime.now()
+        st.session_state["cp_batch_last_preview"] = {
+            "built_at": now,                       # datetime — used for the 30-min age check
+            "built_at_str": now.strftime("%H:%M"),
+            "n_out_of_spec": sm.get("out_of_spec"),
+            "n_roster": sm.get("roster"),
+            "total_legs": sm.get("total_legs"),
+        }
+    except Exception:  # noqa: BLE001 — binding is best-effort; never break the preview
+        pass
+
+
+def _batch_preview_freshness(now: datetime | None = None) -> tuple[float | None, bool]:
+    """(age_secs, is_fresh) for the LAST reviewed BATCH preview. Reuses the same pure freshness
+    decision + window as the single-account rail (a reviewed batch preview also expires after
+    30 min and must be rebuilt before an arm re-enables)."""
+    last = st.session_state.get("cp_batch_last_preview")
+    built_at = last.get("built_at") if isinstance(last, dict) else None
+    return _freshness_of(built_at, now or datetime.now())
+
+
+def _render_batch_preview_result(stdout: str, stderr: str) -> None:
+    """Turn the batch executor's stdout into a per-account table + margin pre-flight column +
+    aggregate summary, then ALWAYS show the raw log (the source of truth)."""
+    parsed = _parse_batch_preview(stdout)
+    sm = parsed.get("summary")
+
+    if sm is not None:
+        t1, t2, t3, t4 = st.columns(4)
+        t1.metric("Roster accounts", sm["roster"])
+        t2.metric("Out of spec", sm["out_of_spec"])
+        t3.metric("In spec", sm["in_spec"])
+        t4.metric("Total legs", sm["total_legs"])
+        st.caption(
+            f"Total sells ~${sm['total_sells']:,.2f} · total buys ~${sm['total_buys']:,.2f} "
+            f"(buys are re-sized to each account's realized cash at transmit time) · "
+            + (f"{sm['skipped']} unfunded/invisible account(s) skipped · " if sm["skipped"]
+               else "")
+            + "Read-only preview — nothing transmitted."
+        )
+
+    accts = parsed.get("accounts") or []
+    if accts:
+        st.markdown(
+            theme.card(
+                "Out-of-spec roster accounts (read-only preview)",
+                f"{len(accts)} account(s) would be rebalanced to their model — each with its "
+                f"own per-account margin pre-flight (#57) shown below. Every order routes "
+                f"through the same fail-closed engine as the single-account lane; buys are "
+                f"re-sized to realized cash at real transmit time.",
+            ),
+            unsafe_allow_html=True,
+        )
+        table = [{
+            "Account": a["account"],
+            "Model": a["version"],
+            "Sells": a["sells"],
+            "Buys": a["buys"],
+            "Legs": a["legs"],
+            "Margin pre-flight": "OK" if a["margin_preflight_ok"] else "REFUSED",
+            "Executor status": a["status"],
+        } for a in accts]
+        st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
+    elif sm is not None and sm["out_of_spec"] == 0:
+        st.markdown(
+            theme.status_card(
+                "Batch rebalance plan", "good", "Nothing to trade",
+                "Every account on the blessed roster already conforms to its model — there is "
+                "nothing to trade. Nothing was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+    else:
+        st.warning(
+            "The structured batch view was unavailable (the preview output did not match the "
+            "expected format). See the full log below for exactly what the executor reported. "
+            "Nothing was transmitted."
+        )
+
+    if parsed.get("transmission_blocked"):
+        st.markdown(
+            theme.status_card(
+                "Transmission", "info", "Read-only preview — nothing transmitted",
+                "The batch executor confirmed this was a preview only: transmission was "
+                "blocked on every account and nothing was placed, armed, or sent.",
+            ),
+            unsafe_allow_html=True,
+        )
+
+    with st.expander("Show the full batch preview log"):
+        st.code((stdout or "") + (("\n" + stderr) if stderr else ""), language=None)
+
+
+def _run_batch_preview_and_render() -> None:
+    """Run the batch executor in PREVIEW mode (no args) and render the per-account plan.
+    Mirrors _run_preview_and_render: same existence check, same subprocess posture, same
+    plain-English failure cards. Transmits nothing."""
+    if not os.path.exists(VENV_PYTHON) or not _BATCH_SCRIPT.exists():
+        st.markdown(
+            theme.status_card(
+                "Batch read-only preview", "bad", "Could not start the batch preview",
+                "The batch executor or its Python could not be found on this machine. Nothing "
+                "was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+    try:
+        with st.spinner("Building the read-only BATCH preview (reading every roster account "
+                        "on the port-4003 gateway)…"):
+            proc = subprocess.run(
+                [VENV_PYTHON, str(_BATCH_SCRIPT)],
+                cwd=str(_BATCH_CWD), capture_output=True, text=True,
+                timeout=_BATCH_PREVIEW_TIMEOUT_SEC,
+            )
+        stdout, stderr = proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        st.markdown(
+            theme.status_card(
+                "Batch read-only preview", "bad", "Timed out reaching the live-trade gateway",
+                "The batch preview did not finish in time. The live-trade Gateway (port 4003) "
+                "may be down or not logged in. Nothing was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
+        st.markdown(
+            theme.status_card(
+                "Batch read-only preview", "bad", "Couldn't reach the live-trade gateway",
+                f"Couldn't reach the live-trade gateway (port 4003) — is it up and logged in? "
+                f"({type(exc).__name__}). Nothing was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    _render_batch_preview_result(stdout, stderr)
+    _store_batch_last_preview(stdout)
+    _arm_execute_audit(
+        category="control_plane_batch_preview",
+        message=("Built a read-only multi-account BATCH rebalance preview across the blessed "
+                 "roster — nothing was transmitted."),
+        severity="info")
+
+
+def _classify_batch_output(stdout: str, stderr: str) -> str:
+    """Classify the batch executor's real-run output into 'filled' | 'blocked' | 'error'.
+    'filled' wins when the batch armed-complete line is present; otherwise any block marker
+    means nothing transmitted; anything else is an unexpected error."""
+    combined = ((stdout or "") + "\n" + (stderr or "")).lower()
+    if "batch armed complete" in combined:
+        return "filled"
+    if any(mk in combined for mk in ("batch transmission blocked", "preview only",
+                                     "not armed", "would transmit")):
+        return "blocked"
+    return "error"
+
+
+def _run_batch_execute_and_render(can_press: bool, pressed: bool) -> None:
+    """The batch transmit path — modelled on _run_execute_and_render: same
+    `if not can_press or not pressed: return` gate, same executor-existence check, same guarded
+    audit, same in-handler arm-token construction, same subprocess invocation of the batch
+    executor with the token, same result classification + audits. Returns immediately unless
+    BOTH gates hold and the button was pressed."""
+    if not can_press or not pressed:
+        return
+    if not os.path.exists(VENV_PYTHON) or not _BATCH_SCRIPT.exists():
+        st.markdown(
+            theme.status_card(
+                "Batch execute", "bad", "Could not start the batch executor",
+                "The batch executor or its Python could not be found on this machine. Nothing "
+                "was transmitted.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    _arm_execute_audit(
+        category="control_plane_batch_execute_fired",
+        message=("Operator armed and fired the multi-account BATCH rebalance across the "
+                 "blessed roster (typed confirm + reviewed preview). The executor transmits "
+                 "only if the 4003 Gateway is physically armed and each account's gate passes."),
+        severity="warn")
+
+    # The arm token is built ONLY here, inside the guarded, gated handler.
+    arm_token = "--arm-i-" + "understand"
+    try:
+        with st.spinner("Transmitting the BATCH rebalance to the live-trade Gateway "
+                        "(port 4003) — per-account two-phase cash-gated across the roster…"):
+            proc = subprocess.run(
+                [VENV_PYTHON, str(_BATCH_SCRIPT), arm_token],
+                cwd=str(_BATCH_CWD), capture_output=True, text=True,
+                timeout=_BATCH_EXECUTE_TIMEOUT_SEC,
+            )
+        stdout, stderr = proc.stdout or "", proc.stderr or ""
+    except subprocess.TimeoutExpired:
+        _arm_execute_audit(
+            category="control_plane_batch_execute_result",
+            message=("The BATCH rebalance execute run timed out before the executor reported "
+                     "a result; the Gateway may be down. Transmission state is unconfirmed — "
+                     "verify in TWS."),
+            severity="bad")
+        st.markdown(
+            theme.status_card(
+                "Batch execute", "bad", "Timed out before the executor reported back",
+                "The batch run did not finish in time. The live-trade Gateway (port 4003) may "
+                "be down or not logged in. Check each account and open orders in TWS to "
+                "confirm state before trying again.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+    except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
+        _arm_execute_audit(
+            category="control_plane_batch_execute_result",
+            message=(f"The BATCH rebalance execute run failed to start or crashed "
+                     f"({type(exc).__name__}). Nothing was confirmed transmitted — verify in "
+                     f"TWS."),
+            severity="bad")
+        st.markdown(
+            theme.status_card(
+                "Batch execute", "bad", "Couldn't run the batch executor",
+                f"Couldn't run the batch executor ({type(exc).__name__}) — the live-trade "
+                f"Gateway (port 4003) may be down. Nothing was confirmed transmitted; check "
+                f"the accounts in TWS.",
+            ),
+            unsafe_allow_html=True,
+        )
+        return
+
+    verdict = _classify_batch_output(stdout, stderr)
+    if verdict == "filled":
+        st.markdown(
+            theme.status_card(
+                "Batch execute", "good", "The batch rebalance was transmitted",
+                "The per-account rebalance was transmitted across the roster — review each "
+                "account's fills below and DISARM the Gateway (re-check 'Read-Only API' on the "
+                "port 4003 Gateway in TWS) now that you are finished.",
+            ),
+            unsafe_allow_html=True,
+        )
+        result_msg = ("The multi-account BATCH rebalance was transmitted across the blessed "
+                      "roster (per-account two-phase cash-gated). Review fills and disarm the "
+                      "Gateway.")
+        result_sev = "good"
+    elif verdict == "blocked":
+        st.markdown(
+            theme.status_card(
+                "Batch execute", "warn", "Nothing was transmitted — the Gateway was not armed",
+                "Nothing was transmitted on any account — the Gateway was not armed (or a "
+                "safety gate blocked it). Arm the 4003 Gateway in TWS (uncheck 'Read-Only "
+                "API') and try again.",
+            ),
+            unsafe_allow_html=True,
+        )
+        result_msg = ("The BATCH rebalance execute run transmitted NOTHING — the 4003 Gateway "
+                      "was not armed or a safety gate blocked every account.")
+        result_sev = "warn"
+    else:
+        st.markdown(
+            theme.status_card(
+                "Batch execute", "bad", "The batch executor returned an unexpected result",
+                "The executor did not report either a completed batch or a clean block. Read "
+                "the full log below carefully and verify every account and open orders in TWS "
+                "before doing anything else.",
+            ),
+            unsafe_allow_html=True,
+        )
+        result_msg = ("The BATCH rebalance execute run returned an UNEXPECTED result (neither "
+                      "completed nor a clean block) — verify in TWS.")
+        result_sev = "bad"
+
+    _render_batch_preview_result(stdout, stderr)
+    _arm_execute_audit(category="control_plane_batch_execute_result",
+                       message=result_msg, severity=result_sev)
+
+
+def _render_batch_rebalance() -> None:
+    """The multi-account BATCH rebalance rail: Review (build a read-only preview of every
+    out-of-spec roster account) -> Arm (check the 4003 Gateway armed state + type the confirm
+    phrase) -> Send (run the per-account two-phase rebalance). Modelled on the single-account
+    rail; execution is sandboxed to roster.enrolled_roster() by the executor's own account
+    wall. Nothing sends until the operator refreshes a preview, physically arms the gateway in
+    TWS, types the confirm phrase, and presses Send."""
+    st.caption(
+        "Rebalance EVERY out-of-spec account on the blessed roster to its model, one account "
+        "at a time, behind the SAME review -> arm -> transmit gate as the single-account lane. "
+        "Each account routes through the same fail-closed engine (per-account margin pre-flight "
+        "+ two-phase cash-gated transmit). Execution is scoped to the roster allow-list "
+        "(roster.enrolled_roster()); it never widens beyond the blessed accounts. Read-only "
+        "until you deliberately refresh a preview, arm the gateway by hand in TWS, type the "
+        "confirm phrase, and press Send."
+    )
+
+    plan_slot = st.container()
+    cols = st.columns(3)
+
+    # Step 1 · Review.
+    with cols[0]:
+        st.markdown(theme.section("Step 1 · Review"), unsafe_allow_html=True)
+        st.caption("Build a read-only preview of every out-of-spec roster account. Reads the "
+                   "gateway; transmits nothing.")
+        pressed_build = st.button("Build read-only batch preview", key="cp_batch_build_btn")
+
+    if pressed_build:
+        with plan_slot:
+            _run_batch_preview_and_render()
+
+    batch_age_secs, batch_fresh = _batch_preview_freshness()
+    has_batch_preview = isinstance(st.session_state.get("cp_batch_last_preview"), dict)
+    with cols[0]:
+        if not has_batch_preview:
+            st.markdown(theme.pill("No batch preview yet — press Build", "unknown"),
+                        unsafe_allow_html=True)
+        elif batch_fresh:
+            st.markdown(
+                theme.pill(f"Preview fresh (under {int(PREVIEW_FRESHNESS_SECS // 60)} min)",
+                           "good"), unsafe_allow_html=True)
+        else:
+            _mins = int((batch_age_secs or 0) // 60)
+            st.markdown(theme.pill(f"Preview expired ({_mins} min old) — rebuild it", "warn"),
+                        unsafe_allow_html=True)
+
+    # Step 2 · Arm — reuse the SAME read-only 4003 armed-state probe as the single-account rail,
+    # plus a typed confirm phrase (the batch spans the roster, so it types a fixed phrase).
+    with cols[1]:
+        st.markdown(theme.section("Step 2 · Arm"), unsafe_allow_html=True)
+        st.caption("Uncheck 'Read-Only API' on the port-4003 Gateway in TWS by hand, then "
+                   f"type '{BATCH_CONFIRM_PHRASE}' to confirm you reviewed the batch preview "
+                   f"and armed it.")
+        pressed_arm = st.button("Check whether the 4003 Gateway is armed",
+                                key="cp_batch_arm_probe_btn")
+        confirm_val = st.text_input(
+            f"Type '{BATCH_CONFIRM_PHRASE}' to confirm", value="",
+            key="cp_batch_execute_confirm",
+            placeholder=f"type {BATCH_CONFIRM_PHRASE} here")
+        confirmed = confirm_val.strip().upper() == BATCH_CONFIRM_PHRASE
+        if confirmed:
+            st.markdown(theme.pill("Confirm phrase typed", "good"), unsafe_allow_html=True)
+        else:
+            st.markdown(theme.pill(f"Type {BATCH_CONFIRM_PHRASE} to confirm", "warn"),
+                        unsafe_allow_html=True)
+
+    arm_slot = st.container()
+    if pressed_arm:
+        with arm_slot:
+            _run_arm_probe_and_render()   # reuse the single-account rail's armed-state probe
+
+    # Step 3 · Send.
+    with cols[2]:
+        st.markdown(theme.section("Step 3 · Send"), unsafe_allow_html=True)
+        can_press = batch_fresh and confirmed
+        pressed = st.button("Send batch rebalance to IBKR", key="cp_batch_execute_btn",
+                            disabled=not can_press, use_container_width=True)
+        if batch_fresh:
+            step1_mark = "✓ fresh batch preview reviewed"
+        elif batch_age_secs is not None:
+            step1_mark = (f"• expired — rebuild the batch preview "
+                          f"({int(batch_age_secs // 60)} min old)")
+        else:
+            step1_mark = "• not yet — build the batch preview"
+        step2_mark = ("✓ confirm phrase typed" if confirmed
+                      else f"• not yet — type {BATCH_CONFIRM_PHRASE}")
+        st.markdown(
+            f"- {step1_mark}\n"
+            f"- {step2_mark}\n"
+            f"- Even with both ✓, nothing sends unless the port-4003 Gateway is physically "
+            f"armed in TWS ('Read-Only API' unchecked) — the executor measures it per account "
+            f"and refuses otherwise. Execution stays scoped to the blessed roster."
+        )
+
+    send_slot = st.container()
+    with send_slot:
+        _run_batch_execute_and_render(can_press, pressed)
+
+
+# =========================================================================== #
 # Page entry point — scannable verdict/tiles + 3-column send rail.             #
 # =========================================================================== #
 def render_control_plane() -> None:
@@ -983,6 +1599,28 @@ def render_control_plane() -> None:
     # Now fill the reserved top slots from the (possibly just-updated) session state.
     with verdict_slot:
         _render_verdict_and_tiles()
+
+    # --- WHOLE-BOOK OUT-OF-SPEC READ (read-only, multi-account). ------------------------ #
+    # Extends the page past the single pinned account with a read-only, all-accounts
+    # out-of-spec surface (CRM roster + frozen engine). Builds/transmits nothing; it shares
+    # no state with the gated Send rail above.
+    st.divider()
+    with st.expander("Whole-book out-of-spec read (read-only — every account)",
+                     expanded=False):
+        _render_whole_book_outofspec()
+
+    # --- BATCH REBALANCE (transmit-capable, multi-account, roster-scoped). --------------- #
+    # The transmit-capable counterpart to the read-only whole-book read above: it rebalances
+    # every OUT-OF-SPEC roster account to its model behind the SAME review -> arm -> transmit
+    # gate as the single-account rail. Sends NOTHING until a human refreshes a preview, arms
+    # the 4003 Gateway by hand, types the confirm phrase, and presses Send; the executor keeps
+    # execution scoped to roster.enrolled_roster() (the account wall).
+    st.divider()
+    st.markdown(theme.section("Batch rebalance — every out-of-spec roster account"),
+                unsafe_allow_html=True)
+    with st.expander("Batch rebalance the whole roster (review -> arm -> transmit)",
+                     expanded=False):
+        _render_batch_rebalance()
 
     # --- Safety line + the full gate prose (moved here from the old top gate card). ------ #
     st.caption(
