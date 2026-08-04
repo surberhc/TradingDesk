@@ -175,3 +175,58 @@ def test_main_returns_zero(monkeypatch):
     })
     monkeypatch.setattr(gr, "default_reap_log_path", lambda: None)
     assert gr.main([]) == 0
+
+
+def test_spares_login_window_gateway_when_nobody_bound():
+    # The 2026-08-04 fix: nobody owns 4003 and a gateway is past the short boot grace but
+    # still within the login/2FA window -> it is a login in progress, NOT an orphan. Spare
+    # it. (Before the fix this pid was killed, thrashing the human's 2FA.)
+    killed = []
+    res = gr.reap_orphans(
+        grace_secs=180,
+        login_grace_secs=1800,
+        get_owner=lambda: None,
+        find_gateways=lambda: [_gw(200, age=600)],
+        is_alive=lambda p: True,
+        get_cmdline=lambda p: LT,
+        kill=lambda p: killed.append(p) or True,
+        my_pid=1,
+    )
+    assert killed == []
+    assert res["spared"] == [200]
+
+
+def test_reaps_login_window_gateway_once_past_login_grace():
+    # A genuinely hung unbound gateway (nobody owns 4003) is still cleaned once it ages past
+    # the login window.
+    killed = []
+    res = gr.reap_orphans(
+        grace_secs=180,
+        login_grace_secs=1800,
+        get_owner=lambda: None,
+        find_gateways=lambda: [_gw(200, age=2000)],
+        is_alive=lambda p: True,
+        get_cmdline=lambda p: LT,
+        kill=lambda p: killed.append(p) or True,
+        my_pid=1,
+    )
+    assert killed == [200]
+
+
+def test_owner_present_reaps_orphan_on_short_boot_grace():
+    # When a live session already OWNS 4003, a second unbound gateway past the SHORT boot
+    # grace is a true port-race orphan and is reaped promptly (the long login grace does NOT
+    # apply once there is a winner).
+    killed = []
+    res = gr.reap_orphans(
+        grace_secs=180,
+        login_grace_secs=1800,
+        get_owner=lambda: 100,
+        find_gateways=lambda: [_gw(100, age=9999), _gw(200, age=600)],
+        is_alive=lambda p: True,
+        get_cmdline=lambda p: LT,
+        kill=lambda p: killed.append(p) or True,
+        my_pid=1,
+    )
+    assert killed == [200]
+    assert 100 in res["spared"]

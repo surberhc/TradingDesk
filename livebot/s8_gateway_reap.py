@@ -40,6 +40,16 @@ SAFETY — THE LOAD-BEARING CHECKS (mirrors s8_reap's discipline)
 4. BOOT GRACE. A gateway younger than ``BOOT_GRACE_SECS`` is spared even if it is not yet
    bound — it may still be starting up and about to bind 4003. A healthy cold start binds
    well inside this window, so a genuinely healthy boot is never mistaken for an orphan.
+5. LOGIN / 2FA GRACE. When NO process yet owns port 4003, an unbound gateway is almost
+   always the one-and-only gateway still completing login (typically sitting at the IBKR
+   2FA prompt), NOT an orphan — orphans exist only once some gateway has WON the port and a
+   loser is left bound to nothing. Such a still-logging-in gateway is spared for the much
+   longer ``LOGIN_GRACE_SECS`` window so the reaper can never kill a human's in-progress
+   2FA and force a relaunch whose fresh 2FA is killed in turn (the 2026-08-04 reaper-vs-2FA
+   thrash: 5 successive logins reaped on the 3-min boot grace, ~53 min of gateway downtime,
+   the 08:45 watchdog alert). True orphans — a gateway unbound while ANOTHER already owns
+   4003 — are still reaped on the short boot grace, and a genuinely hung unbound gateway is
+   still cleaned once past the login window, or the instant a real session binds 4003.
 
 NEVER RAISES, NEVER BLOCKS. Every failure is caught and reported in the returned dict;
 ``main`` always exits 0. This module has NO order path, NO ``ib_async`` import, and NO
@@ -68,6 +78,10 @@ LIVE_TRADE_PORT = 4003
 INSTALL_MARKER = r"C:\IBC-Live-Trade"
 # A gateway younger than this is spared — it may still be booting toward binding 4003.
 BOOT_GRACE_SECS = 180
+# When NOBODY yet owns port 4003, a still-unbound gateway is the sole login in progress
+# (usually waiting on the IBKR 2FA prompt), not an orphan — spare it this much longer so a
+# human has time to answer 2FA. See SAFETY item 5 (the 2026-08-04 reaper-vs-2FA thrash).
+LOGIN_GRACE_SECS = 1800
 REAP_LOG_NAME = "s8_gateway_reap.log"
 
 # Tri-state sentinel returned by the port-owner probe when it could not be performed at
@@ -189,6 +203,7 @@ def default_reap_log_path():
 def reap_orphans(
     *,
     grace_secs: int = BOOT_GRACE_SECS,
+    login_grace_secs: int = LOGIN_GRACE_SECS,
     get_owner: Callable[[], Any] = port_owner_pid,
     find_gateways: Callable[[], Optional[List[Dict[str, Any]]]] = find_live_trade_gateways,
     is_alive: Callable[[int], bool] = s8_lock.pid_alive,
@@ -246,10 +261,24 @@ def reap_orphans(
                     f"gateway). Never reaped.")
                 continue
 
-            if age < grace_secs:
+            # Choose the grace window. When SOME process already owns 4003, any OTHER unbound
+            # gateway lost the port-binding race and is a genuine orphan -> the short BOOT
+            # grace applies. When NOBODY owns 4003 yet, this is almost certainly the sole
+            # gateway still completing login (waiting on the IBKR 2FA prompt); killing it
+            # forces a relaunch whose fresh 2FA is killed in turn -- the 2026-08-04
+            # reaper-vs-2FA thrash. Give it the much longer LOGIN grace so a human has time to
+            # answer 2FA. A truly hung gateway is still reaped once past that window, or the
+            # moment a real session binds 4003.
+            effective_grace = grace_secs if owner is not None else max(grace_secs, login_grace_secs)
+            if age < effective_grace:
                 result["spared"].append(pid)
-                log(f"s8_gateway_reap: sparing pid={pid} — only {age:.0f}s old "
-                    f"(< {grace_secs}s boot grace); it may still be binding 4003.")
+                if owner is None:
+                    log(f"s8_gateway_reap: sparing pid={pid} — {age:.0f}s old and NO gateway "
+                        f"owns 4003 yet (< {effective_grace}s login/2FA grace); it is likely "
+                        f"still completing login. Never kill an in-progress 2FA.")
+                else:
+                    log(f"s8_gateway_reap: sparing pid={pid} — only {age:.0f}s old "
+                        f"(< {grace_secs}s boot grace); it may still be binding 4003.")
                 continue
 
             # Aged, and not the port owner -> orphan candidate. Re-verify positive ID at
