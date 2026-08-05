@@ -19,6 +19,16 @@ REM ===========================================================================
 set "VENV_PY=C:\TradingDesk-Local\venv\Scripts\python.exe"
 set "REPO=%~dp0.."
 
+REM --- Resolve the live CRM DSN from the User-scope registry if it is not already
+REM     present in this process env. Task Scheduler can cache its environment until a
+REM     reboot, so a freshly-set User TRADINGDESK_CRM_DSN may be invisible to the
+REM     inherited env, silently dropping the read-only CRM role back to the built-in
+REM     allow-list. Pull it live here. Only set when empty (never clobber an
+REM     already-correct inherited value); never echo it (it contains a password). ---
+if not defined TRADINGDESK_CRM_DSN (
+    for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('TRADINGDESK_CRM_DSN','User')"`) do set "TRADINGDESK_CRM_DSN=%%V"
+)
+
 REM --- PYTHONPATH shim so `import rebalance_engine` / `from connections import ...`
 REM     resolve; the script also adds connections + paperbot + dashboard\desk to
 REM     sys.path itself (belt-and-suspenders). ---
