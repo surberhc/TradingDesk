@@ -83,8 +83,16 @@ STRATEGY_VERSION = "Balanced"   # matches strategies.config.ACTIVE_VERSION
 # master (run accounts.py to check), enrolling it is a no-op the engine will skip.
 # DU8922144 (Balanced) and DU8922146 (Growth) were pulled 2026-07-09 (Andrew's
 # decision) to free them up for testing other strategies later; their S0 positions are
-# being liquidated separately. `conductor/ACCOUNT_ALLOCATION.md` is now the
-# authoritative account -> strategy map — update it alongside any ENROLLMENT edit.
+# being liquidated separately.
+#
+# SOURCE OF TRUTH: the live CRM roster (`public.v_tradingdesk_roster`, read via
+# `paperbot/roster.py` -> `crm_roster`) is now the authoritative account -> strategy map.
+# This ENROLLMENT dict is a DEGRADED-MODE FALLBACK ONLY — the live CRM roster is the source
+# of truth. `roster.enrolled_roster()` falls back to it when the CRM DSN
+# (`TRADINGDESK_CRM_DSN`) is unset or the CRM is unreachable, so the account wall always
+# has a deterministic allow-list; several monitor/reporting paths also still read it
+# directly, so it stays in place. (The old hand-maintained `conductor/ACCOUNT_ALLOCATION.md`
+# map was RETIRED 2026-08-05 — superseded by the roster feed.)
 VALID_VERSIONS = ("Conservative", "Balanced", "Growth")
 ENROLLMENT = {
     # account number  : strategy version  (set to each client's risk profile)

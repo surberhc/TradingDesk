@@ -16,10 +16,11 @@ The blessed roster now comes FIRST from the CRM's read-only view ``v_tradingdesk
 (via crm_roster), scoped to Andrew's book and intersected with FUNDED reality (accounts that
 actually have a latest holdings snapshot). This replaces the hand-maintained
 ``config.ENROLLMENT`` as the authoritative source. ``config.ENROLLMENT`` is LEFT IN PLACE as
-a fallback (and to be retired later): if the CRM connection is not wired yet (the read-only
-role's connection string in the ``TRADINGDESK_CRM_DSN`` env var — Andrew's provisioning step)
-or unreachable, ``enrolled_roster`` degrades to the local config so the wall always has a
-deterministic allow-list and nothing here can break by a transient DB outage.
+a DEGRADED-MODE FALLBACK ONLY — the live CRM roster is the source of truth: if the CRM
+connection is not wired yet (the read-only role's connection string in the
+``TRADINGDESK_CRM_DSN`` env var — Andrew's provisioning step) or unreachable,
+``enrolled_roster`` degrades to the local config so the wall always has a deterministic
+allow-list and nothing here can break by a transient DB outage.
 """
 from __future__ import annotations
 
@@ -54,8 +55,9 @@ def enrolled_roster() -> list[str]:
     Built FIRST from the CRM roster view (``crm_enrolled_roster`` — Andrew's book, funded
     reality). If the CRM path is not wired (no ``TRADINGDESK_CRM_DSN`` env var / read-only
     role connection string set — Andrew's provisioning step) or is unreachable, it degrades
-    to the local ``config.ENROLLMENT`` map (kept in place for exactly this fallback and to be
-    retired later), so the account wall always has a deterministic allow-list.
+    to the local ``config.ENROLLMENT`` map (kept in place as a degraded-mode fallback only;
+    the live CRM roster is the source of truth), so the account wall always has a
+    deterministic allow-list.
 
     It is INDEPENDENT of any planner output on purpose — the account wall must gate on who we
     are blessed to trade, never on 'whatever the planner produced'. Pure: reads the CRM view
