@@ -55,9 +55,46 @@ def _bond_value(qty: float, mark: float, market_value) -> float:
     return _to_float(market_value)
 
 
+# --- NAV / holdings-value mismatch fail-safe (pre-arm exclusion) -----------------
+# An account whose recorded NAV (roster ``total_value``) is wildly BELOW the value its own
+# latest holdings + cash imply is EXCLUDED from the engine run, so it can never be sized or
+# armed off a NAV that disagrees with reality — WHATEVER the cause (a departed/closed account
+# whose positions transferred out while its last holdings snapshot is now stale; an upstream
+# Flex-feed dropout; any other data desync). This is a FAIL-SAFE EXCLUSION, not a "heal" or
+# "re-sync" instruction: it asserts nothing about which side is correct, only that the two
+# disagree too much to size an order safely — a human reviews it.
+#
+# It is deliberately ONE-SIDED. Only ``total_value`` << holdings+cash is caught. The opposite
+# (``total_value`` > holdings) is the NORMAL, CORRECT cash cushion — ``holdings_snapshots``
+# records positions only and excludes cash, so a cash-heavy / under-deployed account rightly
+# has total_value above its holdings sum and must NOT be flagged (sizing to total_value there
+# is exactly what deploys the idle cash). Confirmed on live data 2026-08-05: the two departed
+# APS Ventures accounts sit at total_value/(holdings+cash) ~= 0.001, while cash-heavy accounts
+# sit at ~1.00 — a 0.5 cut cleanly separates them.
+#
+# CASH NOTE: the roster view does not currently expose cash_balance, so ``cash`` degrades to
+# 0.0 (reference == holdings alone) unless a caller supplies it. That fallback is CONSERVATIVE:
+# holdings <= holdings+cash, so a 0-cash reference can only ever flag a STRICT SUBSET — it never
+# false-flags a healthy cash-heavy/normal account regardless of size. If cash_balance is later
+# added to the roster row, the guard consumes it automatically and becomes fully cash-aware.
+_NAV_MISMATCH_RATIO = 0.5              # flag when total_value < 50% of (holdings + cash)
+_NAV_MISMATCH_MIN_REFERENCE = 1000.0  # ignore sub-$1k references (snapshot noise, immaterial)
+_NAV_MISMATCH_REASON = ("NAV/holdings mismatch — manual review "
+                        "(possible closed/departed account or data issue)")
+
+
+def _is_nav_mismatch(total_value: float, reference: float) -> bool:
+    """True iff recorded ``total_value`` is materially below the ``reference`` (holdings+cash)
+    it should reflect — the fail-safe pre-arm exclusion test. One-sided (only the dangerous
+    under-statement direction) and floored at a small reference so trivially tiny accounts are
+    not flagged. Pure."""
+    return (reference > _NAV_MISMATCH_MIN_REFERENCE
+            and total_value < _NAV_MISMATCH_RATIO * reference)
+
+
 def account_inputs_from_roster(roster_rows: list[Mapping],
                                holdings_by_account: Mapping[str, list[Mapping]],
-                               ) -> tuple[list[dict], list[dict]]:
+                               ) -> tuple[list[dict], list[dict], list[dict]]:
     """Turn CRM roster rows + their latest holdings into ``rebalance_engine`` account_inputs.
 
     For each roster row:
@@ -81,11 +118,19 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
     account's non-bond legs still size against the corrected full NAV (which includes the
     bond value). An account with NO bonds is byte-identical to before.
 
-    Returns ``(account_inputs, skipped)``. ``skipped`` collects accounts with no usable
-    net_liq (unfunded / no snapshot) — the read-only stand-in for 'not funded reality', kept
-    OUT of the engine run and surfaced separately. PURE."""
+    Returns ``(account_inputs, skipped, excluded)``.
+      * ``skipped``  — accounts with no usable net_liq (unfunded / no snapshot): the read-only
+        stand-in for 'not funded reality', kept OUT of the engine run and surfaced separately.
+      * ``excluded`` — accounts whose recorded NAV (``total_value``) is wildly BELOW the
+        holdings+cash it should reflect (see ``_is_nav_mismatch``). A FAIL-SAFE pre-arm
+        exclusion — held OUT of the engine so they can NEVER be sized or armed off a NAV that
+        disagrees with reality (a departed/closed account with a now-stale holdings snapshot, a
+        feed dropout, or any other data desync), and surfaced for MANUAL review. Checked BEFORE
+        the net_liq fallback so an account cannot be silently sized off a stale holdings sum.
+    PURE."""
     account_inputs: list[dict] = []
     skipped: list[dict] = []
+    excluded: list[dict] = []
 
     for row in roster_rows:
         aid = str(row.get("account_id"))
@@ -117,16 +162,41 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
                 prices[sym] = px
             holdings_value += _to_float(h.get("market_value"))
 
-        net_liq = _to_float(row.get("total_value"))
-        if not (net_liq > 0):
-            net_liq = holdings_value
-
         base = {
             "account": account,
             "advisor_name": row.get("advisor_name"),
             "entity": row.get("entity"),
             "master_name": row.get("master_name"),
         }
+
+        # FAIL-SAFE NAV/holdings mismatch guard (BEFORE the net_liq fallback): if the recorded
+        # NAV is PRESENT but wildly below the holdings+cash it should reflect, EXCLUDE the
+        # account from the engine so it can never be sized/armed off a NAV that disagrees with
+        # reality. Gated on total_value being PRESENT: a genuinely-absent total_value (None) is
+        # the legitimate "no roster NAV, fall back to holdings" case (a funded account whose NAV
+        # column wasn't populated) — NOT a mismatch. A present total_value that is 0/tiny against
+        # a large holdings snapshot IS the dangerous case (a departed/closed account, a feed
+        # dropout) and is caught here, ahead of the fallback that would otherwise size it off a
+        # possibly-stale holdings sum. (This book is unlevered — total = invested + cash with
+        # cash >= 0 — so a NAV below half of holdings is never a legit margin account here; once
+        # cash_balance is exposed on the roster row the reference becomes exact for that case too.)
+        raw_present = row.get("total_value") is not None
+        raw_total = _to_float(row.get("total_value"))
+        cash = _to_float(row.get("cash_balance"))     # absent in the roster view today -> 0.0
+        reference = holdings_value + cash
+        if raw_present and _is_nav_mismatch(raw_total, reference):
+            excluded.append({**base, "version": version,
+                             "total_value": raw_total,
+                             "holdings_value": holdings_value,
+                             "cash_balance": cash,
+                             "reference": reference,
+                             "reason": _NAV_MISMATCH_REASON})
+            continue
+
+        net_liq = raw_total
+        if not (net_liq > 0):
+            net_liq = holdings_value
+
         if not (net_liq > 0):
             skipped.append({**base, "version": version,
                             "reason": "no net_liq / no holdings snapshot (unfunded)"})
@@ -146,7 +216,7 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
             "bonds": bonds,
         })
 
-    return account_inputs, skipped
+    return account_inputs, skipped, excluded
 
 
 def _legs_from_orders(orders: Mapping[str, int]) -> list[dict]:
@@ -220,14 +290,19 @@ def scan_out_of_spec(roster_rows: list[Mapping],
     ``strategy_target.current_target("Growth")``) — supplied by the caller so this stays pure
     and broker-free. Returns::
 
-        {"verdicts": [...], "skipped": [...], "n_accounts": int,
-         "n_out_of_spec": int, "n_in_spec": int}
+        {"verdicts": [...], "skipped": [...], "excluded": [...], "n_accounts": int,
+         "n_out_of_spec": int, "n_in_spec": int, "n_excluded": int}
+
+    ``excluded`` carries any account held OUT of the run by the fail-safe NAV/holdings mismatch
+    guard (recorded NAV wildly below holdings+cash — a departed/closed account or a data
+    desync). Excluded accounts are NEVER sized or armed; they surface for manual review only.
 
     Builds and transmits NOTHING (``build_plan`` is the pure engine; no ``ib``, no arming)."""
-    account_inputs, skipped = account_inputs_from_roster(roster_rows, holdings_by_account)
+    account_inputs, skipped, excluded = account_inputs_from_roster(
+        roster_rows, holdings_by_account)
     if not account_inputs:
-        return {"verdicts": [], "skipped": skipped, "n_accounts": 0,
-                "n_out_of_spec": 0, "n_in_spec": 0}
+        return {"verdicts": [], "skipped": skipped, "excluded": excluded, "n_accounts": 0,
+                "n_out_of_spec": 0, "n_in_spec": 0, "n_excluded": len(excluded)}
 
     result = rebalance_engine.build_plan(
         account_inputs, dict(targets), band_pct=band_pct, universe=universe)
@@ -236,7 +311,9 @@ def scan_out_of_spec(roster_rows: list[Mapping],
     return {
         "verdicts": verdicts,
         "skipped": skipped,
+        "excluded": excluded,
         "n_accounts": len(verdicts),
         "n_out_of_spec": n_oos,
         "n_in_spec": len(verdicts) - n_oos,
+        "n_excluded": len(excluded),
     }
