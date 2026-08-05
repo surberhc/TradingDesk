@@ -75,13 +75,32 @@ def _connect(real_errors: list[str]):
     return ib
 
 
-def main() -> None:
+def main() -> int:
+    """Run one EOD pass. Returns a process exit code: 0 = success or a legitimate
+    no-op (weekend / market holiday); non-zero = a genuine failure the scheduler
+    must surface (gateway never came up, or no root produced data on a trading
+    day). The jobstatus "forward" key is written on EVERY path — it is the second,
+    independent detection channel (heartbeat_alarm's watchdog) and must keep
+    working regardless of the exit code."""
     today = date.today()
     daystr = today.strftime("%Y%m%d")
     if today.weekday() >= 5:             # 5=Sat, 6=Sun
         log(f"{daystr} is a weekend — nothing to collect.")
         jobstatus.write("forward", "ok", message="weekend — no trading day", day=daystr)
-        return
+        return 0
+    # Full-day market holiday: a clean no-op like a weekend — a closed session
+    # would return empty chains for every root and be scored "fail" below. Defensive:
+    # a missing/edge calendar year must never BLOCK a real collection, so any
+    # calendar error falls through and we proceed as if it were a trading day.
+    try:
+        from connections import market_calendar as _cal
+        if _cal.is_holiday(today):
+            name = _cal.holiday_name(today) or "market holiday"
+            log(f"{daystr} is a market holiday ({name}) — nothing to collect.")
+            jobstatus.write("forward", "ok", message=f"{name} — no trading day", day=daystr)
+            return 0
+    except Exception as e:                # noqa: BLE001 — never block collection on a calendar hiccup
+        log(f"  (holiday check skipped: {e!r}); proceeding as a trading day")
 
     log(f"=== forward_live run {daystr} start (per-root depth: SPX/SPXW band=+/-"
         f"{config.FORWARD_DEEP_STRIKE_BAND} exps<={config.FORWARD_DEEP_MAX_EXPIRATIONS}; "
@@ -89,7 +108,7 @@ def main() -> None:
     if not gw.ensure_gateway():
         log("Live-data Gateway did not come up within timeout - aborting; retry next scheduled run.")
         jobstatus.write("forward", "fail", message="Gateway did not come up", day=daystr)
-        return
+        return 1
 
     real_errors: list[str] = []
     ib = _connect(real_errors)
@@ -150,6 +169,12 @@ def main() -> None:
                              "empty": empty, "fail": fail, "real_errors": len(real_errors)},
                     message=f"EOD option-chain collect, live-data Gateway ({ok} roots written)")
 
+    # Exit non-zero ONLY when nothing was collected on a trading day ("fail"): that is
+    # a genuine outage the scheduler must show red. "partial" (some roots written, some
+    # failed) stays exit 0 — data landed and the jobstatus "partial" key is what surfaces
+    # the degraded roots to the heartbeat watchdog, so it doesn't warrant a hard failure.
+    return 0 if overall in ("ok", "partial") else 1
+
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
