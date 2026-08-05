@@ -1,3 +1,5 @@
+> **Corrected 2026-08-05:** the original verdict overstated this as a refutation/blocker ("REFUTED", "Andrew must become an FA master", "Option 2 not buildable"). That reading was WRONG — FA block/group orders are already PROVEN and FA Groups + CRM-brain is the LOCKED architecture; the 2-account view is deliberate access scoping, not a capability gap. The factual probe results below are unchanged; the corrected interpretation is in the Verdict section.
+
 # Step-0 FA-master probe — live 4003 login `apsv1816` (2026-08-05)
 
 **Question (MASTER_PLAN Priority-1):** Is the 4003 live-trade login an IBKR Financial
@@ -18,21 +20,30 @@ ALIASES), and `ib.accountSummary()`. Placed / modified / cancelled nothing.
 - `requestFA(3)` ALIASES → **timeout, None returned**
   (ib_async logged `requestFAAsync: Timeout` on all three — the server sent no FA payload.)
 
-## Verdict
-- **(a) Is `apsv1816` an FA master? NO.** A real FA master answers `requestFA` with a groups/
-  aliases XML payload and lists every managed sub-account in `managedAccounts()`. This login
-  answered `requestFA` with a hard timeout (no FA data channel) and reports only 2 accounts,
-  both ordinary types (TRUST / INDIVIDUAL), not an advisor umbrella.
-- **(b) Accounts exposed: exactly 2** — `U14438624` (trust) + `U5721712` (individual). NOT the
-  client book.
-- **(c) FA GROUPS defined? NONE.** No groups, profiles, or aliases exist on this login.
-- **(d) REFUTES the plan's "all client accounts under one 4003 FA master" claim.** Option 2 (FA
-  Group orders on 4003) is **NOT buildable as-is** — there is no FA master and no client
-  accounts to group. The per-account-direct executor (`paperbot/batch_rebalance_execute.py`)
-  remains the only proven whole-book path.
+## Verdict (corrected 2026-08-05)
+The raw facts above stand: today the live 4003 login `apsv1816` exposes exactly 2 accounts
+(`U14438624` trust + `U5721712` retired individual), no FA groups/profiles/aliases are defined,
+and `requestFA(1/2/3)` timed out. What those facts MEAN, correctly:
 
-## What would unblock Option 2
-Andrew must convert/link this login to an actual FA master in IBKR Account Management (or log
-the 4003 gateway in under the firm's real FA advisor login) so the client accounts appear under
-one master; only then do `managedAccounts()` and `requestFA` expose a groupable client book.
-Until then, book-wide trading goes through the per-account-direct executor.
+- **This is NOT a refutation and NOT a capability gap.** FA block/group orders are already
+  **PROVEN** on the paper gateway (2026-06-27 real block proof — one master fill split to sub-
+  accounts; see [[fa-block-order-allocation]]), and **FA Groups + a CRM-as-brain is the LOCKED
+  architecture** for running the book ([[ibkr-sleeve-architecture]]). The mechanism works; the
+  question was never whether FA groups are buildable.
+- **The 2-account view is Andrew's DELIBERATE access scoping "for right now"** — not evidence
+  that `apsv1816` can't be an FA master or that the client book doesn't exist. Nothing here says
+  Andrew "must become an FA master"; that framing was wrong and is removed.
+- **No live "Growth" group is populated yet — which is exactly what's EXPECTED at this stage.**
+  Populating the live `Growth` group with client accounts is a normal point-and-click build step
+  Andrew performs WHEN the live FA-group port is built, precisely as
+  `FA_Group_Live_Port_BuildPlan_2026-08-04.md` ("IBKR setup (Andrew)") already specifies. The
+  probe simply confirms that step hasn't been done yet; it refutes nothing.
+
+## Next step
+Build the live FA-group port per the existing plan
+(`FA_Group_Live_Port_BuildPlan_2026-08-04.md`): the new `paperbot/live_fa_block_execute.py`
+module + tests + read-only group verification. Andrew populates the live `Growth` group (add the
+client U-accounts, method = "Contracts or Shares") point-and-click WHEN we build, then arms the
+4003 gateway only for the one supervised tiny-block proof. Until that port is live, book-wide
+trading continues through the already-proven per-account-direct executor
+(`paperbot/batch_rebalance_execute.py`).
