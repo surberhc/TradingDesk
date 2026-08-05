@@ -79,7 +79,9 @@ def render_pulse() -> None:
                 big, sub, pulse=s8_live),
             unsafe_allow_html=True)
 
-    # --- (b) Strategy 0 — the steady paper-only truth --- #
+    # --- (b) Strategy 0 — live real-money on the funded trust account
+    #         U14438624, rebalanced monthly by hand through the gated
+    #         review -> arm -> transmit Control Plane. --- #
     with t2:
         tiingo_date = s0.get("tiingo_date")
         through = f" · data through {tiingo_date}" if tiingo_date else ""
@@ -92,7 +94,7 @@ def render_pulse() -> None:
         st.markdown(
             T.status_card(
                 "Strategy 0 — adaptive all-weather",
-                "info", "Paper only — real-money OFF", sub),
+                "info", "Live with real money — rebalanced monthly by hand", sub),
             unsafe_allow_html=True)
 
     # --- (c) Systems — one health read across gateways, feeds, automation --- #
