@@ -195,25 +195,26 @@ def backup_fa_groups(ib) -> str:
     return path
 
 
-def set_group_contracts_or_shares(ib, fa_group: str, per_account_split: dict) -> str:
-    """Set ONE FA group's allocation to ContractsOrShares == per_account_split via
-    replaceFA, preserving every OTHER group untouched.
+def compute_group_contracts_or_shares_xml(current_xml: str, fa_group: str,
+                                          per_account_split: dict) -> str:
+    """PURE (no broker): given the CURRENT full GROUPS XML, return the NEW full GROUPS XML
+    with ONLY `fa_group` mutated — its <defaultMethod> set to ContractsOrShares and its
+    <ListOfAccts> rewritten to exactly `per_account_split` (each Account's <amount> = its
+    shares) — and every OTHER group left untouched in the tree (its element object is
+    re-serialized unchanged). Returns the new XML string; writes/transmits NOTHING.
 
-    requestFA(1) returns the FULL groups XML; replaceFA(1, xml) REPLACES the full set.
-    So we read current, mutate only the named group's <defaultMethod> -> ContractsOrShares
-    and its <ListOfAccts> Account/percent entries to the split, leave all other groups
-    byte-for-byte, and write it back. Returns the XML we wrote (for the ledger).
-
-    Serialize this — it is a shared-plumbing write. The caller does ONE group at a time,
-    in lockstep with placing that group's block (ContractsOrShares is per-order-quantity).
-    """
+    FAILS CLOSED (raises RuntimeError) on: blank/missing current XML, the named group not
+    present, or the group having no ListOfAccts element — so a bad read can never produce a
+    silently-wrong config. This is the single definition of the group-XML mutation, shared by
+    the armed writer (set_group_contracts_or_shares) and the unarmed preview diff
+    (live_fa_block_execute) so the previewed XML is byte-identical to what would be written."""
     import xml.etree.ElementTree as ET
 
-    current = str(ib.requestFA(1) or "").strip()
+    current = str(current_xml or "").strip()
     if not current:
         raise RuntimeError(
-            f"requestFA(1) returned no groups XML — cannot safely set ContractsOrShares "
-            f"on '{fa_group}'. FAILING CLOSED (no config written, no order placed).")
+            f"no current groups XML supplied — cannot safely set ContractsOrShares on "
+            f"'{fa_group}'. FAILING CLOSED (no config computed, no order placed).")
     root = ET.fromstring(current)
 
     target = None
@@ -255,7 +256,24 @@ def set_group_contracts_or_shares(ib, fa_group: str, per_account_split: dict) ->
         amt = ET.SubElement(ael, f"{tag_prefix}amount")
         amt.text = str(int(shares))
 
-    new_xml = ET.tostring(root, encoding="unicode")
+    return ET.tostring(root, encoding="unicode")
+
+
+def set_group_contracts_or_shares(ib, fa_group: str, per_account_split: dict) -> str:
+    """Set ONE FA group's allocation to ContractsOrShares == per_account_split via
+    replaceFA, preserving every OTHER group untouched.
+
+    requestFA(1) returns the FULL groups XML; replaceFA(1, xml) REPLACES the full set.
+    So we read current, mutate only the named group's <defaultMethod> -> ContractsOrShares
+    and its <ListOfAccts> Account/percent entries to the split (via the PURE
+    compute_group_contracts_or_shares_xml, leaving all other groups untouched), and write it
+    back. Returns the XML we wrote (for the ledger).
+
+    Serialize this — it is a shared-plumbing write. The caller does ONE group at a time,
+    in lockstep with placing that group's block (ContractsOrShares is per-order-quantity).
+    """
+    current = str(ib.requestFA(1) or "").strip()
+    new_xml = compute_group_contracts_or_shares_xml(current, fa_group, per_account_split)
     ib.replaceFA(1, new_xml)   # serialized config write
     return new_xml
 
