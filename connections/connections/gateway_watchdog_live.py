@@ -84,15 +84,31 @@ CHECK_INTERVAL_MIN = 5          # informational; the SCHEDULER enforces the cade
 GRACE_SECS = 300               # gateway must be continuously down this long before we force-restart
 MAX_RESTARTS_PER_HOUR = 3      # after this many restarts in a rolling hour, STOP and alert
 
-# TODO(live-data-gateway-setup): PLACEHOLDER — the live-data Gateway instance
-# (C:\IBC-Live-Data) does not exist yet, so its config.ini AutoRestartTime is
-# UNKNOWN. This value is a structural placeholder only, copied from the paper
-# default's format so the maintenance-window plumbing has something to point
-# at — it is NOT a confirmed nightly-reset time for this instance. UPDATE THIS
-# once the user builds the second IBC instance and sets its own AutoRestartTime
-# in C:\IBC-Live-Data\config.ini; until then a "down" reading in this window will be
-# (incorrectly) treated as an expected nightly bounce rather than a wedge.
-MAINTENANCE_WINDOW_ET = ("23:45", "00:45")  # PLACEHOLDER — see TODO above
+# LOGIN / 2FA GRACE (ported from livebot/s8_gateway_reap.py commit a173ca2). A live
+# login pushes an IBKR Mobile 2FA approval; while a gateway PROCESS exists but port
+# 4001 is not yet serving data, it is almost always still completing login (sitting at
+# the 2FA prompt — the weekly Sunday 01:00 ET re-auth), NOT a wedge. Killing it to
+# relaunch would push a FRESH 2FA and, on the next cycle, kill that one too — the
+# 2026-08-04 reaper-vs-2FA thrash (5 successive logins reaped on the short grace). So a
+# down-but-PROCESS-PRESENT gateway younger than this is SPARED (no kill, no relaunch) so
+# a human has time to tap 2FA. A gateway with NO process at all is (safely) launched
+# fresh; only a process older than this is treated as genuinely hung -> kill+relaunch.
+LOGIN_GRACE_SECS = 1800
+
+# Sentinel: the gateway process-scan could not be performed at all (distinct from a
+# determinate float age and from None="no process"). Forces the SAFE choice — spare,
+# never kill — because we must never risk reaping a process that might be mid-2FA.
+UNKNOWN_AGE = "UNKNOWN"
+
+# The live-data Gateway restarts ITSELF daily at C:\IBC-Live-Data\config.ini
+# AutoRestartTime = 01:05 AM (machine system tz = America/Chicago = 02:05 ET), reusing
+# the authenticated session with NO 2FA (only the weekly Sunday 01:00 ET re-auth needs a
+# human tap). A "down" reading during that self-restart is the expected bounce, not a
+# wedge, so the watchdog does nothing in this window. Bracket 02:05 ET with a small
+# margin. VERIFIED 2026-08-05 by reading C:\IBC-Live-Data\config.ini and the machine
+# timezone (Central); supersedes the old ("23:45","00:45") placeholder that pre-dated
+# the instance being built.
+MAINTENANCE_WINDOW_ET = ("01:55", "02:20")
 
 # --------------------------------------------------------------------------- #
 # State file — LOCAL only, never Drive. Overridable via env so tests point it
@@ -107,6 +123,54 @@ STATE_FILE = os.environ.get(
     r"C:\TradingDesk-Local\state\live_data\gateway_watchdog_state.json",
 )
 
+# Positive-ID marker for a live-data Gateway PROCESS — the FULL install dir, NEVER the
+# bare "C:\IBC" prefix (which is a substring of all three lanes; matching on it was the
+# 2026-07-23 cross-lane-kill incident). Only used READ-ONLY here (age lookup), but kept
+# strict for the same reason.
+LIVE_DATA_INSTALL_MARKER = r"C:\IBC-Live-Data"
+
+
+def youngest_gateway_age(*, run=None):
+    """Age (secs) of the YOUNGEST live-data Gateway process, or None if none exist, or
+    ``UNKNOWN_AGE`` if the scan could not be performed.
+
+    Scans java/javaw processes whose command line contains ``LIVE_DATA_INSTALL_MARKER``
+    (full dir, never the bare ``C:\\IBC`` prefix — see the marker note). This is the
+    seam the LOGIN/2FA grace uses to tell "process present but not serving yet" (still
+    logging in) from "no process at all" (safe to launch). Never raises: any failure or
+    indeterminate result returns ``UNKNOWN_AGE`` so the caller SPARES rather than kills.
+    ``run`` is injectable for tests; defaults to ``subprocess.run``.
+    """
+    import subprocess  # noqa: PLC0415
+    if run is None:
+        run = subprocess.run
+    if os.name != "nt":
+        return UNKNOWN_AGE
+    ps = (
+        "$ErrorActionPreference='SilentlyContinue';"
+        "$now=Get-Date;"
+        "$p=@(Get-CimInstance Win32_Process -Filter \"Name='java.exe' OR Name='javaw.exe'\");"
+        "$a=@($p | Where-Object { $_.CommandLine -and $_.CommandLine -like '*C:\\IBC-Live-Data*' } |"
+        " ForEach-Object { [double]($now - $_.CreationDate).TotalSeconds });"
+        "if($a.Count -eq 0){Write-Output 'NONE'}else{[double]($a | Measure-Object -Minimum).Minimum}"
+    )
+    try:
+        out = run(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", ps],
+            capture_output=True, text=True, timeout=60,
+        )
+    except Exception:  # noqa: BLE001 — undeterminable -> spare, never a licence to kill
+        return UNKNOWN_AGE
+    text = (getattr(out, "stdout", "") or "").strip()
+    if not text:
+        return UNKNOWN_AGE
+    if "NONE" in text:
+        return None
+    try:
+        return float(text.split()[0])
+    except (ValueError, IndexError):
+        return UNKNOWN_AGE
+
 
 # --------------------------------------------------------------------------- #
 # PURE DECISION LOGIC — fully injectable; tests drive this with a fake clock and
@@ -117,10 +181,11 @@ STATE_FILE = os.environ.get(
 # MAINTENANCE_WINDOW_ET rather than the paper module's (see module docstring).
 #
 # action_taken is one of:
-#   "maintenance" | "healthy" | "grace_started" | "within_grace"
+#   "maintenance" | "healthy" | "grace_started" | "within_grace" | "login_grace"
 #   | "restarted" | "restart_failed" | "rate_limited"
 # --------------------------------------------------------------------------- #
-def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn):
+def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn,
+             gateway_age=None, login_grace_secs=LOGIN_GRACE_SECS):
     """Run one watchdog cycle. Never raises for policy reasons; returns updated state.
 
     Parameters
@@ -135,7 +200,17 @@ def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn):
     launch_fn: zero-arg callable -> bool. Brings up exactly ONE fresh gateway
                (ibkr_live_data.ensure_gateway). True == it came up.
     log_fn   : one-arg callable(str) for a human log line.
+    gateway_age : zero-arg callable -> float | None | UNKNOWN_AGE. Age (secs) of the
+               YOUNGEST live-data Gateway PROCESS, or None if no process exists, or
+               UNKNOWN_AGE if the scan could not be performed. Used ONLY once a gateway
+               is judged wedged, to apply the LOGIN/2FA grace (see LOGIN_GRACE_SECS): a
+               down-but-process-present gateway younger than login_grace_secs (or an
+               UNKNOWN scan) is SPARED rather than killed, so the watchdog can never reap
+               a gateway that is mid-login/2FA. Defaults to the real process scan.
+    login_grace_secs : the LOGIN/2FA grace window (injectable for tests).
     """
+    if gateway_age is None:
+        gateway_age = youngest_gateway_age
     # Normalize incoming state so a partial/garbage file can't crash policy.
     down_since = state.get("down_since")
     restarts = list(state.get("restarts") or [])
@@ -181,7 +256,31 @@ def run_once(*, now, healthy, state, kill_fn, launch_fn, log_fn):
         log_fn(f"down {int(down_for)}s, within grace ({GRACE_SECS}s)")
         return _persist("within_grace")
 
-    # Down >= GRACE_SECS -> WEDGED. Enforce the rolling-hour restart limit.
+    # Down >= GRACE_SECS -> candidate WEDGE. But FIRST apply the LOGIN/2FA grace: a gateway
+    # that is down while its PROCESS is still present (and young) is almost certainly still
+    # completing login — sitting at the IBKR 2FA prompt (the weekly Sunday re-auth) — not
+    # truly wedged. Killing it to relaunch would push a FRESH 2FA and reap it again next
+    # cycle (the 2026-08-04 reaper-vs-2FA thrash). Only launch when NO process exists, and
+    # only kill a process that has sat unbound past the whole login window.
+    try:
+        age = gateway_age()
+    except Exception as e:  # noqa: BLE001 — a probe hiccup must NEVER license a kill
+        log_fn(f"gateway_age probe error ({e!r}); treating as indeterminate — sparing.")
+        age = UNKNOWN_AGE
+    if age == UNKNOWN_AGE:
+        log_fn("wedged, but the gateway process-scan is indeterminate; NOT killing "
+               "(cannot risk reaping a mid-login/2FA gateway) — will retry next cycle.")
+        return _persist("login_grace")
+    if age is not None and age < login_grace_secs:
+        log_fn(f"wedged, but a gateway process is present and only {int(age)}s old "
+               f"(< {login_grace_secs}s login/2FA grace) — likely still completing login "
+               f"(weekly re-auth). Sparing: no kill, no relaunch, no 2FA re-push.")
+        return _persist("login_grace")
+    # Fall through only when age is None (NO gateway process -> safe to launch a fresh one)
+    # OR age >= login_grace_secs (a process sat unbound past the login window -> genuinely
+    # hung -> kill+relaunch).
+
+    # Enforce the rolling-hour restart limit.
     if len(restarts) >= MAX_RESTARTS_PER_HOUR:
         # A wedge that survived MAX_RESTARTS_PER_HOUR fresh restarts is IBKR-side
         # (e.g. a locked session that a human must clear). Do NOT restart again.
