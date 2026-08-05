@@ -1,7 +1,7 @@
 # IBKR API CURRENCY — the living record
 
 **Owner:** the desk. **Governing rule:** `CLAUDE.md` § *IBKR currency — build against what IBKR does now*.
-**Last reviewed:** 2026-07-23.
+**Last reviewed:** 2026-08-05.
 
 ---
 
@@ -371,6 +371,67 @@ Consequences for the desk:
 
 **Desk decision 2026-07-27:** fractional is **not** pursued. The S0 live-pilot account is funded larger so whole-share sizing represents the model faithfully; no CPAPI integration is built. Revisit only if fractional becomes a genuine product requirement.
 
+### 3.11 Gateway auto-restart and the weekly 2FA cadence — **READ-FROM-DOCS 2026-08-05** (basis for keeping the 4001 live-data lane up unattended)
+
+Established 2026-08-05 from IBKR + IBC documentation (no gateway connection, no orders — this is a
+**read-from-docs** finding, kept separate from the verified-live findings above). Motivating problem: the
+nightly EOD option collector (`datacollector\forward_daily_live.py`) **cold-launches** the port-4001
+live-data Gateway (login `databot0001`, live mode) at ~17:20–17:30 CT every night; a cold live-account
+login forces a 2FA push that, unattended, no one answers → the Gateway hangs at the login screen, port
+4001 never opens, and the pull aborts. It has failed every night since ~2026-07-28. The fix direction is
+to keep 4001 **continuously up** with IBC auto-restart so the nightly job connects to an already-running
+Gateway instead of cold-launching one. The mechanism:
+
+**(a) Auto-restart reuses the authenticated session — no 2FA on the daily restart.** IB Gateway supports
+two mutually exclusive daily-shutdown modes: **Auto restart** and **Auto logoff**. Auto-*logoff* shuts
+the Gateway down at the set time and requires a full manual re-authenticate to bring it back; Auto-*restart*
+shuts down and **relaunches reusing the current session's security tokens, with no re-authentication**.
+IBC drives this via **`AutoRestartTime`** (set in the Gateway "Lock and Exit" config dialog, or
+`config.ini`; default 11:45 PM in the system timezone). With auto-restart, IBC can "run all week with a
+single login at the start of the week." — IbcAlpha/IBC `userguide.md` (master, read 2026-08-05,
+<https://github.com/IbcAlpha/IBC/blob/master/userguide.md>); IBKR *Auto Restart Considerations*
+(<https://www.ibkrguides.com/traderworkstation/auto-restart-considerations.htm>, read 2026-08-05).
+
+**(b) The real forced-2FA cadence is WEEKLY — first login after Sunday 01:00 ET.** IBKR invalidates the
+platform security tokens **each Sunday at 01:00 am ET**; a full manual authentication (the 2FA push) is
+required only on the **first** login after that. Verbatim: *"This procedure will require manual
+authentication once a week, the first time you log into the platform after the security tokens have been
+invalidated. This security process occurs each Sunday at 1:00 am ET."* Daily auto-restarts in between do
+**not** prompt for 2FA. — IBKR *Auto Restart Considerations* (read 2026-08-05). So a continuously-running
+4001 Gateway needs a human to tap 2FA **roughly once a week** (a Sunday-morning re-auth), not nightly.
+
+**What forces a fresh full 2FA login (i.e. breaks the session):**
+- The **weekly Sunday 01:00 ET** token invalidation (the normal, expected case).
+- **Any restart that is NOT a clean IB auto-restart** — a Gateway **crash**, an unexpected close, a
+  machine reboot, or a **manual/cold launch** (exactly what `forward_daily_live.py` does today). A cold
+  launch always re-authenticates and therefore always pushes 2FA.
+- **Rare IBKR-side token revocation** — *"In rare cases — for example for security reasons — we may need
+  to revoke the authentication token, causing your platform to require manual authentication once the
+  restart is completed."* (IBKR, read 2026-08-05.)
+
+**(c) A LIVE login cannot be made 2FA-free — set honest expectations.** IBKR's Secure Login System makes
+two-factor authentication **mandatory for all users**; there is **no supported opt-out** (the old
+sub-$250k SLS opt-out is gone). The `databot0001` live-data login is a live-account login, so 2FA applies
+to it regardless of its read-only/one-account restriction. — IBKR *Secure Login System*
+(<https://www.interactivebrokers.com/en/general/secure-login.php>) / *Supported 2FA* docs, read 2026-08-05.
+**Honest expectation:** the best achievable is **~one phone tap per week** (after the Sunday reset, plus
+after any crash), never zero. There is no config that eliminates it.
+
+**(d) IBC's 2FA-timeout handling — relevant to the watchdog design.** IBC exposes
+**`ReloginAfterSecondFactorAuthenticationTimeout`** (detect a timed-out 2FA alert and re-initiate login)
+and the start-script **`TWOFA_TIMEOUT_ACTION`** (`restart` vs `exit`). IBC's own guidance:
+*"If you have another automatic means of restarting IBC after it closes (for example Task Scheduler on
+Windows), then you should consider setting the `TWOFA_TIMEOUT_ACTION` variable in your start script to
+`exit`, to avoid the situation where both mechanisms react at the same time."* — IBC `userguide.md` (read
+2026-08-05). This is the **reaper-vs-2FA race** the desk already hit on the 4003 live-trade lane
+(see review log 2026-07-27 and `livebot\s8_gateway_reap.py`): a watchdog and IBC's own relogin must not
+both fire on the same push. The 4001 design must reuse the 4003 lane's LOGIN_GRACE approach.
+
+**Note:** all three Gateways share ONE IBC install and one `C:\Jts` Java install (§2a), differing only in
+settings dir and port — 4001 = `C:\IBC-Live-Data`, 4003 = `C:\IBC-Live-Trade`. `AutoRestartTime` lives in
+the **per-instance settings dir**, so setting it for 4001 (`C:\IBC-Live-Data`) does **not** touch the 4003
+live-trade lane. Confirm this isolation before changing anything (Step-3 guardrail).
+
 ---
 
 ## 4. MONITORING CHANNELS
@@ -412,6 +473,7 @@ Consequences for the desk:
 
 | Date | Trigger | What was checked | Outcome |
 |---|---|---|---|
+| **2026-08-05** | Trigger: nightly EOD option collector (`forward_daily_live.py`, 4001 live-data lane) failing since ~2026-07-28 — cold-launches the Gateway nightly and hangs on the unanswered 2FA push. Read-from-docs only, no gateway connection. | IBKR *Auto Restart Considerations* + IbcAlpha/IBC `userguide.md` (both read 2026-08-05) for: auto-restart-vs-auto-logoff session reuse, the weekly forced-2FA cadence, what breaks a session, IBC `AutoRestartTime` / `ReloginAfterSecondFactorAuthenticationTimeout` / `TWOFA_TIMEOUT_ACTION`; IBKR SLS docs for the mandatory-2FA / no-opt-out policy. | New **§3.11** added. Findings: IB Gateway **auto-restart reuses the authenticated session with NO 2FA on the daily restart**; a full manual 2FA is forced only on the **first login after the weekly Sunday 01:00 ET token invalidation** (or after a crash / cold launch / rare IBKR token revocation). A **live** login **cannot** be made 2FA-free (SLS mandatory, no opt-out) — best achievable is **~one phone tap/week**. Basis for the Step-3 design to keep 4001 continuously up via IBC `AutoRestartTime` and have the nightly job REUSE the running Gateway instead of cold-launching. No code/order-path change in this pass; no version bump. |
 | **2026-07-27** | Trigger: S0 live pilot surfaced whole-share truncation on a small account (U5721712 $957 → SPY/VTI sized to 0). **Event-triggered check of ONE surface (fractional shares), not a full quarterly review.** | Evaluated whether fractional / `cashQty` equity orders are reachable via the TWS API (`ib_async`, ports 4001/4002/4003). | Outcome: **NOT reachable** — TWS API supports fractional/`cashQty` for crypto & forex only (**VERIFIED** verbatim from IBKR *Notes & Limitations*, 2026-07-27). Fractional stock buying is Web-API/CPAPI-only (stock `cashQty` since 2026-03-27, RECORDED). New **§3.10** added. Desk decision: do NOT build fractional; fund the pilot account instead. No code/order-path change; no version bump. |
 | **2026-07-27** (S8 live-trade gateway, IBC) | Live-trade IBC config change (`C:\IBC-Live-Trade\config.ini`); no gateway connection, no orders | Checked IbcAlpha/IBC master `resources/config.ini` (read 2026-07-27) for the current 2FA-timeout flag. | Switched the live-trade IBC from the DEPRECATED `ExitAfterSecondFactorAuthenticationTimeout=no` to the supported `ReloginAfterSecondFactorAuthenticationTimeout=no` (IBC 3.14+). Source: IbcAlpha/IBC master `resources/config.ini`, read 2026-07-27. Behavior: after an unanswered IBKR Mobile 2FA push, IBC ends the attempt (rather than hanging on IB's ~13-min server socket timeout) so the `LiveTradeGatewayOpen` scheduled task can relaunch and issue a fresh push. Zero-transmit / login behavior only — not order-routing, so no `paperbot\version.py` bump. Deprecation-exposure item: `ExitAfterSecondFactorAuthenticationTimeout` is announced-for-removal; now unused. |
 | **2026-07-24** | Trigger: conductor #53 evaluation (no gateway, no orders) | Checked `ib_async` client-version negotiation vs the `OrderAllocation` preview gate | Outcome: found `ib_async` 2.1.0 `MaxClientVersion=178` caps the negotiated version below `MIN_SERVER_VER_FULL_ORDER_PREVIEW_FIELDS=195`, so the per-account `OrderAllocation` preview is UNREACHABLE via `ib_async` regardless of gateway build; only official `ibapi` can receive it. Corrected §3.1/§3.9 ("10.45.1g satisfies 195" is necessary-not-sufficient). #53 EVALUATED->DEFER; opened #57 (deferred build gated on a live faGroup-block whatIf populate test + 2nd funded account). |
