@@ -434,6 +434,68 @@ live-trade lane. Confirm this isolation before changing anything (Step-3 guardra
 
 ---
 
+### 3.12 `databot0001` (4001 live-data) prompts for a TYPED 2FA code, not an IBKR Mobile push — it is NOT enrolled in IB Key — **RESEARCH 2026-08-05**
+
+Owner-reported 2026-08-05: the port-4001 live-data login **`databot0001`** prompts at the Gateway login
+for a **typed authenticator/security code** — enterable only by someone physically at the desk — whereas
+the port-4003 live-trade login **`apsv1816`** authenticates by an **IBKR Mobile push** (approve-on-phone,
+Face ID / IB Key) that can be approved from anywhere. Goal: make `databot0001` behave like `apsv1816`.
+
+**Root cause — account-level 2FA *enrollment*, NOT IBC config.** A read-only diff of the two IBC configs
+(`C:\IBC-Live-Data\config.ini` vs `C:\IBC-Live-Trade\config.ini`, read 2026-08-05) shows their second-factor
+settings are **identical**: both carry `ReloginAfterSecondFactorAuthenticationTimeout=no`,
+`SecondFactorAuthenticationExitInterval=60`, `SecondFactorAuthenticationTimeout=180`, and **neither has a
+`SecondFactorDevice` key**. So the difference in 2FA *method* is not coming from IBC — it comes from which
+2FA method each **IBKR username** is enrolled in: `apsv1816` is enrolled in IBKR Mobile IB Key (push);
+`databot0001` is not, so IBKR falls back to a typed-code method (SMS / mobile-authenticator TOTP / temporary
+security code).
+
+**Docs basis (all read 2026-08-05):**
+- IBKR lists five primary 2FA methods; **IBKR Mobile – IB Key** (push approval, "most convenient") is a
+  *distinct* method from the typed-code methods (Mobile Authenticator TOTP, SMS, Email, DSC+). — IBKR
+  *Two-Factor Authentication Methods*, <https://www.ibkrguides.com/securelogin/sls/twofactorauth.htm>
+  (page dated "Last updated May 13, 2026").
+- A login prompting for a *typed* code therefore means that username is authenticating via a code method —
+  i.e. **IB Key push is not the active method** for it. IB Key push happens only if IBKR Mobile IB Key is
+  activated for that username. — same source.
+- **IBC `SecondFactorDevice`** helps *only when a username already has more than one 2FA device enrolled*
+  and the Gateway shows a selection list: "If you have enabled more than one second factor authentication
+  device, TWS presents a list from which you must select the device you want to use for this login."
+  `SecondFactorDevice` auto-picks the named entry (value must match the list string **exactly**; blank =
+  manual pick). — IbcAlpha/IBC master `resources/config.ini`, read 2026-08-05
+  (<https://github.com/IbcAlpha/IBC/blob/master/resources/config.ini>). It does **not** create a push where
+  none is enrolled, so on its own it cannot fix `databot0001`; it becomes relevant only *after* IB Key is
+  enrolled AND the login then presents a device menu.
+
+**The fix (owner-side, on the phone — no config change fixes this by itself):** enroll/activate `databot0001`
+in IBKR Mobile IB Key, exactly as `apsv1816` already is. Current IBKR flow — IBKR *Activating the IBKR
+Mobile – IB Key*, <https://ibkrguides.com/securelogin/sls/activating-two-factor-via-mobile.htm> (page dated
+July 9, 2026): install IBKR Mobile, then either **(portal path)** log into Client Portal as `databot0001`,
+complete the "Secure Login System / Account Protection" task to display a QR code and scan it with IBKR
+Mobile; or **(in-app path)** open IBKR Mobile → **Register Two-Factor** → enter `databot0001`'s
+username+password → confirm the phone number → enter the SMS activation code → complete with Face ID /
+passcode (Android: set a 4–6 digit PIN). After activation, `databot0001`'s next Gateway login **pushes to
+IBKR Mobile** instead of prompting for a typed code.
+
+**Conditional follow-up (only if the menu appears):** if, after enrollment, `databot0001` has *multiple*
+enrolled 2FA devices and the Gateway shows a device-selection list, add
+`SecondFactorDevice=<exact list label>` to `C:\IBC-Live-Data\config.ini` to auto-pick IB Key. The list label
+observed in the wild is "IB Key Security via IBKR Mobile" (gnzsnz/ib-gateway-docker discussion #155, read
+2026-08-05) — **UNCONFIRMED for this account**; read the actual list text before setting it. If IB Key
+becomes the only method, no config change is needed.
+
+**Relation to §3.11:** §3.11 (added earlier 2026-08-05) assumed the cold nightly launch "forces a 2FA
+*push*." This refines that — for `databot0001` the prompt is a **typed code**, not a push, which is *why* it
+could never be answered unattended/remotely. Enrolling IB Key converts it to a phone-approvable push and is
+complementary to the §3.11 keep-4001-up design (one phone tap per week after the Sunday reset, instead of a
+typed code no one can enter). No order-path change; login/2FA only, so no `paperbot\version.py` bump.
+
+**Constraint respected:** read-only + research; no IBC file edited, no gateway touched, no login performed.
+The `C:\IBC-Live-Data\config.ini` change above is a *recommendation for whoever owns that file*, not applied
+here.
+
+---
+
 ## 4. MONITORING CHANNELS
 
 > **POPULATED 2026-07-23.** The 2026-07-23 FA research pass validated the authoritative source
@@ -473,6 +535,7 @@ live-trade lane. Confirm this isolation before changing anything (Step-3 guardra
 
 | Date | Trigger | What was checked | Outcome |
 |---|---|---|---|
+| **2026-08-05** | Trigger: owner cannot bring up the 4001 live-data lane remotely — `databot0001` prompts for a **typed** 2FA code (desk-only), while `apsv1816`/4003 uses an IBKR Mobile push. Read-only + research, no gateway/login. | Read-only diff of both IBC configs (`C:\IBC-Live-Data` vs `C:\IBC-Live-Trade`, 2026-08-05) for any 2FA-method key; verified IBKR 2FA-method list, IB Key enrollment flow, and IBC `SecondFactorDevice` semantics against current IBKR/IBC docs (all read 2026-08-05). | New **§3.12** added. Findings: the two configs' second-factor settings are **identical** and **neither sets `SecondFactorDevice`** — so the push-vs-typed-code difference is **account-level enrollment**, not IBC. `databot0001` is **not enrolled in IBKR Mobile IB Key**; a typed-code prompt = IB Key is not the active method. Fix is **owner-side** (activate IBKR Mobile IB Key for `databot0001`, same as `apsv1816`); IBC `SecondFactorDevice` only matters if a multi-device selection menu appears afterward. Refines §3.11's "forces a push" assumption. No order-path change; no version bump. |
 | **2026-08-05** | Trigger: nightly EOD option collector (`forward_daily_live.py`, 4001 live-data lane) failing since ~2026-07-28 — cold-launches the Gateway nightly and hangs on the unanswered 2FA push. Read-from-docs only, no gateway connection. | IBKR *Auto Restart Considerations* + IbcAlpha/IBC `userguide.md` (both read 2026-08-05) for: auto-restart-vs-auto-logoff session reuse, the weekly forced-2FA cadence, what breaks a session, IBC `AutoRestartTime` / `ReloginAfterSecondFactorAuthenticationTimeout` / `TWOFA_TIMEOUT_ACTION`; IBKR SLS docs for the mandatory-2FA / no-opt-out policy. | New **§3.11** added. Findings: IB Gateway **auto-restart reuses the authenticated session with NO 2FA on the daily restart**; a full manual 2FA is forced only on the **first login after the weekly Sunday 01:00 ET token invalidation** (or after a crash / cold launch / rare IBKR token revocation). A **live** login **cannot** be made 2FA-free (SLS mandatory, no opt-out) — best achievable is **~one phone tap/week**. Basis for the Step-3 design to keep 4001 continuously up via IBC `AutoRestartTime` and have the nightly job REUSE the running Gateway instead of cold-launching. No code/order-path change in this pass; no version bump. |
 | **2026-07-27** | Trigger: S0 live pilot surfaced whole-share truncation on a small account (U5721712 $957 → SPY/VTI sized to 0). **Event-triggered check of ONE surface (fractional shares), not a full quarterly review.** | Evaluated whether fractional / `cashQty` equity orders are reachable via the TWS API (`ib_async`, ports 4001/4002/4003). | Outcome: **NOT reachable** — TWS API supports fractional/`cashQty` for crypto & forex only (**VERIFIED** verbatim from IBKR *Notes & Limitations*, 2026-07-27). Fractional stock buying is Web-API/CPAPI-only (stock `cashQty` since 2026-03-27, RECORDED). New **§3.10** added. Desk decision: do NOT build fractional; fund the pilot account instead. No code/order-path change; no version bump. |
 | **2026-07-27** (S8 live-trade gateway, IBC) | Live-trade IBC config change (`C:\IBC-Live-Trade\config.ini`); no gateway connection, no orders | Checked IbcAlpha/IBC master `resources/config.ini` (read 2026-07-27) for the current 2FA-timeout flag. | Switched the live-trade IBC from the DEPRECATED `ExitAfterSecondFactorAuthenticationTimeout=no` to the supported `ReloginAfterSecondFactorAuthenticationTimeout=no` (IBC 3.14+). Source: IbcAlpha/IBC master `resources/config.ini`, read 2026-07-27. Behavior: after an unanswered IBKR Mobile 2FA push, IBC ends the attempt (rather than hanging on IB's ~13-min server socket timeout) so the `LiveTradeGatewayOpen` scheduled task can relaunch and issue a fresh push. Zero-transmit / login behavior only — not order-routing, so no `paperbot\version.py` bump. Deprecation-exposure item: `ExitAfterSecondFactorAuthenticationTimeout` is announced-for-removal; now unused. |
