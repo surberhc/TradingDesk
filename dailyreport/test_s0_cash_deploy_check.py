@@ -44,3 +44,29 @@ def test_build_notice_is_plain_english():
     assert "Idle cash" in title
     assert job.ACCOUNT in body
     assert "Control Plane" in hint
+
+
+def test_main_snooze_skips_repost(tmp_path, monkeypatch, capsys):
+    """While the operator has the idle-cash notice snoozed, the daily run must SKIP posting —
+    the poster-side is_snoozed skip is what actually silences the re-nag (dismiss alone
+    re-posts)."""
+    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+    # force a should-propose scenario without touching the broker
+    monkeypatch.setattr(job, "read_cash",
+                        lambda: {"net_liq": 100_000, "total_cash": 5_000})
+    import importlib
+    import action_center
+    importlib.reload(action_center)
+
+    # first run posts the idle-cash notice
+    assert job.main([]) == 0
+    assert action_center.has_open(job._DEDUP_KEY)
+
+    # operator ignores it for 5 days
+    assert action_center.snooze(job._DEDUP_KEY, 5)
+
+    # next run must skip posting; the hidden notice is left untouched
+    assert job.main([]) == 0
+    assert "snoozed" in capsys.readouterr().out.lower()
+    assert action_center.read_notices() == []
+    assert action_center.is_snoozed(job._DEDUP_KEY)

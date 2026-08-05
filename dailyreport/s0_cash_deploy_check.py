@@ -210,6 +210,12 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     import action_center
+    # Snooze / "ignore for N days": if the operator snoozed this idle-cash notice, SKIP posting
+    # while the snooze is live. Dismiss alone does NOT durably suppress (the next run re-posts a
+    # fresh notice) — the poster-side is_snoozed skip is what actually silences the daily nag.
+    if action_center.is_snoozed(_DEDUP_KEY):
+        print("Idle-cash notice is snoozed (ignored) by the operator; posting nothing.")
+        return 0
     key = action_center.post_notice(kind="cash_deploy", title=title, body=body,
                                     severity="warn", action_hint=hint, dedup_key=_DEDUP_KEY)
     if key:
