@@ -149,7 +149,7 @@ def fetch_holdings_latest(account_ids: Iterable[str], conn=None) -> dict[str, li
             cur.execute(
                 "select account_id, symbol, asset_category, quantity, mark_price, "
                 "market_value, as_of_date "
-                "from v_tradingdesk_holdings_latest where account_id = any(%s)",
+                "from v_tradingdesk_holdings_latest where account_id = any(%s::uuid[])",
                 (ids,))
             for r in _rows_as_dicts(cur):
                 out.setdefault(str(r["account_id"]), []).append(r)
