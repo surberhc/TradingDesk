@@ -264,13 +264,20 @@ def test_live_current_state_is_green():
 
 
 # --------------------------------------------------------------------------- #
-# heartbeat_alarm integration — the page decision
+# heartbeat_alarm integration — the OUTSTANDING-problem decision
 # --------------------------------------------------------------------------- #
+# UPDATED 2026-08-05: handle_tripwire no longer sends email directly. Per the owner's
+# one-email-a-day rule, it now RETURNS (line, problem|None) and the Drive-sync guard is
+# folded into the single consolidated morning digest (heartbeat_alarm.maybe_send_digest).
+# So these tests pin the new contract: GREEN -> no problem; TRIPPED/UNEVALUABLE -> a
+# problem descriptor carrying the folder + remediation wording; the handler itself never
+# calls _send (the digest owns delivery); and there is no more per-handler cooldown
+# (once-a-day de-dupe lives in the digest, covered in test_heartbeat_alarm.py).
 def _now():
     return dt.datetime.now().timestamp()
 
 
-def test_handle_tripwire_green_does_not_send(monkeypatch):
+def test_handle_tripwire_green_returns_no_problem_and_never_sends(monkeypatch):
     sent = []
     monkeypatch.setattr(hba, "_send", lambda s, h: sent.append((s, h)) or True)
     monkeypatch.setattr(hba, "_tripwire", types.SimpleNamespace(
@@ -278,18 +285,15 @@ def test_handle_tripwire_green_does_not_send(monkeypatch):
                           "should_page": False, "reasons": [], "remediation": "",
                           "protected": [PROT]}))
     state = {}
-    line = hba.handle_tripwire(state, _now(), dry_run=False)
+    line, problem = hba.handle_tripwire(state, _now())
     assert "GREEN" in line
+    assert problem is None
     assert sent == []
 
 
-def test_handle_tripwire_tripped_sends_and_names_folder_and_remediation(monkeypatch):
-    captured = {}
-    def _send(subject, html):
-        captured["subject"] = subject
-        captured["html"] = html
-        return True
-    monkeypatch.setattr(hba, "_send", _send)
+def test_handle_tripwire_tripped_returns_problem_naming_folder_and_remediation(monkeypatch):
+    sent = []
+    monkeypatch.setattr(hba, "_send", lambda s, h: sent.append((s, h)) or True)
     remediation = (r"C:\TradingDesk-Local appears to be under Google Drive sync/backup "
                    r"management — this is the wrong-folder corruption risk; disconnect "
                    r"it in Google Drive Desktop immediately.")
@@ -299,29 +303,37 @@ def test_handle_tripwire_tripped_sends_and_names_folder_and_remediation(monkeypa
                           "reasons": ["[threat1_volume] C:\\TradingDesk-Local is ON THE DRIVE VOLUME"],
                           "remediation": remediation, "protected": [PROT]}))
     state = {}
-    line = hba.handle_tripwire(state, _now(), dry_run=False)
-    assert "ALERT SENT" in line
-    assert "TradingDesk-Local" in captured["subject"]
-    assert "TradingDesk-Local" in captured["html"]
-    assert "Google Drive Desktop" in captured["html"]           # remediation present
-    # de-dupe recorded so the next sweep suppresses
-    assert "last_alert_ts" in state[hba._TRIPWIRE_NAME]
+    line, problem = hba.handle_tripwire(state, _now())
+    assert "OUTSTANDING" in line
+    assert sent == [], "the handler must NOT send — the digest owns delivery"
+    assert problem is not None
+    assert problem["status"] == "TRIPPED"
+    assert "TradingDesk-Local" in problem["cause"]
+    assert "Google Drive Desktop" in problem["cause"]           # remediation present
+    # protected folder surfaced in the detail rows
+    assert any("TradingDesk-Local" in str(v) for _, v in problem["rows"])
 
 
-def test_handle_tripwire_unevaluable_pages_when_module_missing(monkeypatch):
-    # If the tripwire module itself failed to import, handle_tripwire must FAIL CLOSED.
-    captured = {}
-    monkeypatch.setattr(hba, "_send",
-                        lambda s, h: (captured.update(subject=s, html=h), True)[1])
+def test_handle_tripwire_unevaluable_returns_problem_when_module_missing(monkeypatch):
+    # If the tripwire module itself failed to import, handle_tripwire must FAIL CLOSED —
+    # now by returning an OUTSTANDING problem (folded into the digest), not by paging.
+    sent = []
+    monkeypatch.setattr(hba, "_send", lambda s, h: sent.append((s, h)) or True)
     monkeypatch.setattr(hba, "_tripwire", None)
     state = {}
-    line = hba.handle_tripwire(state, _now(), dry_run=False)
-    assert "UNEVALUABLE" in line and "ALERT SENT" in line
-    assert "could NOT evaluate" in captured["subject"] or "could not evaluate" in captured["subject"].lower()
-    assert "TradingDesk-Local" in captured["html"]
+    line, problem = hba.handle_tripwire(state, _now())
+    assert "UNEVALUABLE" in line and "OUTSTANDING" in line
+    assert sent == []
+    assert problem is not None
+    assert problem["status"] == "UNEVALUABLE"
+    assert "could not evaluate" in problem["cause"].lower()
+    assert "TradingDesk-Local" in problem["cause"] or any(
+        "TradingDesk-Local" in str(v) for _, v in problem["rows"])
 
 
-def test_handle_tripwire_dry_run_never_sends(monkeypatch):
+def test_handle_tripwire_never_sends_directly(monkeypatch):
+    # The handler is send-free by construction now: even a TRIPPED evaluation only
+    # RETURNS a problem; nothing is emailed until the digest decides.
     monkeypatch.setattr(hba, "_send",
                         lambda s, h: (_ for _ in ()).throw(AssertionError("must not send")))
     monkeypatch.setattr(hba, "_tripwire", types.SimpleNamespace(
@@ -329,13 +341,14 @@ def test_handle_tripwire_dry_run_never_sends(monkeypatch):
                           "should_page": True, "reasons": ["x"],
                           "remediation": "r", "protected": [PROT]}))
     state = {}
-    line = hba.handle_tripwire(state, _now(), dry_run=True)
-    assert "WOULD-SEND" in line
-    # dry-run must NOT record a cooldown (so a real future alert is never suppressed)
-    assert "last_alert_ts" not in state.get(hba._TRIPWIRE_NAME, {})
+    line, problem = hba.handle_tripwire(state, _now())  # would raise if it sent
+    assert problem is not None
+    assert "OUTSTANDING" in line
 
 
-def test_handle_tripwire_cooldown_suppresses_second_page(monkeypatch):
+def test_handle_tripwire_no_handler_cooldown_every_sweep_reports_problem(monkeypatch):
+    # There is no longer a per-handler cooldown: two consecutive sweeps both return the
+    # problem (de-dupe to once-a-day is the digest's job, not the handler's).
     calls = []
     monkeypatch.setattr(hba, "_send", lambda s, h: calls.append(1) or True)
     monkeypatch.setattr(hba, "_tripwire", types.SimpleNamespace(
@@ -344,13 +357,13 @@ def test_handle_tripwire_cooldown_suppresses_second_page(monkeypatch):
                           "remediation": "r", "protected": [PROT]}))
     state = {}
     now = _now()
-    hba.handle_tripwire(state, now, dry_run=False)              # sends
-    line2 = hba.handle_tripwire(state, now + 60, dry_run=False)  # within cooldown
-    assert len(calls) == 1
-    assert "SUPPRESSED" in line2
+    _, p1 = hba.handle_tripwire(state, now)
+    _, p2 = hba.handle_tripwire(state, now + 60)
+    assert p1 is not None and p2 is not None
+    assert calls == [], "handler never sends; both sweeps just report the problem"
 
 
-def test_handle_tripwire_recovery_clears_cooldown(monkeypatch):
+def test_handle_tripwire_recovery_returns_no_problem_and_clears_legacy_cooldown(monkeypatch):
     monkeypatch.setattr(hba, "_send", lambda s, h: True)
     tripped = {"ok": False, "tripped": True, "unevaluable": False, "should_page": True,
                "reasons": ["x"], "remediation": "r", "protected": [PROT]}
@@ -358,10 +371,13 @@ def test_handle_tripwire_recovery_clears_cooldown(monkeypatch):
              "reasons": [], "remediation": "", "protected": [PROT]}
     mod = types.SimpleNamespace(evaluate=lambda: tripped)
     monkeypatch.setattr(hba, "_tripwire", mod)
-    state = {}
+    # Seed a legacy cooldown key to prove recovery still clears it (log accuracy).
     now = _now()
-    hba.handle_tripwire(state, now, dry_run=False)
-    assert "last_alert_ts" in state[hba._TRIPWIRE_NAME]
+    state = {hba._TRIPWIRE_NAME: {"last_alert_ts": now}}
+    _, p_tripped = hba.handle_tripwire(state, now)
+    assert p_tripped is not None
     mod.evaluate = lambda: green
-    hba.handle_tripwire(state, now + 60, dry_run=False)         # recovered
+    line, p_green = hba.handle_tripwire(state, now + 60)        # recovered
+    assert p_green is None
+    assert "GREEN" in line
     assert "last_alert_ts" not in state[hba._TRIPWIRE_NAME]

@@ -305,9 +305,10 @@ def test_handle_deadline_uses_live_trigger_plus_buffer(tmp_path, monkeypatch):
     job = _deadline_job(tmp_path)
     state: dict = {}
     now_dt = dt.datetime.now().replace(hour=20, minute=50, second=0, microsecond=0)
-    line = hba.handle_deadline(job, state, now_dt.timestamp(), dry_run=True)
+    line, problem = hba.handle_deadline(job, state, now_dt.timestamp())
     assert "pre-deadline" in line
     assert "21:00" in line
+    assert problem is None  # pre-deadline is never an outstanding problem
 
 
 def test_handle_deadline_falls_back_and_logs_when_live_query_fails(tmp_path, monkeypatch, capsys):
@@ -321,9 +322,10 @@ def test_handle_deadline_falls_back_and_logs_when_live_query_fails(tmp_path, mon
     state: dict = {}
     # Before the fallback deadline (21:00) -> should just report pre-deadline, no email.
     now_dt = dt.datetime.now().replace(hour=20, minute=0, second=0, microsecond=0)
-    line = hba.handle_deadline(job, state, now_dt.timestamp(), dry_run=True)
+    line, problem = hba.handle_deadline(job, state, now_dt.timestamp())
     assert "pre-deadline" in line
     assert "21:00" in line  # fallback value, unchanged by any buffer
+    assert problem is None
 
     out = capsys.readouterr().out
     assert "fallback" in out.lower()
@@ -414,3 +416,149 @@ def test_absent_heartbeat_with_unparseable_grace_alerts(tmp_path):
     a = hba.assess(job, now)
     assert a["alert"] is True, "an unparseable grace must never suppress a real alert"
     assert a["status"] == "missing"
+
+
+# --------------------------------------------------------------------------- #
+# 2026-08-05: ONE-EMAIL-A-DAY consolidated morning digest, silent overnight.
+# The 15-min sweep still assesses/logs every entry; only EMAIL is gated. The digest
+# sends at most once per calendar day, only inside [DIGEST_SEND_HOUR,
+# DIGEST_WINDOW_END_HOUR), and only when >=1 problem is outstanding. These tests pin
+# (a) outside-window -> no send; (b) inside-window, unsent -> exactly one consolidated
+# send covering ALL items; (c) second sweep same day -> no resend; (d) zero problems ->
+# no send; (e) --dry-run never sends. Time + mailer are injected so no wall-clock
+# dependence and no real email.
+# --------------------------------------------------------------------------- #
+def _ts_at_hour(hour: int, minute: int = 0) -> float:
+    """A POSIX timestamp for today at the given local hour:minute (deterministic)."""
+    return dt.datetime.now().replace(
+        hour=hour, minute=minute, second=0, microsecond=0).timestamp()
+
+
+def _sample_problems() -> list[dict]:
+    """Two distinct outstanding problems, digest-descriptor shape."""
+    return [
+        {"label": "Job Alpha", "status": "STALE", "cause": "Alpha supervisor died.",
+         "rows": [("Age (cold for)", "2h05m"), ("Owning task", "AlphaTask")]},
+        {"label": "Job Bravo", "status": "MISSING", "cause": "Bravo never ran today.",
+         "rows": [("Detail", "date=None status=None"), ("Owning task", "BravoTask")]},
+    ]
+
+
+def _capture_send(monkeypatch):
+    """Replace hba._send with a recorder; returns the list it appends (subject, html) to."""
+    calls: list[tuple[str, str]] = []
+
+    def fake_send(subject, html):
+        calls.append((subject, html))
+        return True
+
+    monkeypatch.setattr(hba, "_send", fake_send)
+    return calls
+
+
+def test_digest_outside_window_no_send(monkeypatch):
+    """(a) Outstanding problems but the local hour is BEFORE the window (overnight) ->
+    NO email, and last_sent_date is not recorded. Overnight is silent."""
+    calls = _capture_send(monkeypatch)
+    state: dict = {}
+    now = _ts_at_hour(3)  # 03:00, well before DIGEST_SEND_HOUR (7)
+    assert not (hba.DIGEST_SEND_HOUR <= 3 < hba.DIGEST_WINDOW_END_HOUR)
+    line = hba.maybe_send_digest(state, now, _sample_problems(), dry_run=False)
+    assert calls == [], "overnight must be totally silent"
+    assert "OUTSIDE" in line
+    assert state.get("_digest", {}).get("last_sent_date") is None
+
+
+def test_digest_inside_window_sends_once_covering_all_items(monkeypatch):
+    """(b) Inside the morning window, not yet sent today, >=1 problem -> EXACTLY ONE
+    consolidated send whose body lists ALL outstanding items; last_sent_date recorded."""
+    calls = _capture_send(monkeypatch)
+    state: dict = {}
+    now = _ts_at_hour(hba.DIGEST_SEND_HOUR + 1)  # comfortably inside [7,12)
+    problems = _sample_problems()
+    line = hba.maybe_send_digest(state, now, problems, dry_run=False)
+
+    assert len(calls) == 1, "must send exactly one consolidated email"
+    subject, html = calls[0]
+    assert "2 items need attention" in subject
+    # Body must cover BOTH items — labels, statuses, and their remediation wording.
+    for token in ("Job Alpha", "Job Bravo", "STALE", "MISSING",
+                  "Alpha supervisor died.", "Bravo never ran today.",
+                  "AlphaTask", "BravoTask"):
+        assert token in html, f"digest body missing {token!r}"
+    today = dt.datetime.fromtimestamp(now).strftime("%Y%m%d")
+    assert state["_digest"]["last_sent_date"] == today
+    assert "SENT" in line
+
+
+def test_digest_second_sweep_same_day_no_resend(monkeypatch):
+    """(c) A second sweep the SAME calendar day, still inside the window, must NOT send
+    a second email (at most one per day)."""
+    calls = _capture_send(monkeypatch)
+    now = _ts_at_hour(hba.DIGEST_SEND_HOUR + 2)
+    today = dt.datetime.fromtimestamp(now).strftime("%Y%m%d")
+    state: dict = {"_digest": {"last_sent_date": today}}  # already sent this morning
+    line = hba.maybe_send_digest(state, now, _sample_problems(), dry_run=False)
+    assert calls == [], "must not resend after already sending today"
+    assert "already sent" in line
+
+
+def test_digest_inside_window_zero_problems_no_send(monkeypatch):
+    """(d) Inside the window, not yet sent, but ZERO outstanding problems -> no email
+    (a clean morning stays silent), and last_sent_date is not recorded."""
+    calls = _capture_send(monkeypatch)
+    state: dict = {}
+    now = _ts_at_hour(hba.DIGEST_SEND_HOUR + 1)
+    line = hba.maybe_send_digest(state, now, [], dry_run=False)
+    assert calls == [], "no problems -> no email"
+    assert "0 outstanding" in line
+    assert state.get("_digest", {}).get("last_sent_date") is None
+
+
+def test_digest_dry_run_never_sends(monkeypatch):
+    """(e) --dry-run: even inside the window with outstanding problems, NEVER actually
+    send and NEVER record last_sent_date (so a real send can still happen later)."""
+    calls = _capture_send(monkeypatch)
+    state: dict = {}
+    now = _ts_at_hour(hba.DIGEST_SEND_HOUR + 1)
+    line = hba.maybe_send_digest(state, now, _sample_problems(), dry_run=True)
+    assert calls == [], "dry-run must never send"
+    assert "WOULD-SEND" in line
+    assert state.get("_digest", {}).get("last_sent_date") is None
+
+
+# --------------------------------------------------------------------------- #
+# Handlers now RETURN (line, problem|None) — problem is folded into the digest.
+# Assessment/detection is unchanged; these pin the new return contract.
+# --------------------------------------------------------------------------- #
+def test_handle_job_returns_problem_when_stale(tmp_path):
+    """A cold heartbeat -> handle_job returns a non-None problem descriptor carrying the
+    job's status + cause, and a line marking it OUTSTANDING (no immediate send)."""
+    now = dt.datetime.now().timestamp()
+    job = _job(tmp_path)
+    hb = job["heartbeat"]
+    hb.write_text("2026-08-05 02:00:00  shard alive\n")
+    os.utime(hb, (now - 2 * 3600, now - 2 * 3600))
+    _write(job["progress"], {"complete": False, "done": 100, "total": 399600},
+           age_s=2 * 3600, now=now)
+    state: dict = {}
+    line, problem = hba.handle_job(job, state, now)
+    assert problem is not None
+    assert problem["status"] == "STALE"
+    assert problem["label"] == job["label"]
+    assert "OUTSTANDING" in line
+
+
+def test_handle_job_returns_none_when_fresh(tmp_path):
+    """A fresh, in-progress heartbeat -> no problem (nothing folded into the digest)."""
+    now = dt.datetime.now().timestamp()
+    job = _job(tmp_path)
+    hb = job["heartbeat"]
+    hb.write_text("2026-08-05 10:44:00  shard 4 alive\n")
+    os.utime(hb, (now - 30, now - 30))
+    _write(job["progress"], {"complete": False, "done": 25886, "total": 399600},
+           age_s=30, now=now)
+    state: dict = {}
+    line, problem = hba.handle_job(job, state, now)
+    assert problem is None
+    assert "no alert" in line

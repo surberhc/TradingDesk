@@ -12,7 +12,10 @@ THE GAP THIS CLOSES (2026-07-01)
 DESIGN
   * SINGLE-RUN checker, NOT a loop. Windows Task Scheduler runs it every 15 min
     (HeartbeatStalenessAlarm). Each run reads each monitored job's heartbeat, decides
-    fresh / complete / STALE, and emails at most once per de-dupe window while cold.
+    fresh / complete / STALE, LOGS every per-job line, and updates state. That
+    ASSESSMENT cadence is unchanged. What changed (2026-08-05) is only WHEN EMAIL is
+    sent: at most ONE consolidated morning digest per day (see DIGEST below), never
+    the old per-problem repeat-every-3h paging that woke the owner overnight.
   * INDEPENDENT of the thing it watches — it only reads files, never touches the
     collector, terminal, or supervisor. It cannot itself wedge the pipeline.
   * REUSES the project email path (dailyreport\mailer.py — the same Gmail STARTTLS
@@ -36,10 +39,26 @@ SUPPRESSION (no alert) — FRESHNESS GATES COMPLETION (fix 2026-07-06):
   suppress — a stale leftover 'complete:true' beside a dead supervisor is exactly the
   2026-07-05 silent-death this alarm now catches instead of logging "COMPLETE".
 
-DE-DUPE
-  A small JSON state file records the last alert time per job so we email at most
-  once per COOLDOWN (default 3h) while a job stays cold, and CLEAR the cooldown once
-  the job recovers (fresh again) so a future outage re-alerts immediately.
+DIGEST (2026-08-05) — ONE EMAIL PER DAY, SILENT OVERNIGHT
+  The owner's hard requirement: at most ONE email per day and total silence overnight.
+  So the old per-problem immediate send + 3h cooldown is REPLACED by a single
+  consolidated morning digest:
+    * Every 15-min sweep still assesses every JOBS entry, every DEADLINE_JOBS entry,
+      and the Drive-sync tripwire; still logs every per-job line + the "sweep done:"
+      line; still updates state; still writes RAN_MARKER. None of that changed.
+    * The sweep builds a list of CURRENTLY-OUTSTANDING problems. If (and only if) the
+      local hour is in [DIGEST_SEND_HOUR, DIGEST_WINDOW_END_HOUR), we have NOT already
+      sent today, and there is >=1 outstanding problem, ONE email is sent listing ALL
+      outstanding problems (each with its label, status, age/detail, owning task, and
+      the same remediation wording the old per-problem alerts carried). We then record
+      state["_digest"]["last_sent_date"] = today.
+    * Outside the window, already-sent-today, or zero problems -> assess + log only, no
+      email. Overnight is silent. A problem that clears before the morning window simply
+      never appears in that day's digest (recovery = absence from the digest).
+  The Drive-sync tripwire (Google-Drive corruption risk) is currently immediate; per
+  the one-email-a-day rule it is FOLDED INTO THE SAME DAILY DIGEST rather than sent
+  separately. (Whether that one guard deserves an overnight-exception is an open owner
+  decision; for now, one digest for everything.)
 
 EXTENSIBILITY
   JOBS below is a simple list of dicts. Add a collector by appending one entry
@@ -171,7 +190,18 @@ def _latest_task_trigger_hhmm(task_name: str) -> tuple[int, int] | None:
 # --------------------------------------------------------------------------- #
 STATE_FILE = config.DATA_ROOT / "heartbeat_alarm_state.json"
 LOG = config.DATA_ROOT / "heartbeat_alarm.log"
-COOLDOWN_SECS = 3 * 3600            # at most one alert per job per 3h while cold
+
+# --- Consolidated daily digest (2026-08-05) -------------------------------- #
+# Owner requirement: AT MOST ONE email per day — a single morning digest listing every
+# outstanding problem — and TOTAL SILENCE overnight. The 15-min sweep still ASSESSES,
+# LOGS, updates state, and writes RAN_MARKER every run (unchanged); only EMAIL is gated.
+# The digest may send only when the local hour is in [DIGEST_SEND_HOUR,
+# DIGEST_WINDOW_END_HOUR) and only once per calendar day (tracked in the state file
+# under state["_digest"]["last_sent_date"]). This REPLACES the old per-problem immediate
+# send + 3h cooldown (COOLDOWN_SECS), which paged the owner day and night.
+DIGEST_SEND_HOUR = 7               # earliest local (CT) hour the digest may send (07:00)
+DIGEST_WINDOW_END_HOUR = 12        # exclusive upper bound of the send window (noon)
+_DIGEST_STATE_KEY = "_digest"      # state sub-dict: {"last_sent_date": "YYYYMMDD"}
 
 # Proof-of-life marker written at the end of every sweep. The EOD digest reads its
 # mtime (build_alarm) so the report the user reads turns red if the alarm dies.
@@ -333,11 +363,12 @@ DEADLINE_JOBS: list[dict] = [
 ]
 
 
-def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
-    """Assert that a once-daily job ran by its deadline. Mirrors the old handle_eod
-    logic, generalized. After the deadline, alarm if the status JSON's date != today
-    OR its status == 'fail' OR it's missing/unreadable. One-line status string.
-    Reuses the same COOLDOWN de-dupe + pre-deadline cooldown reset as handle_job."""
+def handle_deadline(job: dict, state: dict, now: float) -> tuple[str, dict | None]:
+    """Assess a once-daily job against its deadline WITHOUT sending. After the deadline,
+    the job is OUTSTANDING if the status JSON's date != today OR its status == 'fail' OR
+    it's missing/unreadable. Returns (one-line status, problem|None); a non-None problem
+    is folded into the daily consolidated digest by main(). Recovery/pre-deadline clears
+    any legacy cooldown key so state stays clean and logs stay accurate."""
     name = job["name"]
     label = job["label"]
     status_file = Path(job["status_file"])
@@ -364,14 +395,14 @@ def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
 
     if job.get("market_dependent") and not _is_trading_day(now_dt.date()):
         # Market closed today (weekend/holiday): this job has no session to run,
-        # so its absence is expected, not a fault. Clear any cooldown and skip.
+        # so its absence is expected, not a fault. Clear any legacy cooldown and skip.
         js.pop("last_alert_ts", None)
-        return f"{name}: market closed today — {label} not expected (no check)"
+        return f"{name}: market closed today — {label} not expected (no check)", None
 
     if now_dt < deadline:
-        # New day / pre-deadline: clear any prior cooldown so today re-alarms.
+        # Pre-deadline: the job may still legitimately run — not outstanding yet.
         js.pop("last_alert_ts", None)
-        return f"{name}: pre-deadline ({now_dt:%H:%M} < {hhmm}) — no check"
+        return f"{name}: pre-deadline ({now_dt:%H:%M} < {hhmm}) — no check", None
 
     ok, detail = False, "status file absent/unreadable"
     try:
@@ -388,42 +419,21 @@ def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
     if ok:
         if js.pop("last_alert_ts", None) is not None:
             log(f"{name}: recovered — cleared alert cooldown")
-        return f"{name}: OK (today's {label} confirmed by status file)"
+        return f"{name}: OK (today's {label} confirmed by status file)", None
 
-    last = js.get("last_alert_ts")
-    cool_remaining = (last + COOLDOWN_SECS - now) if last else 0
-    if last and cool_remaining > 0:
-        return (f"{name}: MISSING ({detail}) — alert SUPPRESSED "
-                f"(cooldown {int(cool_remaining // 60)}m left)")
-
-    subject = f"[TradingDesk ALARM] {label} did NOT run today"
-    html = (
-        f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
-        f'max-width:640px;margin:0 auto;color:#111827;">'
-        f'<div style="font-size:18px;font-weight:700;color:#ef4444;">'
-        f'&#9679; TradingDesk ALARM — {label} did not run</div>'
-        f'<div style="font-size:13px;color:#374151;margin:8px 0;">'
+    # OUTSTANDING — build a problem for the digest (no immediate send).
+    cause = (
         f'It is past {hhmm} and no fresh, healthy status was recorded today for '
         f'<b>{label}</b>. The <b>{task_name}</b> task may have crashed or not fired. '
-        f'Check its log and run it manually.</div>'
-        f'<table style="border-collapse:collapse;font-size:13px;">'
-        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Detail</td>'
-        f'<td style="padding:2px 0;color:#111827;">{detail}</td></tr>'
-        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Status file</td>'
-        f'<td style="padding:2px 0;color:#111827;">{status_file}</td></tr>'
-        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Owning task</td>'
-        f'<td style="padding:2px 0;color:#111827;">{task_name}</td></tr></table>'
-        f'<div style="font-size:11px;color:#9ca3af;margin-top:10px;">'
-        f'Automated staleness alarm · TradingDesk\\datacollector\\heartbeat_alarm.py</div></div>')
-
-    if dry_run:
-        log(f"WOULD-SEND: {subject}")
-        return f"{name}: MISSING ({detail}) — WOULD-SEND (dry-run)"
-    sent = _send(subject, html)
-    if sent:
-        js["last_alert_ts"] = now
-        return f"{name}: MISSING ({detail}) — ALERT SENT"
-    return f"{name}: MISSING ({detail}) — SEND FAILED (will retry next run)"
+        f'Check its log and run it manually.')
+    problem = {
+        "label": label,
+        "status": "MISSING",
+        "cause": cause,
+        "rows": [("Detail", detail), ("Status file", str(status_file)),
+                 ("Owning task", task_name)],
+    }
+    return f"{name}: MISSING ({detail}) — OUTSTANDING (folded into daily digest)", problem
 
 
 # --------------------------------------------------------------------------- #
@@ -438,15 +448,16 @@ def handle_deadline(job: dict, state: dict, now: float, dry_run: bool) -> str:
 _TRIPWIRE_NAME = "drive_sync_tripwire"
 
 
-def handle_tripwire(state: dict, now: float, dry_run: bool) -> str:
-    """Evaluate the Drive-sync tripwire and page if it TRIPPED or is UNEVALUABLE.
+def handle_tripwire(state: dict, now: float) -> tuple[str, dict | None]:
+    """Evaluate the Drive-sync tripwire WITHOUT sending. If it TRIPPED or is UNEVALUABLE
+    it becomes an OUTSTANDING problem folded into the daily digest by main().
 
     FAILS CLOSED: if the tripwire module could not be imported, or a check inside it
-    could not be evaluated, that is itself a page ("could not evaluate") rather than
-    silence — a guard that quietly can't look is the exact silent failure the whole
-    body of work exists to kill. Reuses handle_job/handle_deadline's cooldown +
-    recovery-reset so a healthy machine never re-pages and a real trip re-alerts once
-    it recovers-then-recurs."""
+    could not be evaluated, that is itself an outstanding problem ("could not evaluate")
+    rather than silence — a guard that quietly can't look is the exact silent failure the
+    whole body of work exists to kill. Per the one-email-a-day rule this guard rides the
+    SAME daily digest as everything else (overnight-exception is an open owner decision).
+    Clears any legacy cooldown key on recovery so state stays clean."""
     name = _TRIPWIRE_NAME
     js = state.setdefault(name, {})
 
@@ -465,57 +476,34 @@ def handle_tripwire(state: dict, now: float, dry_run: bool) -> str:
     if not v.get("should_page"):
         if js.pop("last_alert_ts", None) is not None:
             log(f"{name}: recovered (GREEN) — cleared alert cooldown")
-        return f"{name}: GREEN (TradingDesk-Local not under Drive management) — no alert"
+        return f"{name}: GREEN (TradingDesk-Local not under Drive management) — no alert", None
 
     kind = "TRIPPED" if v.get("tripped") else "UNEVALUABLE"
 
-    last = js.get("last_alert_ts")
-    cool_remaining = (last + COOLDOWN_SECS - now) if last else 0
-    if last and cool_remaining > 0:
-        return (f"{name}: {kind} — alert SUPPRESSED "
-                f"(cooldown {int(cool_remaining // 60)}m left)")
-
     if v.get("tripped"):
-        subject = "[TradingDesk ALARM] C:\\TradingDesk-Local is under Google Drive management"
         headline = "TradingDesk-Local under Google Drive management"
-        lead = v.get("remediation")
+        lead = v.get("remediation") or ""
     else:
-        subject = "[TradingDesk ALARM] Drive-sync tripwire could NOT evaluate TradingDesk-Local"
         headline = "Drive-sync tripwire could not evaluate"
         lead = ("The tripwire that guards C:\\TradingDesk-Local against Google Drive "
                 "sync/backup management could NOT complete a check this run, so it is "
-                "FAILING CLOSED and paging rather than going silent. Investigate — the "
-                "guard is not currently proving the folder is safe. " + v.get("remediation", ""))
+                "FAILING CLOSED rather than going silent. Investigate — the guard is not "
+                "currently proving the folder is safe. " + v.get("remediation", ""))
 
     reasons = v.get("reasons") or []
     reasons_html = "".join(
-        f'<tr><td style="padding:2px 0;color:#111827;">{r}</td></tr>' for r in reasons)
+        f'<div style="padding:2px 0;color:#111827;">{r}</div>' for r in reasons)
     protected = ", ".join(v.get("protected") or [])
-    html = (
-        f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
-        f'max-width:640px;margin:0 auto;color:#111827;">'
-        f'<div style="font-size:18px;font-weight:700;color:#ef4444;">'
-        f'&#9679; TradingDesk ALARM — {headline}</div>'
-        f'<div style="font-size:13px;color:#374151;margin:8px 0;">{lead}</div>'
-        f'<table style="border-collapse:collapse;font-size:13px;">'
-        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Kind</td>'
-        f'<td style="padding:2px 0;color:#111827;">{kind}</td></tr>'
-        f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;">Protected</td>'
-        f'<td style="padding:2px 0;color:#111827;">{protected}</td></tr></table>'
-        f'<div style="font-size:12px;color:#6b7280;margin-top:8px;">Findings:</div>'
-        f'<table style="border-collapse:collapse;font-size:13px;">{reasons_html}</table>'
-        f'<div style="font-size:11px;color:#9ca3af;margin-top:10px;">'
-        f'Automated state-assertion tripwire · '
-        f'TradingDesk\\datacollector\\drive_sync_tripwire.py</div></div>')
-
-    if dry_run:
-        log(f"WOULD-SEND: {subject}")
-        return f"{name}: {kind} — WOULD-SEND (dry-run)"
-    sent = _send(subject, html)
-    if sent:
-        js["last_alert_ts"] = now
-        return f"{name}: {kind} — ALERT SENT"
-    return f"{name}: {kind} — SEND FAILED (will retry next run)"
+    cause = (f'<b>{headline}.</b> {lead}'
+             + (f'<div style="font-size:12px;color:#6b7280;margin-top:6px;">Findings:</div>'
+                f'{reasons_html}' if reasons else ''))
+    problem = {
+        "label": "Drive-sync tripwire (Google Drive corruption risk)",
+        "status": kind,
+        "cause": cause,
+        "rows": [("Kind", kind), ("Protected", protected)],
+    }
+    return f"{name}: {kind} — OUTSTANDING (folded into daily digest)", problem
 
 
 # --------------------------------------------------------------------------- #
@@ -755,10 +743,11 @@ def _fmt_age(age_s) -> str:
     return f"{m // 60}h{m % 60:02d}m"
 
 
-def _build_alert(job: dict, a: dict) -> tuple[str, str]:
-    """(subject, html_body) for a stale/missing job."""
+def _job_cause(job: dict, a: dict) -> str:
+    """The cause/remediation sentence for a stale/missing job — the SAME wording the old
+    per-problem alert carried, so the daily digest reads identically. Shared by
+    _build_alert and _job_problem (the digest path)."""
     age = _fmt_age(a["age_s"])
-    subject = f"[TradingDesk ALARM] {job['label']} heartbeat cold {age}"
     # Default wording assumes a SUPERVISED collector writing every ~30s. That is true
     # of the SPXW-style jobs this alarm was born for, but false — and misleading — for
     # jobs with other shapes (e.g. a once-daily repo backup). Such a job supplies its
@@ -775,15 +764,38 @@ def _build_alert(job: dict, a: dict) -> tuple[str, str]:
                  f"Check Windows Task Scheduler task <b>{job['task_name']}</b>.")
         if job.get("cause_missing"):
             cause = job["cause_missing"].format(age=age, task_name=job["task_name"])
-    rows = [
-        ("Job", job["label"]),
+    return cause
+
+
+def _job_rows(job: dict, a: dict) -> list[tuple[str, str]]:
+    """The detail rows for a stale/missing job (shared by _build_alert + the digest)."""
+    return [
         ("Status", a["status"].upper()),
         ("Last heartbeat", a["last_ts"]),
-        ("Age (cold for)", age),
+        ("Age (cold for)", _fmt_age(a["age_s"])),
         ("Progress", a["progress"]),
         ("Heartbeat file", a["hb_path"]),
         ("Owning task", job["task_name"]),
     ]
+
+
+def _job_problem(job: dict, a: dict) -> dict:
+    """A digest problem descriptor for a stale/missing job."""
+    return {
+        "label": job["label"],
+        "status": a["status"].upper(),
+        "cause": _job_cause(job, a),
+        "rows": _job_rows(job, a),
+    }
+
+
+def _build_alert(job: dict, a: dict) -> tuple[str, str]:
+    """(subject, html_body) for a stale/missing job. Retained for reuse/back-compat;
+    the live path now folds problems into the daily digest (see _build_digest)."""
+    age = _fmt_age(a["age_s"])
+    subject = f"[TradingDesk ALARM] {job['label']} heartbeat cold {age}"
+    cause = _job_cause(job, a)
+    rows = [("Job", job["label"])] + _job_rows(job, a)
     rows_html = "".join(
         f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;white-space:nowrap;">{k}</td>'
         f'<td style="padding:2px 0;color:#111827;">{v}</td></tr>'
@@ -819,40 +831,112 @@ def _send(subject: str, html: str) -> bool:
 # --------------------------------------------------------------------------- #
 # Per-job handling (de-dupe + send) and one-line status
 # --------------------------------------------------------------------------- #
-def handle_job(job: dict, state: dict, now: float, dry_run: bool,
-               heartbeat_override: str | None = None) -> str:
+def handle_job(job: dict, state: dict, now: float,
+               heartbeat_override: str | None = None) -> tuple[str, dict | None]:
+    """Assess one rolling-freshness job WITHOUT sending. Returns (one-line status,
+    problem|None); a non-None problem (stale/missing) is folded into the daily
+    consolidated digest by main(). Recovery clears any legacy cooldown key so state
+    stays clean and logs stay accurate."""
     a = assess(job, now, heartbeat_override=heartbeat_override)
     name = job["name"]
     js = state.setdefault(name, {})
     age = _fmt_age(a["age_s"])
 
     if not a["alert"]:
-        # Recovered / fresh / complete -> clear any cooldown so a future outage
-        # re-alerts immediately.
+        # Recovered / fresh / complete -> clear any legacy cooldown so state stays clean.
         if js.pop("last_alert_ts", None) is not None:
             log(f"{name}: recovered ({a['status']}) — cleared alert cooldown")
         return (f"{name}: {a['status'].upper()} (age {age}, "
-                f"progress {a['progress']}) — no alert")
+                f"progress {a['progress']}) — no alert"), None
 
-    # Alert-worthy (stale/missing). Apply the de-dupe cooldown.
-    last = js.get("last_alert_ts")
-    cool_remaining = (last + COOLDOWN_SECS - now) if last else 0
-    if last and cool_remaining > 0:
-        return (f"{name}: {a['status'].upper()} (age {age}) — alert SUPPRESSED "
-                f"(cooldown {int(cool_remaining // 60)}m left)")
+    # OUTSTANDING (stale/missing) — build a problem for the digest, no immediate send.
+    return (f"{name}: {a['status'].upper()} (age {age}) — OUTSTANDING "
+            f"(folded into daily digest)"), _job_problem(job, a)
 
-    subject, html = _build_alert(job, a)
+
+# --------------------------------------------------------------------------- #
+# Consolidated daily digest (one email/day, silent overnight)
+# --------------------------------------------------------------------------- #
+def _build_digest(problems: list[dict], now_dt: "dt.datetime") -> tuple[str, str]:
+    """(subject, html_body) for ONE consolidated email listing every outstanding
+    problem. Reuses each problem's own cause/remediation wording and detail rows, so
+    the digest reads exactly like the old per-problem alerts did — just batched."""
+    n = len(problems)
+    noun = "item" if n == 1 else "items"
+    verb = "needs" if n == 1 else "need"
+    subject = f"[TradingDesk] Overnight status — {n} {noun} {verb} attention"
+
+    sections = []
+    for p in problems:
+        rows_html = "".join(
+            f'<tr><td style="padding:2px 14px 2px 0;color:#6b7280;white-space:nowrap;'
+            f'vertical-align:top;">{k}</td>'
+            f'<td style="padding:2px 0;color:#111827;">{v}</td></tr>'
+            for k, v in p.get("rows", []))
+        sections.append(
+            f'<div style="border-left:3px solid #ef4444;padding:2px 0 8px 12px;'
+            f'margin:14px 0;">'
+            f'<div style="font-size:15px;font-weight:700;color:#111827;">'
+            f'{p["label"]} '
+            f'<span style="font-size:12px;font-weight:600;color:#ef4444;">'
+            f'[{p["status"]}]</span></div>'
+            f'<div style="font-size:13px;color:#374151;margin:6px 0;">{p["cause"]}</div>'
+            f'<table style="border-collapse:collapse;font-size:13px;">{rows_html}</table>'
+            f'</div>')
+
+    html = (
+        f'<div style="font-family:-apple-system,Segoe UI,Roboto,Arial,sans-serif;'
+        f'max-width:640px;margin:0 auto;color:#111827;">'
+        f'<div style="font-size:18px;font-weight:700;color:#ef4444;">'
+        f'&#9679; TradingDesk overnight status — {n} {noun} {verb} attention</div>'
+        f'<div style="font-size:12px;color:#6b7280;margin:6px 0 2px;">'
+        f'Consolidated once-daily digest as of {now_dt:%Y-%m-%d %H:%M} local. Items that '
+        f'cleared before this morning are not listed. This is the ONLY alarm email today.'
+        f'</div>'
+        f'{"".join(sections)}'
+        f'<div style="font-size:11px;color:#9ca3af;margin-top:12px;">'
+        f'Automated daily digest · TradingDesk\\datacollector\\heartbeat_alarm.py</div></div>')
+    return subject, html
+
+
+def maybe_send_digest(state: dict, now: float, problems: list[dict],
+                      dry_run: bool) -> str:
+    """Send at most ONE consolidated email per calendar day, only inside the morning
+    delivery window [DIGEST_SEND_HOUR, DIGEST_WINDOW_END_HOUR), and only when there is
+    >=1 outstanding problem. Otherwise assess+log only (overnight is silent). Returns a
+    one-line status for the sweep log. Records last_sent_date only on a real (non-dry)
+    successful send."""
+    now_dt = dt.datetime.fromtimestamp(now)
+    hour = now_dt.hour
+    today = now_dt.strftime("%Y%m%d")
+    dstate = state.setdefault(_DIGEST_STATE_KEY, {})
+    n = len(problems)
+
+    in_window = DIGEST_SEND_HOUR <= hour < DIGEST_WINDOW_END_HOUR
+    already_today = dstate.get("last_sent_date") == today
+
+    if not in_window:
+        return (f"digest: {n} outstanding — OUTSIDE send window "
+                f"({hour:02d}:xx not in [{DIGEST_SEND_HOUR:02d},"
+                f"{DIGEST_WINDOW_END_HOUR:02d})) — no email (silent)")
+    if already_today:
+        return (f"digest: {n} outstanding — already sent today ({today}) — no email")
+    if n == 0:
+        return ("digest: 0 outstanding — nothing to send")
+
+    subject, html = _build_digest(problems, now_dt)
     if dry_run:
         log(f"WOULD-SEND: {subject}")
-        # In dry-run we do NOT record the alert time (so repeated self-tests behave
-        # identically and we never suppress a real future alert).
-        return f"{name}: {a['status'].upper()} (age {age}) — WOULD-SEND (dry-run)"
+        for p in problems:
+            log(f"  WOULD-SEND item: {p['label']} [{p['status']}]")
+        # Dry-run never records last_sent_date (repeat self-tests stay identical).
+        return f"digest: {n} outstanding — WOULD-SEND (dry-run, {n} item(s))"
 
     sent = _send(subject, html)
     if sent:
-        js["last_alert_ts"] = now
-        return f"{name}: {a['status'].upper()} (age {age}) — ALERT SENT"
-    return f"{name}: {a['status'].upper()} (age {age}) — SEND FAILED (will retry next run)"
+        dstate["last_sent_date"] = today
+        return f"digest: {n} outstanding — SENT (recorded last_sent_date={today})"
+    return f"digest: {n} outstanding — SEND FAILED (will retry next run)"
 
 
 # --------------------------------------------------------------------------- #
@@ -871,11 +955,14 @@ def main() -> int:
     now = dt.datetime.now().timestamp()
     state = _load_state()
     lines: list[str] = []
+    problems: list[dict] = []  # currently-outstanding items -> consolidated digest
 
     for i, job in enumerate(JOBS):
         override = args.test_stale if (args.test_stale and i == 0) else None
         try:
-            line = handle_job(job, state, now, args.dry_run, heartbeat_override=override)
+            line, problem = handle_job(job, state, now, heartbeat_override=override)
+            if problem:
+                problems.append(problem)
         except Exception as e:  # noqa: BLE001 — one bad job must not kill the sweep
             line = f"{job.get('name', '?')}: CHECK ERROR — {type(e).__name__}: {e}"
         lines.append(line)
@@ -883,19 +970,29 @@ def main() -> int:
 
     for job in DEADLINE_JOBS:
         try:
-            line = handle_deadline(job, state, now, args.dry_run)
+            line, problem = handle_deadline(job, state, now)
+            if problem:
+                problems.append(problem)
         except Exception as e:  # noqa: BLE001 — one bad check must not kill the sweep
             line = f"{job.get('name', '?')}: CHECK ERROR — {type(e).__name__}: {e}"
         lines.append(line)
         log(line)
 
-    # Drive-sync tripwire (state assertion, not staleness). Same sweep, same de-dupe.
+    # Drive-sync tripwire (state assertion, not staleness). Same sweep; folded into the
+    # SAME daily digest per the one-email-a-day rule (overnight-exception open decision).
     try:
-        line = handle_tripwire(state, now, args.dry_run)
+        line, problem = handle_tripwire(state, now)
+        if problem:
+            problems.append(problem)
     except Exception as e:  # noqa: BLE001 — one bad check must not kill the sweep
         line = f"{_TRIPWIRE_NAME}: CHECK ERROR — {type(e).__name__}: {e}"
     lines.append(line)
     log(line)
+
+    # EMAIL GATE: at most one consolidated digest per day, only in the morning window.
+    digest_line = maybe_send_digest(state, now, problems, args.dry_run)
+    lines.append(digest_line)
+    log(digest_line)
 
     if not args.dry_run:
         _save_state(state)
