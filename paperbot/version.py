@@ -15,10 +15,42 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.29.0"
+VERSION = "0.30.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.30.0", "2026-08-05", "BOND valuation + leg-emission fix in the whole-book out-of-spec "
+                             "scan (crm_outofspec). BUG (flagged by the whole-book out-of-spec "
+                             "scan, then CONFIRMED against live IBKR data 2026-08-05 for U7349974/"
+                             "U7349657/U7552751/U7552750/U7333246): the pure engine values every "
+                             "holding as qty*mark, but IBKR carries an individual BOND with a "
+                             "FACE-value quantity (e.g. 10000) and a per-100 (percent-of-par) "
+                             "price (e.g. 100.146), so a bond was valued ~100x too high "
+                             "(10000*100.146 = 1,001,462 vs the true 10,014.63 = qty*mark/100, "
+                             "which equals IBKR's own reported market_value exactly), inflating "
+                             "NAV/drift, and the engine can't emit a placeable equity order for a "
+                             "face-value/per-100 CUSIP. FIX (crm_outofspec.account_inputs_from_"
+                             "roster, the CRM->engine assembly layer that alone sees "
+                             "asset_category): rows with asset_category=='BOND' are (a) valued "
+                             "CORRECTLY as qty*mark/100 into the account's holdings value/NAV, and "
+                             "(b) held OUT of the engine's positions/prices — so the pure engine "
+                             "never sees a bond, never inflates the account's valuation, and never "
+                             "emits a broken bond leg; they are returned on `bonds` and surfaced by "
+                             "verdicts_from_plans as n_bonds/bonds with action 'manual liquidation "
+                             "required (bond)' (S0 Growth holds no individual bonds — all "
+                             "sells-to-exit, done by a human), making a bond-holding account "
+                             "out_of_spec. The account's NON-bond legs still size against the "
+                             "corrected full NAV. Control-plane page surfaces a Bonds (manual) "
+                             "column + a manual-liquidation expander. The rebalance_engine and "
+                             "reconcile are UNTOUCHED; the crm_rebalance sleeve path already "
+                             "excludes non-STK instruments. Order-affecting (corrects NAV-driven "
+                             "sizing + which positions become legs) but NON-bond accounts are "
+                             "byte-identical — proven by a characterization test (ETF-only plan "
+                             "identical with/without the new `bonds` key) plus new tests (bond "
+                             "valued /100 not *100, bond legs excluded + flagged, mixed bond+ETF "
+                             "sizes the ETF part off corrected NAV). Rule #1 clean: no strategy/"
+                             "regime/band/sizing knob touched. READ-ONLY throughout; NOTHING "
+                             "transmitted."),
     ("0.29.0", "2026-07-31", "safe_execute: DEPLOY-vs-REBALANCE purpose + self-computed "
                              "per-account MARGIN pre-flight (#57). (1) ExecutionRequest gains a "
                              "trailing `purpose` field (default PURPOSE_DEPLOY): DEPLOY is the "

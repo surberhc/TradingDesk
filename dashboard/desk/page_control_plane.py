@@ -1016,6 +1016,7 @@ def _render_whole_book_outofspec() -> None:
             "Positions": v.get("n_positions", 0),
             "Would-trade legs": v.get("n_legs", 0),
             "Alien": v.get("n_alien", 0),
+            "Bonds (manual)": v.get("n_bonds", 0),
         } for v in shown]
         st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
 
@@ -1028,6 +1029,18 @@ def _render_whole_book_outofspec() -> None:
                             f"{v.get('version') or '—'} — {v['n_legs']} leg(s)")
                 st.dataframe(pd.DataFrame(v["legs"]), hide_index=True,
                              use_container_width=True)
+
+        # Individual bonds are NOT auto-tradeable equity legs — the engine excludes them and
+        # they need a human to liquidate. Surface them explicitly so they are never missed.
+        if any(v.get("bonds") for v in shown):
+            with st.expander("Bonds requiring MANUAL liquidation (excluded from auto legs)"):
+                for v in shown:
+                    if not v.get("bonds"):
+                        continue
+                    st.markdown(f"**{v['account']}** · {v.get('advisor_name') or '—'} · "
+                                f"{v.get('version') or '—'} — {v['n_bonds']} bond(s)")
+                    st.dataframe(pd.DataFrame(v["bonds"]), hide_index=True,
+                                 use_container_width=True)
 
 
 # =========================================================================== #

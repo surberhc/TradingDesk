@@ -30,6 +30,31 @@ def _to_float(x) -> float:
         return 0.0
 
 
+# Asset category (v_tradingdesk_holdings_latest.asset_category) that marks an individual
+# BOND. IBKR represents a bond position's QUANTITY as its FACE / PAR amount (e.g. 10000)
+# and its price as a PERCENTAGE OF PAR quoted per 100 (a mark of 100.146 == 100.146% of
+# face). So a bond's true value is  qty * mark / 100 , NOT qty * mark — valuing it as
+# qty * mark overstates it ~100x. Confirmed against live IBKR data 2026-08-05: for every
+# BOND row the broker's own reported market_value equals qty * mark / 100 exactly. See
+# `_is_bond` for the single detection point.
+_BOND_CATEGORY = "BOND"
+
+
+def _is_bond(asset_category) -> bool:
+    """True iff a holdings row is an individual bond (asset_category == 'BOND'). Single
+    source of truth for bond detection so valuation and order-exclusion never disagree."""
+    return str(asset_category or "").strip().upper() == _BOND_CATEGORY
+
+
+def _bond_value(qty: float, mark: float, market_value) -> float:
+    """A bond's true dollar value. IBKR quotes bond price as a percent of par per 100, and
+    the position quantity is the face amount, so value = qty * mark / 100. Falls back to the
+    broker's reported market_value when the mark is missing/non-positive (never qty*mark)."""
+    if mark == mark and mark > 0:          # mark is a real, positive per-100 price
+        return qty * mark / 100.0
+    return _to_float(market_value)
+
+
 def account_inputs_from_roster(roster_rows: list[Mapping],
                                holdings_by_account: Mapping[str, list[Mapping]],
                                ) -> tuple[list[dict], list[dict]]:
@@ -39,8 +64,22 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
       * account   = the IBKR number (crm_roster.account_identifier — CRM->desk identity map)
       * version   = the roster ``model`` (today uniformly "Growth")
       * positions = {symbol -> quantity}  from the account's latest holdings snapshot
+                    (individual BONDS excluded — see below)
       * prices    = {symbol -> mark_price} from the same snapshot (positive marks only)
       * net_liq   = roster ``total_value``; falls back to the holdings market-value sum
+      * bonds     = [{symbol, quantity, mark_price, value}] — individual bond holdings,
+                    valued correctly (qty * mark / 100) and held OUT of the engine
+
+    BONDS (order-affecting correctness, 2026-08-05). IBKR carries an individual bond with a
+    FACE-VALUE quantity and a per-100 (percent-of-par) price, so valuing it as qty*mark — as
+    the pure engine does for equities — overstates it ~100x and can't produce a placeable
+    equity order for a CUSIP. So bonds are (a) valued correctly (qty*mark/100) into the
+    account's holdings value / NAV, and (b) kept OUT of ``positions``/``prices`` — the engine
+    never sees them, so it never inflates the account's valuation and never emits a broken
+    bond leg. They are returned on ``bonds`` for the verdict to surface as MANUAL liquidation
+    (S0 Growth holds no individual bonds — they are all sells-to-exit, done by a human). The
+    account's non-bond legs still size against the corrected full NAV (which includes the
+    bond value). An account with NO bonds is byte-identical to before.
 
     Returns ``(account_inputs, skipped)``. ``skipped`` collects accounts with no usable
     net_liq (unfunded / no snapshot) — the read-only stand-in for 'not funded reality', kept
@@ -56,6 +95,7 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
 
         positions: dict[str, float] = {}
         prices: dict[str, float] = {}
+        bonds: list[dict] = []
         holdings_value = 0.0
         for h in holds:
             sym = str(h.get("symbol") or "").strip()
@@ -63,6 +103,15 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
                 continue
             qty = _to_float(h.get("quantity"))
             px = _to_float(h.get("mark_price"))
+            if _is_bond(h.get("asset_category")):
+                # Value the bond correctly (qty*mark/100) into NAV, but keep it OUT of the
+                # engine's positions/prices: the equity engine can neither value nor route a
+                # face-value/per-100 CUSIP. Surfaced separately for manual liquidation.
+                value = _bond_value(qty, px, h.get("market_value"))
+                bonds.append({"symbol": sym, "quantity": qty, "mark_price": px,
+                              "value": value})
+                holdings_value += value
+                continue
             positions[sym] = positions.get(sym, 0.0) + qty
             if px == px and px > 0:
                 prices[sym] = px
@@ -94,6 +143,7 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
             "entity": row.get("entity"),
             "master_name": row.get("master_name"),
             "n_positions": len(positions),
+            "bonds": bonds,
         })
 
     return account_inputs, skipped
@@ -127,9 +177,18 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
             continue
         orders = getattr(p, "orders", {}) or {}
         legs = _legs_from_orders(orders)
+        # Individual bonds are excluded from the auto-generated equity legs (the engine
+        # can't route them) and surfaced explicitly as MANUAL liquidation so a human acts on
+        # them — never silently dropped. Holding one makes the account out-of-spec.
+        bond_legs = [{"symbol": b["symbol"], "side": "SELL",
+                      "quantity": b.get("quantity"), "value": b.get("value"),
+                      "action": "manual liquidation required (bond)"}
+                     for b in (ai.get("bonds") or [])]
         # AccountPlan.needs_rebalance is the engine's band verdict; treat any would-trade
-        # leg as out-of-spec too (defensive — orders only fill when the band is breached).
-        out_of_spec = bool(getattr(p, "needs_rebalance", False)) or bool(legs)
+        # leg (or a held bond needing manual liquidation) as out-of-spec too (defensive —
+        # orders only fill when the band is breached).
+        out_of_spec = (bool(getattr(p, "needs_rebalance", False))
+                       or bool(legs) or bool(bond_legs))
         verdicts.append({
             "account": account,
             "version": ai.get("version"),
@@ -142,6 +201,8 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
             "n_legs": len(legs),
             "legs": legs,
             "n_alien": len(getattr(p, "alien_lines", []) or []),
+            "n_bonds": len(bond_legs),
+            "bonds": bond_legs,
         })
     verdicts.sort(key=lambda v: (not v["out_of_spec"], -v["net_liq"]))
     return verdicts

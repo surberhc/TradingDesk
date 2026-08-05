@@ -494,6 +494,16 @@ typed code no one can enter). No order-path change; login/2FA only, so no `paper
 The `C:\IBC-Live-Data\config.ini` change above is a *recommendation for whoever owns that file*, not applied
 here.
 
+### 3.13 Individual BONDS carry a FACE-value quantity and a per-100 (percent-of-par) price — value = qty × mark / 100 — **CONFIRMED-FROM-LIVE-DATA 2026-08-05**
+
+IBKR represents an individual fixed-income position with the **quantity as its FACE / PAR amount** (e.g. `10000`) and the **price quoted as a percentage of par per 100** (a mark of `100.146` means 100.146 % of face). So a bond's dollar value is **`qty × mark / 100`**, *not* `qty × mark` — the latter overstates it ~100×. IBKR's own convention: "The price for bonds is quoted as a percentage of its face relative to 100" (IBKR campus / Bonds Marketplace, accessed 2026-08-05; https://www.interactivebrokers.com/en/trading/products-bonds.php and the IBKR "Face Value" glossary https://www.interactivebrokers.com/campus/glossary-terms/face-value/).
+
+**Confirmed directly from live account data 2026-08-05** (the strongest evidence — IBKR's *own reported `market_value`* equals `qty × mark / 100` exactly): e.g. CUSIP `797843BE8` in U7552750/U7552751 shows `qty=10000`, `mark=100.14628819`, and IBKR's `market_value=10014.63` (= 10000 × 100.14628819 / 100). Verified across 11 bond rows in 5 accounts (U7349974/U7349657/U7552751/U7552750/U7333246). Equities on the same accounts (`asset_category='STK'`, e.g. BUCK) have `qty × mark == market_value` — the per-100 convention is bond-specific.
+
+Consequences for the desk (why this is an order-affecting gotcha):
+- The pure rebalance engine values every holding as `qty × mark` (`reconcile.py`). Feeding it a bond raw would inflate the account's NAV/drift ~100× **and** try to emit a placeable equity order for a face-value/per-100 CUSIP (impossible). Fixed 2026-08-05 (paperbot v0.30.0) in the CRM→engine assembly layer (`crm_outofspec.account_inputs_from_roster`, the only layer that sees `asset_category`): bonds are valued `qty × mark / 100` into NAV, held **out** of the engine's positions/prices, and surfaced for **manual liquidation** (S0 Growth holds no individual bonds). The sleeve-ledger path (`crm_rebalance`) already excludes non-STK instruments.
+- The bond-order **warning/validation** surface (`bondContractDetails`, the API "bypass Bond warning" option for orders outside face-value limits) is noted but **not depended on** — the desk does not route individual bonds programmatically; they are flagged for a human.
+
 ---
 
 ## 4. MONITORING CHANNELS
