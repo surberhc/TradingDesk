@@ -56,6 +56,7 @@ import page_feeds
 import page_history
 import page_research
 import page_s0
+import page_s0_model
 import page_s8
 import pulse
 
@@ -88,6 +89,8 @@ pages = [
     st.Page(page_history.render_history, title="History & Event Log", icon="📜"),
     st.Page(page_s0.render_s0_full,
             title="Strategy 0 — Adaptive All-Weather Core", icon="📈"),
+    st.Page(page_s0_model.render_s0_model,
+            title="Strategy 0 — Model & Parameters", icon="📋"),
     st.Page(page_control_plane.render_control_plane,
             title="Control Plane — S0 rebalance", icon="🎛️"),
     st.Page(page_s8.render_s8_full,
