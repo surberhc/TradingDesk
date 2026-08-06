@@ -54,6 +54,7 @@ import page_action_center
 import page_control_plane
 import page_feeds
 import page_history
+import page_models
 import page_research
 import page_s0
 import page_s0_model
@@ -91,6 +92,8 @@ pages = [
             title="Strategy 0 — Adaptive All-Weather Core", icon="📈"),
     st.Page(page_s0_model.render_s0_model,
             title="Strategy 0 — Model & Parameters", icon="📋"),
+    st.Page(page_models.render_models,
+            title="Strategy Models — all models", icon="🗂️"),
     st.Page(page_control_plane.render_control_plane,
             title="Control Plane — S0 rebalance", icon="🎛️"),
     st.Page(page_s8.render_s8_full,
