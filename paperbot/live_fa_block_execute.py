@@ -17,6 +17,41 @@ FA-block flow in rebalance_execute.py — composed from the SAME primitives, not
   * rebalance_execute.set_group_contracts_or_shares          -> the armed replaceFA write
   * order_router.build_fa_block / place / transmit_guard / already_present  -> the block order
   * safe_execute.armed_session / account_wall_ok / _probe_gateway_readonly / _margin_preflight_ok
+  * safe_execute's PROVEN TWO-PHASE CASH GATE — its constants (PHASE_TERMINAL_TIMEOUT_SEC,
+    CASH_SETTLE_SEC, CASH_SAFETY_BUFFER_PCT, _TERMINAL_STATUSES), its realized-cash reader
+    (_total_cash_value), its whole-share cash scaler (_scale_buys_to_cash) and its LOUD phase
+    reporter (_report_phase) are IMPORTED AND USED HERE, never re-implemented (see
+    "TWO-PHASE CASH GATE" below).
+
+TWO-PHASE CASH GATE (conductor #64, applied to the BLOCK lane)
+--------------------------------------------------------------
+safe_execute.execute_plan is the desk's single source of truth for "sell first, re-read the
+REALIZED cash, then buy only what that cash covers". It is PER-ACCOUNT and LEG-based, so the
+block lane cannot call it: an FA block is ONE order per group per symbol, allocated across
+sub-accounts by the group's stored ContractsOrShares split. This module therefore gives the
+BLOCK lane the SAME discipline out of the SAME pieces:
+
+  1. routes are PARTITIONED into SELL blocks and BUY blocks; SELLS ALWAYS GO FIRST. A route
+     whose side is neither BUY nor SELL FAILS CLOSED — the whole run is refused, never guessed.
+  2. every SELL block is placed and WAITED to terminal state (bounded by
+     safe_execute.PHASE_TERMINAL_TIMEOUT_SEC); anything still working at the timeout is
+     CANCELLED and reported LOUDLY. Group writes stay in lockstep with their own block, one at
+     a time, exactly as before (a block's allocation is the group's live ContractsOrShares).
+  3. after CASH_SETTLE_SEC, accountSummary is re-read and safe_execute._total_cash_value gives
+     each SUB-ACCOUNT its REALIZED cash. Missing/unparseable -> that account contributes ZERO
+     to the buy phase (FAIL CLOSED) and that fact is reported LOUDLY.
+  4. the BUY blocks are RE-SIZED to that realized cash with CASH_SAFETY_BUFFER_PCT applied
+     exactly as the per-account path does. This is the only genuinely new logic: BOTH the
+     block quantity AND the group's ContractsOrShares split are recomputed so each sub-account
+     buys only what its OWN realized cash covers. Cash is NEVER netted across accounts and
+     quantities are NEVER rounded up (whole-share floor + greedy trim, via _scale_buys_to_cash).
+  5. the re-sized BUY blocks are placed.
+  6. any account that RAISED proceeds but ended the run with cash left UNINVESTED is reported
+     loudly and machine-readably (account, dollars, reason) — a sold-but-not-reinvested account
+     is never left silently sitting in cash.
+
+PREVIEW shows the whole phasing (what would be sold first, that buys would be re-sized to
+realized cash) with ZERO broker interaction: no accountSummary read, no cash gate, no writes.
 
 PARAMETERIZED TARGET GATEWAY (the config flip)
 ----------------------------------------------
@@ -66,7 +101,8 @@ from __future__ import annotations
 import difflib
 import sys
 from contextlib import nullcontext
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace as dc_replace
+from types import SimpleNamespace
 
 from ib_async import IB   # noqa: E402
 
@@ -77,13 +113,22 @@ import live_quotes        # noqa: E402
 import order_router       # noqa: E402
 import rebalance_execute  # noqa: E402  (backup_fa_groups + the shared group-XML primitives)
 import rebalance_run      # noqa: E402  (resolve_tier_groups + build_preview + prices_for)
+import s0_live            # noqa: E402  (filter_account_summary — the per-account summary filter)
 import strategy_target    # noqa: E402
 import version            # noqa: E402
 from connections import clientids, gateway_probe, ibkr_paper   # noqa: E402
 from gateway_lock import GatewayBusyRefuse, gateway_lock        # noqa: E402
 from rebalance_engine import build_plan                         # noqa: E402
-from safe_execute import (account_wall_ok, armed_session,       # noqa: E402
-                          _margin_preflight_ok)
+# THE TWO-PHASE CASH GATE IS safe_execute's — imported, never re-implemented. The
+# underscore-prefixed names are private-by-convention module internals of the desk's ONE proven
+# transmit chokepoint; importing them (rather than copying their bodies here) is deliberate, so
+# the block lane and the per-account lane can NEVER drift on the cash discipline. Duplicating a
+# cash reader / terminal-status set / safety buffer for this lane is exactly the failure mode
+# conductor #64 exists to prevent.
+from safe_execute import (CASH_SAFETY_BUFFER_PCT, CASH_SETTLE_SEC,        # noqa: E402
+                          PHASE_TERMINAL_TIMEOUT_SEC, account_wall_ok, armed_session,
+                          _TERMINAL_STATUSES, _margin_preflight_ok, _report_phase,
+                          _scale_buys_to_cash, _total_cash_value)
 
 
 # The arm token must be typed EXACTLY. No abbreviation, no default. (Same kind as the other
@@ -313,41 +358,442 @@ def connect_target(target: TargetGateway = TARGET, *, armed: bool, timeout: int 
 
 
 # ========================================================================================
+# THE CASH GATE, BLOCK-SHAPED — the only genuinely NEW logic in this module. safe_execute's
+# per-account gate scales a LEG list to one account's realized cash; a BLOCK is one order
+# shared by many sub-accounts, so the split itself must be re-sized. Both functions below are
+# PURE (no broker, no config, no mutation of their inputs) so they are testable offline.
+# ========================================================================================
+def read_realized_cash(ib, accounts_) -> dict:
+    """Re-read REALIZED cash (TotalCashValue) per SUB-ACCOUNT off a FRESH accountSummary.
+
+    Composed from the two shared readers rather than a new one: s0_live.filter_account_summary
+    narrows the master's blended summary to ONE account, then safe_execute._total_cash_value
+    parses it — the SAME ground truth the per-account lane's between-phases buy sizing uses,
+    never the plan's expected sale proceeds.
+
+    Returns {account: float | None}. None means missing/unparseable, and the caller then FAILS
+    CLOSED (that account contributes ZERO to the buy phase). A whole-summary read failure fails
+    every account closed the same way."""
+    try:
+        all_summary = ib.accountSummary()
+    except Exception as exc:   # noqa: BLE001
+        print(f"      !! accountSummary read FAILED ({type(exc).__name__}: {exc}) — EVERY "
+              f"account FAILS CLOSED and contributes ZERO to the buy phase.")
+        return {a: None for a in sorted(accounts_)}
+    return {acct: _total_cash_value(s0_live.filter_account_summary(all_summary, account=acct))
+            for acct in sorted(accounts_)}
+
+
+def resize_buy_routes_to_realized_cash(buy_routes_with_limits, cash_by_account, *,
+                                       buffer_pct: float = CASH_SAFETY_BUFFER_PCT):
+    """PURE: re-size BUY blocks so each SUB-ACCOUNT buys only what its OWN realized cash covers.
+
+    `buy_routes_with_limits` is [(RoutePlan, block_limit)]; `cash_by_account` is
+    {account: realized cash | None} (None -> FAIL CLOSED -> that account is treated as 0.0).
+
+    Each account's slice of every buy block becomes one pseudo-leg, and the account's OWN legs
+    are scaled by safe_execute._scale_buys_to_cash — the SAME whole-share floor + greedy trim
+    the per-account lane uses, with the SAME CASH_SAFETY_BUFFER_PCT. Quantities are only ever
+    reduced (never rounded up), and each account is scaled against ITS OWN cash ALONE, so one
+    account's proceeds can NEVER fund another's buy.
+
+    Both the group's ContractsOrShares split AND the block's total quantity are recomputed (the
+    block is re-issued via dataclasses.replace, leaving the engine's original route untouched).
+
+    Returns (resized_with_limits, dropped_with_limits, detail):
+      resized_with_limits : [(RoutePlan, limit)] whose re-sized total_qty is > 0
+      dropped_with_limits : [(RoutePlan, limit)] that scaled all the way to zero (no cash)
+      detail              : {account: {realized_cash, cash_read_ok, budget, planned_notional,
+                                       sized_notional, min_buy_limit, had_buy_legs,
+                                       adjustments}}"""
+    legs_by_acct: dict = {}
+    for idx, (r, limit) in enumerate(buy_routes_with_limits):
+        lim = float(limit) if limit is not None else float("nan")
+        if not (lim == lim and lim > 0):
+            # UNPRICEABLE block (NaN/<=0 reference). order_router's HARD price guard would
+            # reject it at build time anyway; dropping it here keeps the cash gate from ever
+            # sizing against a bad price. Fails CLOSED: no legs, so the block scales to zero.
+            print(f"      !! UNPRICEABLE buy block {r.symbol} group={r.fa_group} "
+                  f"(limit={limit!r}) — DROPPED before cash sizing (fail closed).")
+            continue
+        for acct, qty in sorted(r.per_account_split.items()):
+            q = int(qty)
+            if q <= 0:
+                continue
+            # `source` carries the route index so the scaled result maps back to its block.
+            legs_by_acct.setdefault(acct, []).append(SimpleNamespace(
+                symbol=r.symbol, side="BUY", qty=q, limit=lim, notional=q * lim,
+                source=f"fa_block#{idx}"))
+
+    detail: dict = {}
+    new_qty: dict = {}
+    for acct in sorted(set(legs_by_acct) | set(cash_by_account)):
+        raw = cash_by_account.get(acct)
+        cash_ok = raw is not None
+        cash = float(raw) if cash_ok else 0.0          # FAIL CLOSED: unreadable cash buys NOTHING
+        legs = legs_by_acct.get(acct, [])
+        budget = max(0.0, cash * (1.0 - buffer_pct))
+        scaled, adjustments = _scale_buys_to_cash(legs, cash, buffer_pct=buffer_pct)
+        sized_notional = sum(w.notional for w in scaled)
+        # HARD per-account invariant — the load-bearing anti-negative check, per account and
+        # NEVER netted across accounts (mirrors safe_execute.execute_plan's assert).
+        assert sized_notional <= budget + 1e-6, (
+            f"block cash-gate invariant violated for {acct}: buy notional {sized_notional} > "
+            f"budget {budget}")
+        for w in scaled:
+            new_qty[(int(str(w.source).split("#")[1]), acct)] = int(w.qty)
+        detail[acct] = {
+            "realized_cash": (float(raw) if cash_ok else None),
+            "cash_read_ok": cash_ok,
+            "budget": budget,
+            "planned_notional": sum(l.notional for l in legs),
+            "sized_notional": sized_notional,
+            "min_buy_limit": (min(l.limit for l in legs) if legs else None),
+            "had_buy_legs": bool(legs),
+            "adjustments": adjustments,
+        }
+
+    resized, dropped = [], []
+    for idx, (r, limit) in enumerate(buy_routes_with_limits):
+        split = {a: q for (i, a), q in new_qty.items() if i == idx and q > 0}
+        total = sum(split.values())
+        if total <= 0:
+            dropped.append((r, limit))
+            continue
+        resized.append((dc_replace(r, per_account_split=dict(sorted(split.items())),
+                                   total_qty=int(total)), limit))
+    return resized, dropped, detail
+
+
+def uninvested_proceeds_report(proceeds_by_account: dict, cash_detail: dict,
+                               placed_notional_by_account: dict) -> list[dict]:
+    """PURE: the OPERATOR EXCEPTION REPORT — every account that RAISED proceeds in the sell
+    phase but ended the run with that money sitting in cash. A sold-but-not-reinvested account
+    must never be silently left behind.
+
+    `proceeds_by_account` is what the SELL phase ACTUALLY raised per account (split shares x the
+    block limit x the block's fill fraction) — accounts with no realized proceeds are not an
+    exception and are not reported.
+
+    The shortfall is measured against the account's own INTENDED buy notional, NOT against its
+    TotalCashValue: total cash legitimately includes a pre-existing cash sleeve, so
+    budget-minus-placed would cry wolf on every run. Fires when:
+      * CASH_UNREADABLE            — realized cash could not be read, so the account contributed
+                                     ZERO to the buy phase (fail closed) and its whole intended
+                                     buy went undone;
+      * NO_BUY_ROUTE               — it raised proceeds and this run had no buy block for it;
+      * BUY_SHORT_OF_REALIZED_CASH — its placed buys came up short of its intended buys by at
+                                     least ONE share of its cheapest buy leg (re-sized down,
+                                     refused, dropped, or unfilled). Sub-one-share whole-share
+                                     remainder is irreducible and is NOT an exception.
+
+    Returns [{account, dollars_uninvested, proceeds_raised, realized_cash, planned_notional,
+    placed_notional, reason, detail}] — machine-readable, sorted by account."""
+    report: list[dict] = []
+    for acct in sorted(proceeds_by_account):
+        proceeds = float(proceeds_by_account.get(acct, 0.0) or 0.0)
+        if proceeds <= 0.0:
+            continue
+        d = cash_detail.get(acct) or {}
+        planned = float(d.get("planned_notional", 0.0) or 0.0)
+        placed = float(placed_notional_by_account.get(acct, 0.0) or 0.0)
+        shortfall = max(0.0, planned - placed)
+        row = {"account": acct, "dollars_uninvested": shortfall, "proceeds_raised": proceeds,
+               "realized_cash": d.get("realized_cash"), "planned_notional": planned,
+               "placed_notional": placed}
+        if not d.get("cash_read_ok", False):
+            row["reason"] = "CASH_UNREADABLE"
+            row["detail"] = ("realized TotalCashValue could not be read — this account "
+                             "contributed ZERO to the buy phase (FAIL CLOSED); its sale "
+                             "proceeds are sitting UNINVESTED.")
+            report.append(row)
+            continue
+        if not d.get("had_buy_legs", False):
+            row["dollars_uninvested"] = proceeds
+            row["reason"] = "NO_BUY_ROUTE"
+            row["detail"] = ("account raised proceeds but this run had NO buy block for it — "
+                             "the whole realized amount is sitting in cash.")
+            report.append(row)
+            continue
+        floor_price = float(d.get("min_buy_limit") or 0.0)
+        if shortfall > 0.0 and shortfall >= floor_price:
+            row["reason"] = "BUY_SHORT_OF_REALIZED_CASH"
+            row["detail"] = ("placed buys came up short of this account's INTENDED buys by at "
+                             "least one share of its cheapest leg (re-sized down / refused / "
+                             "dropped / unfilled) — proceeds left in cash.")
+            report.append(row)
+    return report
+
+
+# ========================================================================================
 # THE FA-BLOCK ROUTE LOOP — the e2e body: per fa_block route, surface the group-write DIFF,
 # run the account wall + margin pre-flight over the split, then (armed+permitted) write the
 # group's ContractsOrShares + place ONE block; else build-only. NEVER whatIf a block.
 # ========================================================================================
+def _cancel_working_block(ib, order_ref: str) -> int:
+    """Cancel any order still WORKING under this block's orderRef at the phase timeout — the
+    block-lane equivalent of safe_execute._transmit_phase's "cancel + report LOUDLY" straggler
+    give-up. A sell still working is cash NOT raised, so it must never be left alive while the
+    buy phase sizes against realized cash. Fully fail-soft (a broker read/cancel error is
+    swallowed and reported by the caller's LOUD phase report). Returns the number cancelled."""
+    trades = None
+    for reader in ("openTrades", "reqAllOpenOrders"):
+        fn = getattr(ib, reader, None)
+        if fn is None:
+            continue
+        try:
+            trades = fn() or []
+        except Exception:   # noqa: BLE001
+            trades = None
+            continue
+        if trades:
+            break
+    cancelled = 0
+    for t in (trades or []):
+        o = getattr(t, "order", None) or t
+        if getattr(o, "orderRef", None) != order_ref:
+            continue
+        try:
+            ib.cancelOrder(o)
+            cancelled += 1
+        except Exception:   # noqa: BLE001
+            pass
+    if cancelled:
+        print(f"      !! CANCELLED {cancelled} still-working order(s) for ref={order_ref} at "
+              f"the phase timeout.")
+    return cancelled
+
+
+def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
+                       permit: bool, summaries: dict | None, phase_label: str) -> dict:
+    """Run ONE fa_block route: account wall over the split, margin pre-flight over the split,
+    the would-write group DIFF, then (armed+permitted) the lockstep replaceFA + block place, or
+    (preview) build-only. This is the UNCHANGED per-route body — every gate in the same order,
+    with the same fail-closed `SKIP` semantics — lifted into a function so the phase runner can
+    call it for the SELL blocks first and the BUY blocks after.
+
+    Returns one result dict in safe_execute._report_phase's per-leg shape (symbol/side/
+    requested/filled/status/reprices/skipped/reason) plus block extras (group, split, limit,
+    replace_fa, fills, order_ref)."""
+    res = {"symbol": r.symbol, "side": r.side, "requested": float(r.total_qty), "filled": 0.0,
+           "status": "PREVIEW" if not permit else "NOT_PLACED", "reprices": 0, "skipped": False,
+           "reason": "", "group": r.fa_group, "split": dict(sorted(r.per_account_split.items())),
+           "limit": None, "replace_fa": 0, "fills": [], "order_ref": "", "phase": phase_label}
+
+    print("\n" + "-" * 88)
+    print(f"    [{phase_label}][fa_block] {r.side} {r.symbol} x{r.total_qty}  "
+          f"group={r.fa_group}  faMethod='{r.fa_method}'  "
+          f"split={dict(sorted(r.per_account_split.items()))}")
+
+    def _skip(status: str, reason: str) -> dict:
+        res["skipped"], res["status"], res["reason"] = True, status, reason
+        return res
+
+    # ACCOUNT WALL over the WHOLE split (fail closed).
+    wall_ok, wall_reason = account_wall_over_split(r.per_account_split, allowed)
+    if not wall_ok:
+        print(f"      SKIP — account wall: {wall_reason}")
+        return _skip("SKIPPED_ACCOUNT_WALL", wall_reason)
+
+    # Per-account MARGIN pre-flight over the split (the whatIf substitute; fail closed).
+    mg_ok, mg_reason = margin_preflight_over_split(r, account_inputs, targets, summaries)
+    print(f"      margin_preflight_over_split ok={mg_ok}"
+          + ("" if mg_ok else f"   reason: {mg_reason}"))
+    if not mg_ok:
+        print("      SKIP — margin pre-flight refused this block.")
+        return _skip("SKIPPED_MARGIN", mg_reason)
+
+    # Surface the exact would-write group DIFF (both preview and armed) for human review.
+    try:
+        current_xml = str(ib.requestFA(1) or "").strip() if ib is not None else ""
+        _new_xml, diff = group_write_plan(current_xml, r.fa_group, r.per_account_split)
+        print("      WOULD-WRITE group DIFF (replaceFA overwrites the WHOLE groups XML; "
+              "only this group changes):")
+        if diff:
+            for line in diff.splitlines():
+                print(f"        {line}")
+        else:
+            print("        (no change — the group already holds this exact split)")
+    except RuntimeError as exc:
+        print(f"      GROUP-WRITE FAILED CLOSED — {exc}")
+        print("      SKIP — refusing to write/place against an unresolved group.")
+        return _skip("SKIPPED_GROUP_WRITE", str(exc))
+
+    if limit is None:
+        limit = rebalance_execute._fa_block_limit(r, _quotes_cache, account_inputs, targets)
+    res["limit"] = limit
+    print(f"      block limit = {limit} (marketable={config.FA_BLOCK_MARKETABLE})")
+
+    if not permit:
+        # PREVIEW: build the block object (build-only) and log; write NO FA config.
+        try:
+            bo = order_router.build_fa_block(
+                r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib)
+        except ValueError as exc:
+            print(f"      PRICE GUARD skipped this block: {exc}")
+            return _skip("SKIPPED_PRICE_GUARD", str(exc))
+        res["order_ref"] = bo.order_ref
+        order_router.place(ib, [bo], armed=False)
+        print("      PREVIEW — block built + logged; NO replaceFA, nothing transmitted.")
+        return res
+
+    # ARMED + permitted: write THIS group's ContractsOrShares, THEN place its block.
+    print(f"      writing ContractsOrShares via replaceFA: "
+          f"{dict(sorted(r.per_account_split.items()))}")
+    rebalance_execute.set_group_contracts_or_shares(ib, r.fa_group, r.per_account_split)
+    res["replace_fa"] = 1
+    try:
+        bo = order_router.build_fa_block(
+            r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib)
+    except ValueError as exc:
+        print(f"      PRICE GUARD skipped this block AFTER the group write: {exc}")
+        return _skip("SKIPPED_PRICE_GUARD_AFTER_WRITE", str(exc))
+    res["order_ref"] = bo.order_ref
+    # NEVER what-if a block (it hangs). Place directly, watch fills. Dedup lives in place().
+    # The fill watch is BOUNDED by safe_execute.PHASE_TERMINAL_TIMEOUT_SEC — the SAME bound the
+    # per-account phase discipline uses, so a phase always terminates and never blocks the wire.
+    placed = order_router.place(ib, [bo], armed=True,
+                                fill_timeout=int(PHASE_TERMINAL_TIMEOUT_SEC))
+    fills = list(placed.get("fills", []) or [])
+    res["fills"] = fills
+    res["filled"] = sum(float(f.get("filled", 0.0) or 0.0) for f in fills)
+    if placed.get("skipped"):
+        res["skipped"] = True
+        res["status"] = "SKIPPED_WORKING"
+        res["reason"] = "an identical WORKING block is already open — not double-submitting"
+        return res
+    if not fills:
+        res["status"] = "NO_FILL_RECORD"
+        res["reason"] = "block transmitted but no order status came back — LOUD, needs review"
+        return res
+    res["status"] = str(fills[0].get("status", "") or "")
+    if res["status"] not in _TERMINAL_STATUSES:
+        # STRAGGLER give-up, mirroring _transmit_phase: cancel and report LOUDLY. Never leave a
+        # working block alive across the cash re-read.
+        _cancel_working_block(ib, res["order_ref"])
+        res["reason"] = (f"NOT TERMINAL after {PHASE_TERMINAL_TIMEOUT_SEC:.0f}s "
+                         f"(status={res['status']}) — cancelled at the phase timeout")
+    elif res["filled"] < res["requested"]:
+        res["reason"] = "UNFILLED remainder (block reached terminal state short)"
+    return res
+
+
+def _notional_by_account(routes_with_limits, results) -> dict:
+    """PURE: per-account dollars a phase ACTUALLY transacted — the account's split shares x the
+    block limit x the block's FILL FRACTION (a block allocates pro-rata to its ContractsOrShares
+    split, so a partial block fill lands pro-rata too). Skipped/refused blocks contribute zero.
+    Used for BOTH the sell phase's realized proceeds and the buy phase's placed notional."""
+    out: dict = {}
+    for (r, _limit), res in zip(routes_with_limits, results):
+        if res.get("skipped"):
+            continue
+        requested = float(res.get("requested", 0.0) or 0.0)
+        frac = min(max((float(res.get("filled", 0.0) or 0.0) / requested)
+                       if requested > 0 else 0.0, 0.0), 1.0)
+        lim = float(res.get("limit") or 0.0)
+        for acct, q in r.per_account_split.items():
+            out[acct] = out.get(acct, 0.0) + float(q) * lim * frac
+    return out
+
+
+def _run_block_phase(ib, phase_label, routes_with_limits, account_inputs, targets, allowed,
+                     as_of, *, permit: bool, summaries: dict | None) -> list[dict]:
+    """Run ONE phase's blocks (all sells, or all buys) and return their result dicts.
+
+    Blocks are run ONE AT A TIME: an FA block's allocation IS its group's live
+    ContractsOrShares, so the replaceFA and the block it governs must stay in lockstep (two
+    blocks on the same group in flight would race the group's split). order_router.place
+    already waits each block to terminal within the bounded fill window, so serial execution is
+    also what makes "all sells reach terminal state before any buy is sized" true."""
+    print(f"\n    ===== PHASE {phase_label} — {len(routes_with_limits)} block(s) =====")
+    if not routes_with_limits:
+        print(f"    [{phase_label}] no blocks.")
+        return []
+    return [_execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit,
+                               permit=permit, summaries=summaries, phase_label=phase_label)
+            for r, limit in routes_with_limits]
+
+
 def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetGateway,
                             *, permit: bool, summaries: dict | None = None) -> dict:
-    """Drive the fa_block routes. `permit` is the FULL armed gate result (code gate AND gateway
-    write-enabled) computed by the caller. When permit is False this is a PREVIEW: it prints
-    each route's would-write group DIFF and builds the block (build-only, place(armed=False)),
-    writing NO FA config and transmitting nothing. When permit is True it writes each group's
-    ContractsOrShares (replaceFA) in lockstep with placing that group's block, one at a time,
-    watching fills. Reuses order_router.build_fa_block/place (dedup + price guard live inside).
+    """Drive the fa_block routes under the SAME two-phase cash gate the per-account lane uses
+    (see the module docstring): SELL blocks first, then a fresh REALIZED-cash read per
+    sub-account, then BUY blocks RE-SIZED to that cash, then the uninvested-proceeds exception
+    report.
+
+    `permit` is the FULL armed gate result (code gate AND gateway write-enabled) computed by the
+    caller. When permit is False this is a PREVIEW: it prints the phase plan, each route's
+    would-write group DIFF and builds the block (build-only, place(armed=False)), writing NO FA
+    config, transmitting nothing, and performing NO broker cash read. When permit is True it
+    writes each group's ContractsOrShares (replaceFA) in lockstep with placing that group's
+    block, one at a time, watching fills. Reuses order_router.build_fa_block/place (dedup +
+    price guard live inside).
+
+    A route whose side is neither BUY nor SELL FAILS CLOSED: the WHOLE run is refused before the
+    backup, before any group write and before any order — the phase order cannot be guessed.
 
     Direct routes (a tier with a single account) are OUT OF SCOPE for this module (the FA-block
     path needs >=2 accounts); they are listed and SKIPPED here — the per-account-direct path
     (batch_rebalance_execute.py) owns them.
 
-    Returns a summary dict: {n_blocks, n_direct_skipped, replace_fa_writes, placed_fills, backup}."""
+    Returns a summary dict. The original keys are UNCHANGED for existing callers —
+    {n_blocks, n_direct_skipped, replace_fa_writes, placed_fills, backup} — and are EXTENDED
+    with {refused, refused_reason, n_sell_blocks, n_buy_blocks, sell_results, buy_results,
+    realized_cash, buy_resize, dropped_buy_blocks, uninvested}."""
     fa_routes = [r for r in routes if r.route == "fa_block"]
     direct_routes = [r for r in routes if r.route != "fa_block"]
     placed_fills: list[dict] = []
-    replace_fa_writes = 0
     backup_path = ""
+
+    def _summary(**extra) -> dict:
+        base = {"n_blocks": len(fa_routes), "n_direct_skipped": len(direct_routes),
+                "replace_fa_writes": 0, "placed_fills": placed_fills, "backup": backup_path,
+                "refused": False, "refused_reason": "", "n_sell_blocks": 0, "n_buy_blocks": 0,
+                "sell_results": [], "buy_results": [], "realized_cash": {}, "buy_resize": {},
+                "dropped_buy_blocks": [], "uninvested": []}
+        base.update(extra)
+        return base
 
     if direct_routes:
         print(f"\n    NOTE: {len(direct_routes)} DIRECT route(s) are OUT OF SCOPE for the "
               f"FA-block module and are SKIPPED here (per-account-direct path owns them): "
               f"{', '.join(f'{r.side} {r.symbol} @ {r.account}' for r in direct_routes)}")
 
+    # [1] PARTITION — SELLS ALWAYS FIRST. An unknown side FAILS CLOSED (refuse, never guess).
+    sell_routes = [r for r in fa_routes if str(r.side).upper() == "SELL"]
+    buy_routes = [r for r in fa_routes if str(r.side).upper() == "BUY"]
+    unknown = [r for r in fa_routes if str(r.side).upper() not in ("BUY", "SELL")]
+    if unknown:
+        detail = ", ".join(f"{r.side!r} {r.symbol} group={r.fa_group}" for r in unknown)
+        reason = (f"{len(unknown)} fa_block route(s) with an UNKNOWN side ({detail}) — the "
+                  f"sell-before-buy phase order cannot be determined. FAILING CLOSED: the "
+                  f"WHOLE run is refused. No backup, no replaceFA, no order, nothing "
+                  f"transmitted.")
+        print(f"\n    !! REFUSING THE RUN — {reason}")
+        return _summary(refused=True, refused_reason=reason)
+
     if not fa_routes:
         print("\n    No FA-block routes (a group needs >=2 accounts). Nothing to write/place.")
-        return {"n_blocks": 0, "n_direct_skipped": len(direct_routes),
-                "replace_fa_writes": 0, "placed_fills": placed_fills, "backup": backup_path}
+        return _summary()
 
     as_of = next(iter(targets.values())).as_of
+    allowed = list(target.enrollment.keys())
+
+    print(f"\n    PHASE PLAN (two-phase cash gate): SELL {len(sell_routes)} block(s) FIRST, "
+          f"then re-read REALIZED cash per sub-account, then BUY {len(buy_routes)} block(s) "
+          f"RE-SIZED to that cash (safety buffer {CASH_SAFETY_BUFFER_PCT:.2%}).")
+    for r in sell_routes:
+        print(f"      1. SELL {r.symbol} x{r.total_qty} group={r.fa_group}")
+    for r in buy_routes:
+        print(f"      2. BUY  {r.symbol} x{r.total_qty} group={r.fa_group}  "
+              f"(quantity + group split WILL be re-sized to realized cash)")
+
+    # Block limits are computed ONCE, up front, so the buy re-sizing prices the SAME cap the
+    # block is actually placed at (a second quote read could drift and break the cash gate).
+    sell_with_limits = [(r, rebalance_execute._fa_block_limit(r, _quotes_cache, account_inputs,
+                                                              targets)) for r in sell_routes]
+    buy_with_limits = [(r, rebalance_execute._fa_block_limit(r, _quotes_cache, account_inputs,
+                                                             targets)) for r in buy_routes]
 
     # ARMED + permitted: MANDATORY backup of the whole groups XML BEFORE any replaceFA write.
     if permit:
@@ -355,75 +801,94 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
         backup_path = rebalance_execute.backup_fa_groups(ib)
         print(f"      backup -> {backup_path}")
 
-    allowed = list(target.enrollment.keys())
-    for r in fa_routes:
-        print("\n" + "-" * 88)
-        print(f"    [fa_block] {r.side} {r.symbol} x{r.total_qty}  group={r.fa_group}  "
-              f"faMethod='{r.fa_method}'  split={dict(sorted(r.per_account_split.items()))}")
-
-        # ACCOUNT WALL over the WHOLE split (fail closed).
-        wall_ok, wall_reason = account_wall_over_split(r.per_account_split, allowed)
-        if not wall_ok:
-            print(f"      SKIP — account wall: {wall_reason}")
-            continue
-
-        # Per-account MARGIN pre-flight over the split (the whatIf substitute; fail closed).
-        mg_ok, mg_reason = margin_preflight_over_split(r, account_inputs, targets, summaries)
-        print(f"      margin_preflight_over_split ok={mg_ok}"
-              + ("" if mg_ok else f"   reason: {mg_reason}"))
-        if not mg_ok:
-            print("      SKIP — margin pre-flight refused this block.")
-            continue
-
-        # Surface the exact would-write group DIFF (both preview and armed) for human review.
-        try:
-            current_xml = str(ib.requestFA(1) or "").strip() if ib is not None else ""
-            _new_xml, diff = group_write_plan(current_xml, r.fa_group, r.per_account_split)
-            print("      WOULD-WRITE group DIFF (replaceFA overwrites the WHOLE groups XML; "
-                  "only this group changes):")
-            if diff:
-                for line in diff.splitlines():
-                    print(f"        {line}")
-            else:
-                print("        (no change — the group already holds this exact split)")
-        except RuntimeError as exc:
-            print(f"      GROUP-WRITE FAILED CLOSED — {exc}")
-            print("      SKIP — refusing to write/place against an unresolved group.")
-            continue
-
-        limit = rebalance_execute._fa_block_limit(r, _quotes_cache, account_inputs, targets)
-        print(f"      block limit = {limit} (marketable={config.FA_BLOCK_MARKETABLE})")
-
-        if not permit:
-            # PREVIEW: build the block object (build-only) and log; write NO FA config.
-            try:
-                bo = order_router.build_fa_block(
-                    r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib)
-            except ValueError as exc:
-                print(f"      PRICE GUARD skipped this block: {exc}")
-                continue
-            order_router.place(ib, [bo], armed=False)
-            print("      PREVIEW — block built + logged; NO replaceFA, nothing transmitted.")
-            continue
-
-        # ARMED + permitted: write THIS group's ContractsOrShares, THEN place its block.
-        print(f"      writing ContractsOrShares via replaceFA: "
-              f"{dict(sorted(r.per_account_split.items()))}")
-        rebalance_execute.set_group_contracts_or_shares(ib, r.fa_group, r.per_account_split)
-        replace_fa_writes += 1
-        try:
-            bo = order_router.build_fa_block(
-                r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib)
-        except ValueError as exc:
-            print(f"      PRICE GUARD skipped this block AFTER the group write: {exc}")
-            continue
-        # NEVER what-if a block (it hangs). Place directly, watch fills. Dedup lives in place().
-        res = order_router.place(ib, [bo], armed=True)
+    # [2] PHASE 1 — SELLS. Every sell block reaches terminal state (bounded) before any buy is
+    # sized; stragglers are cancelled and reported LOUDLY inside _execute_one_route.
+    sell_results = _run_block_phase(ib, "SELL", sell_with_limits, account_inputs, targets,
+                                   allowed, as_of, permit=permit, summaries=summaries)
+    for res in sell_results:
         placed_fills.extend(res.get("fills", []))
 
-    return {"n_blocks": len(fa_routes), "n_direct_skipped": len(direct_routes),
-            "replace_fa_writes": replace_fa_writes, "placed_fills": placed_fills,
-            "backup": backup_path}
+    # [3] BETWEEN PHASES — RE-READ realized cash. NEVER trust the plan's expected proceeds; a
+    # cancelled/short sell block means that cash never landed. PREVIEW does NO broker read.
+    realized_cash: dict = {}
+    cash_accounts = sorted({a for r, _l in buy_with_limits for a in r.per_account_split}
+                           | {a for r, _l in sell_with_limits for a in r.per_account_split})
+    if permit:
+        ib.sleep(CASH_SETTLE_SEC)      # let streaming account values catch up to the fills
+        realized_cash = read_realized_cash(ib, cash_accounts)
+        print(f"\n    REALIZED cash (fresh TotalCashValue per sub-account) — buys are sized to "
+              f"THIS, never to expected proceeds:")
+        for acct in cash_accounts:
+            val = realized_cash.get(acct)
+            if val is None:
+                print(f"      !! {acct}: TotalCashValue UNREADABLE — FAIL CLOSED, this account "
+                      f"contributes ZERO to the buy phase.")
+            else:
+                print(f"      {acct}: {val:,.2f}")
+    else:
+        print(f"\n    PREVIEW — would now wait {CASH_SETTLE_SEC:.0f}s and re-read realized "
+              f"TotalCashValue for {', '.join(cash_accounts) or '(none)'}, then RE-SIZE every "
+              f"buy block (quantity AND group split) so each account buys only what its OWN "
+              f"realized cash covers. No broker read performed; buy quantities below are the "
+              f"UNRESIZED plan.")
+
+    # [4] RE-SIZE the buy blocks to realized cash (armed only — preview keeps plan quantities so
+    # the operator sees the engine's intent; the print above says they would be re-sized).
+    buy_resize: dict = {}
+    dropped: list = []
+    if permit:
+        buy_with_limits, dropped, buy_resize = resize_buy_routes_to_realized_cash(
+            buy_with_limits, realized_cash)
+        for acct in sorted(buy_resize):
+            for adj in buy_resize[acct]["adjustments"]:
+                verb = "SKIP  " if adj["new_qty"] == 0 else "REDUCE"
+                print(f"      {verb} {acct} {adj['symbol']}: {adj['orig_qty']} -> "
+                      f"{adj['new_qty']} shares (fit to that account's OWN realized cash)")
+        for r, _limit in dropped:
+            print(f"      !! DROPPED buy block {r.symbol} group={r.fa_group}: every account "
+                  f"scaled to zero shares against realized cash.")
+
+    # [5] PHASE 2 — BUYS (re-sized).
+    buy_results = _run_block_phase(ib, "BUY", buy_with_limits, account_inputs, targets,
+                                  allowed, as_of, permit=permit, summaries=summaries)
+    for res in buy_results:
+        placed_fills.extend(res.get("fills", []))
+
+    replace_fa_writes = sum(res.get("replace_fa", 0)
+                            for res in (sell_results + buy_results))
+
+    # [6] LOUD reporting. Armed runs get safe_execute's phase reporter verbatim (same format the
+    # per-account lane prints) plus the uninvested-proceeds exception report.
+    uninvested: list = []
+    if permit:
+        _report_phase("SELL", sell_results)
+        _report_phase("BUY", buy_results)
+
+        proceeds_by_account = _notional_by_account(sell_with_limits, sell_results)
+        placed_by_account = _notional_by_account(buy_with_limits, buy_results)
+        uninvested = uninvested_proceeds_report(proceeds_by_account, buy_resize,
+                                                placed_by_account)
+        if uninvested:
+            print("\n    !! UNINVESTED PROCEEDS (LOUD — an account SOLD but is sitting in "
+                  "cash; needs human review):")
+            for row in uninvested:
+                print(f"      -> account={row['account']} dollars_uninvested="
+                      f"{row['dollars_uninvested']:,.2f} reason={row['reason']} "
+                      f"proceeds_raised={row['proceeds_raised']:,.2f} "
+                      f"realized_cash={row['realized_cash']} "
+                      f"planned_notional={row['planned_notional']:,.2f} "
+                      f"placed_notional={row['placed_notional']:,.2f} :: {row['detail']}")
+        else:
+            print("\n    Uninvested-proceeds check: CLEAN — every account that raised proceeds "
+                  "redeployed them (within the whole-share remainder + safety buffer).")
+
+    return _summary(replace_fa_writes=replace_fa_writes,
+                    refused=False, refused_reason="",
+                    n_sell_blocks=len(sell_routes), n_buy_blocks=len(buy_routes),
+                    sell_results=sell_results, buy_results=buy_results,
+                    realized_cash=realized_cash, buy_resize=buy_resize,
+                    dropped_buy_blocks=[r.symbol for r, _l in dropped],
+                    uninvested=uninvested)
 
 
 # Module-level quote cache the route loop reads for marketable-cap block pricing (reuses
@@ -608,6 +1073,12 @@ def _run_session(target: TargetGateway, targets: dict, *, armed: bool) -> int:
         backup_path = result.get("backup", "")
 
         _ledger(target, armed, permit, why, routes, result, backup_path)
+        if result.get("refused"):
+            # Unknown route side -> the phase order could not be determined -> the WHOLE run was
+            # refused before any backup/write/order. Non-zero rc so a scheduler never reads it
+            # as a clean run.
+            print(f"\nREFUSED — {result.get('refused_reason')}")
+            return 2
         if permit:
             print("\nDone. ARMED run complete — review fills + the group writes above, then "
                   "DISARM the gateway.")
@@ -638,7 +1109,15 @@ def _ledger(target, armed, permit, why, routes, result, backup_path) -> None:
         "fills": result.get("placed_fills", []),
         "fa_backup": backup_path,
         "replace_fa_writes": result.get("replace_fa_writes", 0),
-        "halted": False, "halt_reason": "",
+        # Two-phase cash gate (conductor #64): the audit trail for what was sold first, what
+        # cash actually landed, how the buys were re-sized, and any account left in cash.
+        "phases": {"n_sell_blocks": result.get("n_sell_blocks", 0),
+                   "n_buy_blocks": result.get("n_buy_blocks", 0),
+                   "realized_cash": result.get("realized_cash", {}),
+                   "dropped_buy_blocks": result.get("dropped_buy_blocks", []),
+                   "uninvested": result.get("uninvested", [])},
+        "halted": bool(result.get("refused")),
+        "halt_reason": result.get("refused_reason", ""),
         "gate": {"target": target.name, "port": target.port,
                  "readonly": config.READONLY, "dry_run": config.DRY_RUN,
                  "armed": armed, "permitted": permit, "why": why},

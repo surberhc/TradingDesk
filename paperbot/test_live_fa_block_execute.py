@@ -267,6 +267,22 @@ class _FakeIB:
     def reqExecutions(self, *_a, **_k):
         return []
 
+    def accountSummary(self, *_a, **_k):
+        """Ample REALIZED cash for every paper sub. The two-phase cash gate (conductor #64)
+        re-reads TotalCashValue between the SELL and BUY phases; these tests are about the loop
+        mechanics, not the gate, so every account reports far more cash than any block needs and
+        the buy sizing passes through unchanged. The gate itself (short cash, unreadable cash,
+        no netting, uninvested proceeds) is covered in test_live_fa_block_execute_phases.py."""
+        return [SimpleNamespace(account=a, tag="TotalCashValue", value="100000000")
+                for a in ("DU8922142", "DU8922143", "DU8922144", "DU8922145", "DU8922146",
+                          "DU9999999")]
+
+    def openTrades(self):
+        return []
+
+    def cancelOrder(self, _order):
+        pass
+
     def qualifyContracts(self, *c):
         return c
 
