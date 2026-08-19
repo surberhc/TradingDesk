@@ -9,8 +9,11 @@ Under the current safety config (READONLY + DRY_RUN, plus ReadOnlyApi=yes on the
 gateway) transmission is physically impossible. The guard fails CLOSED.
 
 Idempotency (ENFORCED, not just aspirational): every order carries a deterministic orderRef
-  paperbot:<account>:<as_of>:<side>:<symbol>   (or paperbot:<fa_group>:... for FA blocks)
-so a restart re-derives the SAME id. Before the FIRST placeOrder for a leg, the pre-transmit
+  paperbot:<account>:<as_of>:<side>:<symbol>[:<run_id>]
+  paperbot:<fa_group>:<as_of>:<side>:<symbol>[:<run_id>]   (FA blocks — keyed on the GROUP)
+so a restart WITHIN the run re-derives the SAME id. The trailing <run_id> is the PER-RUN stamp
+(v0.34.0, see _run_stamp) — constant across one run, different on the next, which is what makes
+a re-run new work instead of "already done". Before the FIRST placeOrder for a leg, the pre-transmit
 dedup gate `already_present()` reads BROKER TRUTH (reqAllOpenOrders + reqExecutions) and the
 transmit journal, and lets ONLY a genuinely FRESH leg through — a working/filled/partial/
 uncertain leg transmits NOTHING. This is what actually prevents a crash-resume, retry, or a
@@ -121,13 +124,14 @@ def already_present(ib, order_ref, target_qty, *, day=None,
     return LegState.FRESH
 
 
-def order_ref_for_route(route, as_of) -> str:
+def order_ref_for_route(route, as_of, run_id=None) -> str:
     """The deterministic orderRef for a staged route, matching EXACTLY what build() /
     build_fa_block() stamp — so the dedup gate keys on the same string the transmit path
-    uses. FA blocks key on the group; direct legs key on the account."""
+    uses. FA blocks key on the group; direct legs key on the account. `run_id` must be the
+    SAME value the caller passes to build()/build_fa_block() for that run (see _run_stamp)."""
     if getattr(route, "route", None) == "fa_block":
-        return f"paperbot:{route.fa_group}:{as_of}:{route.side}:{route.symbol}"
-    return _order_ref(route.account, as_of, route.side, route.symbol)
+        return _fa_block_ref(route.fa_group, as_of, route.side, route.symbol, run_id)
+    return _order_ref(route.account, as_of, route.side, route.symbol, run_id)
 
 
 @dataclass
@@ -138,8 +142,43 @@ class BuiltOrder:
     order_ref: str
 
 
-def _order_ref(account: str, as_of, side: str, symbol: str) -> str:
-    return f"paperbot:{account}:{as_of}:{side}:{symbol}"
+# ---------------------------------------------------------------------------------------
+# PER-RUN ORDER-REF STAMP (v0.34.0). WHY: the base ref carries the model `as_of`, which for a
+# monthly model is effectively a MONTH stamp. already_present() keys the dedup on the ref, so a
+# SECOND run of the same group+symbol+side inside that month read as "already done" and silently
+# sent NOTHING — the 2026-07-28 incident (a bought-then-sold symbol needing a re-buy could not
+# be re-sent). safe_execute fixed its OWN lane by appending a PER-RUN stamp to the ref
+# (_deploy_ref / _run_id); this is the SAME convention, hoisted to the one place every lane
+# builds a ref, so the block lane and the paper rebalance lane cannot drift from it.
+#
+# WHAT IS PRESERVED: WITHIN one run the run_id is constant, so the ref is constant, so
+# already_present() still classifies a second submission of the SAME leg as WORKING/COMPLETE and
+# transmits nothing. A retry, a straggler re-price, a crash-resume inside the run and a stacked
+# ladder are all gated exactly as before.
+# WHAT IS DELIBERATELY DROPPED: cross-run suppression. A NEW run gets a NEW ref, so it is
+# correctly treated as NEW WORK rather than as "already done". That is the point — the engine's
+# delta-vs-current-positions becomes the sole source of truth for what to trade, which is the
+# only thing that can be right after a position has already moved.
+# SIDE is part of the base ref, so a SELL and a BUY of the same symbol in the SAME run (the
+# two-phase cash gate places both) can never collide with or dedup each other.
+# TRACEABILITY: run_id is a human-readable wall-clock stamp (YYYYmmddTHHMMSS — safe_execute.
+# _run_id) and is ALSO written to the run's ledger record, so an order on the wire joins back to
+# the run that produced it from either direction.
+# run_id=None yields the UNCHANGED base ref — kept for the lanes that key a DURABLE transmit
+# journal on the ref (morning_execute_run), where the cross-day "already sent" tripwire is the
+# intended behavior and a per-run ref would silently disable it.
+def _run_stamp(base: str, run_id) -> str:
+    """Append the per-run stamp to a base orderRef; run_id=None yields the base unchanged."""
+    return f"{base}:{run_id}" if run_id else base
+
+
+def _order_ref(account: str, as_of, side: str, symbol: str, run_id=None) -> str:
+    return _run_stamp(f"paperbot:{account}:{as_of}:{side}:{symbol}", run_id)
+
+
+def _fa_block_ref(fa_group: str, as_of, side: str, symbol: str, run_id=None) -> str:
+    """The FA-BLOCK orderRef: keyed on the GROUP (not any one account), same per-run stamp."""
+    return _run_stamp(f"paperbot:{fa_group}:{as_of}:{side}:{symbol}", run_id)
 
 
 def _check_limit_price(symbol: str, limit_price) -> float:
@@ -314,10 +353,13 @@ def build_rung(rung: dict, symbol, side, qty, cap, *, account=None, fa_group=Non
     return builder(symbol, side, qty, cap, **kwargs)
 
 
-def build(approved, account: str, as_of, ib=None) -> list[BuiltOrder]:
+def build(approved, account: str, as_of, ib=None, run_id=None) -> list[BuiltOrder]:
     """Construct (contract, LIMIT order) for each approved intent. transmit stays
     False. If an ib session is given, qualify the contracts (read-only) so we know
     they resolve on IBKR before we would ever route them.
+
+    `run_id` stamps the PER-RUN orderRef (see _run_stamp): the caller passes ONE run_id for
+    the whole run so within-run dedup still holds while a NEW run is seen as new work.
 
     HARD PRICE GUARD: each intent's limit price is validated (NaN/None/<=0 rejected)
     BEFORE any order object is built — a bad price raises rather than producing a
@@ -329,7 +371,7 @@ def build(approved, account: str, as_of, ib=None) -> list[BuiltOrder]:
         order = LimitOrder(o.side, o.quantity, o.limit_price)
         order.account = account
         order.tif = "DAY"
-        order.orderRef = _order_ref(account, as_of, o.side, o.symbol)
+        order.orderRef = _order_ref(account, as_of, o.side, o.symbol, run_id)
         order.transmit = False          # never armed in this module
         built.append(BuiltOrder(o.symbol, contract, order, order.orderRef))
     if ib is not None and built:
@@ -341,11 +383,16 @@ def build(approved, account: str, as_of, ib=None) -> list[BuiltOrder]:
 
 
 def build_fa_block(symbol: str, side: str, quantity: int, limit_price: float,
-                   fa_group: str, fa_method: str, as_of, ib=None) -> BuiltOrder:
+                   fa_group: str, fa_method: str, as_of, ib=None,
+                   run_id=None) -> BuiltOrder:
     """Construct ONE FA group (block) order: the master executes it as a single block
     at one average price and allocates across the group's accounts by fa_method. No
     single `account` is set — that is what makes it a group order rather than a direct
     one. transmit stays False (this module never arms).
+
+    `run_id` stamps the PER-RUN orderRef (see _run_stamp). The two-phase cash gate places a
+    SELL block and a BUY block inside the SAME run: they share the run_id and are kept apart
+    by the `side` already in the base ref, so they can never dedup each other.
 
     HARD PRICE GUARD: the block's limit price is validated (NaN/None/<=0 rejected)
     BEFORE the order object is built — a missing quote can never become a $0/NaN block
@@ -356,7 +403,7 @@ def build_fa_block(symbol: str, side: str, quantity: int, limit_price: float,
     order.faGroup = fa_group        # the allocation group defined on the gateway
     order.faMethod = fa_method      # e.g. "NetLiq" (proportional to each acct's net liq)
     order.tif = "DAY"
-    order.orderRef = f"paperbot:{fa_group}:{as_of}:{side}:{symbol}"
+    order.orderRef = _fa_block_ref(fa_group, as_of, side, symbol, run_id)
     order.transmit = False
     if ib is not None:
         try:

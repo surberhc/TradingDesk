@@ -19,6 +19,10 @@ group-XML write). This file covers ONLY the phasing + cash gate:
       and stays quiet when every account redeployed as intended.
   (g) PREVIEW still transmits nothing, writes no FA config, and does NO broker cash read — while
       still printing the phase plan.
+  (h) The PER-RUN orderRef stamp (v0.34.0): two runs on the same day for the same group/symbol/
+      side get DIFFERENT refs and BOTH send (the 2026-07-28 root cause), while a duplicate leg
+      WITHIN one run is still gated, a SELL and a BUY of one symbol in one run never collide,
+      and every ref traces back to the run id the summary (and the ledger) records.
 
 Run:
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_live_fa_block_execute_phases.py -q
@@ -507,3 +511,148 @@ def test_cash_gate_pieces_are_the_shared_safe_execute_ones():
     assert lx._total_cash_value is safe_execute._total_cash_value
     assert lx._scale_buys_to_cash is safe_execute._scale_buys_to_cash
     assert lx._TERMINAL_STATUSES is safe_execute._TERMINAL_STATUSES
+
+
+# ========================================================================================
+# (h) PER-RUN ORDER-REF STAMP (v0.34.0)
+#
+# The block ref used to end at the model `as_of` — for a monthly model, effectively a MONTH
+# stamp — so order_router.place's dedup read a SECOND run of the same group/symbol/side as
+# "an identical WORKING order already exists" and silently sent NOTHING (the 2026-07-28 root
+# cause, fixed then on the per-account lane only). The ref now carries a per-run stamp, and
+# BOTH cash-gate phases of one run share it.
+# ========================================================================================
+class _DedupIB(_FakeIB):
+    """A _FakeIB that reports its OWN placed orders back as broker truth, so the REAL
+    order_router.already_present gate can be exercised: anything this fake already placed is
+    both WORKING (open) and filled. That is what makes a genuine within-run double-submit
+    attempt observable instead of assumed."""
+    def reqAllOpenOrders(self):
+        return [SimpleNamespace(order=SimpleNamespace(orderRef=o.orderRef))
+                for _c, o in self.placed]
+
+    def reqExecutions(self, *_a, **_k):
+        return [SimpleNamespace(execution=SimpleNamespace(
+            orderRef=o.orderRef, shares=float(o.totalQuantity))) for _c, o in self.placed]
+
+
+@pytest.fixture
+def armed_env_real_dedup(monkeypatch):
+    """armed_env, but WITHOUT stubbing already_present — the real dedup gate runs."""
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    monkeypatch.setattr(lx, "margin_preflight_over_split", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(rebalance_execute, "backup_fa_groups", lambda ib: "fake_backup.xml")
+    monkeypatch.setattr(lx, "_quotes_cache", {})
+
+
+def _refs(ib):
+    """Every orderRef this fake actually had placed on it, in placement order."""
+    return [o.orderRef for _c, o in ib.placed]
+
+
+def test_two_runs_same_day_same_block_get_different_refs_and_BOTH_send(armed_env_real_dedup,
+                                                                      monkeypatch):
+    # THE 2026-07-28 REGRESSION TEST at the lane level. Two runs, same day, same group +
+    # symbol + side, against a broker that remembers run 1's fill. Run 2 must still SEND.
+    stamps = iter(["20260819T090000", "20260819T143000"])
+    monkeypatch.setattr(lx, "_run_id", lambda: next(stamps))
+    routes = [_block("SPY", "SELL", {A1: 10, A2: 10})]
+
+    ib = _DedupIB(cash={A1: 1_000_000.0, A2: 1_000_000.0})
+    r1 = _run(ib, routes, permit=True)
+    r2 = _run(ib, routes, permit=True)          # SAME broker: run 1's fill is still visible
+
+    assert r1["run_id"] == "20260819T090000"
+    assert r2["run_id"] == "20260819T143000"
+    assert len(ib.placed) == 2, "run 2 was deduped away — the month-stamped ref bug is back"
+    ref1, ref2 = _refs(ib)
+    assert ref1 != ref2
+    assert ref1.endswith(":20260819T090000") and ref2.endswith(":20260819T143000")
+    # Everything BEFORE the stamp is identical — only the run differs.
+    assert ref1.rsplit(":", 1)[0] == ref2.rsplit(":", 1)[0]
+    assert not r1["sell_results"][0]["skipped"] and not r2["sell_results"][0]["skipped"]
+
+
+def test_within_one_run_a_repeated_block_is_STILL_deduped(armed_env_real_dedup, monkeypatch):
+    # THE GUARANTEE THAT MUST SURVIVE: within ONE run the stamp is constant, so a second
+    # submission of the SAME leg (retry / straggler re-price) still gates and sends nothing.
+    monkeypatch.setattr(lx, "_run_id", lambda: "20260819T090000")
+    routes = [_block("SPY", "SELL", {A1: 10, A2: 10})]
+    ib = _DedupIB(cash={A1: 1_000_000.0, A2: 1_000_000.0})
+
+    _run(ib, routes, permit=True)
+    assert len(ib.placed) == 1
+    # Re-drive the SAME run id (what a retry inside the run derives) — nothing new goes out.
+    again = _run(ib, routes, permit=True)
+    assert len(ib.placed) == 1, "a within-run duplicate escaped the dedup gate"
+    assert again["sell_results"][0]["skipped"] is True
+    assert again["sell_results"][0]["status"] == "SKIPPED_WORKING"
+
+
+def test_sell_and_buy_of_the_same_symbol_in_one_run_do_not_collide(armed_env_real_dedup,
+                                                                   monkeypatch):
+    # Both cash-gate phases share the run stamp; `side` in the ref is what keeps them apart.
+    monkeypatch.setattr(lx, "_run_id", lambda: "20260819T090000")
+    ib = _DedupIB(cash={A1: 1_000_000.0, A2: 1_000_000.0})
+    routes = [_block("SPY", "SELL", {A1: 10, A2: 10}),
+              _block("SPY", "BUY", {A1: 4, A2: 4})]
+    result = _run(ib, routes, permit=True)
+
+    assert [a for a, _s in ib.actions] == ["SELL", "BUY"]
+    sell_ref, buy_ref = _refs(ib)
+    assert sell_ref != buy_ref
+    assert ":SELL:SPY:" in sell_ref and ":BUY:SPY:" in buy_ref
+    # SAME run stamp on both — one run, two phases.
+    assert sell_ref.rsplit(":", 1)[1] == buy_ref.rsplit(":", 1)[1] == "20260819T090000"
+    assert not result["sell_results"][0]["skipped"]
+    assert not result["buy_results"][0]["skipped"]
+
+
+def test_every_block_ref_carries_the_runs_stamp_and_the_ledger_records_it(armed_env,
+                                                                         monkeypatch):
+    # AUDIT/TRACEABILITY: the run id is a readable field of every ref this run placed AND is
+    # returned for the ledger, so an order on the wire joins back to the run that produced it.
+    monkeypatch.setattr(lx, "_run_id", lambda: "20260819T090000")
+    ib = _FakeIB(cash={A1: 1_000_000.0, A2: 1_000_000.0})
+    routes = [_block("SPY", "SELL", {A1: 10, A2: 10}),
+              _block("IVV", "BUY", {A1: 20, A2: 20})]
+    result = _run(ib, routes, permit=True)
+
+    assert result["run_id"] == "20260819T090000"
+    placed_refs = _refs(ib)
+    assert len(placed_refs) == 2
+    for ref in placed_refs:
+        assert ref.rsplit(":", 1)[1] == result["run_id"]
+        # The rest of the ref is still fully readable: group / as_of / side / symbol.
+        parts = ref.split(":")
+        assert parts[0] == "paperbot" and parts[1] == "tier_balanced"
+        assert parts[2] == "2026-08-19" and parts[3] in ("SELL", "BUY")
+    for res in result["sell_results"] + result["buy_results"]:
+        assert res["order_ref"].endswith(":" + result["run_id"])
+
+
+def test_run_stamp_comes_from_safe_execute_not_a_local_copy():
+    # ONE convention desk-wide: this lane reuses safe_execute's run-id generator verbatim.
+    import safe_execute
+    assert lx._run_id is safe_execute._run_id
+
+
+def test_preview_run_also_stamps_and_reports_a_run_id(armed_env, monkeypatch):
+    # A PREVIEW still transmits nothing, but the refs it logs must be the ones the armed run
+    # of that same run would have sent — otherwise the preview is not a preview.
+    monkeypatch.setattr(lx, "_run_id", lambda: "20260819T090000")
+    ib = _FakeIB(cash={A1: 1_000_000.0, A2: 1_000_000.0})
+    result = _run(ib, [_block("SPY", "SELL", {A1: 10, A2: 10})], permit=False)
+    assert ib.placed == [] and ib.replace_fa_calls == 0
+    assert result["run_id"] == "20260819T090000"
+    assert result["sell_results"][0]["order_ref"].endswith(":20260819T090000")
+
+
+def test_refused_run_still_reports_its_run_id(armed_env):
+    # An UNKNOWN side refuses the WHOLE run before any write/order — the audit record still
+    # needs the run id so the refusal is traceable like any other run.
+    ib = _FakeIB(cash={A1: 1_000_000.0, A2: 1_000_000.0})
+    result = _run(ib, [_block("SPY", "HOLD", {A1: 10, A2: 10})], permit=True)
+    assert result["refused"] is True
+    assert result["run_id"]

@@ -15,10 +15,41 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.33.0"
+VERSION = "0.34.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.34.0", "2026-08-19", "PER-RUN ORDER-REF STAMP on the FA-BLOCK lane and the shared "
+                             "paper REBALANCE lane (owner decision 2026-08-19). PROBLEM: the "
+                             "orderRef was paperbot:{account|fa_group}:{as_of}:{side}:{symbol} "
+                             "and `as_of` is the MODEL as-of — for a monthly model, effectively "
+                             "a MONTH stamp. order_router.place dedups on that ref, so a SECOND "
+                             "run of the same group+symbol+side inside the month was classified "
+                             "'an identical WORKING order already exists' and silently sent "
+                             "NOTHING. That is the 2026-07-28 root cause (a bought-then-sold "
+                             "symbol back below target looked 'already done' and could not be "
+                             "re-bought); it was fixed then on the PER-ACCOUNT lane only "
+                             "(safe_execute._deploy_ref/_run_id) and the BLOCK lane was never "
+                             "moved over. FIX: order_router._run_stamp appends a per-run "
+                             "wall-clock id to the ref (new ref: ...:{side}:{symbol}:{run_id}); "
+                             "_order_ref / the new _fa_block_ref / build / build_fa_block / "
+                             "order_ref_for_route all take run_id. live_fa_block_execute mints "
+                             "ONE run_id per call to execute_fa_block_routes (both cash-gate "
+                             "phases share it) and rebalance_execute mints ONE per armed "
+                             "session, both via safe_execute._run_id — one convention desk-wide, "
+                             "not a second format. PRESERVED: within a run the stamp is "
+                             "constant, so already_present still blocks a retry / straggler "
+                             "re-price / crash-resume from double-submitting a leg, and `side` "
+                             "in the ref keeps a SELL and a BUY of the same symbol in the same "
+                             "run apart. DELIBERATELY DROPPED: cross-run suppression — a NEW run "
+                             "is now correctly NEW WORK, with the engine's delta-vs-positions as "
+                             "the sole source of truth. AUDIT: run_id is a readable "
+                             "YYYYmmddTHHMMSS stamp AND is written to both lanes' ledger "
+                             "records, so an orderRef on the wire joins back to its run. "
+                             "UNCHANGED ON PURPOSE: morning_execute_run keeps the base (no "
+                             "run_id) ref — its dedup keys a DURABLE transmit journal on the "
+                             "ref, where cross-run 'already sent today' is the intended "
+                             "behavior and a per-run ref would silently disable it."),
     ("0.33.0", "2026-08-19", "TWO order-affecting change-sets. "
                              "(1) BOND / HELD-ASIDE POSITION CARVE-OUT (owner decision "
                              "2026-08-19). PROBLEM: v0.30.0 valued an individual bond "

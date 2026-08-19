@@ -124,11 +124,13 @@ from rebalance_engine import build_plan                         # noqa: E402
 # transmit chokepoint; importing them (rather than copying their bodies here) is deliberate, so
 # the block lane and the per-account lane can NEVER drift on the cash discipline. Duplicating a
 # cash reader / terminal-status set / safety buffer for this lane is exactly the failure mode
-# conductor #64 exists to prevent.
+# conductor #64 exists to prevent. _run_id rides in on the SAME reasoning: the PER-RUN orderRef
+# stamp (v0.34.0) must be ONE convention desk-wide, so this lane reuses safe_execute's generator
+# verbatim rather than inventing a second wall-clock format.
 from safe_execute import (CASH_SAFETY_BUFFER_PCT, CASH_SETTLE_SEC,        # noqa: E402
                           PHASE_TERMINAL_TIMEOUT_SEC, account_wall_ok, armed_session,
                           _TERMINAL_STATUSES, _margin_preflight_ok, _report_phase,
-                          _scale_buys_to_cash, _total_cash_value)
+                          _run_id, _scale_buys_to_cash, _total_cash_value)
 
 
 # The arm token must be typed EXACTLY. No abbreviation, no default. (Same kind as the other
@@ -565,12 +567,17 @@ def _cancel_working_block(ib, order_ref: str) -> int:
 
 
 def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
-                       permit: bool, summaries: dict | None, phase_label: str) -> dict:
+                       permit: bool, summaries: dict | None, phase_label: str,
+                       run_id: str | None = None) -> dict:
     """Run ONE fa_block route: account wall over the split, margin pre-flight over the split,
     the would-write group DIFF, then (armed+permitted) the lockstep replaceFA + block place, or
     (preview) build-only. This is the UNCHANGED per-route body — every gate in the same order,
     with the same fail-closed `SKIP` semantics — lifted into a function so the phase runner can
     call it for the SELL blocks first and the BUY blocks after.
+
+    `run_id` is the run's PER-RUN orderRef stamp (v0.34.0) — the SAME value for the SELL phase
+    and the BUY phase of one run, so within-run dedup still blocks a double-submit of one leg
+    while a LATER run of the same group/symbol/side is correctly seen as new work.
 
     Returns one result dict in safe_execute._report_phase's per-leg shape (symbol/side/
     requested/filled/status/reprices/skipped/reason) plus block extras (group, split, limit,
@@ -628,7 +635,8 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
         # PREVIEW: build the block object (build-only) and log; write NO FA config.
         try:
             bo = order_router.build_fa_block(
-                r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib)
+                r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib,
+                run_id=run_id)
         except ValueError as exc:
             print(f"      PRICE GUARD skipped this block: {exc}")
             return _skip("SKIPPED_PRICE_GUARD", str(exc))
@@ -644,7 +652,8 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
     res["replace_fa"] = 1
     try:
         bo = order_router.build_fa_block(
-            r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib)
+            r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib,
+            run_id=run_id)
     except ValueError as exc:
         print(f"      PRICE GUARD skipped this block AFTER the group write: {exc}")
         return _skip("SKIPPED_PRICE_GUARD_AFTER_WRITE", str(exc))
@@ -697,7 +706,8 @@ def _notional_by_account(routes_with_limits, results) -> dict:
 
 
 def _run_block_phase(ib, phase_label, routes_with_limits, account_inputs, targets, allowed,
-                     as_of, *, permit: bool, summaries: dict | None) -> list[dict]:
+                     as_of, *, permit: bool, summaries: dict | None,
+                     run_id: str | None = None) -> list[dict]:
     """Run ONE phase's blocks (all sells, or all buys) and return their result dicts.
 
     Blocks are run ONE AT A TIME: an FA block's allocation IS its group's live
@@ -710,12 +720,14 @@ def _run_block_phase(ib, phase_label, routes_with_limits, account_inputs, target
         print(f"    [{phase_label}] no blocks.")
         return []
     return [_execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit,
-                               permit=permit, summaries=summaries, phase_label=phase_label)
+                               permit=permit, summaries=summaries, phase_label=phase_label,
+                               run_id=run_id)
             for r, limit in routes_with_limits]
 
 
 def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetGateway,
-                            *, permit: bool, summaries: dict | None = None) -> dict:
+                            *, permit: bool, summaries: dict | None = None,
+                            run_id: str | None = None) -> dict:
     """Drive the fa_block routes under the SAME two-phase cash gate the per-account lane uses
     (see the module docstring): SELL blocks first, then a fresh REALIZED-cash read per
     sub-account, then BUY blocks RE-SIZED to that cash, then the uninvested-proceeds exception
@@ -736,21 +748,32 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     path needs >=2 accounts); they are listed and SKIPPED here — the per-account-direct path
     (batch_rebalance_execute.py) owns them.
 
+    PER-RUN ORDER-REF STAMP (v0.34.0): ONE `run_id` is minted here (safe_execute._run_id, the
+    same generator the per-account lane uses) and stamped onto EVERY block ref this call places
+    — sells and buys alike, since both phases belong to one run. The block ref used to end at
+    the model `as_of` (effectively a MONTH stamp), so order_router.place's dedup read a SECOND
+    run of the same group/symbol/side as "an identical WORKING order already exists" and sent
+    nothing — the 2026-07-28 root cause, fixed then on the per-account lane only. WITHIN this
+    call the stamp is constant, so a double-submit of one leg is STILL blocked; a LATER run gets
+    a new stamp and is correctly treated as new work. Returned as `run_id` so _ledger can join
+    the audit record to the refs on the wire.
+
     Returns a summary dict. The original keys are UNCHANGED for existing callers —
     {n_blocks, n_direct_skipped, replace_fa_writes, placed_fills, backup} — and are EXTENDED
     with {refused, refused_reason, n_sell_blocks, n_buy_blocks, sell_results, buy_results,
-    realized_cash, buy_resize, dropped_buy_blocks, uninvested}."""
+    realized_cash, buy_resize, dropped_buy_blocks, uninvested, run_id}."""
     fa_routes = [r for r in routes if r.route == "fa_block"]
     direct_routes = [r for r in routes if r.route != "fa_block"]
     placed_fills: list[dict] = []
     backup_path = ""
+    run_id = run_id or _run_id()
 
     def _summary(**extra) -> dict:
         base = {"n_blocks": len(fa_routes), "n_direct_skipped": len(direct_routes),
                 "replace_fa_writes": 0, "placed_fills": placed_fills, "backup": backup_path,
                 "refused": False, "refused_reason": "", "n_sell_blocks": 0, "n_buy_blocks": 0,
                 "sell_results": [], "buy_results": [], "realized_cash": {}, "buy_resize": {},
-                "dropped_buy_blocks": [], "uninvested": []}
+                "dropped_buy_blocks": [], "uninvested": [], "run_id": run_id}
         base.update(extra)
         return base
 
@@ -779,6 +802,8 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     as_of = next(iter(targets.values())).as_of
     allowed = list(target.enrollment.keys())
 
+    print(f"\n    RUN ID {run_id} — stamped onto EVERY block orderRef this run places (sells "
+          f"and buys share it). A later run gets a NEW stamp and is treated as NEW WORK.")
     print(f"\n    PHASE PLAN (two-phase cash gate): SELL {len(sell_routes)} block(s) FIRST, "
           f"then re-read REALIZED cash per sub-account, then BUY {len(buy_routes)} block(s) "
           f"RE-SIZED to that cash (safety buffer {CASH_SAFETY_BUFFER_PCT:.2%}).")
@@ -804,7 +829,8 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     # [2] PHASE 1 — SELLS. Every sell block reaches terminal state (bounded) before any buy is
     # sized; stragglers are cancelled and reported LOUDLY inside _execute_one_route.
     sell_results = _run_block_phase(ib, "SELL", sell_with_limits, account_inputs, targets,
-                                   allowed, as_of, permit=permit, summaries=summaries)
+                                   allowed, as_of, permit=permit, summaries=summaries,
+                                   run_id=run_id)
     for res in sell_results:
         placed_fills.extend(res.get("fills", []))
 
@@ -850,7 +876,8 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
 
     # [5] PHASE 2 — BUYS (re-sized).
     buy_results = _run_block_phase(ib, "BUY", buy_with_limits, account_inputs, targets,
-                                  allowed, as_of, permit=permit, summaries=summaries)
+                                  allowed, as_of, permit=permit, summaries=summaries,
+                                  run_id=run_id)
     for res in buy_results:
         placed_fills.extend(res.get("fills", []))
 
@@ -882,7 +909,7 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
             print("\n    Uninvested-proceeds check: CLEAN — every account that raised proceeds "
                   "redeployed them (within the whole-share remainder + safety buffer).")
 
-    return _summary(replace_fa_writes=replace_fa_writes,
+    return _summary(replace_fa_writes=replace_fa_writes, run_id=run_id,
                     refused=False, refused_reason="",
                     n_sell_blocks=len(sell_routes), n_buy_blocks=len(buy_routes),
                     sell_results=sell_results, buy_results=buy_results,
@@ -1109,6 +1136,10 @@ def _ledger(target, armed, permit, why, routes, result, backup_path) -> None:
         "fills": result.get("placed_fills", []),
         "fa_backup": backup_path,
         "replace_fa_writes": result.get("replace_fa_writes", 0),
+        # PER-RUN ORDER-REF STAMP (v0.34.0). Every block ref this run put on the wire ends in
+        # this run_id, so a human (or an examiner) can join an IBKR orderRef back to THIS audit
+        # record and vice versa. Durable here precisely because the ref alone is not a record.
+        "run_id": result.get("run_id", ""),
         # Two-phase cash gate (conductor #64): the audit trail for what was sold first, what
         # cash actually landed, how the buys were re-sized, and any account left in cash.
         "phases": {"n_sell_blocks": result.get("n_sell_blocks", 0),

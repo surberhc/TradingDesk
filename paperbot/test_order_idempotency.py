@@ -12,6 +12,8 @@ Layers exercised:
   * place()            — per-leg gate on the direct/block path.
   * place_laddered()   — per-leg gate before rung 1.
   * transmit_journal   — append-only ATTEMPTING/SENT/CYCLE_COMPLETE round trip.
+  * the PER-RUN ref stamp (v0.34.0) — a NEW run is NEW WORK, but WITHIN one run nothing
+    double-submits, and a SELL and a BUY of one symbol in one run never collide.
 
 Run:
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_order_idempotency.py -q
@@ -529,3 +531,125 @@ def test_morning_armed_completed_leg_is_skipped(monkeypatch, tmp_path):
     assert rc == 0
     assert fake.placed == []                  # nothing re-transmitted
     assert mer.transmit_journal.state_for(ref, day) is None   # never journaled SENT (skipped)
+
+
+# ============================================================================
+# PER-RUN ORDER-REF STAMP (v0.34.0)
+#
+# The base ref ends at the model `as_of`, which for a monthly model is effectively a MONTH
+# stamp — so a SECOND run of the same leg inside that month was deduped away as "already
+# done" (the 2026-07-28 root cause). The ref now carries a per-run stamp. These tests pin
+# BOTH halves of the contract: a NEW run is new work; WITHIN a run nothing double-submits.
+# ============================================================================
+RUN_A = "20260819T090000"
+RUN_B = "20260819T143000"
+
+
+def test_two_runs_same_day_same_leg_get_DIFFERENT_refs():
+    # Same account, same as_of, same side, same symbol, same DAY — only the run differs.
+    a = orm._order_ref("DU1", AS_OF, "BUY", "SPY", RUN_A)
+    b = orm._order_ref("DU1", AS_OF, "BUY", "SPY", RUN_B)
+    assert a != b
+    # ... and the same for an FA BLOCK ref (keyed on the group, not the account).
+    ga = orm._fa_block_ref("tier_growth", AS_OF, "BUY", "SPY", RUN_A)
+    gb = orm._fa_block_ref("tier_growth", AS_OF, "BUY", "SPY", RUN_B)
+    assert ga != gb
+
+
+def test_second_run_of_an_already_filled_leg_is_FRESH_and_sends():
+    # THE 2026-07-28 REGRESSION TEST. Run A's block filled at the broker. Run B asks for the
+    # SAME group/symbol/side on the SAME day: under the old month-stamped ref it read COMPLETE
+    # and sent nothing. With the per-run stamp it is FRESH -> it sends.
+    ref_a = orm._fa_block_ref("tier_growth", AS_OF, "BUY", "SPY", RUN_A)
+    ref_b = orm._fa_block_ref("tier_growth", AS_OF, "BUY", "SPY", RUN_B)
+    ib = FakeIB(filled_by_ref={ref_a: 30})
+    assert orm.already_present(ib, ref_a, 30) == orm.LegState.COMPLETE   # run A: done
+    assert orm.already_present(ib, ref_b, 30) == orm.LegState.FRESH      # run B: NEW WORK
+
+    bo = orm.build_fa_block("SPY", "BUY", 30, 100.0, "tier_growth", "", AS_OF, ib=ib,
+                            run_id=RUN_B)
+    res = orm.place(ib, [bo], armed=True)
+    assert res["transmitted"] == 1
+    assert len(ib.placed) == 1
+
+
+def test_within_one_run_a_duplicate_leg_is_STILL_blocked():
+    # THE GUARANTEE THAT MUST SURVIVE. Inside ONE run the stamp is constant, so the ref is
+    # constant: a retry / straggler re-price / crash-resume of the SAME leg still gates.
+    ref = orm._fa_block_ref("tier_growth", AS_OF, "BUY", "SPY", RUN_A)
+    ib = FakeIB(open_refs=[ref])          # run A's own block is already WORKING
+    assert orm.already_present(ib, ref, 30) == orm.LegState.WORKING
+
+    bo = orm.build_fa_block("SPY", "BUY", 30, 100.0, "tier_growth", "", AS_OF, ib=ib,
+                            run_id=RUN_A)
+    assert bo.order_ref == ref            # the re-build derives the SAME ref within the run
+    res = orm.place(ib, [bo], armed=True)
+    assert res["transmitted"] == 0
+    assert ib.placed == []                # nothing double-submitted
+    assert res["skipped"][0]["state"] == orm.LegState.WORKING
+
+
+def test_direct_leg_within_one_run_is_STILL_blocked():
+    # Same guarantee on the DIRECT (per-account) path that build() stamps.
+    ref = orm._order_ref("DU1", AS_OF, "BUY", "SPY", RUN_A)
+    ib = FakeIB(open_refs=[ref])
+    built = orm.build([SimpleNamespace(symbol="SPY", side="BUY", quantity=10,
+                                       limit_price=100.0)], "DU1", AS_OF, run_id=RUN_A)
+    assert built[0].order_ref == ref
+    res = orm.place(ib, built, armed=True)
+    assert res["transmitted"] == 0
+    assert ib.placed == []
+
+
+def test_sell_and_buy_of_the_same_symbol_in_one_run_do_not_collide():
+    # The two-phase cash gate places a SELL block and a BUY block in the SAME run, so they
+    # share the run stamp. `side` in the base ref is what must keep them apart.
+    sell = orm._fa_block_ref("tier_growth", AS_OF, "SELL", "SPY", RUN_A)
+    buy = orm._fa_block_ref("tier_growth", AS_OF, "BUY", "SPY", RUN_A)
+    assert sell != buy
+    # A WORKING/filled SELL must NOT gate the BUY of the same symbol in the same run.
+    ib = FakeIB(open_refs=[sell], filled_by_ref={sell: 10})
+    assert orm.already_present(ib, sell, 10) == orm.LegState.WORKING
+    assert orm.already_present(ib, buy, 10) == orm.LegState.FRESH
+
+    bo = orm.build_fa_block("SPY", "BUY", 10, 100.0, "tier_growth", "", AS_OF, ib=ib,
+                            run_id=RUN_A)
+    assert bo.order_ref == buy
+    assert orm.place(ib, [bo], armed=True)["transmitted"] == 1
+
+
+def test_ref_still_traces_back_to_its_run_and_its_inputs():
+    # AUDIT: the ref is not opaque — every field that identifies the order is still readable,
+    # and the trailing field is the run stamp the ledger also records.
+    ref = orm._fa_block_ref("tier_growth", AS_OF, "SELL", "SPY", RUN_A)
+    assert ref == f"paperbot:tier_growth:{AS_OF}:SELL:SPY:{RUN_A}"
+    assert ref.split(":") == ["paperbot", "tier_growth", AS_OF, "SELL", "SPY", RUN_A]
+    assert ref.rsplit(":", 1)[1] == RUN_A          # the run id, joinable to the ledger record
+    assert ref.startswith(orm._fa_block_ref("tier_growth", AS_OF, "SELL", "SPY"))
+
+
+def test_no_run_id_yields_the_UNCHANGED_base_ref():
+    # BACK-COMPAT, ON PURPOSE: morning_execute_run keys a DURABLE transmit journal on the ref,
+    # where cross-run "already sent today" is the INTENDED behavior. Omitting run_id must
+    # therefore leave the historical ref byte-identical.
+    assert orm._order_ref("DU1", AS_OF, "BUY", "SPY") == f"paperbot:DU1:{AS_OF}:BUY:SPY"
+    assert (orm._fa_block_ref("tier_growth", AS_OF, "BUY", "SPY")
+            == f"paperbot:tier_growth:{AS_OF}:BUY:SPY")
+    route = SimpleNamespace(route="fa_block", fa_group="tier_growth", side="BUY", symbol="SPY",
+                            account=None)
+    assert orm.order_ref_for_route(route, AS_OF) == f"paperbot:tier_growth:{AS_OF}:BUY:SPY"
+    assert (orm.order_ref_for_route(route, AS_OF, RUN_A)
+            == f"paperbot:tier_growth:{AS_OF}:BUY:SPY:{RUN_A}")
+
+
+def test_order_ref_for_route_matches_what_the_builders_stamp():
+    # The gate and the wire MUST key on the same string — with the run stamp too.
+    block = SimpleNamespace(route="fa_block", fa_group="tier_growth", side="BUY", symbol="SPY",
+                            account=None)
+    direct = SimpleNamespace(route="direct", fa_group=None, side="BUY", symbol="SPY",
+                             account="DU1")
+    bo = orm.build_fa_block("SPY", "BUY", 30, 100.0, "tier_growth", "", AS_OF, run_id=RUN_A)
+    assert orm.order_ref_for_route(block, AS_OF, RUN_A) == bo.order_ref
+    built = orm.build([SimpleNamespace(symbol="SPY", side="BUY", quantity=10,
+                                       limit_price=100.0)], "DU1", AS_OF, run_id=RUN_A)
+    assert orm.order_ref_for_route(direct, AS_OF, RUN_A) == built[0].order_ref

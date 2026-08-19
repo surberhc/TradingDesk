@@ -78,6 +78,11 @@ from rebalance_engine import build_plan   # noqa: E402
 # Reuse, don't duplicate: the review runner already has the preview, the fail-closed
 # group resolver, the per-version target compute, the price lookup and the direct-intent.
 import rebalance_run     # noqa: E402
+# PER-RUN ORDER-REF STAMP (v0.34.0). safe_execute owns the desk's ONE run-stamp generator
+# (_run_id, private by convention). Importing it — rather than re-deriving a wall-clock format
+# here — is deliberate: one convention across every transmit-capable lane, so the refs the
+# per-account lane, the block lane and this lane put on the wire can never drift apart.
+from safe_execute import _run_id   # noqa: E402
 
 # The arm token must be typed EXACTLY. No abbreviation, no default.
 ARM_TOKEN = "--arm-i-understand"
@@ -360,7 +365,18 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
     only while the gateway lock is HELD. Factored out of execute_armed so the
     `with gateway_lock(...)` block wraps the WHOLE armed flow — not just the connect — and the
     heartbeat keeps the lease alive across the laddered execution. Behavior inside is
-    unchanged from before the lock was added."""
+    unchanged from before the lock was added.
+
+    PER-RUN ORDER-REF STAMP (v0.34.0): ONE run_id is minted here and stamped onto EVERY ref
+    this run builds (block AND direct, dry-run log AND armed transmit). The ref used to end at
+    the model `as_of` — effectively a MONTH stamp — so order_router.place's dedup read a SECOND
+    run of the same account/group + symbol + side as "already done" and sent nothing (the
+    2026-07-28 root cause). WITHIN this run the stamp is constant, so a retry / straggler
+    re-price / crash-resume is STILL blocked from double-submitting a leg; a LATER run gets a
+    new stamp and is correctly treated as new work. It is recorded in the ledger so an orderRef
+    on the wire joins back to this run."""
+    run_id = _run_id()
+    print(f"\n    RUN ID {run_id} — stamped onto every orderRef this run builds.")
     # Connect NON-read-only, pinned to a DU account (flatten_accounts.py pattern). This is
     # the only way the session can transmit; pinning dodges the master account-stream hang.
     print(f"\n[2] Connecting NON-readonly pinned to {PIN_ACCOUNT} "
@@ -438,7 +454,7 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
                 print("    Scope matched ZERO routes — nothing to do. Transmitting nothing, "
                       "writing no FA config.")
                 _ledger(armed, account_inputs, routes, placed_fills, backup_path,
-                        halted=False, halt_reason="")
+                        halted=False, halt_reason="", run_id=run_id)
                 return 0
 
         # [6] RISK GUARDS per account BEFORE any transmit (kill switch + per-order caps).
@@ -468,17 +484,18 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
             print("\n    SAFETY STOP: risk guard halted/vetoed — NOTHING transmitted, no "
                   "FA config written.")
             _ledger(armed, account_inputs, routes, placed_fills, backup_path,
-                    halted=True, halt_reason=halt_reason)
+                    halted=True, halt_reason=halt_reason, run_id=run_id)
             return 2
 
         # If the gate does not fully permit, we stop here: build-only, log, no transmit.
         if not permit:
             print(f"\n[7] Transmission BLOCKED ({why}). Building order objects for the log "
                   f"only (place armed=False) — NOTHING sent, no FA config written.")
-            built = _build_all(ib, routes, account_inputs, targets, quotes=quotes)
+            built = _build_all(ib, routes, account_inputs, targets, quotes=quotes,
+                               run_id=run_id)
             order_router.place(ib, built, armed=False)
             _ledger(armed, account_inputs, routes, placed_fills, backup_path,
-                    halted=False, halt_reason="")
+                    halted=False, halt_reason="", run_id=run_id)
             print("\nDone. DRY-RUN: orders built + logged, nothing transmitted, no FA "
                   "config written.")
             return 0
@@ -503,7 +520,7 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
                 try:
                     bo = order_router.build_fa_block(
                         r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method,
-                        as_of, ib=ib)
+                        as_of, ib=ib, run_id=run_id)
                 except ValueError as exc:
                     print(f"      SKIP — {exc}")
                     continue
@@ -517,14 +534,15 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
                 # -> marketable so a thin Treasury/cash leg (TFLO/VGSH) can never hang.
                 print(f"\n    [direct] {r.side} {r.symbol} x{r.total_qty}  account={r.account}")
                 q = quotes.get(r.symbol)
-                res = _place_direct_laddered(ib, r, q, as_of, armed=True)
+                res = _place_direct_laddered(ib, r, q, as_of, armed=True, run_id=run_id)
                 if res is None:
                     # Fall back to the legacy single capped-limit path (no usable quote
                     # for the ladder caps, or ladder disabled). Neutral reference, unchanged.
                     limit = round(float(rebalance_run.prices_for(account_inputs, targets, r)), 2)
                     intent = rebalance_run._DirectIntent(r.symbol, r.side, r.total_qty, limit)
                     try:
-                        built = order_router.build([intent], r.account, as_of, ib=ib)
+                        built = order_router.build([intent], r.account, as_of, ib=ib,
+                                                   run_id=run_id)
                     except ValueError as exc:
                         print(f"      SKIP — {exc}")
                         continue
@@ -549,7 +567,7 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
             print(f"    (reconcile readout skipped: {exc})")
 
         _ledger(armed, account_inputs, routes, placed_fills, backup_path,
-                halted=False, halt_reason="")
+                halted=False, halt_reason="", run_id=run_id)
         print("\nDone. ARMED run complete. Review fills + reconciliation above; DISARM the "
               "gateway (arming.disarm()) when finished.")
         return 0
@@ -597,7 +615,7 @@ def _ladder_caps(side: str, q) -> dict | None:
 
 
 def _place_direct_laddered(ib, route, q, as_of, armed: bool, *, day=None,
-                           journal_state=order_router._JOURNAL_UNSET):
+                           journal_state=order_router._JOURNAL_UNSET, run_id=None):
     """Place ONE direct route through the laddered router. Returns the ladder result, or
     None to signal the caller to fall back to the legacy single-limit path (quote
     unusable for caps). Classification is data-driven via order_router.classify_instrument
@@ -606,7 +624,12 @@ def _place_direct_laddered(ib, route, q, as_of, armed: bool, *, day=None,
     `day`/`journal_state` are threaded to the ladder's pre-transmit dedup gate: the
     automated morning path passes its PRE-ATTEMPTING journal snapshot so the gate keys on
     broker truth without tripping on this run's own ATTEMPTING record. The manual executor
-    leaves them defaulted (the gate then queries the journal itself)."""
+    leaves them defaulted (the gate then queries the journal itself).
+
+    `run_id` stamps the PER-RUN orderRef (v0.34.0). This executor passes its run stamp; the
+    morning path leaves it None ON PURPOSE — its dedup keys a DURABLE transmit journal on the
+    ref, where the cross-run "already sent today" tripwire is the intended behavior and a
+    per-run ref would silently disable it."""
     caps = _ladder_caps(route.side, q)
     if caps is None:
         print("      (no usable quote for ladder caps — using legacy capped-limit path)")
@@ -614,19 +637,22 @@ def _place_direct_laddered(ib, route, q, as_of, armed: bool, *, day=None,
     rel_spread = live_quotes.relative_spread(q) if q else None
     instrument_class = order_router.classify_instrument(
         route.symbol, sec_type="STK", relative_spread=rel_spread)
-    order_ref = order_router._order_ref(route.account, as_of, route.side, route.symbol)
+    order_ref = order_router._order_ref(route.account, as_of, route.side, route.symbol, run_id)
     return order_router.place_laddered(
         ib, symbol=route.symbol, side=route.side, total_qty=route.total_qty, caps=caps,
         instrument_class=instrument_class, account=route.account, order_ref=order_ref,
         armed=armed, day=day, journal_state=journal_state)
 
 
-def _build_all(ib, routes, account_inputs, targets, quotes=None):
+def _build_all(ib, routes, account_inputs, targets, quotes=None, run_id=None):
     """Build every route's order object (build-only) for the DRY-RUN log. order_router's
     HARD PRICE GUARD rejects NaN/<=0 limits; a rejected route is logged and skipped, never
     built blank. FA-block legs use the SAME marketable limit the armed path would send
     (_fa_block_limit), so the dry review reflects the real price; direct legs keep the
-    neutral reference here (the laddered caps are computed at place-time, not build-time)."""
+    neutral reference here (the laddered caps are computed at place-time, not build-time).
+
+    `run_id` stamps the PER-RUN orderRef (v0.34.0) so the DRY-RUN log shows the SAME ref the
+    armed path of that run would have sent."""
     as_of = next(iter(targets.values())).as_of
     built = []
     for r in routes:
@@ -635,18 +661,24 @@ def _build_all(ib, routes, account_inputs, targets, quotes=None):
                 limit = _fa_block_limit(r, quotes, account_inputs, targets)
                 built.append(order_router.build_fa_block(
                     r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method,
-                    as_of, ib=ib))
+                    as_of, ib=ib, run_id=run_id))
             else:
                 limit = round(float(rebalance_run.prices_for(account_inputs, targets, r)), 2)
                 intent = rebalance_run._DirectIntent(r.symbol, r.side, r.total_qty, limit)
-                built.extend(order_router.build([intent], r.account, as_of, ib=ib))
+                built.extend(order_router.build([intent], r.account, as_of, ib=ib,
+                                                run_id=run_id))
         except ValueError as exc:
             print(f"    PRICE GUARD skipped a route: {exc}")
     return built
 
 
-def _ledger(armed, account_inputs, routes, fills, backup_path, halted, halt_reason):
-    """Append one audit record for this run (dry or armed)."""
+def _ledger(armed, account_inputs, routes, fills, backup_path, halted, halt_reason,
+            run_id=""):
+    """Append one audit record for this run (dry or armed).
+
+    `run_id` is the PER-RUN orderRef stamp (v0.34.0). Recording it here is what keeps the ref
+    auditable: every orderRef this run put on the wire ends in this value, so an examiner can
+    join an IBKR order back to THIS record and back again."""
     permit, why = gate_state(armed)
     ledger.record_run({
         "mode": "REBALANCE_EXEC_ARMED" if permit else "REBALANCE_EXEC_DRYRUN",
@@ -658,6 +690,7 @@ def _ledger(armed, account_inputs, routes, fills, backup_path, halted, halt_reas
         "n_intents": len(routes), "n_approved": len(routes),
         "n_transmitted": len(fills), "fills": fills,
         "fa_backup": backup_path, "halted": halted, "halt_reason": halt_reason,
+        "run_id": run_id,
         "order_vetoes": [], "batch_vetoes": [],
         "gate": {"readonly": config.READONLY, "dry_run": config.DRY_RUN,
                  "armed": armed, "permitted": permit, "why": why},

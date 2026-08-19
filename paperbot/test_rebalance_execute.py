@@ -9,6 +9,10 @@ path rests on:
       in BOTH order_router.build (direct) and build_fa_block (group).
   (c) THE ARMED GATE requires ALL THREE conditions together (READONLY=False AND
       DRY_RUN=False AND armed=True); any one missing -> blocked, fails closed.
+  (d) THE PER-RUN ORDERREF STAMP (v0.34.0) is on every ref this lane builds — block, direct
+      and laddered — so a second run of the same leg is NEW WORK (the 2026-07-28 root cause),
+      a sell and a buy of one symbol in one run stay distinct, and the run id lands in the
+      durable ledger record.
 
 Run:
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_rebalance_execute.py -q
@@ -567,3 +571,96 @@ def test_dry_run_banner_says_dry_review(monkeypatch, capsys):
     assert rc == 0
     assert "DRY-RUN review" in out
     assert "ARMED EXECUTOR: this run CAN transmit" not in out
+
+
+# ============================================================================
+# (d) PER-RUN ORDER-REF STAMP (v0.34.0) — SHARED with the FA-block lane.
+#
+# The ref used to end at the model `as_of` (for a monthly model, a MONTH stamp), so
+# order_router.place's dedup read a SECOND run of the same account/group + symbol + side as
+# "already done" and sent nothing — the 2026-07-28 root cause. Both lanes now mint ONE run
+# stamp per run from safe_execute._run_id and put it on every ref.
+# ============================================================================
+def test_rebalance_lane_uses_the_shared_safe_execute_run_id():
+    # ONE convention desk-wide — not a second wall-clock format grown locally here.
+    import safe_execute
+    assert rx._run_id is safe_execute._run_id
+
+
+def test_build_all_stamps_every_ref_with_the_runs_id():
+    # _build_all covers BOTH route kinds (block + direct); every ref it builds must carry the
+    # run stamp, so the DRY-RUN log shows exactly what the armed path of that run would send.
+    import pandas as pd
+    routes = [_block("Balanced", "TFLO", "tier_balanced", {"DU8922143": 15, "DU8922144": 15}),
+              _direct("Conservative", "TFLO", "DU8922142", 10)]
+    targets = {"Balanced": SimpleNamespace(as_of="2026-08-19",
+                                           prices=pd.Series({"TFLO": 50.10}),
+                                           weights=pd.Series({"TFLO": 1.0})),
+               "Conservative": SimpleNamespace(as_of="2026-08-19",
+                                               prices=pd.Series({"TFLO": 50.10}),
+                                               weights=pd.Series({"TFLO": 1.0}))}
+    ai = [{"account": "DU8922142", "version": "Conservative", "net_liq": 100_000.0,
+           "positions": {}, "prices": {"TFLO": 50.10}},
+          {"account": "DU8922143", "version": "Balanced", "net_liq": 100_000.0,
+           "positions": {}, "prices": {"TFLO": 50.10}},
+          {"account": "DU8922144", "version": "Balanced", "net_liq": 100_000.0,
+           "positions": {}, "prices": {"TFLO": 50.10}}]
+
+    built = rx._build_all(None, routes, ai, targets, quotes={},
+                          run_id="20260819T090000")
+    assert len(built) == 2
+    for b in built:
+        assert b.order_ref.endswith(":20260819T090000")
+        assert b.order.orderRef == b.order_ref
+    # Block keys on the GROUP, direct keys on the ACCOUNT — both still readable in the ref.
+    assert built[0].order_ref == "paperbot:tier_balanced:2026-08-19:BUY:TFLO:20260819T090000"
+    assert built[1].order_ref == "paperbot:DU8922142:2026-08-19:BUY:TFLO:20260819T090000"
+
+    # A SECOND run of the identical route set produces DIFFERENT refs — new work, not
+    # "already done".
+    again = rx._build_all(None, routes, ai, targets, quotes={}, run_id="20260819T143000")
+    assert [b.order_ref for b in again] != [b.order_ref for b in built]
+    for b, a in zip(built, again):
+        assert b.order_ref.rsplit(":", 1)[0] == a.order_ref.rsplit(":", 1)[0]
+
+
+def test_direct_ladder_ref_carries_the_run_stamp(monkeypatch):
+    # The laddered direct path derives its gate ref itself — it must use the SAME stamp, or
+    # the ladder's dedup would key on a different string than the run's other legs.
+    seen = {}
+
+    def _capture(ib, **kw):
+        seen.update(kw)
+        return {"transmitted": 0, "fills": []}
+    monkeypatch.setattr(order_router, "place_laddered", _capture)
+    route = _direct("Conservative", "TFLO", "DU8922142", 10)
+    q = _quote(symbol="TFLO")
+    rx._place_direct_laddered(None, route, q, "2026-08-19", armed=False,
+                              run_id="20260819T090000")
+    assert seen["order_ref"] == "paperbot:DU8922142:2026-08-19:BUY:TFLO:20260819T090000"
+    # Omitted run_id -> the historical base ref, unchanged (the morning lane relies on this).
+    seen.clear()
+    rx._place_direct_laddered(None, route, q, "2026-08-19", armed=False)
+    assert seen["order_ref"] == "paperbot:DU8922142:2026-08-19:BUY:TFLO"
+
+
+def test_sell_and_buy_of_the_same_symbol_in_one_run_stay_distinct():
+    # The sell and the buy of one symbol share the run stamp; `side` keeps them apart, so
+    # neither can dedup the other.
+    sell = order_router.build_fa_block("TFLO", "SELL", 30, 50.0, "tier_balanced", "",
+                                       "2026-08-19", ib=None, run_id="20260819T090000")
+    buy = order_router.build_fa_block("TFLO", "BUY", 30, 50.0, "tier_balanced", "",
+                                      "2026-08-19", ib=None, run_id="20260819T090000")
+    assert sell.order_ref != buy.order_ref
+    assert sell.order_ref.rsplit(":", 1)[1] == buy.order_ref.rsplit(":", 1)[1]
+
+
+def test_ledger_record_carries_the_run_id(monkeypatch):
+    # AUDIT: the run id must land in the DURABLE record, so an orderRef seen at IBKR joins
+    # back to the run that produced it (and vice versa).
+    import ledger
+    captured = {}
+    monkeypatch.setattr(ledger, "record_run", lambda rec: captured.update(rec))
+    rx._ledger(False, [], [], [], "", halted=False, halt_reason="",
+               run_id="20260819T090000")
+    assert captured["run_id"] == "20260819T090000"

@@ -13,6 +13,8 @@ FA-group assertions for the parameterized-target block path:
   (f) DEDUP blocks a duplicate: place() transmits nothing for a WORKING orderRef.
   (g) e2e ARMED loop = EXACTLY one replaceFA + one block order; PREVIEW writes/sends nothing.
   (h) the whatIf seam is OFF by design (FA_BLOCK_WHATIF_ENABLED=False, stub raises).
+  (i) the PER-RUN orderRef stamp (v0.34.0) — a second run of the same block is NEW WORK and
+      sends, while the same run stamp still dedups a duplicate leg.
 
 Run:
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe -m pytest test_live_fa_block_execute.py -q
@@ -437,3 +439,46 @@ def test_margin_preflight_over_split_unlevered_clears():
     route = _block("Balanced", sym, "tier_balanced", {"DU8922143": 5, "DU8922144": 5})
     ok, reason = lx.margin_preflight_over_split(route, ai, {"Balanced": t}, summaries={})
     assert ok is True, reason
+
+
+# --- (i) PER-RUN orderRef stamp on the built block (v0.34.0) -------------------
+def test_build_fa_block_stamps_the_per_run_ref():
+    # The block ref is keyed on the GROUP and now ends in the run stamp. Every other field
+    # stays readable, so a human can still tie the ref to group / as_of / side / symbol.
+    bo = order_router.build_fa_block("SPY", "BUY", 30, 100.0, "tier_balanced", "", "as_of",
+                                     ib=None, run_id="20260819T090000")
+    assert bo.order_ref == "paperbot:tier_balanced:as_of:BUY:SPY:20260819T090000"
+    assert bo.order.orderRef == bo.order_ref     # the wire carries the SAME string
+    # Omitting run_id leaves the historical base ref byte-identical (morning lane back-compat).
+    base = order_router.build_fa_block("SPY", "BUY", 30, 100.0, "tier_balanced", "", "as_of",
+                                       ib=None)
+    assert base.order_ref == "paperbot:tier_balanced:as_of:BUY:SPY"
+
+
+def test_two_runs_of_the_same_block_are_not_deduped_into_each_other(monkeypatch):
+    # THE 2026-07-28 ROOT CAUSE. Run 1's block is WORKING at the broker. Under the old
+    # month-stamped ref, run 2 of the SAME group/symbol/side matched it and sent nothing.
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    run1 = "paperbot:tier_balanced:as_of:BUY:SPY:20260819T090000"
+    ib = _FakeIB(working_refs={run1})
+    bo = order_router.build_fa_block("SPY", "BUY", 30, 100.0, "tier_balanced", "", "as_of",
+                                     ib=None, run_id="20260819T143000")
+    assert bo.order_ref != run1
+    res = order_router.place(ib, [bo], armed=True)
+    assert res["transmitted"] == 1                 # run 2 is NEW WORK — it sends
+    assert len(ib.placed) == 1
+
+
+def test_within_one_run_the_same_block_ref_is_still_deduped(monkeypatch):
+    # ... and the within-run guarantee is untouched: the SAME run stamp still gates.
+    monkeypatch.setattr(config, "READONLY", False)
+    monkeypatch.setattr(config, "DRY_RUN", False)
+    ref = "paperbot:tier_balanced:as_of:BUY:SPY:20260819T090000"
+    ib = _FakeIB(working_refs={ref})
+    bo = order_router.build_fa_block("SPY", "BUY", 30, 100.0, "tier_balanced", "", "as_of",
+                                     ib=None, run_id="20260819T090000")
+    assert bo.order_ref == ref
+    res = order_router.place(ib, [bo], armed=True)
+    assert res["transmitted"] == 0
+    assert ib.placed == []
