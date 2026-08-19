@@ -39,6 +39,7 @@ from dataclasses import dataclass, field
 
 import cashflows
 import config
+import holding_class
 import investable as _investable
 import reconcile
 import strategy_target
@@ -55,6 +56,36 @@ def compute_investable(net_liq: float, reserve: float,
     """Capital the engine may deploy for one account. See investable.compute_investable
     for the canonical logic; this is a thin pass-through re-export."""
     return _investable.compute_investable(net_liq, reserve, cash_reserve_pct)
+
+
+# --- 1b. held-aside carve-out --------------------------------------------------
+# The SAME shape as the reserve carve-out above, one step earlier in the chain: a set-aside
+# amount is removed from NetLiq and everything downstream (targets, drift, the band) is
+# measured against what remains. The difference is only where the number comes from —
+# the reserve is a dollar figure from the cashflow schedule, the held-aside amount is
+# VALUED FROM POSITIONS by holding_class.
+#
+# The two COMPOSE, in this order (each carve-out is removed from what the previous one
+# left, never from the raw NetLiq twice):
+#
+#     managed_net_liq = net_liq - held_aside_value          (not ours to trade at all)
+#     investable      = (managed_net_liq - reserve) * (1 - cash_reserve_pct)
+#
+# The distribution reserve is still computed on the WHOLE account (a client's distribution
+# obligation does not shrink because part of their money sits in bonds) but is carved out
+# of the sleeve we can actually trade — which is the only place cash can be raised.
+#
+# With no held-aside holdings, held_aside_value is 0.0, managed_net_liq == net_liq, and
+# every number below is bit-for-bit what it was before this existed.
+def carve_out_held_aside(net_liq: float, positions: dict,
+                         sec_types: dict | None = None,
+                         prices: dict | None = None,
+                         values: dict | None = None):
+    """Split one account into its MANAGED sleeve and its HELD-ASIDE block (thin re-export
+    of holding_class.carve_out, kept here so the engine's carve-out chain reads in one
+    place). ``sec_types=None`` -> nothing is held aside (today's behavior exactly)."""
+    return holding_class.carve_out(net_liq, positions, sec_types=sec_types,
+                                   prices=prices, values=values)
 
 
 # --- shared no-trade band test -------------------------------------------------
@@ -112,12 +143,18 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target,
                  prices: dict | None = None,
                  band_pct: float | None = None,
-                 universe: set[str] | None = None) -> AccountPlan:
+                 universe: set[str] | None = None,
+                 sec_types: dict | None = None,
+                 values: dict | None = None) -> AccountPlan:
     """Reconcile ONE account against its tier model and emit the share deltas to fix it.
 
     Steps (all pure):
+      * carve     = carve_out_held_aside(net_liq, positions, sec_types, ...)
+                    (held-aside carve-out: instruments the desk never trades — individual
+                    bonds first among them — are valued and removed from the account BEFORE
+                    anything else. Their value sits OUTSIDE the target allocation.)
       * reserve  = cashflows.reserve_for(account, net_liq)        (distribution carve-out)
-      * investable = compute_investable(net_liq, reserve, cash_reserve_pct)
+      * investable = compute_investable(managed_net_liq, reserve, cash_reserve_pct)
       * lines    = reconcile.reconcile(...) — gives, per symbol, the integer target_shares
                    (= int(weight * investable / price)) and the drift weight vs the model.
       * NO-TRADE BAND (account-level, all-or-nothing): the account is left exactly as-is
@@ -130,19 +167,49 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     `prices` (symbol->price) overrides the strategy-data close for sizing/valuation
     (e.g. live quotes at order time). `orders` maps symbol -> signed share delta
     (target - actual); positive = BUY, negative = SELL. Empty if the whole account is
-    in-band."""
+    in-band.
+
+    HELD-ASIDE (`sec_types`, `values`) — the no-trade list, 2026-08-19
+    -----------------------------------------------------------------
+    `sec_types` maps symbol -> instrument type (IBKR `contract.secType` on the live lane,
+    `asset_category` on the CRM lane). It is the ONLY classification input — never a
+    symbol-string guess. `values` (symbol -> broker-reported market value) is an optional
+    pricing fallback for a held-aside holding with no usable quote.
+
+    When supplied, holding_class splits the account: HELD-ASIDE holdings are valued,
+    removed from NetLiq, and reported on the plan — and they NEVER reach reconcile, so they
+    can never become a drift gap, an UNTRACKED/ALIEN line, or a leg of any kind (not a buy,
+    not a sell, not an ALIEN liquidation). The model's weights then apply to the REMAINING
+    sleeve as its own 100%, and both the band test and the drift measurement use that
+    sleeve's NetLiq. An account holding bonds therefore rebalances its non-bond sleeve
+    normally instead of being benched.
+
+    `sec_types=None` (the default, and every pre-existing caller) carves out NOTHING and
+    every number below is exactly what it was before this existed."""
     if band_pct is None:
         band_pct = config.REBALANCE_BAND_PCT
 
+    # Carve-out 1 of 2: instruments we never trade leave the account entirely. With no
+    # sec_types this is the identity (managed_net_liq == net_liq, nothing held aside).
+    carve = carve_out_held_aside(net_liq, positions, sec_types=sec_types,
+                                 prices=prices, values=values)
+    managed_positions = carve.managed_positions
+    managed_net_liq = carve.managed_net_liq
+
+    # The distribution reserve is an obligation of the WHOLE account (bonds do not shrink
+    # a client's scheduled distribution), so it is still computed on net_liq — but it is
+    # carved out of the managed sleeve, the only place cash can actually be raised.
     reserve = cashflows.reserve_for(account, net_liq)
-    investable = compute_investable(net_liq, reserve)
+    investable = compute_investable(managed_net_liq, reserve)
 
     # tolerance_w=band_pct so reconcile classifies a holding MATCHED iff it's inside the
     # band; DRIFTED/MISSING/ROTATE_OUT mean it breached and is eligible for a delta. When
     # `universe` is supplied, reconcile splits the old UNTRACKED bucket into
     # ROTATE_OUT (sell) / ALIEN (review) / FRACTIONAL / SWEEP (all no-autotrade); when
     # None, it stays UNTRACKED (behavior-preserving default — backtester untouched).
-    lines = reconcile.reconcile(target, net_liq, positions, prices=prices,
+    # Reconcile the MANAGED sleeve against the model as its own 100%: managed_net_liq is
+    # the denominator for every weight/drift, and only managed positions are lines at all.
+    lines = reconcile.reconcile(target, managed_net_liq, managed_positions, prices=prices,
                                tolerance_w=band_pct, investable=investable,
                                universe=universe)
 
@@ -159,7 +226,11 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     # defeat the band entirely. A stray UNTRACKED position always breaches (it must be
     # cleared regardless of size). The breach decision lives in band_breached() above so
     # the propose-only account_monitor uses the EXACT same test (no copy-paste).
-    breached = band_breached(lines, net_liq, target, prices=prices, band_pct=band_pct)
+    # Band measured against the MANAGED sleeve (== net_liq when nothing is held aside): a
+    # 4% drift in the tradeable half of a half-bond account is a real 4% breach, not a
+    # diluted 2% that would never trip.
+    breached = band_breached(lines, managed_net_liq, target, prices=prices,
+                             band_pct=band_pct)
 
     # ALIEN / FRACTIONAL / SWEEP lines are NEVER auto-traded (corp-action guard): an alien
     # holding is left in place and surfaced for human review, a fractional DRIP stub is too
@@ -174,9 +245,20 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
             if abs(delta) >= 1:
                 orders[ln.symbol] = delta
 
+    # FAIL CLOSED: a held-aside holding we could not price (or one worth more than the whole
+    # account) makes the managed sleeve's size a guess. Report everything, emit nothing —
+    # the account still surfaces with its reason instead of silently sizing off a bad base.
+    if carve.blocked_reasons:
+        orders = {}
+        breached = False
+
     alien_lines = [ln for ln in lines if ln.status == "ALIEN"]
     return AccountPlan(account, version, net_liq, reserve, investable,
-                       lines, breached, orders, alien_lines)
+                       lines, breached, orders, alien_lines,
+                       managed_net_liq=carve.managed_net_liq,
+                       held_aside_value=carve.held_aside_value,
+                       held_aside=list(carve.held_aside),
+                       blocked_reasons=list(carve.blocked_reasons))
 
 
 def plan_accounts(account_inputs: list[dict],
@@ -184,8 +266,13 @@ def plan_accounts(account_inputs: list[dict],
                   band_pct: float | None = None,
                   universe: set[str] | None = None) -> list[AccountPlan]:
     """Plan many accounts at once. `account_inputs` is a list of dicts, each:
-        {account, version, net_liq, positions, prices(optional)}
+        {account, version, net_liq, positions, prices(optional),
+         sec_types(optional), values(optional)}
     `targets` maps version -> strategy_target.Target (one model per risk tier, run once).
+
+    `sec_types` (symbol -> instrument type) and `values` (symbol -> broker-reported market
+    value) are the OPTIONAL held-aside inputs — see plan_account. An account_input without
+    them behaves exactly as it always has (nothing held aside).
 
     `universe` (the strategy's tradeable symbols) is threaded into every account's
     reconcile so a held symbol the model dropped is classified ROTATE_OUT (sell) vs an
@@ -200,7 +287,7 @@ def plan_accounts(account_inputs: list[dict],
         plans.append(plan_account(
             a["account"], a["version"], a["net_liq"], a["positions"],
             targets[a["version"]], prices=a.get("prices"), band_pct=band_pct,
-            universe=universe))
+            universe=universe, sec_types=a.get("sec_types"), values=a.get("values")))
     return plans
 
 
@@ -309,7 +396,12 @@ def build_plan(account_inputs: list[dict], targets: dict,
 
     `universe` is threaded into per-account reconcile (see plan_accounts). ALIEN holdings
     produce NO route (they are collected on each AccountPlan.alien_lines for human review);
-    only ROTATE_OUT/DRIFTED/MISSING deltas aggregate into blocks. None -> legacy behavior."""
+    only ROTATE_OUT/DRIFTED/MISSING deltas aggregate into blocks. None -> legacy behavior.
+
+    HELD-ASIDE holdings (per-account `sec_types`) produce NO route either, and by a stronger
+    mechanism than ALIEN: they never become reconcile lines at all, so there is no delta to
+    aggregate and no path by which a block could ever contain one. They are carried on each
+    AccountPlan.held_aside for the reporting surfaces."""
     plans = plan_accounts(account_inputs, targets, band_pct=band_pct, universe=universe)
     blocks = aggregate_blocks(plans)
     routes = route_blocks(blocks, tier_groups=tier_groups)

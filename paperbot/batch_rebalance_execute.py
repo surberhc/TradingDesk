@@ -347,9 +347,18 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
         positions_raw = s0_live.filter_positions(all_positions, account=account)
         positions = {p.contract.symbol: p.position
                      for p in positions_raw if p.position != 0}
+        # HELD-ASIDE classification input: the broker's OWN contract.secType ("STK",
+        # "BOND", ...) — the authoritative signal, never a guess off the ticker text.
+        # The engine uses it to carve instruments the desk never trades out of NetLiq,
+        # size the model against the remaining sleeve, and refuse to emit a leg for one.
+        # A position whose secType is blank/unrecognised is held aside and flagged, not
+        # traded (fail closed).
+        sec_types = {p.contract.symbol: getattr(p.contract, "secType", None)
+                     for p in positions_raw if p.position != 0}
         held_symbols |= set(positions)
         per_account_state[account] = {
-            "summary": summary, "net_liq": net_liq, "positions": positions}
+            "summary": summary, "net_liq": net_liq, "positions": positions,
+            "sec_types": sec_types}
 
     target_symbols: set[str] = set()
     for t in targets.values():
@@ -392,11 +401,24 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
             continue
         plan = rebalance_engine.plan_account(
             account, target.version, net_liq, st["positions"], target,
-            prices=prices, universe=strat_universe)
+            prices=prices, universe=strat_universe, sec_types=st["sec_types"])
         plans.append(plan)
         summaries[account] = st["summary"]
         print(f"    {account} [{v}]: NetLiq={net_liq:,.2f}  positions={len(st['positions'])}"
               f"  would-trade legs={sum(1 for d in plan.orders.values() if int(d) != 0)}")
+        # Held-aside holdings are priced, counted and named here — never folded silently
+        # into NAV, and never a leg. The model sized the MANAGED sleeve only.
+        if plan.held_aside:
+            print(f"      held aside (never traded, outside the model allocation): "
+                  f"{len(plan.held_aside)} holding(s) worth "
+                  f"{plan.held_aside_value:,.2f}; model applied to the remaining "
+                  f"{plan.managed_net_liq:,.2f}")
+            for h in plan.held_aside:
+                mv = "unpriced" if h.market_value is None else f"{h.market_value:,.2f}"
+                print(f"        {h.sec_type:8s} {h.symbol:26s} qty={h.quantity:>14,.2f}"
+                      f"  value={mv:>16s}   {h.reason}")
+        for reason in plan.blocked_reasons:
+            print(f"      ORDERS HELD BACK: {reason}")
 
     # [7] Map the sized plans -> per-account ExecutionRequests (PURE; REUSES crm_execute). The
     # helper SKIPS in-band accounts, so `requests` is exactly the OUT-OF-SPEC subset. Every

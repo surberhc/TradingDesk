@@ -27,6 +27,7 @@ from dataclasses import dataclass, field
 import accounts
 import cashflows
 import config
+import holding_class
 import investable as _investable
 import reconcile
 import strategy_target
@@ -37,18 +38,57 @@ from gateway_lock import GatewayBusySkip, gateway_lock
 
 @dataclass
 class AccountPlan:
-    """One account's reconciliation result + the per-symbol share deltas to fix it."""
+    """One account's reconciliation result + the per-symbol share deltas to fix it.
+
+    THE HELD-ASIDE BLOCK (2026-08-19). ``net_liq`` is always the WHOLE account. When the
+    account holds instruments the desk never trades (individual bonds first among them —
+    see holding_class), those sit OUTSIDE the target allocation: their value is carved out
+    and the model's weights apply to the remaining sleeve as its own 100%. So:
+
+        net_liq  ==  managed_net_liq  +  held_aside_value      (both priced)
+
+    and ``reserve`` / ``investable`` / ``lines`` / ``orders`` all describe the MANAGED
+    sleeve only. The held-aside detail travels on the plan (never silently folded into NAV)
+    so every downstream surface can show it: per-position symbol, quantity, market value and
+    the plain-English reason it is not traded."""
     account: str
     version: str
     net_liq: float
     reserve: float
     investable: float
-    lines: list            # reconcile.Line per symbol
+    lines: list            # reconcile.Line per symbol (MANAGED sleeve only)
     needs_rebalance: bool
     orders: dict           # symbol -> signed share delta (target - actual); empty if in-band
     alien_lines: list = field(default_factory=list)   # reconcile.Line's classified ALIEN
                           # (corp-action / manual holdings): surfaced for human review,
                           # NEVER auto-traded. Empty unless a universe was supplied.
+    # --- held-aside carve-out (all inert for an account with none) ---
+    managed_net_liq: float | None = None   # NetLiq the model's 100% applies to.
+                          # None -> the whole account (no held-aside holdings); normalized
+                          # to net_liq in __post_init__ so consumers never special-case it.
+    held_aside_value: float = 0.0          # priced total of the held-aside block
+    held_aside: list = field(default_factory=list)     # holding_class.HeldAsidePosition's:
+                          # PRICED, COUNTED, REPORTED — and never a leg, never an ALIEN.
+    blocked_reasons: list = field(default_factory=list)  # non-empty -> orders deliberately
+                          # withheld (a held-aside holding could not be priced/reconciled);
+                          # the account is still fully reported, it just cannot be sized.
+
+    def __post_init__(self):
+        # An account with no held-aside holdings has a managed sleeve equal to the whole
+        # account — normalizing here keeps every legacy 9-arg construction correct.
+        if self.managed_net_liq is None:
+            self.managed_net_liq = self.net_liq
+
+    @property
+    def unclassified(self) -> list:
+        """Held-aside positions a HUMAN must classify (instrument type undeterminable).
+        Fail-closed by construction: they are already excluded from trading."""
+        return [h for h in self.held_aside if getattr(h, "needs_classification", False)]
+
+    @property
+    def blocked(self) -> bool:
+        """True iff order emission was withheld for a data reason (see blocked_reasons)."""
+        return bool(self.blocked_reasons)
 
 
 @dataclass
@@ -80,6 +120,30 @@ def _strategy_universe() -> set[str] | None:
         return None
 
 
+def _portfolio_values(ib, account: str) -> dict:
+    """{symbol -> broker-reported marketValue} for one account, best-effort.
+
+    Used ONLY as the pricing fallback for a HELD-ASIDE holding (an individual bond has no
+    strategy close and no model weight, so nothing else in this readout knows what it is
+    worth). Read-only. Any failure degrades to {} — the plan then reports the holding as
+    unpriced and withholds orders rather than guessing, which is the intended fail-closed
+    behavior, not a silent zero."""
+    try:
+        items = ib.portfolio(account)
+    except Exception:                       # noqa: BLE001 — older/odd API shapes
+        try:
+            items = [it for it in ib.portfolio() if getattr(it, "account", account) == account]
+        except Exception:                   # noqa: BLE001
+            return {}
+    out: dict = {}
+    for it in items or []:
+        sym = getattr(getattr(it, "contract", None), "symbol", None)
+        mv = getattr(it, "marketValue", None)
+        if sym and mv is not None:
+            out[sym] = float(mv)
+    return out
+
+
 def _targets_by_version() -> dict:
     """Run the validated engine once per DISTINCT enrolled version (compliance: the
     model per risk tier, not a per-client guess)."""
@@ -91,15 +155,28 @@ def _targets_by_version() -> dict:
 
 def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target,
-                 universe: set[str] | None = None) -> AccountPlan:
+                 universe: set[str] | None = None,
+                 sec_types: dict | None = None,
+                 values: dict | None = None) -> AccountPlan:
     """Reconcile one account against its tier model, reserving its distribution cash.
 
     `universe` (the strategy's tradeable symbols) refines a held, model-weight-0 symbol
     into ROTATE_OUT (sell) / ALIEN (review) / FRACTIONAL / SWEEP so the readout shows the
-    corp-action guard's classification. None -> legacy UNTRACKED (readout unchanged)."""
+    corp-action guard's classification. None -> legacy UNTRACKED (readout unchanged).
+
+    `sec_types` (symbol -> IBKR contract.secType) enables the HELD-ASIDE carve-out, exactly
+    as in rebalance_engine.plan_account: instruments the desk never trades are valued,
+    removed from NetLiq and reported on the plan, and the model's weights apply to the
+    remaining sleeve as its own 100%. None (the default) carves out nothing and this readout
+    is byte-identical to before. `values` is the optional broker-reported market-value
+    fallback for pricing a held-aside holding."""
+    carve = holding_class.carve_out(net_liq, positions, sec_types=sec_types,
+                                    prices=None, values=values)
+    managed_positions = carve.managed_positions
+    managed_net_liq = carve.managed_net_liq
     reserve = cashflows.reserve_for(account, net_liq)
-    investable = _investable.compute_investable(net_liq, reserve)
-    lines = reconcile.reconcile(target, net_liq, positions,
+    investable = _investable.compute_investable(managed_net_liq, reserve)
+    lines = reconcile.reconcile(target, managed_net_liq, managed_positions,
                                 tolerance_w=config.REBALANCE_BAND_PCT,
                                 investable=investable, universe=universe)
     # NO-TRADE BAND — ACCOUNT-LEVEL, all-or-nothing. Mirrors rebalance_engine.plan_account
@@ -115,10 +192,11 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
 
     def _trade_weight(ln) -> float:
         # No live `prices` override in this readout's signature; size off the strategy close.
+        # Denominator is the MANAGED sleeve (== net_liq when nothing is held aside).
         price = float(target.prices.get(ln.symbol, float("nan")))
-        if not (price == price and price > 0) or not net_liq:
+        if not (price == price and price > 0) or not managed_net_liq:
             return 0.0
-        return abs(ln.target_shares - int(ln.actual_shares)) * price / net_liq
+        return abs(ln.target_shares - int(ln.actual_shares)) * price / managed_net_liq
 
     breached = (any(ln.status in _ALWAYS_BREACH_STATUSES for ln in lines)
                 or any(_trade_weight(ln) > band_pct for ln in lines
@@ -131,9 +209,18 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
             delta = ln.target_shares - int(ln.actual_shares)
             if abs(delta) >= 1:
                 orders[ln.symbol] = delta
+    # FAIL CLOSED, mirroring rebalance_engine: an unpriceable held-aside holding makes the
+    # managed sleeve's size a guess -> report everything, propose nothing.
+    if carve.blocked_reasons:
+        orders = {}
+        breached = False
     alien_lines = [ln for ln in lines if ln.status == "ALIEN"]
     return AccountPlan(account, version, net_liq, reserve, investable,
-                       lines, breached, orders, alien_lines)
+                       lines, breached, orders, alien_lines,
+                       managed_net_liq=carve.managed_net_liq,
+                       held_aside_value=carve.held_aside_value,
+                       held_aside=list(carve.held_aside),
+                       blocked_reasons=list(carve.blocked_reasons))
 
 
 def aggregate_blocks(plans: list[AccountPlan]) -> list[BlockOrder]:
@@ -187,25 +274,57 @@ def main() -> int:
                 strat_universe = _strategy_universe()
                 plans: list[AccountPlan] = []
                 for info in sorted(clients, key=lambda x: x.number):
-                    positions = {p.contract.symbol: p.position
-                                 for p in ib.positions(info.number) if p.position != 0}
+                    raw = [p for p in ib.positions(info.number) if p.position != 0]
+                    positions = {p.contract.symbol: p.position for p in raw}
+                    # AUTHORITATIVE classification input: the broker's own contract.secType
+                    # ("STK", "BOND", ...) — never a guess off the ticker text. A position
+                    # whose secType is blank/unknown is held aside and flagged, not traded.
+                    sec_types = {p.contract.symbol: getattr(p.contract, "secType", None)
+                                 for p in raw}
                     plans.append(plan_account(info.number, info.version, info.net_liq,
                                               positions, targets[info.version],
-                                              universe=strat_universe))
+                                              universe=strat_universe,
+                                              sec_types=sec_types,
+                                              values=_portfolio_values(ib, info.number)))
 
                 # --- Section A: per-account reconciliation ---
-                print(f"\n{'ACCOUNT':12s} {'TIER':13s} {'NETLIQ':>14s} {'RESERVE':>10s} "
-                      f"{'INVESTABLE':>14s} {'DRIFTED':>7s}  {'ACTION':9s}  CASH FLOWS")
-                print("-" * 92)
+                print(f"\n{'ACCOUNT':12s} {'TIER':13s} {'NETLIQ':>14s} {'HELD ASIDE':>12s} "
+                      f"{'MANAGED':>14s} {'RESERVE':>10s} {'INVESTABLE':>14s} {'DRIFTED':>7s}"
+                      f"  {'ACTION':9s}  CASH FLOWS")
+                print("-" * 118)
                 for p in plans:
                     n_drift = sum(1 for ln in p.lines
                                   if ln.status in ("DRIFTED", "MISSING", "UNTRACKED",
                                                    "ROTATE_OUT"))
-                    action = "REBALANCE" if p.needs_rebalance else "in-band"
-                    print(f"{p.account:12s} {p.version:13s} {p.net_liq:>14,.0f} {p.reserve:>10,.0f} "
+                    action = ("HELD BACK" if p.blocked
+                              else "REBALANCE" if p.needs_rebalance else "in-band")
+                    # NETLIQ is the whole account; HELD ASIDE + MANAGED sum back to it, so
+                    # the money we do not trade is visible instead of vanishing into NAV.
+                    print(f"{p.account:12s} {p.version:13s} {p.net_liq:>14,.0f} "
+                          f"{p.held_aside_value:>12,.0f} {p.managed_net_liq:>14,.0f} "
+                          f"{p.reserve:>10,.0f} "
                           f"{p.investable:>14,.0f} {n_drift:>7d}  {action:9s}  "
                           f"{cashflows.describe(p.account, p.net_liq)}")
-                print("-" * 92)
+                print("-" * 118)
+
+                # --- Section A.0: the HELD-ASIDE block (accounted for, never traded) ---
+                # Individual bonds and anything else on the no-trade list: priced, counted
+                # and named here. They are NOT drift, NOT untracked, NOT alien — they sit
+                # outside the target allocation by decision, and the model's weights apply
+                # to the managed sleeve above as its own 100%.
+                if any(p.held_aside for p in plans):
+                    print("\nHELD ASIDE — outside the model allocation; priced and counted, "
+                          "never traded (no order is ever emitted for these):")
+                    for p in plans:
+                        for h in p.held_aside:
+                            mv = ("unpriced" if h.market_value is None
+                                  else f"{h.market_value:,.2f}")
+                            print(f"    {p.account}  {h.sec_type:8s} {h.symbol:26s} "
+                                  f"qty={h.quantity:>14,.2f}  value={mv:>16s}   {h.reason}")
+                    for p in plans:
+                        for reason in p.blocked_reasons:
+                            print(f"    {p.account}  ORDERS HELD BACK: {reason}")
+                    print()
 
                 # --- Section A.1: per-account holdings detail (incl. the CASH bucket) ---
                 # Slice 3: risk lines now reconcile against their TRUE model weight (no buffer

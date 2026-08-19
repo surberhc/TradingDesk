@@ -13,13 +13,18 @@ These prove the five things the engine must get right:
                                 breaches, the whole account rebalances (in-band siblings too)
   * block aggregation        -> per-account split sums to the block quantity
   * single-account fallback  -> a lone-account block routes DIRECT, not as a group
+  * held-aside carve-out     -> instruments on the no-trade list are priced, counted and
+                                reported, never traded, and sit OUTSIDE the allocation
 """
 from __future__ import annotations
+
+from dataclasses import asdict
 
 import pandas as pd
 import pytest
 
 import config
+import holding_class
 import rebalance_engine as eng
 import strategy_target
 
@@ -236,3 +241,263 @@ def test_mixed_tiers_end_to_end():
         assert sum(r.per_account_split.values()) == r.total_qty
         expected = bal_accts if r.version == "Balanced" else gro_accts
         assert set(r.per_account_split) == expected
+
+
+# ============================================================================== #
+# 6. HELD-ASIDE CARVE-OUT (the bond no-trade list, owner decision 2026-08-19).    #
+#                                                                                 #
+# Held aside means: we PRICE it, we COUNT it, we REPORT it, and we NEVER emit an  #
+# order for it. Its value sits OUTSIDE the target allocation, so the model applies #
+# to the REMAINING sleeve as its own 100%. An account holding individual bonds is  #
+# no longer benched — its non-bond sleeve rebalances normally.                     #
+# ============================================================================== #
+# A live IBKR bond shape: FACE-amount quantity, percent-of-par-per-100 mark.
+BOND_SYM = "797843BE8 4.6 08/01/34"
+BOND_FACE = 10_000
+BOND_MARK = 100.14628819
+BOND_VALUE = BOND_FACE * BOND_MARK / 100.0        # 10,014.628819 — NOT 1,001,462.88
+
+
+def test_characterization_no_held_aside_is_byte_identical_to_today():
+    """CHARACTERIZATION (the load-bearing one): an account with NO held-aside positions
+    must produce exactly today's numbers. Both the legacy call (no sec_types at all) and an
+    all-MANAGED classification must land on the same plan, field for field."""
+    target = make_target({"SPY": 1.0}, {"SPY": 250.0})
+    legacy = eng.plan_account("DU0001", "Balanced", 1_000_000, {}, target, band_pct=0.03)
+    classified = eng.plan_account("DU0001", "Balanced", 1_000_000, {}, target,
+                                  band_pct=0.03, sec_types={"SPY": "STK"})
+
+    # The exact pre-existing numbers (same literals as test_share_math_floor_division).
+    assert legacy.investable == pytest.approx(985_000.0)
+    assert legacy.orders == {"SPY": 3940}
+    assert legacy.net_liq == 1_000_000
+    assert legacy.reserve == 0.0
+
+    # Every field, including the new ones, is identical between the two paths.
+    assert asdict(legacy) == asdict(classified)
+
+    # ...and the new fields are inert: the managed sleeve IS the whole account.
+    for p in (legacy, classified):
+        assert p.managed_net_liq == p.net_liq
+        assert p.held_aside_value == 0.0
+        assert p.held_aside == []
+        assert p.blocked_reasons == []
+        assert p.blocked is False
+        assert p.unclassified == []
+
+
+def test_characterization_holding_positions_unchanged_when_all_managed():
+    """Same characterization with real holdings and a drift breach: classifying every
+    position as STK changes nothing about the plan."""
+    target = make_target({"SPY": 0.5, "BND": 0.5}, {"SPY": 100.0, "BND": 100.0})
+    pos = {"SPY": 4800, "BND": 1000}
+    legacy = eng.plan_account("DU0099", "Balanced", 1_000_000, pos, target, band_pct=0.03)
+    classified = eng.plan_account("DU0099", "Balanced", 1_000_000, pos, target,
+                                  band_pct=0.03,
+                                  sec_types={"SPY": "STK", "BND": "STK"})
+    assert asdict(legacy) == asdict(classified)
+    assert legacy.orders == {"BND": 3925, "SPY": 125}      # unchanged from today
+
+
+def test_bond_is_excluded_from_legs_but_present_in_the_reporting_detail():
+    """A bond never becomes a leg — not a buy, not a sell, not an ALIEN liquidation — and is
+    fully accounted for on the plan: symbol, quantity, market value, reason."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    net_liq = 100_000.0 + BOND_VALUE                    # managed sleeve is exactly 100,000
+    plan = eng.plan_account(
+        "DU0500", "Balanced", net_liq,
+        {"SPY": 0, BOND_SYM: BOND_FACE}, target, band_pct=0.03,
+        prices={"SPY": 100.0, BOND_SYM: BOND_MARK},
+        sec_types={"SPY": "STK", BOND_SYM: "BOND"})
+
+    # --- never a leg, in any direction ---
+    assert BOND_SYM not in plan.orders
+    assert all(not sym.startswith("797843") for sym in plan.orders)
+    # --- and never a reconcile line either, so it can NEVER be read as drift or as an
+    #     UNTRACKED / ALIEN holding awaiting liquidation ---
+    assert BOND_SYM not in {ln.symbol for ln in plan.lines}
+    assert plan.alien_lines == []
+
+    # --- but fully reported ---
+    assert len(plan.held_aside) == 1
+    h = plan.held_aside[0]
+    assert h.symbol == BOND_SYM
+    assert h.sec_type == "BOND"
+    assert h.quantity == BOND_FACE
+    assert h.market_value == pytest.approx(BOND_VALUE)   # per-100, not qty*mark
+    assert "never traded" in h.reason
+    assert h.needs_classification is False
+
+    # --- account totals: total == managed sleeve + held aside, both priced ---
+    assert plan.net_liq == pytest.approx(net_liq)
+    assert plan.held_aside_value == pytest.approx(BOND_VALUE)
+    assert plan.managed_net_liq == pytest.approx(100_000.0)
+    assert plan.managed_net_liq + plan.held_aside_value == pytest.approx(plan.net_liq)
+
+
+def test_model_weights_apply_to_the_remaining_sleeve_as_its_own_100pct():
+    """Bonds sit OUTSIDE the target allocation: an account with a $10,014.63 bond and a
+    $100,000 managed sleeve must size EXACTLY like a $100,000 all-equity account. The bond
+    is NOT counted as the client's fixed-income allocation."""
+    target = make_target({"SPY": 0.6, "BND": 0.4}, {"SPY": 200.0, "BND": 100.0})
+    plain = eng.plan_account("DU0601", "Balanced", 100_000.0, {}, target, band_pct=0.03)
+    with_bond = eng.plan_account(
+        "DU0602", "Balanced", 100_000.0 + BOND_VALUE,
+        {BOND_SYM: BOND_FACE}, target, band_pct=0.03,
+        prices={BOND_SYM: BOND_MARK},
+        sec_types={BOND_SYM: "BOND", "SPY": "STK", "BND": "STK"})
+
+    assert with_bond.investable == pytest.approx(plain.investable)
+    assert with_bond.orders == plain.orders              # identical share targets
+    # investable = 100,000 * (1 - 0.015) = 98,500 ; SPY 60% -> 295 sh @200, BND 40% -> 394 @100
+    assert plain.orders == {"SPY": 295, "BND": 394}
+    # ...and the model's weights sum to 100% OF THE MANAGED SLEEVE, not of the whole account.
+    spy = next(ln for ln in with_bond.lines if ln.symbol == "SPY")
+    assert spy.target_weight == pytest.approx(0.6)
+
+
+def test_unknown_instrument_type_is_held_aside_and_flagged_not_traded():
+    """FAIL CLOSED: an instrument whose type cannot be determined is held aside and reported
+    as needing classification. It is never silently assumed tradeable."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    plan = eng.plan_account(
+        "DU0700", "Balanced", 100_000.0, {"SPY": 0, "MYSTERY": 7}, target, band_pct=0.03,
+        prices={"SPY": 100.0},
+        sec_types={"SPY": "STK"},                # MYSTERY deliberately absent
+        values={"MYSTERY": 5_000.0})
+
+    assert "MYSTERY" not in plan.orders
+    assert "MYSTERY" not in {ln.symbol for ln in plan.lines}
+    assert [h.symbol for h in plan.held_aside] == ["MYSTERY"]
+    assert plan.held_aside[0].sec_type == holding_class.UNKNOWN
+    assert plan.held_aside[0].needs_classification is True
+    assert [h.symbol for h in plan.unclassified] == ["MYSTERY"]
+    # It is still PRICED and carved out, so the rest of the account plans normally.
+    assert plan.managed_net_liq == pytest.approx(95_000.0)
+    assert plan.orders["SPY"] == int(95_000.0 * (1 - CASH_RESERVE) / 100.0)
+
+
+def test_untyped_position_would_have_been_sold_without_classification():
+    """CONTRAST — the behavior the classifier replaces. With NO sec_types, an unrecognised
+    holding is UNTRACKED and always breaches: the engine would SELL it. Classification is
+    what turns that into 'hold it aside and ask a human'."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0, "MYSTERY": 700.0})
+    legacy = eng.plan_account("DU0701", "Balanced", 100_000.0, {"SPY": 0, "MYSTERY": 7},
+                              target, band_pct=0.03)
+    assert legacy.orders["MYSTERY"] == -7            # liquidated today
+    classified = eng.plan_account(
+        "DU0701", "Balanced", 100_000.0, {"SPY": 0, "MYSTERY": 7}, target, band_pct=0.03,
+        sec_types={"SPY": "STK"}, values={"MYSTERY": 4_900.0})
+    assert "MYSTERY" not in classified.orders        # never traded once classified
+
+
+def test_carve_out_composes_with_the_cash_reserve_and_the_distribution_reserve(monkeypatch):
+    """The bond carve-out COMPOSES with the existing reserve; it does not replace it.
+        managed_net_liq = net_liq - held_aside_value
+        investable      = (managed_net_liq - distribution_reserve) * (1 - cash_reserve)
+    and the distribution reserve is still computed on the WHOLE account (a client's
+    scheduled distribution does not shrink because part of their money sits in bonds)."""
+    seen = {}
+
+    def fake_reserve_for(account, nav):
+        seen["nav"] = nav
+        return 10_000.0
+
+    monkeypatch.setattr(eng.cashflows, "reserve_for", fake_reserve_for)
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    net_liq = 100_000.0 + BOND_VALUE
+    plan = eng.plan_account(
+        "DU0800", "Balanced", net_liq, {BOND_SYM: BOND_FACE}, target, band_pct=0.03,
+        prices={BOND_SYM: BOND_MARK}, sec_types={BOND_SYM: "BOND", "SPY": "STK"})
+
+    assert seen["nav"] == pytest.approx(net_liq)       # reserve keyed off the WHOLE account
+    assert plan.reserve == 10_000.0
+    assert plan.managed_net_liq == pytest.approx(100_000.0)
+    # (100,000 - 10,000) * (1 - 0.015) = 88,650  -> both carve-outs applied, in order.
+    assert plan.investable == pytest.approx(90_000.0 * (1 - CASH_RESERVE))
+    assert plan.investable == pytest.approx(88_650.0)
+    assert plan.orders == {"SPY": 886}
+
+
+def test_band_is_measured_against_the_managed_sleeve_not_the_whole_account():
+    """A 4% drift in the tradeable half of a half-bond account is a real 4% breach — it must
+    not be diluted by the held-aside half into an in-band 2%."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    # Managed sleeve 100,000 -> target 985 sh. Hold 940 -> trade 45 sh = $4,500 = 4.5% of the
+    # managed sleeve (breaches a 3% band) but only 2.25% of the 200,000 whole account.
+    plan = eng.plan_account(
+        "DU0900", "Balanced", 200_000.0, {"SPY": 940, "BONDX": 100_000}, target,
+        band_pct=0.03, prices={"SPY": 100.0},
+        sec_types={"SPY": "STK", "BONDX": "BOND"}, values={"BONDX": 100_000.0})
+    assert plan.managed_net_liq == pytest.approx(100_000.0)
+    assert plan.needs_rebalance is True
+    assert plan.orders == {"SPY": 45}
+
+
+def test_formerly_benched_bond_account_now_yields_a_real_plan_end_to_end():
+    """THE POINT OF THE WHOLE CHANGE: an account holding individual bonds used to be held
+    out of the batch entirely. It must now produce a real, routable plan for its non-bond
+    sleeve — with no bond anywhere in the blocks or routes."""
+    target = make_target({"SPY": 0.5, "BND": 0.5}, {"SPY": 100.0, "BND": 100.0})
+    inputs = [
+        # A bond-holding account, badly drifted on its managed sleeve.
+        {"account": "U7552750", "version": "Growth", "net_liq": 100_000.0 + BOND_VALUE,
+         "positions": {"SPY": 100, "BND": 0, BOND_SYM: BOND_FACE},
+         "prices": {"SPY": 100.0, "BND": 100.0, BOND_SYM: BOND_MARK},
+         "sec_types": {"SPY": "STK", "BND": "STK", BOND_SYM: "BOND"}},
+        # A plain account in the same tier, so the block machinery is exercised too.
+        {"account": "U7552751", "version": "Growth", "net_liq": 100_000.0,
+         "positions": {}, "prices": {"SPY": 100.0, "BND": 100.0},
+         "sec_types": {"SPY": "STK", "BND": "STK"}},
+    ]
+    out = eng.build_plan(inputs, {"Growth": target}, band_pct=0.03)
+    bond_plan = next(p for p in out["plans"] if p.account == "U7552750")
+
+    # A REAL plan for the managed sleeve — not a bench.
+    assert bond_plan.needs_rebalance is True
+    assert bond_plan.blocked is False
+    # managed sleeve 100,000 -> investable 98,500 -> 492 sh each @ $100
+    assert bond_plan.orders == {"SPY": 392, "BND": 492}
+    # The bond is reported on the plan and absent from every block and route.
+    assert [h.symbol for h in bond_plan.held_aside] == [BOND_SYM]
+    assert all(b.symbol != BOND_SYM for b in out["blocks"])
+    assert all(r.symbol != BOND_SYM for r in out["routes"])
+    # ...and the two accounts' managed sleeves aggregate into shared blocks as normal.
+    bnd = next(b for b in out["blocks"] if b.symbol == "BND")
+    assert set(bnd.per_account) == {"U7552750", "U7552751"}
+    assert sum(bnd.per_account.values()) == bnd.total_qty
+
+
+def test_unpriceable_held_aside_holding_withholds_orders_and_says_why():
+    """FAIL CLOSED on valuation: if a held-aside holding cannot be priced, the managed
+    sleeve's size is a guess. The engine reports everything and emits nothing, with a named
+    reason — it does not silently treat the holding as worth zero and over-invest."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    plan = eng.plan_account(
+        "DU1000", "Balanced", 100_000.0, {"SPY": 0, "BONDX": 10_000}, target,
+        band_pct=0.03, prices={"SPY": 100.0},
+        sec_types={"SPY": "STK", "BONDX": "BOND"})      # no price, no value for BONDX
+    assert plan.orders == {}
+    assert plan.needs_rebalance is False
+    assert plan.blocked is True
+    assert any("could not be priced" in r for r in plan.blocked_reasons)
+    # Still fully reported, not vanished.
+    assert [h.symbol for h in plan.held_aside] == ["BONDX"]
+    assert plan.held_aside[0].market_value is None
+
+
+def test_held_aside_position_never_reaches_a_block_or_route():
+    """Belt and braces on the safety property: a held-aside symbol cannot appear in ANY
+    block or route, because it never becomes a reconcile line and so has no delta at all."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    inputs = [{"account": "DU1100", "version": "Growth",
+               "net_liq": 100_000.0 + BOND_VALUE,
+               "positions": {BOND_SYM: BOND_FACE},
+               "prices": {"SPY": 100.0, BOND_SYM: BOND_MARK},
+               "sec_types": {BOND_SYM: "BOND", "SPY": "STK"}}]
+    out = eng.build_plan(inputs, {"Growth": target}, band_pct=0.03)
+    every_symbol = ({b.symbol for b in out["blocks"]}
+                    | {r.symbol for r in out["routes"]}
+                    | set(out["plans"][0].orders))
+    assert BOND_SYM not in every_symbol
+    assert every_symbol == {"SPY"}

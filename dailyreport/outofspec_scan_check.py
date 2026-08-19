@@ -101,21 +101,32 @@ def run_scan() -> dict:
 # --------------------------------------------------------------------------- #
 def build_detail(scan: dict) -> list[dict]:
     """Per-account rows for the OUT-OF-SPEC accounts — the expandable table detail. Plain
-    fields: account, model, NAV, out_of_spec, would-trade legs, bond/manual flag."""
+    fields: account, model, account value, the value the model manages, would-trade legs,
+    and the held-aside (never-traded) block.
+
+    HELD ASIDE (2026-08-19): individual bonds — and anything else on the desk's no-trade
+    list — are priced, counted and reported here, but they are NOT a defect and NOT a
+    pending manual sale. They sit outside the model allocation, so the would-trade legs
+    describe the MANAGED sleeve, which is what ``managed_net_liq`` separates out.
+    ``held_back`` is the separate, genuine problem: the engine withheld this account's
+    orders because a held-aside holding could not be priced."""
     detail = []
     for v in scan.get("verdicts", []):
         if not v.get("out_of_spec"):
             continue
-        n_bonds = int(v.get("n_bonds", 0) or 0)
         detail.append({
             "account": v.get("account"),
             "model": v.get("version"),
             "advisor": v.get("advisor_name") or "— unassigned —",
             "net_liq": float(v.get("net_liq", 0.0) or 0.0),
+            "managed_net_liq": float(
+                v.get("managed_net_liq", v.get("net_liq", 0.0)) or 0.0),
             "out_of_spec": True,
             "n_legs": int(v.get("n_legs", 0) or 0),
-            "n_bonds": n_bonds,
-            "manual_bond_liquidation": n_bonds > 0,
+            "n_held_aside": int(v.get("n_held_aside", 0) or 0),
+            "held_aside_value": float(v.get("held_aside_value", 0.0) or 0.0),
+            "n_unclassified": int(v.get("n_unclassified", 0) or 0),
+            "held_back": bool(v.get("blocked")),
         })
     return detail
 
@@ -125,7 +136,9 @@ def build_notice(scan: dict) -> tuple[str, str, str, list[dict]]:
     n_oos = int(scan.get("n_out_of_spec", 0) or 0)
     n_acct = int(scan.get("n_accounts", 0) or 0)
     detail = build_detail(scan)
-    n_manual = sum(1 for r in detail if r["manual_bond_liquidation"])
+    n_held_aside = sum(1 for r in detail if r["n_held_aside"])
+    n_unclassified = sum(1 for r in detail if r["n_unclassified"])
+    n_held_back = sum(1 for r in detail if r["held_back"])
     acct_word = "account is" if n_oos == 1 else "accounts are"
     title = f"{n_oos} of {n_acct} accounts out of spec — rebalance needed"
     body = (
@@ -133,10 +146,23 @@ def build_notice(scan: dict) -> tuple[str, str, str, list[dict]]:
         f"frozen model and would trade to conform. Expand the detail below to see which "
         f"accounts, their model, and account value."
     )
-    if n_manual:
+    if n_held_aside:
         body += (
-            f" {n_manual} of them hold an individual bond that needs manual liquidation (the "
-            f"automatic rebalance can't route a bond)."
+            f" {n_held_aside} of them also hold something the desk never trades (individual "
+            f"bonds). Those holdings are priced and counted but sit outside the model "
+            f"allocation, and the trades listed here rebalance only the part of the account "
+            f"the model manages."
+        )
+    if n_unclassified:
+        body += (
+            f" {n_unclassified} of them hold something we could not identify. It is being "
+            f"held aside and not traded until someone says what it is."
+        )
+    if n_held_back:
+        body += (
+            f" {n_held_back} of them had all trades held back because a holding we never "
+            f"trade could not be priced, so the rest of the account cannot be sized safely. "
+            f"That needs a look."
         )
     hint = (
         "Open the Control Plane -> Whole-book out-of-spec read to review these accounts and, "

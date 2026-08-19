@@ -8,6 +8,7 @@ from dataclasses import asdict
 from types import SimpleNamespace
 
 import pandas as pd
+import pytest
 
 import crm_outofspec
 import rebalance_engine
@@ -143,11 +144,14 @@ def test_scan_runs_pure_engine_via_injected_targets(monkeypatch):
 
 
 # --------------------------------------------------------------------------- #
-# BOND handling (order-affecting correctness, 2026-08-05)                       #
-# IBKR carries a bond with a FACE-value quantity and a per-100 price, so the    #
-# engine's qty*mark valuation overstates it ~100x and can't route it. Bonds     #
-# are valued qty*mark/100 into NAV, kept OUT of the engine, and flagged for     #
-# manual liquidation. Non-bond accounts must be byte-identical to before.       #
+# HELD-ASIDE handling (owner decision, 2026-08-19)                              #
+# Individual bonds are on a NO-TRADE list: priced, counted, reported, never      #
+# traded — and they sit OUTSIDE the target allocation, so the model applies to   #
+# the remaining sleeve as its own 100%. A bond-holding account is NO LONGER      #
+# benched; it rebalances its non-bond sleeve normally. (This replaces the older  #
+# "bond => manual liquidation required" treatment.) IBKR carries a bond with a   #
+# FACE-value quantity and a per-100 price, so it is valued qty*mark/100.         #
+# Non-bond accounts must stay byte-identical.                                    #
 # --------------------------------------------------------------------------- #
 def test_bond_valuation_uses_per_100_not_qty_times_mark():
     # A single bond: 10,000 face @ 100.146 per-100 => true value 10,014.63 (NOT 1,001,462.88).
@@ -160,59 +164,111 @@ def test_bond_valuation_uses_per_100_not_qty_times_mark():
     # NAV is the corrected bond value, not the ~100x-inflated qty*mark.
     assert round(ai["net_liq"], 2) == 10014.63
     assert ai["net_liq"] != 10000 * 100.14628819         # would be the phantom value
-    # The bond is held OUT of the engine's positions/prices (it can't be routed as equity).
-    assert ai["positions"] == {}
-    assert ai["prices"] == {}
-    # ...and surfaced on `bonds`, valued correctly.
-    assert len(ai["bonds"]) == 1
-    assert ai["bonds"][0]["symbol"] == "797843BE8 4.6 08/01/34"
-    assert round(ai["bonds"][0]["value"], 2) == 10014.63
+    # The bond IS handed to the engine, but tagged BOND and priced explicitly — it is the
+    # engine that carves it out, so no caller can forget to.
+    assert ai["positions"] == {"797843BE8 4.6 08/01/34": 10000.0}
+    assert ai["sec_types"] == {"797843BE8 4.6 08/01/34": "BOND"}
+    assert round(ai["values"]["797843BE8 4.6 08/01/34"], 2) == 10014.63
+    assert ai["prices"] == {}                            # never sized -> never priced for sizing
+    assert ai["n_positions"] == 0                        # no MANAGED positions
+    assert ai["n_held_aside"] == 1
 
 
-def test_bond_legs_excluded_and_flagged_manual_liquidation():
-    rows = [_row("U1", "a1", total=25035.55)]
+def test_bond_is_held_aside_reported_and_never_a_leg():
+    # NetLiq is exactly the two bonds' true (per-100) value: an all-bond account.
+    total = 15000 * 100.13943782 / 100.0 + 10000 * 100.14628819 / 100.0
+    rows = [_row("U1", "a1", total=total)]
     holdings = {"a1": [_bond("806721GU4 5 12/01/31", 15000, 100.13943782),
                        _bond("797843BE8 4.6 08/01/34", 10000, 100.14628819)]}
     inputs, _, _ = crm_outofspec.account_inputs_from_roster(rows, holdings)
-    # Model wants only ETFs; the account holds only bonds -> no equity legs, bonds flagged.
+    # Model wants only ETFs; the account holds ONLY bonds -> nothing to trade at all.
     target = _target({"SPY": 1.0}, {"SPY": 500.0})
     result = rebalance_engine.build_plan(inputs, {"Growth": target})
     verdicts = crm_outofspec.verdicts_from_plans(result["plans"], inputs)
     v = verdicts[0]
-    assert v["out_of_spec"] is True          # bonds require manual action
-    assert v["n_bonds"] == 2
-    assert all(b["action"] == "manual liquidation required (bond)" for b in v["bonds"])
-    # No auto-generated leg references a bond symbol.
-    leg_syms = {l["symbol"] for l in v["legs"]}
-    assert leg_syms.isdisjoint({"806721GU4 5 12/01/31", "797843BE8 4.6 08/01/34"})
+    # Both bonds are reported in full — symbol, quantity, market value, reason.
+    assert v["n_held_aside"] == 2
+    assert {h["symbol"] for h in v["held_aside"]} == {"806721GU4 5 12/01/31",
+                                                      "797843BE8 4.6 08/01/34"}
+    assert all(h["sec_type"] == "BOND" for h in v["held_aside"])
+    assert all(h["market_value"] > 0 for h in v["held_aside"])
+    assert all("never traded" in h["reason"] for h in v["held_aside"])
+    assert v["n_unclassified"] == 0
+    # ...and the whole account is accounted for: managed sleeve + held aside == NetLiq.
+    assert v["held_aside_value"] == pytest.approx(total)
+    assert v["managed_net_liq"] == pytest.approx(0.0)
+    assert v["managed_net_liq"] + v["held_aside_value"] == pytest.approx(v["net_liq"])
+    # No leg anywhere references a bond, and holding one is NOT itself out-of-spec.
+    assert v["n_legs"] == 0
+    assert v["out_of_spec"] is False
+    assert v["blocked"] is False
 
 
-def test_mixed_bond_and_etf_sizes_etf_off_corrected_nav_bond_excluded():
-    # total_value is the corrected NAV (includes the bond's true value). The ETF leg must
-    # size off that NAV, and must be IDENTICAL whether or not the (excluded) bond is present.
+def test_bond_account_rebalances_its_managed_sleeve_instead_of_being_benched():
+    """THE BEHAVIOR CHANGE: an account holding an individual bond used to be surfaced as
+    'manual liquidation required' and held out of the batch. It must now show a REAL,
+    actionable out-of-spec figure for its managed sleeve."""
     target = _target({"SPY": 1.0}, {"SPY": 500.0})
-    etf_only = [{"account": "U1", "version": "Growth", "net_liq": 300000.0,
-                 "positions": {"SPY": 1.0}, "prices": {"SPY": 500.0}, "bonds": []}]
-    rows = [_row("U1", "a1", total=300000.0)]
+    rows = [_row("U7552750", "a1", total=110014.63)]
+    holdings = {"a1": [_hold("SPY", 20, 500.0),                       # $10,000 of a $100k sleeve
+                       _bond("797843BE8 4.6 08/01/34", 10000, 100.14628819)]}
+    inputs, _, _ = crm_outofspec.account_inputs_from_roster(rows, holdings)
+    result = rebalance_engine.build_plan(inputs, {"Growth": target})
+    v = crm_outofspec.verdicts_from_plans(result["plans"], inputs)[0]
+
+    assert v["out_of_spec"] is True
+    assert v["n_legs"] == 1                       # a real, routable managed-sleeve leg
+    assert v["legs"][0]["symbol"] == "SPY"
+    assert v["legs"][0]["side"] == "BUY"
+    # Managed sleeve ~100,000 -> investable 98,500 -> 197 sh; holds 20 -> BUY 177.
+    assert v["legs"][0]["shares"] == 177
+    assert round(v["managed_net_liq"], 2) == 100000.0
+    assert v["n_held_aside"] == 1
+    assert v["blocked"] is False
+
+
+def test_managed_sleeve_sizes_as_its_own_100pct_ignoring_the_bond():
+    """Bonds sit OUTSIDE the allocation: a $100k managed sleeve sizes identically whether or
+    not the account also holds a bond. The bond is NOT the client's fixed-income sleeve."""
+    target = _target({"SPY": 1.0}, {"SPY": 500.0})
+    etf_only = [{"account": "U1", "version": "Growth", "net_liq": 100000.0,
+                 "positions": {"SPY": 1.0}, "prices": {"SPY": 500.0}}]
+    rows = [_row("U1", "a1", total=100000.0 + 20000 * 101.49008974 / 100.0)]
     holdings = {"a1": [_hold("SPY", 1, 500.0),
                        _bond("235308RA3 6.45 02/15/35", 20000, 101.49008974)]}
     mixed, _, _ = crm_outofspec.account_inputs_from_roster(rows, holdings)
-    # The ETF sizing (target_shares/orders) is unchanged by the excluded bond.
     p_etf = rebalance_engine.build_plan(etf_only, {"Growth": target})["plans"][0]
     p_mixed = rebalance_engine.build_plan(mixed, {"Growth": target})["plans"][0]
     spy_etf = next(l for l in p_etf.lines if l.symbol == "SPY")
     spy_mixed = next(l for l in p_mixed.lines if l.symbol == "SPY")
     assert spy_mixed.target_shares == spy_etf.target_shares
     assert p_mixed.orders.get("SPY") == p_etf.orders.get("SPY")
-    # The bond never becomes an equity position/leg.
+    # The bond never becomes an equity position/leg, and never a reconcile line.
     assert "235308RA3 6.45 02/15/35" not in p_mixed.orders
-    assert len(mixed[0]["bonds"]) == 1
+    assert "235308RA3 6.45 02/15/35" not in {l.symbol for l in p_mixed.lines}
+    assert [h.symbol for h in p_mixed.held_aside] == ["235308RA3 6.45 02/15/35"]
 
 
-def test_etf_only_account_plan_is_byte_identical_to_pre_bond_input():
+def test_unknown_asset_category_is_held_aside_and_flagged_for_classification():
+    """FAIL CLOSED on an asset_category the desk does not recognise: held aside, reported as
+    needing classification, and never traded."""
+    target = _target({"SPY": 1.0}, {"SPY": 500.0})
+    rows = [_row("U1", "a1", total=110000.0)]
+    holdings = {"a1": [_hold("SPY", 20, 500.0),
+                       _hold("WHATSIT", 4, 2500.0, cat="")]}     # blank category
+    inputs, _, _ = crm_outofspec.account_inputs_from_roster(rows, holdings)
+    assert inputs[0]["sec_types"]["WHATSIT"] == "UNKNOWN"
+    result = rebalance_engine.build_plan(inputs, {"Growth": target})
+    v = crm_outofspec.verdicts_from_plans(result["plans"], inputs)[0]
+    assert v["n_unclassified"] == 1
+    assert [h["symbol"] for h in v["held_aside"]] == ["WHATSIT"]
+    assert all(l["symbol"] != "WHATSIT" for l in v["legs"])
+
+
+def test_etf_only_account_plan_is_byte_identical_to_pre_carve_out_input():
     """Characterization: an ETF/stock-only account produces a plan byte-identical to the
-    same input WITHOUT the new `bonds` key — proving the bond code path is inert for
-    non-bond accounts (the engine's plan is unchanged)."""
+    same input WITHOUT the additive held-aside keys — proving the carve-out code path is
+    inert for accounts with nothing held aside (the engine's plan is unchanged)."""
     target = _target({"SPY": 0.6, "BIL": 0.4}, {"SPY": 500.0, "BIL": 91.0})
     rows = [_row("U1", "a1", total=100000.0)]
     holdings = {"a1": [_hold("SPY", 10, 500.0), _hold("BIL", 5, 91.0)]}
@@ -222,13 +278,32 @@ def test_etf_only_account_plan_is_byte_identical_to_pre_bond_input():
     assert ai["positions"] == {"SPY": 10.0, "BIL": 5.0}
     assert ai["prices"] == {"SPY": 500.0, "BIL": 91.0}
     assert ai["net_liq"] == 100000.0
-    assert ai["bonds"] == []
-    # Legacy input = the produced one minus the additive `bonds` key.
-    legacy = {k: v for k, v in ai.items() if k != "bonds"}
+    assert ai["sec_types"] == {"SPY": "STK", "BIL": "STK"}
+    assert ai["values"] == {}
+    assert ai["n_held_aside"] == 0
+    # Legacy input = the produced one minus the additive classification keys.
+    legacy = {k: v for k, v in ai.items() if k not in ("sec_types", "values")}
     plan_new = rebalance_engine.build_plan([ai], {"Growth": target})
     plan_legacy = rebalance_engine.build_plan([legacy], {"Growth": target})
     assert [asdict(p) for p in plan_new["plans"]] == [asdict(p) for p in plan_legacy["plans"]]
     assert [asdict(b) for b in plan_new["blocks"]] == [asdict(b) for b in plan_legacy["blocks"]]
+
+
+def test_unpriceable_bond_blocks_orders_with_a_named_reason():
+    """FAIL CLOSED on valuation: a bond with no mark and no reported value cannot be carved
+    out, so the account emits nothing — but is surfaced, with the reason, not dropped."""
+    target = _target({"SPY": 1.0}, {"SPY": 500.0})
+    rows = [_row("U1", "a1", total=110000.0)]
+    holdings = {"a1": [_hold("SPY", 20, 500.0),
+                       _bond("BADBOND", 10000, 0.0, mv=0.0)]}      # no mark, no value
+    inputs, _, _ = crm_outofspec.account_inputs_from_roster(rows, holdings)
+    assert "BADBOND" not in inputs[0]["values"]
+    result = rebalance_engine.build_plan(inputs, {"Growth": target})
+    v = crm_outofspec.verdicts_from_plans(result["plans"], inputs)[0]
+    assert v["blocked"] is True
+    assert v["n_legs"] == 0
+    assert v["out_of_spec"] is True                       # surfaced for a human, not hidden
+    assert any("could not be priced" in r for r in v["blocked_reasons"])
 
 
 # --------------------------------------------------------------------------- #

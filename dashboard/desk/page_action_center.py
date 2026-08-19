@@ -31,9 +31,12 @@ _DETAIL_COLS = {
     "model": "Model",
     "advisor": "Advisor",
     "net_liq": "Account value",
+    "managed_net_liq": "Value the model manages",
     "n_legs": "Trades to conform",
-    "n_bonds": "Bonds (manual)",
-    "manual_bond_liquidation": "Needs manual bond sale",
+    "n_held_aside": "Holdings we never trade",
+    "held_aside_value": "Value we never trade",
+    "n_unclassified": "Holdings we could not identify",
+    "held_back": "All trades held back",
 }
 
 
@@ -59,15 +62,25 @@ def _render_detail(n: dict) -> None:
             if not isinstance(r, dict):
                 continue
             nav = r.get("net_liq")
+            managed = r.get("managed_net_liq")
+            held_val = r.get("held_aside_value")
             display.append({
                 "Account": r.get("account", ""),
                 "Model": r.get("model", "") or "",
                 "Advisor": r.get("advisor", "") or "",
                 "Account value": (f"${float(nav):,.0f}"
                                   if isinstance(nav, (int, float)) else ""),
+                # What the model's 100% actually applies to. Holdings the desk never
+                # trades (individual bonds) sit outside the allocation, so this is the
+                # number the "Trades to conform" column rebalances.
+                "Value the model manages": (f"${float(managed):,.0f}"
+                                            if isinstance(managed, (int, float)) else ""),
                 "Trades to conform": r.get("n_legs", ""),
-                "Bonds (manual)": r.get("n_bonds", ""),
-                "Needs manual bond sale": "Yes" if r.get("manual_bond_liquidation") else "",
+                "Holdings we never trade": r.get("n_held_aside", ""),
+                "Value we never trade": (f"${float(held_val):,.0f}"
+                                         if isinstance(held_val, (int, float)) else ""),
+                "Holdings we could not identify": r.get("n_unclassified", ""),
+                "All trades held back": "Yes" if r.get("held_back") else "",
             })
         st.dataframe(display, use_container_width=True, hide_index=True)
 

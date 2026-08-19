@@ -55,10 +55,12 @@ def test_detail_json_round_trip(tmp_path, monkeypatch):
     monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "det.db"))
     import action_center
 
-    detail = [{"account": "U1", "model": "Growth", "net_liq": 123456.0, "n_bonds": 1,
-               "manual_bond_liquidation": True},
-              {"account": "U2", "model": "Growth", "net_liq": 5000.0, "n_bonds": 0,
-               "manual_bond_liquidation": False}]
+    detail = [{"account": "U1", "model": "Growth", "net_liq": 123456.0,
+               "managed_net_liq": 113456.0, "n_held_aside": 1,
+               "held_aside_value": 10000.0, "held_back": False},
+              {"account": "U2", "model": "Growth", "net_liq": 5000.0,
+               "managed_net_liq": 5000.0, "n_held_aside": 0,
+               "held_aside_value": 0.0, "held_back": False}]
     # pass a Python list -> serialized by the store
     k = action_center.post_notice("outofspec", "T", "B", dedup_key="oos",
                                   detail_json=detail)

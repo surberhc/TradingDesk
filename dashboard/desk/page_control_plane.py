@@ -1011,12 +1011,20 @@ def _render_whole_book_outofspec() -> None:
             "Advisor": v.get("advisor_name") or "—",
             "Entity": v.get("entity") or "—",
             "Model": v.get("version") or "—",
-            "Verdict": "OUT OF SPEC" if v["out_of_spec"] else "in spec",
-            "NetLiq": round(float(v.get("net_liq") or 0.0), 2),
+            "Verdict": ("HELD BACK" if v.get("blocked")
+                        else "OUT OF SPEC" if v["out_of_spec"] else "in spec"),
+            "Account value": round(float(v.get("net_liq") or 0.0), 2),
+            # Holdings the desk never trades sit OUTSIDE the model allocation, so the
+            # model's 100% applies to this remainder — and that is what the would-trade
+            # legs rebalance. The two columns always sum back to Account value.
+            "Value the model manages": round(
+                float(v.get("managed_net_liq", v.get("net_liq")) or 0.0), 2),
+            "Value we never trade": round(float(v.get("held_aside_value") or 0.0), 2),
             "Positions": v.get("n_positions", 0),
             "Would-trade legs": v.get("n_legs", 0),
             "Alien": v.get("n_alien", 0),
-            "Bonds (manual)": v.get("n_bonds", 0),
+            "Holdings we never trade": v.get("n_held_aside", 0),
+            "Holdings we could not identify": v.get("n_unclassified", 0),
         } for v in shown]
         st.dataframe(pd.DataFrame(table), hide_index=True, use_container_width=True)
 
@@ -1030,17 +1038,31 @@ def _render_whole_book_outofspec() -> None:
                 st.dataframe(pd.DataFrame(v["legs"]), hide_index=True,
                              use_container_width=True)
 
-        # Individual bonds are NOT auto-tradeable equity legs — the engine excludes them and
-        # they need a human to liquidate. Surface them explicitly so they are never missed.
-        if any(v.get("bonds") for v in shown):
-            with st.expander("Bonds requiring MANUAL liquidation (excluded from auto legs)"):
+        # HOLDINGS THE DESK NEVER TRADES (individual bonds first among them). They are on a
+        # no-trade list, not a pending manual sale: priced, counted and named here, sitting
+        # outside the model allocation. No order is ever emitted for one.
+        if any(v.get("held_aside") for v in shown):
+            with st.expander("Holdings we never trade (priced and counted, outside the "
+                             "model allocation)"):
+                st.caption("These are held aside by decision. They are not drift, not "
+                           "untracked, and not awaiting a sale — the model applies to the "
+                           "rest of the account as its own 100%.")
                 for v in shown:
-                    if not v.get("bonds"):
+                    if not v.get("held_aside"):
                         continue
                     st.markdown(f"**{v['account']}** · {v.get('advisor_name') or '—'} · "
-                                f"{v.get('version') or '—'} — {v['n_bonds']} bond(s)")
-                    st.dataframe(pd.DataFrame(v["bonds"]), hide_index=True,
+                                f"{v.get('version') or '—'} — {v['n_held_aside']} holding(s), "
+                                f"${float(v.get('held_aside_value') or 0.0):,.2f}")
+                    st.dataframe(pd.DataFrame(v["held_aside"]), hide_index=True,
                                  use_container_width=True)
+
+        # Accounts whose trades were HELD BACK for a data reason (a never-traded holding we
+        # could not price, so the rest of the account cannot be sized safely).
+        if any(v.get("blocked") for v in shown):
+            with st.expander("Accounts with ALL trades held back (needs a look)"):
+                for v in shown:
+                    for reason in (v.get("blocked_reasons") or []):
+                        st.markdown(f"**{v['account']}** — {reason}")
 
 
 # =========================================================================== #

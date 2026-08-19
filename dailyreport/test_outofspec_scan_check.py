@@ -19,13 +19,21 @@ import outofspec_scan_check as job  # noqa: E402
 
 
 def _scan(n_oos=2, n_acct=10):
+    # U1 holds an individual bond: HELD ASIDE (priced, counted, never traded) and sitting
+    # outside the model allocation, so its 4 legs rebalance the MANAGED sleeve only.
     verdicts = [
         {"account": "U1", "version": "Growth", "advisor_name": "Amy", "net_liq": 1_000_000.0,
-         "out_of_spec": True, "n_legs": 4, "n_bonds": 1},
+         "managed_net_liq": 900_000.0, "held_aside_value": 100_000.0,
+         "out_of_spec": True, "n_legs": 4, "n_held_aside": 1, "n_unclassified": 0,
+         "blocked": False},
         {"account": "U2", "version": "Growth", "advisor_name": None, "net_liq": 50_000.0,
-         "out_of_spec": True, "n_legs": 2, "n_bonds": 0},
+         "managed_net_liq": 50_000.0, "held_aside_value": 0.0,
+         "out_of_spec": True, "n_legs": 2, "n_held_aside": 0, "n_unclassified": 0,
+         "blocked": False},
         {"account": "U3", "version": "Growth", "advisor_name": "Amy", "net_liq": 25_000.0,
-         "out_of_spec": False, "n_legs": 0, "n_bonds": 0},
+         "managed_net_liq": 25_000.0, "held_aside_value": 0.0,
+         "out_of_spec": False, "n_legs": 0, "n_held_aside": 0, "n_unclassified": 0,
+         "blocked": False},
     ]
     return {"verdicts": verdicts, "skipped": [], "n_accounts": n_acct,
             "n_out_of_spec": n_oos, "n_in_spec": n_acct - n_oos, "bad_versions": []}
@@ -35,18 +43,34 @@ def test_build_detail_only_out_of_spec_rows():
     detail = job.build_detail(_scan())
     accts = [r["account"] for r in detail]
     assert accts == ["U1", "U2"]           # in-spec U3 excluded
-    assert detail[0]["manual_bond_liquidation"] is True   # has a bond
-    assert detail[1]["manual_bond_liquidation"] is False
+    assert detail[0]["n_held_aside"] == 1                 # holds a bond
+    assert detail[0]["held_aside_value"] == 100_000.0
+    assert detail[0]["managed_net_liq"] == 900_000.0      # what the model actually manages
+    assert detail[1]["n_held_aside"] == 0
     assert detail[0]["net_liq"] == 1_000_000.0
+    assert detail[0]["held_back"] is False
 
 
 def test_build_notice_plain_english_and_counts():
     title, body, hint, detail = job.build_notice(_scan(n_oos=2, n_acct=10))
     assert title == "2 of 10 accounts out of spec — rebalance needed"
     assert "out of spec" in body.lower()
-    assert "manual liquidation" in body.lower()      # one bond present
+    # Held-aside holdings are explained as never-traded, NOT as a pending manual sale.
+    assert "never trades" in body.lower()
+    assert "outside the model allocation" in body.lower()
+    assert "liquidation" not in body.lower()
     assert "Control Plane" in hint
     assert len(detail) == 2
+
+
+def test_build_notice_flags_unidentified_and_held_back_accounts():
+    scan = _scan()
+    scan["verdicts"][0]["n_unclassified"] = 1
+    scan["verdicts"][1].update({"n_held_aside": 1, "blocked": True})
+    _, body, _, detail = job.build_notice(scan)
+    assert "could not identify" in body.lower()
+    assert "held back" in body.lower()
+    assert detail[1]["held_back"] is True
 
 
 def test_main_snooze_skips_repost(tmp_path, monkeypatch, capsys):

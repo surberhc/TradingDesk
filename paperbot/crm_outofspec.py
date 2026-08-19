@@ -16,6 +16,7 @@ from __future__ import annotations
 
 from typing import Mapping, Optional
 
+import holding_class
 import rebalance_engine
 import crm_roster
 
@@ -30,29 +31,35 @@ def _to_float(x) -> float:
         return 0.0
 
 
-# Asset category (v_tradingdesk_holdings_latest.asset_category) that marks an individual
-# BOND. IBKR represents a bond position's QUANTITY as its FACE / PAR amount (e.g. 10000)
-# and its price as a PERCENTAGE OF PAR quoted per 100 (a mark of 100.146 == 100.146% of
-# face). So a bond's true value is  qty * mark / 100 , NOT qty * mark — valuing it as
-# qty * mark overstates it ~100x. Confirmed against live IBKR data 2026-08-05: for every
-# BOND row the broker's own reported market_value equals qty * mark / 100 exactly. See
-# `_is_bond` for the single detection point.
-_BOND_CATEGORY = "BOND"
+# --- HELD-ASIDE classification (the no-trade list) -------------------------------
+# The CRM holdings view carries the instrument type in `asset_category`
+# (v_tradingdesk_holdings_latest.asset_category == IBKR Flex `assetCategory`: 'STK',
+# 'BOND', ...). That is the AUTHORITATIVE classification signal and it is handed straight
+# to holding_class — this module makes no judgement of its own and never guesses off a
+# symbol string. holding_class decides MANAGED vs HELD_ASIDE, owns the bond percent-of-par
+# valuation convention, and fails closed on any type it does not recognise.
+#
+# HISTORY (what changed, 2026-08-19): bonds used to be dropped out of the engine's inputs
+# here and surfaced as "manual liquidation required" — i.e. every bond was an implicit
+# sell-to-exit, and in practice the five bond-holding accounts were held back from the
+# batch entirely. The owner's decision replaced that: bonds are HELD ASIDE — priced,
+# counted, reported, never traded — and they sit OUTSIDE the target allocation, so the
+# model applies to the remaining sleeve as its own 100% and the account rebalances that
+# sleeve normally. The carve-out itself now lives in the pure engine (which is what
+# guarantees no leg can ever be emitted for one); this module only supplies the inputs.
+def _sec_type(asset_category) -> str:
+    """The instrument type for one holdings row, normalized. Blank/absent -> UNKNOWN, which
+    holding_class treats as held-aside-and-flag-for-classification (fail closed)."""
+    return holding_class.normalize_type(asset_category)
 
 
-def _is_bond(asset_category) -> bool:
-    """True iff a holdings row is an individual bond (asset_category == 'BOND'). Single
-    source of truth for bond detection so valuation and order-exclusion never disagree."""
-    return str(asset_category or "").strip().upper() == _BOND_CATEGORY
-
-
-def _bond_value(qty: float, mark: float, market_value) -> float:
-    """A bond's true dollar value. IBKR quotes bond price as a percent of par per 100, and
-    the position quantity is the face amount, so value = qty * mark / 100. Falls back to the
-    broker's reported market_value when the mark is missing/non-positive (never qty*mark)."""
-    if mark == mark and mark > 0:          # mark is a real, positive per-100 price
-        return qty * mark / 100.0
-    return _to_float(market_value)
+def _holding_value(qty: float, mark: float, sec_type: str, market_value) -> float | None:
+    """One holding's true dollar value under its instrument type's price convention
+    (a BOND's quantity is FACE and its mark is a percent of par per 100, so its value is
+    qty * mark / 100 — never qty * mark, which overstates it ~100x). Delegates to
+    holding_class.position_value so valuation and order-exclusion read the SAME table.
+    Returns None when the row cannot be valued at all."""
+    return holding_class.position_value(qty, mark, sec_type, reported_value=market_value)
 
 
 # --- NAV / holdings-value mismatch fail-safe (pre-arm exclusion) -----------------
@@ -101,22 +108,21 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
       * account   = the IBKR number (crm_roster.account_identifier — CRM->desk identity map)
       * version   = the roster ``model`` (today uniformly "Growth")
       * positions = {symbol -> quantity}  from the account's latest holdings snapshot
-                    (individual BONDS excluded — see below)
-      * prices    = {symbol -> mark_price} from the same snapshot (positive marks only)
+                    (EVERY holding, held-aside ones included — the engine carves them out)
+      * prices    = {symbol -> mark_price} for MANAGED holdings (positive marks only)
+      * sec_types = {symbol -> instrument type} from ``asset_category`` — the engine's ONLY
+                    classification input
+      * values    = {symbol -> dollar market value} for HELD-ASIDE holdings, valued under
+                    their own price convention (a bond's qty*mark/100). This is what lets
+                    the engine carve them out without knowing anything about the CRM feed.
       * net_liq   = roster ``total_value``; falls back to the holdings market-value sum
-      * bonds     = [{symbol, quantity, mark_price, value}] — individual bond holdings,
-                    valued correctly (qty * mark / 100) and held OUT of the engine
 
-    BONDS (order-affecting correctness, 2026-08-05). IBKR carries an individual bond with a
-    FACE-VALUE quantity and a per-100 (percent-of-par) price, so valuing it as qty*mark — as
-    the pure engine does for equities — overstates it ~100x and can't produce a placeable
-    equity order for a CUSIP. So bonds are (a) valued correctly (qty*mark/100) into the
-    account's holdings value / NAV, and (b) kept OUT of ``positions``/``prices`` — the engine
-    never sees them, so it never inflates the account's valuation and never emits a broken
-    bond leg. They are returned on ``bonds`` for the verdict to surface as MANUAL liquidation
-    (S0 Growth holds no individual bonds — they are all sells-to-exit, done by a human). The
-    account's non-bond legs still size against the corrected full NAV (which includes the
-    bond value). An account with NO bonds is byte-identical to before.
+    HELD-ASIDE HOLDINGS (owner decision, 2026-08-19). Individual bonds — and anything else
+    holding_class classifies HELD_ASIDE — are on a NO-TRADE list, not a reason to bench the
+    account. They are handed to the engine WITH their instrument type and their correct
+    value; the engine prices them, carves their value out of NetLiq, applies the model to
+    the remaining sleeve as its own 100%, and can never emit a leg for one. An account with
+    no held-aside holdings produces byte-identical inputs and a byte-identical plan.
 
     Returns ``(account_inputs, skipped, excluded)``.
       * ``skipped``  — accounts with no usable net_liq (unfunded / no snapshot): the read-only
@@ -140,7 +146,10 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
 
         positions: dict[str, float] = {}
         prices: dict[str, float] = {}
-        bonds: list[dict] = []
+        sec_types: dict[str, str] = {}
+        values: dict[str, float] = {}
+        n_managed = 0
+        n_held_aside = 0
         holdings_value = 0.0
         for h in holds:
             sym = str(h.get("symbol") or "").strip()
@@ -148,16 +157,20 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
                 continue
             qty = _to_float(h.get("quantity"))
             px = _to_float(h.get("mark_price"))
-            if _is_bond(h.get("asset_category")):
-                # Value the bond correctly (qty*mark/100) into NAV, but keep it OUT of the
-                # engine's positions/prices: the equity engine can neither value nor route a
-                # face-value/per-100 CUSIP. Surfaced separately for manual liquidation.
-                value = _bond_value(qty, px, h.get("market_value"))
-                bonds.append({"symbol": sym, "quantity": qty, "mark_price": px,
-                              "value": value})
-                holdings_value += value
-                continue
+            sec_type = _sec_type(h.get("asset_category"))
             positions[sym] = positions.get(sym, 0.0) + qty
+            sec_types[sym] = sec_type
+            if holding_class.is_held_aside(sec_type):
+                # HELD ASIDE: priced under its own convention (a bond's qty*mark/100) and
+                # handed to the engine as an explicit value so it can be carved out of
+                # NetLiq. Never given a `prices` entry — nothing here will ever be sized.
+                n_held_aside += 1
+                value = _holding_value(qty, px, sec_type, h.get("market_value"))
+                if value is not None:
+                    values[sym] = values.get(sym, 0.0) + value
+                    holdings_value += value
+                continue
+            n_managed += 1
             if px == px and px > 0:
                 prices[sym] = px
             holdings_value += _to_float(h.get("market_value"))
@@ -208,12 +221,16 @@ def account_inputs_from_roster(roster_rows: list[Mapping],
             "net_liq": net_liq,
             "positions": positions,
             "prices": prices,
+            "sec_types": sec_types,
+            "values": values,
             # carried through for display; the engine ignores unknown keys.
             "advisor_name": row.get("advisor_name"),
             "entity": row.get("entity"),
             "master_name": row.get("master_name"),
-            "n_positions": len(positions),
-            "bonds": bonds,
+            # MANAGED holdings only — the held-aside ones are counted separately so a
+            # bond can never be mistaken for a position the model is supposed to hold.
+            "n_positions": n_managed,
+            "n_held_aside": n_held_aside,
         })
 
     return account_inputs, skipped, excluded
@@ -237,7 +254,23 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
 
     out_of_spec == the engine's account-level no-trade-band verdict (AccountPlan
     ``needs_rebalance``), with a would-trade-legs fallback. Kept as a separate function so it
-    is unit-testable with synthetic AccountPlans (no backtest)."""
+    is unit-testable with synthetic AccountPlans (no backtest).
+
+    THE HELD-ASIDE HALF (accounting for them like professionals). Each verdict carries the
+    account's held-aside block straight off the engine's plan — the authoritative
+    classification, not a second opinion assembled here:
+
+        managed_net_liq   what the model's 100% actually applies to
+        held_aside_value  the priced total sitting outside the allocation
+        held_aside        per-position symbol / quantity / market value / reason
+        n_unclassified    held-aside positions a human must still identify
+
+    and ``net_liq == managed_net_liq + held_aside_value``, so a reader can always see the
+    whole account AND the part of it the desk trades. A held-aside holding does NOT make an
+    account out-of-spec — it is not a defect, it is a documented no-trade holding, and the
+    out-of-spec figure now describes the MANAGED sleeve alone. What DOES surface is
+    ``blocked``: the engine withheld orders because a held-aside holding could not be priced
+    or reconciled, which is a data problem needing a human."""
     meta = {ai["account"]: ai for ai in account_inputs}
     by_acct = {p.account: p for p in plans}
     verdicts: list[dict] = []
@@ -247,32 +280,38 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
             continue
         orders = getattr(p, "orders", {}) or {}
         legs = _legs_from_orders(orders)
-        # Individual bonds are excluded from the auto-generated equity legs (the engine
-        # can't route them) and surfaced explicitly as MANUAL liquidation so a human acts on
-        # them — never silently dropped. Holding one makes the account out-of-spec.
-        bond_legs = [{"symbol": b["symbol"], "side": "SELL",
-                      "quantity": b.get("quantity"), "value": b.get("value"),
-                      "action": "manual liquidation required (bond)"}
-                     for b in (ai.get("bonds") or [])]
-        # AccountPlan.needs_rebalance is the engine's band verdict; treat any would-trade
-        # leg (or a held bond needing manual liquidation) as out-of-spec too (defensive —
-        # orders only fill when the band is breached).
+        # The engine's own held-aside records: priced, counted, named, and structurally
+        # incapable of having produced a leg (they never became reconcile lines at all).
+        held = [h.as_dict() if hasattr(h, "as_dict") else dict(h)
+                for h in (getattr(p, "held_aside", None) or [])]
+        blocked_reasons = list(getattr(p, "blocked_reasons", None) or [])
+        net_liq = float(getattr(p, "net_liq", ai.get("net_liq", 0.0)) or 0.0)
+        held_value = float(getattr(p, "held_aside_value", 0.0) or 0.0)
+        managed_net_liq = float(getattr(p, "managed_net_liq", None) or (net_liq - held_value))
+        # AccountPlan.needs_rebalance is the engine's band verdict on the MANAGED sleeve;
+        # treat any would-trade leg as out-of-spec too (defensive — orders only fill when
+        # the band is breached), and a blocked account as needing attention.
         out_of_spec = (bool(getattr(p, "needs_rebalance", False))
-                       or bool(legs) or bool(bond_legs))
+                       or bool(legs) or bool(blocked_reasons))
         verdicts.append({
             "account": account,
             "version": ai.get("version"),
             "advisor_name": ai.get("advisor_name"),
             "entity": ai.get("entity"),
             "master_name": ai.get("master_name"),
-            "net_liq": float(getattr(p, "net_liq", ai.get("net_liq", 0.0)) or 0.0),
+            "net_liq": net_liq,
+            "managed_net_liq": managed_net_liq,
+            "held_aside_value": held_value,
             "n_positions": ai.get("n_positions", 0),
             "out_of_spec": out_of_spec,
             "n_legs": len(legs),
             "legs": legs,
             "n_alien": len(getattr(p, "alien_lines", []) or []),
-            "n_bonds": len(bond_legs),
-            "bonds": bond_legs,
+            "n_held_aside": len(held),
+            "held_aside": held,
+            "n_unclassified": sum(1 for h in held if h.get("needs_classification")),
+            "blocked": bool(blocked_reasons),
+            "blocked_reasons": blocked_reasons,
         })
     verdicts.sort(key=lambda v: (not v["out_of_spec"], -v["net_liq"]))
     return verdicts
@@ -291,7 +330,8 @@ def scan_out_of_spec(roster_rows: list[Mapping],
     and broker-free. Returns::
 
         {"verdicts": [...], "skipped": [...], "excluded": [...], "n_accounts": int,
-         "n_out_of_spec": int, "n_in_spec": int, "n_excluded": int}
+         "n_out_of_spec": int, "n_in_spec": int, "n_excluded": int,
+         "n_with_held_aside": int, "held_aside_value": float, "n_blocked": int}
 
     ``excluded`` carries any account held OUT of the run by the fail-safe NAV/holdings mismatch
     guard (recorded NAV wildly below holdings+cash — a departed/closed account or a data
@@ -302,7 +342,8 @@ def scan_out_of_spec(roster_rows: list[Mapping],
         roster_rows, holdings_by_account)
     if not account_inputs:
         return {"verdicts": [], "skipped": skipped, "excluded": excluded, "n_accounts": 0,
-                "n_out_of_spec": 0, "n_in_spec": 0, "n_excluded": len(excluded)}
+                "n_out_of_spec": 0, "n_in_spec": 0, "n_excluded": len(excluded),
+                "n_with_held_aside": 0, "n_blocked": 0, "held_aside_value": 0.0}
 
     result = rebalance_engine.build_plan(
         account_inputs, dict(targets), band_pct=band_pct, universe=universe)
@@ -316,4 +357,10 @@ def scan_out_of_spec(roster_rows: list[Mapping],
         "n_out_of_spec": n_oos,
         "n_in_spec": len(verdicts) - n_oos,
         "n_excluded": len(excluded),
+        # Book-level held-aside accounting: how many accounts hold something on the
+        # no-trade list, what it is all worth, and how many had orders withheld for a
+        # data reason. Held-aside money is reported, never silently absorbed into NAV.
+        "n_with_held_aside": sum(1 for v in verdicts if v["n_held_aside"]),
+        "held_aside_value": sum(v["held_aside_value"] for v in verdicts),
+        "n_blocked": sum(1 for v in verdicts if v["blocked"]),
     }

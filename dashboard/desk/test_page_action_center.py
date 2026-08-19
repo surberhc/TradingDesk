@@ -35,9 +35,11 @@ def _seed(db_path):
         "outofspec", "3 of 10 accounts out of spec — rebalance needed",
         "Three accounts drifted.", severity="warn", dedup_key="outofspec_open",
         detail_json=[{"account": "U1", "model": "Growth", "advisor": "A", "net_liq": 1e6,
-                      "n_legs": 4, "n_bonds": 1, "manual_bond_liquidation": True},
+                      "managed_net_liq": 9e5, "n_legs": 4, "n_held_aside": 1,
+                      "held_aside_value": 1e5, "n_unclassified": 0, "held_back": False},
                      {"account": "U2", "model": "Growth", "advisor": "A", "net_liq": 5e4,
-                      "n_legs": 2, "n_bonds": 0, "manual_bond_liquidation": False}])
+                      "managed_net_liq": 5e4, "n_legs": 2, "n_held_aside": 0,
+                      "held_aside_value": 0.0, "n_unclassified": 0, "held_back": False}])
     return action_center
 
 
