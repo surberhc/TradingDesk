@@ -3,7 +3,19 @@
 **Registered:** 2026-08-24 (written and committed BEFORE any run - the timestamp is the point).
 **Author:** desk research (Claude), on Andrew's instruction ("draft the prereg with the ceiling check first", 2026-08-24).
 **Source proposal:** Andrew's "Sector Momentum Core Strategy" memo, emailed 2026-08-24 (25 sections). This prereg adapts that memo to S0's chassis and to what our data can actually support; every departure from the memo is named in section 8.
-**Status at registration:** hypothesis only. Phase 0 is a KILL GATE - it can end this study in a single cheap run, before any signal is built.
+**Status at registration:** hypothesis only.
+
+> **OUTCOME (stamped 2026-08-24, after the run). PHASE 2 REFUTED - "July stands."**
+> The decisive gate ("beats the NEUTRAL-ONLY arm") FAILED in all nine cells and both OOS
+> halves: neutral-only 8.49% CAGR vs overlay cells 8.10%-8.30% (-0.19 to -0.39 pts), monotone
+> in both swept dimensions. Worse than the Amendment-1 random control (random 5-of-11:
+> 8.51% mean, stdev 0.21, +0.02 pts) - the composite selects sectors slightly worse than a
+> coin flip. The 12-1 skip month, the drifting neutral, the strategic-weight sizing and the
+> position caps - all four pre-registered differences from July - changed nothing, which
+> establishes that July was not an artifact of its momentum window.
+> **What SURVIVES: the NEUTRAL-ONLY arm** (Phase 1), performance-neutral vs baseline and
+> delivering the 11-holding book. Full result:
+> `backtester/output/S0_sector_momentum_phase2_2026-08-24.md`. Phase 0 is a KILL GATE - it can end this study in a single cheap run, before any signal is built.
 
 > Why this prereg exists. A closely-related study already REFUTED sector/size tilting in S0 (PREREG_S0_equity_sleeve_broadening_2026-07-20.md; report backtester/output/S0_equity_sleeve_broadening_2026-07-20.md). Re-testing a refuted idea is only legitimate if we name IN ADVANCE what is materially different and what would have to be true for the answer to change. Section 2 does that. If the new elements do not carry the result, the honest verdict is "July stands" and we say so.
 
