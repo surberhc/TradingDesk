@@ -163,9 +163,53 @@ def fetch_holdings_latest(account_ids: Iterable[str], conn=None) -> dict[str, li
             conn.close()
 
 
+# How stale a NAV may be before an all-cash account stops counting as visible. The IBKR flex
+# sync runs daily, so a week of silence means the feed — not the account — is the problem.
+FUNDED_NAV_MAX_AGE_DAYS = 7
+
+# Minimum cash before a POSITIONLESS account counts as fundable. Applies ONLY to the
+# NAV-without-holdings path: an account that already holds positions is on the roster whatever
+# it is worth, exactly as before. Set at $100 because the cheapest thing the desk can buy is
+# one share (PDBC ~$19, XLB ~$54, up to XLK ~$183), so below this there is no order to place
+# and the account would just add noise. Andrew's call 2026-08-24, after the fix swept in three
+# dust accounts ($957, $3, $1) alongside the eight real ones.
+FUNDED_MIN_CASH_NAV = 100.0
+
+
 def funded_account_ids(account_ids: Iterable[str], conn=None) -> set[str]:
-    """The subset of the given CRM account_ids that have a latest holdings snapshot — the
-    read-only stand-in for 'funded / visible reality' (an account with no holdings snapshot
-    is not something the desk can act on). READ-ONLY."""
-    holdings = fetch_holdings_latest(account_ids, conn=conn)
-    return {aid for aid, rows in holdings.items() if rows}
+    """The subset of the given CRM account_ids the desk can actually act on — 'funded reality'.
+
+    An account qualifies if it has a latest HOLDINGS snapshot, **or** if it has a fresh NAV
+    with at least FUNDED_MIN_CASH_NAV in it. That second clause matters: this used to require holdings alone,
+    which silently excluded a newly funded, never-traded account — it holds 100% cash, so it
+    has no positions to snapshot. Those are exactly the accounts that most need their first
+    trade (deploy the cash), and the old test dropped them from the executable roster while
+    they looked perfectly healthy everywhere else. Found 2026-08-24 with a $826k rollover that
+    had been assigned, repped, and adrift since April.
+
+    The NAV must be FRESH (see FUNDED_NAV_MAX_AGE_DAYS). A stale NAV means the feed is broken,
+    and acting on a stale balance is worse than not acting. READ-ONLY."""
+    ids = [str(a) for a in account_ids]
+    if not ids:
+        return set()
+    holdings = fetch_holdings_latest(ids, conn=conn)
+    funded = {aid for aid, rows in holdings.items() if rows}
+
+    sql = ("select id::text from accounts "
+           "where id::text = any(%s) and archived_at is null "
+           "and coalesce(total_value, 0) >= %s "
+           "and nav_as_of is not null and nav_as_of >= current_date - %s")
+    own = conn is None
+    conn = conn or _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, (ids, FUNDED_MIN_CASH_NAV, FUNDED_NAV_MAX_AGE_DAYS))
+            funded |= {r[0] for r in cur.fetchall()}
+    except CrmRosterUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise CrmRosterUnavailable(f"CRM funded-NAV query failed: {exc}") from exc
+    finally:
+        if own:
+            conn.close()
+    return funded
