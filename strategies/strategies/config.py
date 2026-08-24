@@ -134,7 +134,9 @@ DEFENSIVE_ASSETS = (TBILLS + SHORT_TREASURIES + FLOATING_RATE
 REAL_ASSETS = GOLD + TIPS + COMMODITIES
 
 # Full download list (DATA.md). data_loader filters by inception per month.
-ALL_TICKERS = (EQUITY_CORE + SECTORS + DEFENSIVE_ASSETS + REAL_ASSETS)
+SMALL_TIER_TICKERS = ["SCHB"]   # the small-account equity proxy; see SMALL_TIER_* below.
+                                # USFR is already in DEFENSIVE_ASSETS, so only SCHB is new.
+ALL_TICKERS = (EQUITY_CORE + SECTORS + DEFENSIVE_ASSETS + REAL_ASSETS + SMALL_TIER_TICKERS)
 
 # Benchmarks for the report (SPEC §2, §14, §15)
 BENCHMARK_SPY = "SPY"

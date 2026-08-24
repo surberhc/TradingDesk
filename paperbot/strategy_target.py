@@ -27,6 +27,7 @@ if str(_BACKTESTER) not in sys.path:
     sys.path.insert(0, str(_BACKTESTER))
 
 from src import backtest, data_loader  # noqa: E402  (after sys.path setup)
+from strategies import small_tier  # noqa: E402  (shared brain; small-account rendering)
 
 import config  # paperbot config (STRATEGY_VERSION, etc.)
 
@@ -47,10 +48,19 @@ def current_target(version: str = config.STRATEGY_VERSION) -> Target:
     `end=None` lets the backtester run to the most recent data date; the final row
     of its target-weights frame is the portfolio it wants to hold now.
     """
-    result = backtest.run_backtest(version=version, end=None)
+    # A "(Small)" label is NOT a separate strategy: it runs its PARENT version's engine and
+    # then projects that output onto the two whole-share-viable tickers. Small accounts
+    # therefore get the same regime decisions as everyone else, just rendered coarsely.
+    parent = small_tier.parent_version(version)
+    is_small = small_tier.is_small(version)
+
+    result = backtest.run_backtest(version=parent, end=None)
     weights_df = result["weights"]
     weights = weights_df.iloc[-1]
     weights = weights[weights > 1e-9]
+    if is_small:
+        weights = small_tier.collapse(weights)
+        weights = weights[weights > 1e-9]
 
     prices = data_loader.load_prices()
     price_date = prices.index[-1]
@@ -64,5 +74,5 @@ def current_target(version: str = config.STRATEGY_VERSION) -> Target:
         prices=latest,
         as_of=weights_df.index[-1],
         price_date=price_date,
-        version=result["version"],
+        version=(version if is_small else result["version"]),
     )
