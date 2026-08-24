@@ -1,22 +1,38 @@
-"""Offline tests for the S8 dashboard tab's PURE helpers (dashboard/app.py).
+r"""Offline tests for the S8 page's PURE helpers (dashboard/desk/page_s8.py).
 
 These exercise the store-record selection and the distance-to-stop math WITHOUT a
 Streamlit runtime, without IBKR, and without touching the real capture store (the temp
-store test points S8_PILOT_ROOT at a throwaway dir). Importing app.py self-bootstraps
-sys.path (paperbot/backtester/connections/strategies/dailyreport/livebot) and runs a few
-Streamlit calls in "bare mode" (harmless warnings) — nothing connects to any Gateway.
+store test points S8_PILOT_ROOT at a throwaway dir). page_s8 relies on desk_app.py's
+sys.path bootstrap at runtime, so this module reproduces that bootstrap itself before
+importing it — nothing connects to any Gateway.
 
-Run from dashboard/:
-    "C:\\TradingDesk-Local\\venv\\Scripts\\python.exe" -m pytest -q
+Moved here from dashboard/test_s8_panels.py when app.py (:8501) was archived; page_s8
+carries the exact port of the same helpers. Run from dashboard/:
+    "C:\TradingDesk-Localenv\Scripts\python.exe" -m pytest -q
 """
 from __future__ import annotations
+
+import sys
+from pathlib import Path
+
+# page_s8 imports the pure livebot modules by bare name, relying on desk_app.py's
+# sys.path bootstrap. Reproduce it here so the page imports standalone under pytest.
+_HERE = Path(__file__).resolve().parent
+_REPO = _HERE.parents[1]
+for _sub in ("paperbot", "backtester", "connections", "strategies",
+             "dailyreport", "livebot"):
+    _p = _REPO / _sub
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
+if str(_HERE) not in sys.path:
+    sys.path.insert(0, str(_HERE))
 
 import warnings
 
 warnings.filterwarnings("ignore")
 
 import pandas as pd  # noqa: E402
-import app  # noqa: E402  (import triggers the sys.path bootstrap the helpers rely on)
+import page_s8  # noqa: E402
 import s8_monitor_core  # noqa: E402
 import s8_schema  # noqa: E402
 import s8_store  # noqa: E402
@@ -59,7 +75,7 @@ def _closed_rec(trade_id="c1", date="20260720", pnl=-20.0, mae=-25.0, reason="st
 
 def test_distance_open_not_stopped():
     rec = _open_rec(credit=4.0, stop=7.3)
-    d = app.s8_distance_to_stop(rec, short_ask=5.0, long_bid=1.0)
+    d = page_s8.s8_distance_to_stop(rec, short_ask=5.0, long_bid=1.0)
     assert d["spread_cost"] == 4.0
     assert d["stop_price"] == 7.3
     assert abs(d["distance_to_stop"] - 3.3) < 1e-9
@@ -69,7 +85,7 @@ def test_distance_open_not_stopped():
 
 def test_distance_stopped_when_cost_reaches_stop():
     rec = _open_rec(credit=4.0, stop=7.3, qty=1)
-    d = app.s8_distance_to_stop(rec, short_ask=9.0, long_bid=1.5)  # cost 7.5 >= 7.3
+    d = page_s8.s8_distance_to_stop(rec, short_ask=9.0, long_bid=1.5)  # cost 7.5 >= 7.3
     assert d["spread_cost"] == 7.5
     assert d["distance_to_stop"] < 0
     assert d["running_pnl"] == -350.0       # (4.0 - 7.5) * 100
@@ -78,7 +94,7 @@ def test_distance_stopped_when_cost_reaches_stop():
 
 def test_distance_missing_quote_is_none_safe():
     rec = _open_rec()
-    d = app.s8_distance_to_stop(rec, short_ask=None, long_bid=1.0)
+    d = page_s8.s8_distance_to_stop(rec, short_ask=None, long_bid=1.0)
     assert d["spread_cost"] is None
     assert d["distance_to_stop"] is None
     assert d["running_pnl"] is None
@@ -87,7 +103,7 @@ def test_distance_missing_quote_is_none_safe():
 
 def test_distance_respects_qty():
     rec = _open_rec(credit=4.0, stop=7.3, qty=3)
-    d = app.s8_distance_to_stop(rec, short_ask=9.0, long_bid=1.5)
+    d = page_s8.s8_distance_to_stop(rec, short_ask=9.0, long_bid=1.5)
     assert d["running_pnl"] == -1050.0      # -3.5 * 100 * 3
 
 
@@ -95,7 +111,7 @@ def test_distance_matches_monitor_core_directly():
     """The tab must never drift from the frozen monitor-core stop/P&L math."""
     rec = _open_rec(credit=4.15, stop=7.4, qty=1)
     short_ask, long_bid = 6.2, 1.1
-    d = app.s8_distance_to_stop(rec, short_ask, long_bid)
+    d = page_s8.s8_distance_to_stop(rec, short_ask, long_bid)
     pos = s8_monitor_core.MonitorPosition(
         trade_id=rec.trade_id, side=rec.side, short_strike=rec.entry.short_strike,
         long_strike=rec.entry.long_strike, qty=1,
@@ -113,16 +129,16 @@ def test_available_dates_sorted_desc():
     recs = [_open_rec(trade_id="a", date="20260717"),
             _open_rec(trade_id="b", date="20260720"),
             _open_rec(trade_id="c", date="20260718")]
-    assert app._s8_available_dates(recs) == ["20260720", "20260718", "20260717"]
+    assert page_s8._s8_available_dates(recs) == ["20260720", "20260718", "20260717"]
 
 
 def test_records_for_date_filters():
     recs = [_open_rec(trade_id="a", date="20260717"),
             _open_rec(trade_id="b", date="20260720")]
-    got = app._s8_records_for_date(recs, "20260720")
+    got = page_s8._s8_records_for_date(recs, "20260720")
     assert [r.trade_id for r in got] == ["b"]
     # None date -> all records
-    assert len(app._s8_records_for_date(recs, None)) == 2
+    assert len(page_s8._s8_records_for_date(recs, None)) == 2
 
 
 # --------------------------------------------------------------------------- #
@@ -145,7 +161,7 @@ def test_latest_tick_per_leg_picks_newest_by_ts():
         {"trade_id": "t1", "ts": "2026-07-20T14:00:03.000-05:00", "leg": "long",
          "bid": 0.9, "ask": 1.0},
     ])
-    latest = app._s8_latest_tick_per_leg(df)
+    latest = page_s8._s8_latest_tick_per_leg(df)
     assert latest["t1"]["short"]["ask"] == 3.5      # from the newest short row
     assert latest["t1"]["short"]["bid"] == 3.4
     assert latest["t1"]["short"]["delta"] == -0.31
@@ -154,8 +170,8 @@ def test_latest_tick_per_leg_picks_newest_by_ts():
 
 
 def test_latest_tick_per_leg_empty_and_none():
-    assert app._s8_latest_tick_per_leg(pd.DataFrame()) == {}
-    assert app._s8_latest_tick_per_leg(None) == {}
+    assert page_s8._s8_latest_tick_per_leg(pd.DataFrame()) == {}
+    assert page_s8._s8_latest_tick_per_leg(None) == {}
 
 
 def test_latest_tick_nan_coerced_to_none():
@@ -163,7 +179,7 @@ def test_latest_tick_nan_coerced_to_none():
         {"trade_id": "t1", "ts": "2026-07-20T14:00:00.000-05:00", "leg": "short",
          "bid": float("nan"), "ask": 3.2, "iv": float("nan")},
     ])
-    q = app._s8_latest_tick_per_leg(df)["t1"]["short"]
+    q = page_s8._s8_latest_tick_per_leg(df)["t1"]["short"]
     assert q["bid"] is None
     assert q["ask"] == 3.2
     assert q["iv"] is None
@@ -178,8 +194,8 @@ def test_overlay_distance_from_latest_recorded_tick():
         {"trade_id": rec.trade_id, "ts": "2026-07-20T14:00:05.000-05:00",
          "leg": "long", "bid": 1.0, "ask": 1.2},
     ])
-    latest = app._s8_latest_tick_per_leg(df)[rec.trade_id]
-    d = app.s8_distance_to_stop(rec, latest["short"]["ask"], latest["long"]["bid"])
+    latest = page_s8._s8_latest_tick_per_leg(df)[rec.trade_id]
+    d = page_s8.s8_distance_to_stop(rec, latest["short"]["ask"], latest["long"]["bid"])
     assert d["spread_cost"] == 4.0                  # 5.0 - 1.0
     assert abs(d["distance_to_stop"] - 3.3) < 1e-9  # 7.3 - 4.0
     assert d["running_pnl"] == 0.0                  # (4.0 - 4.0) * 100
@@ -190,20 +206,20 @@ def test_tick_age_and_stale_threshold():
     from datetime import datetime as dt, timezone, timedelta
     ct = timezone(timedelta(hours=-5))
     now = dt(2026, 7, 20, 14, 0, 40, tzinfo=ct)
-    fresh = app._s8_tick_age_secs("2026-07-20T14:00:00-05:00", now=now)
+    fresh = page_s8._s8_tick_age_secs("2026-07-20T14:00:00-05:00", now=now)
     assert abs(fresh - 40.0) < 1e-6
-    assert fresh <= app.S8_TICK_STALE_SECS          # 40s is fresh
-    stale = app._s8_tick_age_secs("2026-07-20T13:00:00-05:00", now=now)
-    assert stale > app.S8_TICK_STALE_SECS           # 1h old -> stale
-    assert app._s8_tick_age_secs(None) is None
-    assert app._s8_tick_age_secs("not-a-timestamp") is None
+    assert fresh <= page_s8.S8_TICK_STALE_SECS          # 40s is fresh
+    stale = page_s8._s8_tick_age_secs("2026-07-20T13:00:00-05:00", now=now)
+    assert stale > page_s8.S8_TICK_STALE_SECS           # 1h old -> stale
+    assert page_s8._s8_tick_age_secs(None) is None
+    assert page_s8._s8_tick_age_secs("not-a-timestamp") is None
 
 
 def test_fmt_age_labels():
-    assert app._s8_fmt_age(None) == "—"
-    assert app._s8_fmt_age(4) == "4s ago"
-    assert app._s8_fmt_age(123) == "2m03s ago"
-    assert app._s8_fmt_age(3660) == "1h01m ago"
+    assert page_s8._s8_fmt_age(None) == "—"
+    assert page_s8._s8_fmt_age(4) == "4s ago"
+    assert page_s8._s8_fmt_age(123) == "2m03s ago"
+    assert page_s8._s8_fmt_age(3660) == "1h01m ago"
 
 
 def test_ticks_dataframe_reads_partition(tmp_path, monkeypatch):
@@ -218,14 +234,14 @@ def test_ticks_dataframe_reads_partition(tmp_path, monkeypatch):
         {"trade_id": "o2", "ts": "2026-07-20T14:00:00.000-05:00", "leg": "short",
          "bid": 2.0, "ask": 2.4},
     ]), "20260720")
-    got = app._s8_ticks_dataframe("20260720", ["o1"])
-    latest = app._s8_latest_tick_per_leg(got)
+    got = page_s8._s8_ticks_dataframe("20260720", ["o1"])
+    latest = page_s8._s8_latest_tick_per_leg(got)
     assert set(latest) == {"o1"}                    # filtered to requested trade_ids
     assert latest["o1"]["short"]["ask"] == 3.5
     assert latest["o1"]["long"]["bid"] == 1.0
     # a date with no partition -> empty frame -> empty selection
-    assert len(app._s8_ticks_dataframe("20250101", ["o1"])) == 0
-    assert app._s8_latest_tick_per_leg(app._s8_ticks_dataframe("20250101")) == {}
+    assert len(page_s8._s8_ticks_dataframe("20250101", ["o1"])) == 0
+    assert page_s8._s8_latest_tick_per_leg(page_s8._s8_ticks_dataframe("20250101")) == {}
 
 
 # --------------------------------------------------------------------------- #
@@ -241,10 +257,10 @@ def test_store_roundtrip_and_selection(tmp_path, monkeypatch):
     recs = s8_store.read_trade_records()
     assert {r.trade_id for r in recs} == {"o1", "c1", "o2"}
 
-    today = app._s8_records_for_date(recs, "20260720")
+    today = page_s8._s8_records_for_date(recs, "20260720")
     assert {r.trade_id for r in today} == {"o1", "c1"}
-    opens = [r for r in today if app.s8_report.is_open(r)]
-    closed = [r for r in today if not app.s8_report.is_open(r)]
+    opens = [r for r in today if page_s8.s8_report.is_open(r)]
+    closed = [r for r in today if not page_s8.s8_report.is_open(r)]
     assert [r.trade_id for r in opens] == ["o1"]
     assert [r.trade_id for r in closed] == ["c1"]
 
@@ -253,7 +269,7 @@ def test_compute_aggregates_over_closed():
     recs = [_closed_rec(trade_id="c1", pnl=10.0, mae=-5.0),
             _closed_rec(trade_id="c2", pnl=-20.0, mae=-25.0),
             _open_rec(trade_id="o1")]
-    agg = app.s8_report.compute_aggregates(recs)
+    agg = page_s8.s8_report.compute_aggregates(recs)
     assert agg["closed_count"] == 2
     assert agg["open_count"] == 1
     assert agg["win_count"] == 1            # only c1 positive
@@ -268,11 +284,11 @@ def test_compute_aggregates_over_closed():
 def test_render_helpers_do_not_crash_offline():
     opens = [_open_rec(trade_id="o1"), _open_rec(trade_id="o2", side="CALL")]
     closed = [_closed_rec(trade_id="c1")]
-    app._render_s8_open_positions(opens)
-    app._render_s8_open_positions([])                 # empty path
+    page_s8._render_open_positions(opens)
+    page_s8._render_open_positions([])                 # empty path
     # No session_date -> no tick read attempted; overlay fail-softs to "no tick"/"—".
-    app._render_s8_live_monitor(opens, is_today=True)         # today, no ticks -> "—"
-    app._render_s8_live_monitor(opens, is_today=False)        # past session, no overlay
-    app._render_s8_live_monitor([], is_today=True)            # empty path
-    app.render_s8_closed(opens + closed, "20260720")
-    app.render_s8_closed([], "20260720")              # empty path
+    page_s8._render_live_monitor(opens, is_today=True)         # today, no ticks -> "—"
+    page_s8._render_live_monitor(opens, is_today=False)        # past session, no overlay
+    page_s8._render_live_monitor([], is_today=True)            # empty path
+    page_s8._render_closed(opens + closed, "20260720")
+    page_s8._render_closed([], "20260720")              # empty path
