@@ -44,7 +44,19 @@ EXECUTION_BUFFER_DAYS = 0      # optional extra one-day buffer (SPEC §13)
 # ---------------------------------------------------------------------------
 # Universe (SPEC §2, DATA.md)
 # ---------------------------------------------------------------------------
-EQUITY_CORE = ["SPY", "VTI", "RSP"]
+# DE-DUPLICATED 2026-08-24 (Andrew's call). VTI was REMOVED: it is 0.996-correlated with
+# SPY (tracking-difference stdev 1.61%/yr, 2015+) — the same cap-weighted bet held twice.
+# Equal-weighting SPY+VTI+RSP made the sleeve effectively ~2/3 cap-weight / ~1/3 equal-weight,
+# so EQUITY_CORE_WEIGHTS below PRESERVES that exact exposure with two funds instead of three.
+# This is a DE-DUPLICATION, not a re-optimization: naively dropping VTI and equal-weighting
+# the remaining two would silently become a 50/50 cap/equal sleeve — a real allocation change
+# that tested WORSE (sleeve-only CAGR 12.87% vs 13.18%, 2015-02->2026-08). Do not "simplify"
+# these weights back to equal without re-testing.
+EQUITY_CORE = ["SPY", "RSP"]
+
+# Relative weights WITHIN the equity core, normalized over whichever members pass the trend
+# gate on a given date (parts/sector._core_weights). Absent/omitted ticker -> equal weight.
+EQUITY_CORE_WEIGHTS = {"SPY": 2.0 / 3.0, "RSP": 1.0 / 3.0}
 
 SECTORS = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV",
            "XLI", "XLB", "XLRE", "XLK", "XLU"]

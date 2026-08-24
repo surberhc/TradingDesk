@@ -43,11 +43,25 @@ def _above_trend(series: pd.Series, asof: pd.Timestamp, window: int) -> bool:
 
 
 def _core_weights(prices: pd.DataFrame, asof: pd.Timestamp) -> pd.Series:
-    """Equal-weight the broad-beta members above their 200d trend; SPY fallback."""
+    """Weight the broad-beta members above their 200d trend; SPY fallback.
+
+    Members are weighted by ``config.EQUITY_CORE_WEIGHTS``, RENORMALIZED over whichever
+    members actually pass the trend gate on this date (so dropping a member re-splits its
+    weight across the survivors in proportion, not equally). A core ticker with no entry in
+    that map — or the map being absent/empty — falls back to EQUAL weight, which reproduces
+    the pre-2026-08-24 behaviour exactly. See config.EQUITY_CORE for why the weights are
+    not equal: they preserve the old three-fund sleeve's effective cap/equal mix after VTI
+    was removed as a duplicate of SPY.
+    """
     core = [t for t in config.EQUITY_CORE if t in prices.columns]
     above = [t for t in core if gates.is_above_asof(prices[t], asof, buffer=config.trend_margin("sector"))]
     chosen = above or (["SPY"] if "SPY" in prices.columns else core[:1])
-    return pd.Series(1.0 / len(chosen), index=chosen)
+    raw = getattr(config, "EQUITY_CORE_WEIGHTS", None) or {}
+    weights = pd.Series([float(raw.get(t, 1.0 / len(chosen))) for t in chosen], index=chosen)
+    total = float(weights.sum())
+    if total <= 0:  # degenerate map -> fall back to equal weight rather than divide by zero
+        return pd.Series(1.0 / len(chosen), index=chosen)
+    return weights / total
 
 
 def select_sectors(
