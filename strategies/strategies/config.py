@@ -86,6 +86,34 @@ SECTOR_NEUTRAL_ANCHOR = {            # 50/50 cap/equal blend, Aug 2026 (Andrew's
 }
 SECTOR_NEUTRAL_REBUILD = "QE"        # quarterly re-derivation of the neutral (memo section 3)
 
+# --- Phase 2: MOMENTUM OVERLAY on the sector neutral (STUDY-ONLY, DEFAULT OFF) ----
+# Prereg docs/PREREG_S0_sector_momentum_core_2026-08-24.md section 5.
+#
+# STRUCTURE (memo section 4): the core is PERMANENT. SECTOR_CORE_PCT of the sleeve always sits
+# at neutral weights, so no sector is ever fully exited even when its momentum is poor. Only
+# the remaining tactical slice tilts. This is not squeamishness: Phase 0 measured the
+# anti-oracle (deliberately holding the WORST sectors) at a -46.91% drawdown against a -10.08%
+# baseline, so concentrated sector selection is violently asymmetric when wrong. The permanent
+# core is what caps that.
+SECTOR_MOMENTUM_ENABLED = False      # STUDY FLAG. Requires SECTOR_NEUTRAL_ENABLED to matter.
+SECTOR_CORE_PCT = 0.70               # swept {0.80, 0.70, 0.60} = the memo's three risk levels
+
+# Composite score weights. Breadth (memo section 10, 10%) is DROPPED - constituent-level data
+# does not exist here - and its weight is redistributed PRO RATA across the surviving four, so
+# no new free parameter is introduced. See prereg section 5 / section 7.
+SECTOR_SCORE_WEIGHTS = {
+    "mom_12_1": 0.39,      # 12-1 month relative momentum, SKIP MONTH (the headline new signal)
+    "mom_6_1": 0.28,       # 6-1 month relative momentum (responsiveness)
+    "risk_adj": 0.17,      # 6m return / 6m realized vol
+    "trend": 0.16,         # absolute trend: 10-month MA and 50/200 cross
+}
+SECTOR_SKIP_MONTHS = 1               # the skip month; 12-1 and 6-1 both end one month back
+SECTOR_ELIGIBLE_TOP_N = 5            # memo section 12: must rank top-5 AND be above its 10m MA
+SECTOR_TACTICAL_MAX_ADD_PTS = 0.10   # memo section 14: cap 1 - +10 pts of total portfolio
+SECTOR_TACTICAL_MAX_ADD_MULT = 0.50  # memo section 14 cap 2: +50% of strategic weight.
+                                     # SWEPT {0.50, 0.75, 1.00} in Phase 2 - see prereg
+                                     # Amendment 2. Not picked; must show a plateau.
+
 
 # ---------------------------------------------------------------------------
 # SMALL-ACCOUNT TIER - whole-share proxy for accounts under the threshold

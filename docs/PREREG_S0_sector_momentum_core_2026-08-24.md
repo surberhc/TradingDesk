@@ -119,6 +119,38 @@ Amended, pre-committed BEFORE any Phase 2 number exists:
 This amendment RAISES the bar. It is recorded here rather than applied silently, and it was
 written before Phase 1 was built.
 
+### AMENDMENT 2 - tactical allocation mechanics (added 2026-08-24, AFTER Phase 1, BEFORE any Phase 2 result)
+
+Building the overlay exposed an internal contradiction between the memo's own rules. Recorded
+and fixed BEFORE any performance number exists, so this is specification, not tuning.
+
+THE PROBLEM (measured on 2026-08-21 weights, 70/30 split). The section 14 cap is the LESSER of
++10 pts and +50% of strategic weight. The 50% leg binds on 4 of the 5 eligible sectors, so only
+25.2 of the 30 tactical points can be placed. Section 15 then returns the stranded 4.8 pts PRO
+RATA across all eleven sectors - which sends 2.03 pts to the SIX sectors that just FAILED the
+eligibility screen (XLY scored 8/100 and received tactical money), and hands the largest single
+share back to XLK, the biggest strategic weight. Sections 14 and 15 together therefore work
+AGAINST the memo's own objective #2, reducing mega-cap dependence.
+
+FIX 1 - CASCADE (structural; no cap raised, no parameter added). Unplaced tactical budget is
+RE-OFFERED to the eligible sectors that still have cap room, iteratively, until either the
+budget is placed or every eligible sector is at its cap. Only the true residual returns to the
+strategic core per section 15. Tactical money stays inside sectors that passed BOTH tests.
+
+FIX 2 - SWEEP THE MULTIPLIER, DO NOT PICK IT. SECTOR_TACTICAL_MAX_ADD_MULT joins the sweep at
+{0.50, 0.75, 1.00} and must show a PLATEAU. Raising it to 1.00 because XLE looked constrained
+on one date would be exactly the curve-fitting rule #1 forbids. The +10 pt ABSOLUTE ceiling is
+NOT swept - it stays fixed as the hard concentration guard, which Phase 0's -46.91% anti-oracle
+drawdown says not to loosen.
+
+Sweep grid becomes 3 core splits x 3 multipliers = 9 cells. The plateau gate applies across
+BOTH dimensions.
+
+OBSERVED SIDE EFFECT, recorded now so it is not mistaken for a finding later: with the cascade,
+a HIGHER multiplier REDUCES mega-cap concentration (XLK 30.5% at mult 0.50 -> 29.2% at 0.75 and
+1.00), because budget that would have leaked back to strategic weights instead reaches the
+smaller eligible sectors. This is mechanical, not evidence of edge.
+
 B. THE ADOPT DECISION - a return-vs-drawdown TRADE-OFF, Andrew's call on balance. Per his standing instruction (2026-07-20): no hard drawdown floor or ceiling. Report the bull-regime return gain side by side with each episode's drawdown change - the actual exchange rate - plus the operational cost (11 funds vs 2, turnover, small-account feasibility). Beta attribution informs this decision; it does not gate it.
 
 Valid honest outcomes, none hidden:

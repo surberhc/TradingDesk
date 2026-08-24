@@ -55,6 +55,10 @@ def _core_weights(prices: pd.DataFrame, asof: pd.Timestamp) -> pd.Series:
     """
     if getattr(config, "SECTOR_NEUTRAL_ENABLED", False):
         # STUDY ARM: the 11-sector drifting neutral REPLACES broad beta as the sleeve core.
+        # With the Phase 2 flag on, the momentum overlay tilts the tactical slice on top of it;
+        # the neutral core underneath is untouched either way.
+        if getattr(config, "SECTOR_MOMENTUM_ENABLED", False):
+            return momentum_overlay(prices, asof)
         return neutral_weights(prices, asof)
     core = [t for t in config.EQUITY_CORE if t in prices.columns]
     above = [t for t in core if gates.is_above_asof(prices[t], asof, buffer=config.trend_margin("sector"))]
@@ -144,6 +148,178 @@ def neutral_weights(prices: pd.DataFrame, asof) -> pd.Series:
     w = hist.loc[prior[-1]] if len(prior) else hist.iloc[0]
     w = w[w > 0]
     return w / w.sum()
+
+
+MONTH_DAYS = TRADING_DAYS_PER_MONTH   # local alias; 21 trading days ~ 1 month
+
+
+def _skip_month_return(series: "pd.Series", asof, months: int) -> float:
+    """Total return over `months` ending SKIP_MONTHS ago (the classic 12-1 construction).
+
+    The most recent month is excluded on purpose: very-short-horizon price action shows
+    REVERSAL, not continuation, so including it dilutes the momentum signal. This is the one
+    genuinely new element versus the refuted July study, which used un-skipped 3m/6m windows.
+    """
+    hist = series.loc[:asof].dropna()
+    skip = config.SECTOR_SKIP_MONTHS * MONTH_DAYS
+    lag = months * MONTH_DAYS
+    if len(hist) <= lag + skip:
+        return float("nan")
+    end = hist.iloc[-1 - skip]
+    start = hist.iloc[-1 - skip - lag]
+    if not (pd.notna(end) and pd.notna(start)) or start <= 0:
+        return float("nan")
+    return end / start - 1.0
+
+
+def _percentile_scores(raw: dict) -> dict:
+    """Rank a {sector -> value} map into 0-100 percentile scores (best = 100).
+
+    NaN entries score 0 rather than being dropped: a sector we cannot measure must not be
+    silently treated as mid-pack, and it must still be RANKED so the eligibility cut sees a
+    complete field of 11.
+    """
+    usable = {k: v for k, v in raw.items() if pd.notna(v)}
+    out = {k: 0.0 for k in raw}
+    if not usable:
+        return out
+    order = sorted(usable, key=lambda k: usable[k])
+    n = len(order)
+    for i, k in enumerate(order):
+        out[k] = 100.0 if n == 1 else 100.0 * i / (n - 1)
+    return out
+
+
+def _trend_score(series: "pd.Series", asof) -> float:
+    """Absolute-trend score (memo section 9): 100 both tests, 50 one, 0 neither.
+
+    Test A: price above its 10-month moving average. Test B: 50-day MA above the 200-day.
+    Unlike the relative metrics this is ABSOLUTE - it asks whether the sector is healthy on
+    its own terms, not merely healthier than its peers, which is what stops the model from
+    buying the best-performing loser in a broad bear market.
+    """
+    hist = series.loc[:asof].dropna()
+    ma10m = config.MA_MONTHS * MONTH_DAYS
+    score = 0.0
+    if len(hist) >= ma10m and hist.iloc[-1] > hist.tail(ma10m).mean():
+        score += 50.0
+    if len(hist) >= 200 and hist.tail(50).mean() > hist.tail(200).mean():
+        score += 50.0
+    return score
+
+
+def composite_scores(prices: "pd.DataFrame", asof) -> "pd.Series":
+    """The 0-100 composite momentum score per sector (prereg section 5).
+
+    Four metrics: 12-1 and 6-1 skip-month relative momentum, 6-month risk-adjusted momentum,
+    and absolute trend. Breadth is absent by design - no constituent data exists - and its
+    weight was redistributed pro rata in config, not reallocated by judgement.
+
+    Causal: every window is trailing, so a date-T score uses only data on/before T.
+    """
+    asof = pd.Timestamp(asof)
+    secs = [t for t in config.SECTORS if t in prices.columns]
+    w = config.SECTOR_SCORE_WEIGHTS
+
+    r12 = {t: _skip_month_return(prices[t], asof, 12) for t in secs}
+    r6 = {t: _skip_month_return(prices[t], asof, 6) for t in secs}
+    ra = {}
+    for t in secs:
+        daily = prices[t].loc[:asof].pct_change().dropna().tail(6 * MONTH_DAYS)
+        vol = float(daily.std() * (252 ** 0.5)) if len(daily) > 2 else float("nan")
+        ra[t] = (r6[t] / vol) if (pd.notna(r6[t]) and pd.notna(vol) and vol > 0) else float("nan")
+
+    s12, s6, sra = _percentile_scores(r12), _percentile_scores(r6), _percentile_scores(ra)
+    strend = {t: _trend_score(prices[t], asof) for t in secs}
+
+    return pd.Series({
+        t: (w["mom_12_1"] * s12[t] + w["mom_6_1"] * s6[t]
+            + w["risk_adj"] * sra[t] + w["trend"] * strend[t])
+        for t in secs
+    }).sort_values(ascending=False)
+
+
+def _above_10m(series: "pd.Series", asof) -> bool:
+    hist = series.loc[:asof].dropna()
+    ma = config.MA_MONTHS * MONTH_DAYS
+    return bool(len(hist) >= ma and hist.iloc[-1] > hist.tail(ma).mean())
+
+
+def momentum_overlay(prices: "pd.DataFrame", asof) -> "pd.Series":
+    """Core + tactical overlay over the 11 sectors (memo sections 4, 12, 13, 14).
+
+    SECTOR_CORE_PCT always sits at neutral weights - the core is PERMANENT, so no sector is
+    ever fully exited. The tactical remainder goes only to sectors that are BOTH top-N by
+    composite AND above their 10-month MA, split in proportion to
+    ``strategic_weight x composite`` so momentum picks the winners while the strategic weight
+    stops a tiny sector from ballooning. Each sector's tactical ADD is capped at the lesser of
+    SECTOR_TACTICAL_MAX_ADD_PTS and SECTOR_TACTICAL_MAX_ADD_MULT x its strategic weight.
+
+    Any tactical budget that cannot be placed - too few eligible sectors, or caps binding -
+    returns PRO RATA to the core (memo section 15). It never goes to cash: whether to own
+    equity at all is the regime engine's decision, not this function's.
+    """
+    asof = pd.Timestamp(asof)
+    neutral = neutral_weights(prices, asof)
+    core_pct = float(config.SECTOR_CORE_PCT)
+    tactical_budget = max(0.0, 1.0 - core_pct)
+    weights = neutral * core_pct
+
+    if tactical_budget <= 1e-12:
+        return weights / weights.sum()
+
+    scores = composite_scores(prices, asof)
+    ranked = [t for t in scores.index if t in neutral.index]
+    top = set(ranked[: int(config.SECTOR_ELIGIBLE_TOP_N)])
+    eligible = [t for t in ranked if t in top and _above_10m(prices[t], asof)]
+
+    placed = 0.0
+    if eligible:
+        caps = {t: min(float(config.SECTOR_TACTICAL_MAX_ADD_PTS),
+                       float(config.SECTOR_TACTICAL_MAX_ADD_MULT) * float(neutral[t]))
+                for t in eligible}
+        add = {t: 0.0 for t in eligible}
+        remaining = tactical_budget
+        # CASCADE. Allocate by strategic_weight x composite, then RE-OFFER whatever the caps
+        # rejected to the eligible sectors that still have room, and repeat until either the
+        # budget is placed or every eligible sector is at its cap.
+        #
+        # Why this differs from the memo (section 15 sends unplaced budget straight back to the
+        # strategic core): with the section 14 caps binding on most eligible sectors, that rule
+        # pushes tactical money PRO RATA across all eleven — including the six that just FAILED
+        # the eligibility screen — and hands the largest share to the biggest strategic weight,
+        # which works against the memo's own objective of reducing mega-cap dependence.
+        # Measured 2026-08-21: 4.8 of 30 points were unplaceable, 2.03 of which went to
+        # non-eligible sectors. Cascading keeps tactical money inside the sectors that passed
+        # both tests. It raises NO cap and adds NO parameter.
+        for _ in range(len(eligible) + 1):
+            room = [t for t in eligible if caps[t] - add[t] > 1e-12]
+            if remaining <= 1e-12 or not room:
+                break
+            factor = {t: float(neutral[t]) * float(scores[t]) for t in room}
+            total = sum(factor.values())
+            if total <= 0:
+                break
+            placed_this_pass = 0.0
+            for t in room:
+                want = remaining * factor[t] / total
+                take = min(want, caps[t] - add[t])
+                add[t] += take
+                placed_this_pass += take
+            if placed_this_pass <= 1e-15:
+                break
+            remaining -= placed_this_pass
+        for t in eligible:
+            weights[t] += add[t]
+            placed += add[t]
+
+    leftover = tactical_budget - placed
+    if leftover > 1e-12:
+        # Every eligible sector is at its cap. Only NOW does the residual return to the core,
+        # pro rata (memo section 15). It never goes to cash — whether to own equity at all is
+        # the regime engine's decision, not this function's.
+        weights = weights + neutral * leftover
+    return weights / weights.sum()
 
 
 def select_sectors(

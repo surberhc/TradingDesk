@@ -72,6 +72,8 @@ import sys
 import config
 import crm_execute
 import crm_roster
+from strategies import small_tier
+from strategies import config as config_s
 import live_quotes
 import rebalance_engine
 import roster
@@ -120,6 +122,12 @@ def _kill_switch_present() -> bool:
 # ========================================================================================
 # ROSTER + PER-ACCOUNT MODEL VERSION (the execution allow-list, human-blessed).
 # ========================================================================================
+# Accounts whose STORED model label disagreed with what their NAV says they should hold.
+# Populated by resolve_roster_versions and surfaced loudly in the preview: a non-empty
+# map means the CRM record is stale (tier scan behind/down) and the desk overrode it.
+_TIER_MISMATCHES: dict[str, tuple] = {}
+
+
 def resolve_roster_versions(roster_accounts: list[str]) -> dict[str, str]:
     """Map each blessed roster account -> its model version, from the SAME source the roster
     derives from. Prefer the CRM roster ``model`` (v_tradingdesk_roster), fall back to the
@@ -128,17 +136,35 @@ def resolve_roster_versions(roster_accounts: list[str]) -> dict[str, str]:
     Pure/read-only: SELECTs from the read-only CRM role when configured, else reads config;
     contacts no broker, builds no order."""
     crm_models: dict[str, str] = {}
+    crm_navs: dict[str, float] = {}
     if crm_roster.is_configured():
         try:
             for r in crm_roster.fetch_roster(advisor_name=crm_roster.DEFAULT_ADVISOR):
-                crm_models[crm_roster.account_identifier(r)] = (
-                    r.get("model") or "")
+                acct = crm_roster.account_identifier(r)
+                crm_models[acct] = (r.get("model") or "")
+                nav = r.get("total_value")
+                if nav is not None:
+                    crm_navs[acct] = float(nav)
         except crm_roster.CrmRosterUnavailable:
-            crm_models = {}   # CRM unreachable -> config fallback below
+            crm_models, crm_navs = {}, {}   # CRM unreachable -> config fallback below
     out: dict[str, str] = {}
     for a in roster_accounts:
-        out[a] = (crm_models.get(a) or config.ENROLLMENT.get(a)
-                  or config.STRATEGY_VERSION)
+        label = (crm_models.get(a) or config.ENROLLMENT.get(a)
+                 or config.STRATEGY_VERSION)
+        # PRE-TRADE TIER CHECK (authoritative). The CRM's stored label is a RECORD, and a
+        # record can be stale — the nightly tier scan might not have run. NAV is the thing
+        # that actually decides which model an account can hold whole-share, and we have it
+        # right here, so we recompute the tier at the moment of use instead of trusting the
+        # stored label. This is deliberately independent of any scheduled job: if every scan
+        # in the system stopped, this still sizes each account against the correct model.
+        # Hysteresis is honoured by passing the stored label as the incumbent.
+        parent = small_tier.parent_version(label)
+        if parent in config_s.CLIENT_VERSIONS and a in crm_navs:
+            effective = small_tier.tier_for(crm_navs[a], parent, current_label=label)
+            if effective != label:
+                _TIER_MISMATCHES[a] = (label, effective, crm_navs[a])
+            label = effective
+        out[a] = label
     return out
 
 
@@ -259,6 +285,18 @@ def main(armed: bool = False, today: object = None) -> int:
               "connected, nothing transmitted.")
         return 0
     versions = resolve_roster_versions(roster_accounts)
+    if _TIER_MISMATCHES:
+        # The desk overrode the CRM's stored model for these accounts. That is the pre-trade
+        # check doing its job, but it also means the system of record is STALE — say so here
+        # rather than let a silent override hide a dead tier scan.
+        print("")
+        print(f"    !! MODEL TIER OVERRIDE - the CRM record disagrees with NAV for "
+              f"{len(_TIER_MISMATCHES)} account(s).")
+        print(f"       The desk is sizing against the NAV-correct model, NOT the stored one. "
+              f"The CRM record is stale;")
+        print(f"       check that 'daily-model-tier-scan' is still running.")
+        for acct, (stored, effective, nav) in sorted(_TIER_MISMATCHES.items()):
+            print(f"         {acct}: NAV ${nav:,.0f}  stored='{stored}'  -> using '{effective}'")
     print(f"    roster ({len(roster_accounts)} account(s)):")
     for a in roster_accounts:
         print(f"      {a}  ->  {versions[a]}")
