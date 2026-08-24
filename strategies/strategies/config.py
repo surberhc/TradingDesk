@@ -61,6 +61,31 @@ EQUITY_CORE_WEIGHTS = {"SPY": 2.0 / 3.0, "RSP": 1.0 / 3.0}
 SECTORS = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV",
            "XLI", "XLB", "XLRE", "XLK", "XLU"]
 
+# ---------------------------------------------------------------------------
+# SECTOR NEUTRAL CORE (STUDY-ONLY, DEFAULT OFF) - prereg
+# docs/PREREG_S0_sector_momentum_core_2026-08-24.md, Phase 1 "neutral-only" arm.
+#
+# Replaces the broad-beta equity sleeve (EQUITY_CORE) with the 11 Select Sector SPDRs held
+# at a DRIFTING STRATEGIC NEUTRAL. Motivation is NOT return: Phase 0 measured the neutral at
+# +15 bps/yr, i.e. free. It is held for (a) sector de-concentration vs cap weight, (b) a real
+# management surface (tax-loss harvesting between sectors, rebalancing, tilts), and (c) a
+# defensible client-facing book. It is NOT risk diversification: the 11 SPDRs partition the
+# S&P 500, so this is the same asset-class exposure shown as 11 line items.
+#
+# NEUTRAL = halfway between cap-weight (SPY) and equal-weight (RSP) sector allocations.
+# ANCHOR is Andrew's Aug-2026 table; weights for any other date are reconstructed by
+# de-drifting / drifting that anchor with realized sector returns (parts/sector.neutral_weights).
+# Reconstruction degrades going back (the Jun-2018 XLC spin-off is invisible to it), biasing
+# early-period weights toward UNDERweighting eventual winners - i.e. conservative, not flattering.
+SECTOR_NEUTRAL_ENABLED = False       # STUDY FLAG. True replaces EQUITY_CORE in the equity sleeve.
+SECTOR_NEUTRAL_ANCHOR_DATE = "2026-08-21"
+SECTOR_NEUTRAL_ANCHOR = {            # 50/50 cap/equal blend, Aug 2026 (Andrew's memo section 3)
+    "XLK": 0.274, "XLF": 0.133, "XLI": 0.119, "XLV": 0.110, "XLY": 0.099,
+    "XLC": 0.067, "XLP": 0.055, "XLU": 0.039, "XLE": 0.038, "XLRE": 0.037,
+    "XLB": 0.029,
+}
+SECTOR_NEUTRAL_REBUILD = "QE"        # quarterly re-derivation of the neutral (memo section 3)
+
 TBILLS = ["SGOV", "BIL"]
 SHORT_TREASURIES = ["SHY", "VGSH"]
 FLOATING_RATE = ["USFR", "TFLO"]

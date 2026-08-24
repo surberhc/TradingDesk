@@ -53,6 +53,9 @@ def _core_weights(prices: pd.DataFrame, asof: pd.Timestamp) -> pd.Series:
     not equal: they preserve the old three-fund sleeve's effective cap/equal mix after VTI
     was removed as a duplicate of SPY.
     """
+    if getattr(config, "SECTOR_NEUTRAL_ENABLED", False):
+        # STUDY ARM: the 11-sector drifting neutral REPLACES broad beta as the sleeve core.
+        return neutral_weights(prices, asof)
     core = [t for t in config.EQUITY_CORE if t in prices.columns]
     above = [t for t in core if gates.is_above_asof(prices[t], asof, buffer=config.trend_margin("sector"))]
     chosen = above or (["SPY"] if "SPY" in prices.columns else core[:1])
@@ -62,6 +65,85 @@ def _core_weights(prices: pd.DataFrame, asof: pd.Timestamp) -> pd.Series:
     if total <= 0:  # degenerate map -> fall back to equal weight rather than divide by zero
         return pd.Series(1.0 / len(chosen), index=chosen)
     return weights / total
+
+
+_NEUTRAL_CACHE: dict = {}
+
+
+def _neutral_history(prices: pd.DataFrame) -> "pd.Series":
+    """Quarterly history of the drifting sector NEUTRAL, as {quarter_end -> weights}.
+
+    Built by walking config.SECTOR_NEUTRAL_ANCHOR (a known 50/50 cap/equal blend at
+    config.SECTOR_NEUTRAL_ANCHOR_DATE) outward along the quarter grid, de-drifting
+    BACKWARD and drifting FORWARD by each sector's realized return over the quarter,
+    renormalizing each step.
+
+    CAUSALITY. For dates AFTER the anchor this is strictly causal (it only compounds
+    realized returns). For dates BEFORE the anchor it RECONSTRUCTS a historical fact —
+    the index's sector weights at T, which were knowable at T — rather than forecasting
+    anything. The reconstruction's error comes from index RECONSTITUTIONS it cannot see
+    (notably the 2018-06 XLC spin-off out of XLK/XLY), not from return-chasing: because
+    de-drifting assigns a LOWER past weight to sectors that subsequently outperformed, any
+    residual bias UNDERweights eventual winners early, which is conservative for a backtest
+    rather than flattering. Do not extend this reconstruction far before 2020 without
+    re-anchoring on real point-in-time index weights.
+    """
+    key = (config.SECTOR_NEUTRAL_ANCHOR_DATE, tuple(sorted(config.SECTOR_NEUTRAL_ANCHOR.items())),
+           prices.index[0], prices.index[-1], len(prices.index))
+    hit = _NEUTRAL_CACHE.get(key)
+    if hit is not None:
+        return hit
+
+    secs = [t for t in config.SECTOR_NEUTRAL_ANCHOR if t in prices.columns]
+    idx = prices.index
+    grid = [d for d in pd.date_range(idx[0], idx[-1], freq=config.SECTOR_NEUTRAL_REBUILD)]
+    grid = sorted({idx[idx <= d][-1] for d in grid if (idx <= d).any()})
+    a_ts = pd.Timestamp(config.SECTOR_NEUTRAL_ANCHOR_DATE)
+    a_pos = idx[idx <= a_ts][-1] if (idx <= a_ts).any() else idx[-1]
+    if a_pos not in grid:
+        grid = sorted(set(grid) | {a_pos})
+
+    w0 = pd.Series({t: float(config.SECTOR_NEUTRAL_ANCHOR[t]) for t in secs})
+    w0 = w0 / w0.sum()
+    hist = {a_pos: w0}
+    i = grid.index(a_pos)
+
+    def _qret(t0, t1):
+        out = {}
+        for t in secs:
+            a = prices[t].loc[:t0].iloc[-1] if (prices.index <= t0).any() else float("nan")
+            b = prices[t].loc[:t1].iloc[-1] if (prices.index <= t1).any() else float("nan")
+            out[t] = (b / a - 1.0) if (pd.notna(a) and pd.notna(b) and a > 0) else 0.0
+        return pd.Series(out)
+
+    for j in range(i, 0, -1):                       # backward: reconstruct the past
+        t1, t0 = grid[j], grid[j - 1]
+        prev = hist[t1] / (1.0 + _qret(t0, t1))
+        hist[t0] = prev / prev.sum()
+    for j in range(i, len(grid) - 1):                # forward: strictly causal
+        t0, t1 = grid[j], grid[j + 1]
+        nxt = hist[t0] * (1.0 + _qret(t0, t1))
+        hist[t1] = nxt / nxt.sum()
+
+    out = pd.Series(hist).sort_index()
+    _NEUTRAL_CACHE[key] = out
+    return out
+
+
+def neutral_weights(prices: pd.DataFrame, asof) -> pd.Series:
+    """The drifting sector NEUTRAL in force on `asof` — the most recent quarterly rebuild
+    on or before that date. Fractions over the 11 SPDR sectors, summing to 1.
+
+    NOT trend-gated: this is the STRATEGIC core and stays fully invested by design (memo
+    section 15). Deciding whether to own equity at all is the regime engine's job, and it
+    sizes this sleeve from the outside.
+    """
+    asof = pd.Timestamp(asof)
+    hist = _neutral_history(prices)
+    prior = hist.index[hist.index <= asof]
+    w = hist.loc[prior[-1]] if len(prior) else hist.iloc[0]
+    w = w[w > 0]
+    return w / w.sum()
 
 
 def select_sectors(
