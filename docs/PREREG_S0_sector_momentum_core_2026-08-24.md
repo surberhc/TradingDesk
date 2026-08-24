@@ -98,6 +98,27 @@ A. HARD GATES - these decide whether a result is REAL (non-negotiable, CLAUDE.md
 - OOS survival: the benefit appears in BOTH halves of the (already short) window - split 2018-07 -> 2022-12 and 2023-01 -> present.
 - PLATEAU: a contiguous region of the core/tactical sweep behaves consistently. One lucky cell = curve-fit = dead.
 
+### AMENDMENT 1 - significance bar for Phase 2 (added 2026-08-24, AFTER Phase 0, BEFORE Phase 1/2 is built)
+
+Phase 0 measured the noise floor of NO-SKILL sector selection: random 5-of-11 picks produced a
+standard deviation of 84 bps/yr of total-portfolio CAGR across seeds (range 7.56%-9.79%). The
+75 bps Phase 0 kill threshold therefore sits BELOW that noise floor. It remains valid for what it
+gated - a CEILING of 1,877 bps is far outside any noise band - but it is NOT a usable
+significance bar for a realistic signal.
+
+Amended, pre-committed BEFORE any Phase 2 number exists:
+- A Phase 2 point estimate is judged against the RANDOM-SELECTION distribution, not against
+  baseline. The random arm (>= 20 seeds) is run as a permanent control arm and its spread is
+  reported alongside every result.
+- The block-bootstrap 95% CI on alpha (prereg section 6, arm 4) must EXCLUDE ZERO. A point
+  estimate inside the random arm's +/-1 sigma band is reported as "indistinguishable from luck",
+  regardless of sign.
+- The NEUTRAL-ONLY arm is expected to land near baseline (Phase 0 measured +15 bps for
+  equal-weight-all-11). Beating it by less than the random spread is NOT evidence of skill.
+
+This amendment RAISES the bar. It is recorded here rather than applied silently, and it was
+written before Phase 1 was built.
+
 B. THE ADOPT DECISION - a return-vs-drawdown TRADE-OFF, Andrew's call on balance. Per his standing instruction (2026-07-20): no hard drawdown floor or ceiling. Report the bull-regime return gain side by side with each episode's drawdown change - the actual exchange rate - plus the operational cost (11 funds vs 2, turnover, small-account feasibility). Beta attribution informs this decision; it does not gate it.
 
 Valid honest outcomes, none hidden:
