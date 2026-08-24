@@ -73,12 +73,46 @@ def _crm_result():
 ROSTER = [ACCT_A, ACCT_B]
 
 
-# --- roster accessor ----------------------------------------------------------------
-def test_enrolled_roster_is_sorted_deduped_config_keys():
+# --- enrolled_roster(): every branch, deterministic (never reads the live CRM) --------
+# These monkeypatch the CRM seam on purpose. The old single test called enrolled_roster()
+# bare, so it hit the live database and asserted the 3-account degraded-mode fallback; once
+# the CRM read-seam went live it returned Andrew's real book and failed. A unit test must
+# not depend on live database contents.
+
+def test_enrolled_roster_falls_back_to_config_when_crm_unwired(monkeypatch):
+    """CRM not wired (no DSN) -> the degraded-mode local allow-list, sorted + de-duped."""
+    monkeypatch.setattr(roster.crm_roster, "is_configured", lambda: False)
     r = roster.enrolled_roster()
     assert r == sorted(set(config.ENROLLMENT))
     assert r == sorted(r) and len(r) == len(set(r))       # sorted + de-duped
     assert ACCT_A in r and ACCT_B in r                    # the human-blessed accounts
+
+
+def test_enrolled_roster_prefers_crm_over_config(monkeypatch):
+    """CRM wired and returning rows -> the CRM roster IS the allow-list; config is not consulted."""
+    monkeypatch.setattr(roster.crm_roster, "is_configured", lambda: True)
+    monkeypatch.setattr(roster, "crm_enrolled_roster", lambda *a, **k: ["U100", "U200"])
+    r = roster.enrolled_roster()
+    assert r == ["U100", "U200"]
+    assert ACCT_A not in r and ACCT_B not in r            # config fallback NOT mixed in
+
+
+def test_enrolled_roster_degrades_to_config_when_crm_unreachable(monkeypatch):
+    """CRM wired but unreachable -> fail-soft to the local allow-list, never an empty roster."""
+    monkeypatch.setattr(roster.crm_roster, "is_configured", lambda: True)
+
+    def _boom(*a, **k):
+        raise roster.crm_roster.CrmRosterUnavailable("simulated outage")
+
+    monkeypatch.setattr(roster, "crm_enrolled_roster", _boom)
+    assert roster.enrolled_roster() == sorted(set(config.ENROLLMENT))
+
+
+def test_enrolled_roster_degrades_to_config_when_crm_returns_empty(monkeypatch):
+    """CRM wired and reachable but empty -> the account wall must never be left empty."""
+    monkeypatch.setattr(roster.crm_roster, "is_configured", lambda: True)
+    monkeypatch.setattr(roster, "crm_enrolled_roster", lambda *a, **k: [])
+    assert roster.enrolled_roster() == sorted(set(config.ENROLLMENT))
 
 
 # --- (a) one request per non-empty-orders account, correct field mapping ------------

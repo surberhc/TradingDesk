@@ -6,8 +6,8 @@ runner that reads a REAL funded account (even though it is zero-transmit):
   * the target is computed BEFORE connecting — a target-computation failure connects nothing.
   * the connection is the READ-ONLY s0_live lane (connect_s0_live), and NO transmit path is
     ever exercised (the module imports no order_router; ib.placeOrder is never called).
-  * every read is FILTERED to the individual account U5721712 — the trust account U14438624
-    and the 'All' aggregate are never used for NetLiq or positions.
+  * every read is FILTERED to S0's own execution account (U14438624) — other accounts
+    under the same login and the 'All' aggregate are never used for NetLiq or positions.
   * an absent target account -> alert + non-zero return, nothing sized.
   * plan_account is wired with account/target/prices/universe, and a band breach renders
     'WOULD BUY / WOULD SELL' lines while transmitting nothing.
@@ -25,8 +25,16 @@ import pytest
 
 import s0_live_pilot_run as sp
 
-ACCT = sp.s0_live.S0_LIVE_ACCOUNT          # "U5721712" — S0's individual live account
-TRUST = "U14438624"                        # S8's trust account under the same login
+ACCT = sp.s0_live.S0_LIVE_ACCOUNT   # S0's live execution account (U14438624 since 2026-07-28)
+OTHER = "U5721712"                  # the RETIRED account, still visible under the same 4003 login
+
+# Guard: these fixtures only test anything while they are DIFFERENT accounts. ACCT tracks
+# S0_LIVE_ACCOUNT, so a future retarget that collides with OTHER would silently turn the
+# read-filtering tests below into no-ops. That happened once already (S0 moved to U14438624
+# on 2026-07-28, which was this file's hardcoded "other" account), so fail loudly instead.
+assert OTHER != ACCT, (
+    "test fixture collision: the 'other account' must not be S0's own execution account"
+)
 
 
 # --- fixtures -----------------------------------------------------------------------
@@ -131,7 +139,7 @@ def test_connects_readonly_and_never_transmits(monkeypatch):
     assert not hasattr(sp, "arming")
 
 
-# --- 3. every read is FILTERED to U5721712 ------------------------------------------
+# --- 3. every read is FILTERED to S0's own account ----------------------------------
 def test_reads_are_filtered_to_individual_account(monkeypatch):
     _patch_common(monkeypatch)
     captured = {}
@@ -139,12 +147,12 @@ def test_reads_are_filtered_to_individual_account(monkeypatch):
     fake = _FakeIB(
         summary_rows=[
             _summary_row(ACCT, "NetLiquidation", "100000"),
-            _summary_row(TRUST, "NetLiquidation", "999999"),   # trust — must be ignored
+            _summary_row(OTHER, "NetLiquidation", "999999"),   # other account — must be ignored
             _summary_row("All", "NetLiquidation", "888"),      # aggregate — must be ignored
         ],
         position_rows=[
             _pos_row(ACCT, "SPY", 10),
-            _pos_row(TRUST, "TLT", 5),                          # trust — must be ignored
+            _pos_row(OTHER, "TLT", 5),                          # other account — must be ignored
         ],
     )
     monkeypatch.setattr(sp.s0_live, "connect_s0_live", lambda *a, **k: fake)
@@ -160,15 +168,15 @@ def test_reads_are_filtered_to_individual_account(monkeypatch):
     rc = sp.main()
 
     assert rc == 0
-    assert captured["net_liq"] == 100000.0             # U5721712's NetLiq, not the trust's
-    assert captured["positions"] == {"SPY": 10}        # only U5721712's positions
+    assert captured["net_liq"] == 100000.0             # S0's own NetLiq, not the other account's
+    assert captured["positions"] == {"SPY": 10}        # only S0's own positions
 
 
 # --- 4. target account NOT found under the login ------------------------------------
 def test_account_not_found_alerts_and_sizes_nothing(monkeypatch):
     _patch_common(monkeypatch)
 
-    fake = _FakeIB([_summary_row(TRUST, "NetLiquidation", "999999"),
+    fake = _FakeIB([_summary_row(OTHER, "NetLiquidation", "999999"),
                     _summary_row("All", "NetLiquidation", "888")], [])
     monkeypatch.setattr(sp.s0_live, "connect_s0_live", lambda *a, **k: fake)
 
