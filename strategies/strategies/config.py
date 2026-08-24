@@ -86,6 +86,38 @@ SECTOR_NEUTRAL_ANCHOR = {            # 50/50 cap/equal blend, Aug 2026 (Andrew's
 }
 SECTOR_NEUTRAL_REBUILD = "QE"        # quarterly re-derivation of the neutral (memo section 3)
 
+
+# ---------------------------------------------------------------------------
+# SMALL-ACCOUNT TIER - whole-share proxy for accounts under the threshold
+# DECIDED 2026-08-06 for Growth. Proposal: SmallAccount_Tier_Proposal_2026-08-05.md.
+# EXTENDED 2026-08-24 (Andrew) to ALL THREE versions: Conservative, Balanced, Growth.
+#
+# WHY: fractional / cash-quantity orders are impossible over the TWS socket API, and the full
+# models' SPY at ~$766/share cannot be whole-share-held on target in a small account. Rather
+# than hold a badly-tracking multi-ETF model, small accounts hold a 2-ticker PROXY of the SAME
+# engine output: the equity sleeve collapses to one cheap total-market ETF and everything else
+# (defensive + real-asset) collapses to the same floating-rate fund the full models already use.
+# SCHB ~$29.61/share vs SPY ~$766 is the whole point - it is the fine-grained quantum.
+#
+# This is NOT a separate strategy, and there is not one per version. It is a RENDERING of
+# whichever version's engine output onto two tickers, so each version's own dynamic
+# risk-on/risk-off behaviour - the actual edge - is preserved exactly. Conservative (Small),
+# Balanced (Small) and Growth (Small) therefore differ from each other exactly as their
+# full-size parents do: by the equity/defensive split the engine hands them.
+SMALL_TIER_EQUITY = "SCHB"        # total US market; 0.9984 corr to VTI, 0.99%/yr tracking diff
+SMALL_TIER_DEFENSIVE = "USFR"     # the same floating-rate sleeve the full models use
+SMALL_TIER_SUFFIX = " (Small)"    # label convention: "Balanced" -> "Balanced (Small)"
+
+# NAV tiering with HYSTERESIS, so an account near the line does not churn models every month.
+# NOTE: the $25k boundary was derived from GROWTH's whole-share math (its ~85% equity sleeve
+# in $766 SPY is the binding constraint). Per-version drift is measured in
+# backtester/output/SmallAccount_AllVersions_2026-08-24.md; a version needing a different
+# boundary gets an entry in SMALL_TIER_THRESHOLD_BY_VERSION rather than a global change.
+SMALL_TIER_THRESHOLD = 25_000.0   # the decision boundary for a NEW/unassigned account
+SMALL_TIER_PROMOTE_AT = 27_500.0  # small -> full only at/above this
+SMALL_TIER_DEMOTE_AT = 22_500.0   # full -> small only below this
+SMALL_TIER_THRESHOLD_BY_VERSION: dict = {}   # empty = every version uses the values above
+
 TBILLS = ["SGOV", "BIL"]
 SHORT_TREASURIES = ["SHY", "VGSH"]
 FLOATING_RATE = ["USFR", "TFLO"]
