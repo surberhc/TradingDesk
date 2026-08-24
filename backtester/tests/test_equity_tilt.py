@@ -17,6 +17,27 @@ import pandas as pd
 import pytest
 
 from strategies import config
+
+import pytest as _pytest_for_pin
+from strategies import config as _cfg_pin
+from strategies.parts import sector as _sector_pin
+
+
+@_pytest_for_pin.fixture(autouse=True)
+def _legacy_broad_beta_path():
+    """This module covers the ORIGINAL broad-beta + equity-tilt path.
+
+    That path is still live and still correct, but it only runs when the 11-sector neutral is
+    OFF - and the neutral was ARMED in production on 2026-08-24. Pin the flag off so this
+    module keeps testing what it was written to test.
+    """
+    prev = _cfg_pin.SECTOR_NEUTRAL_ENABLED
+    _cfg_pin.SECTOR_NEUTRAL_ENABLED = False
+    _sector_pin._NEUTRAL_CACHE.clear()
+    yield
+    _cfg_pin.SECTOR_NEUTRAL_ENABLED = prev
+    _sector_pin._NEUTRAL_CACHE.clear()
+
 from strategies.parts import equity_tilt, sector
 
 from src import beta_attrib

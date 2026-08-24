@@ -77,57 +77,73 @@ _NEUTRAL_CACHE: dict = {}
 def _neutral_history(prices: pd.DataFrame) -> "pd.Series":
     """Quarterly history of the drifting sector NEUTRAL, as {quarter_end -> weights}.
 
-    Built by walking config.SECTOR_NEUTRAL_ANCHOR (a known 50/50 cap/equal blend at
-    config.SECTOR_NEUTRAL_ANCHOR_DATE) outward along the quarter grid, de-drifting
-    BACKWARD and drifting FORWARD by each sector's realized return over the quarter,
-    renormalizing each step.
+    Built from config.SECTOR_NEUTRAL_OBSERVED, a dated list of real observations of the
+    50/50 cap/equal blend. Between observations the weights DRIFT FORWARD on each sector's
+    realized return; on an observation date they SNAP to the observed vector. This is the
+    memo section 3 quarterly-recalculation rule expressed directly.
 
-    CAUSALITY. For dates AFTER the anchor this is strictly causal (it only compounds
-    realized returns). For dates BEFORE the anchor it RECONSTRUCTS a historical fact —
-    the index's sector weights at T, which were knowable at T — rather than forecasting
-    anything. The reconstruction's error comes from index RECONSTITUTIONS it cannot see
-    (notably the 2018-06 XLC spin-off out of XLK/XLY), not from return-chasing: because
-    de-drifting assigns a LOWER past weight to sectors that subsequently outperformed, any
-    residual bias UNDERweights eventual winners early, which is conservative for a backtest
-    rather than flattering. Do not extend this reconstruction far before 2020 without
-    re-anchoring on real point-in-time index weights.
+    STRICTLY CAUSAL. A weight at T depends only on observations dated on or before T and on
+    returns realized on or before T, so appending future bars — or adding a later observation
+    — cannot change it. There is deliberately NO backward reconstruction: an earlier version
+    de-drifted backward from a 2026 anchor and failed tests/test_no_lookahead.py, because that
+    makes every historical weight a function of data that did not exist yet.
+
+    The earliest entry's own provenance (an estimate, with disclosed error) is documented at
+    config.SECTOR_NEUTRAL_OBSERVED. It is a frozen constant, not a per-date re-derivation.
     """
-    key = (config.SECTOR_NEUTRAL_ANCHOR_DATE, tuple(sorted(config.SECTOR_NEUTRAL_ANCHOR.items())),
+    obs = {pd.Timestamp(k): v for k, v in config.SECTOR_NEUTRAL_OBSERVED.items()}
+    key = (tuple(sorted((str(k), tuple(sorted(v.items()))) for k, v in obs.items())),
            prices.index[0], prices.index[-1], len(prices.index))
     hit = _NEUTRAL_CACHE.get(key)
     if hit is not None:
         return hit
 
-    secs = [t for t in config.SECTOR_NEUTRAL_ANCHOR if t in prices.columns]
     idx = prices.index
     grid = [d for d in pd.date_range(idx[0], idx[-1], freq=config.SECTOR_NEUTRAL_REBUILD)]
     grid = sorted({idx[idx <= d][-1] for d in grid if (idx <= d).any()})
-    a_ts = pd.Timestamp(config.SECTOR_NEUTRAL_ANCHOR_DATE)
-    a_pos = idx[idx <= a_ts][-1] if (idx <= a_ts).any() else idx[-1]
-    if a_pos not in grid:
-        grid = sorted(set(grid) | {a_pos})
+    # Every observation gets its own grid point so a re-anchor takes effect on its real date.
+    for od in obs:
+        if (idx <= od).any():
+            grid = sorted(set(grid) | {idx[idx <= od][-1]})
+    if not grid:
+        raise ValueError("no usable quarter grid for the sector neutral")
 
-    w0 = pd.Series({t: float(config.SECTOR_NEUTRAL_ANCHOR[t]) for t in secs})
-    w0 = w0 / w0.sum()
-    hist = {a_pos: w0}
-    i = grid.index(a_pos)
+    def _snap_for(t):
+        """The latest OBSERVED vector dated on or before t, or None."""
+        prior = [od for od in obs if (idx <= od).any() and idx[idx <= od][-1] <= t]
+        if not prior:
+            return None
+        return obs[max(prior)]
 
     def _qret(t0, t1):
         out = {}
-        for t in secs:
-            a = prices[t].loc[:t0].iloc[-1] if (prices.index <= t0).any() else float("nan")
-            b = prices[t].loc[:t1].iloc[-1] if (prices.index <= t1).any() else float("nan")
-            out[t] = (b / a - 1.0) if (pd.notna(a) and pd.notna(b) and a > 0) else 0.0
+        for tk in secs:
+            a = prices[tk].loc[:t0].iloc[-1] if (prices.index <= t0).any() else float("nan")
+            b = prices[tk].loc[:t1].iloc[-1] if (prices.index <= t1).any() else float("nan")
+            out[tk] = (b / a - 1.0) if (pd.notna(a) and pd.notna(b) and a > 0) else 0.0
         return pd.Series(out)
 
-    for j in range(i, 0, -1):                       # backward: reconstruct the past
-        t1, t0 = grid[j], grid[j - 1]
-        prev = hist[t1] / (1.0 + _qret(t0, t1))
-        hist[t0] = prev / prev.sum()
-    for j in range(i, len(grid) - 1):                # forward: strictly causal
-        t0, t1 = grid[j], grid[j + 1]
-        nxt = hist[t0] * (1.0 + _qret(t0, t1))
-        hist[t1] = nxt / nxt.sum()
+    all_tickers = sorted({t for v in obs.values() for t in v})
+    secs = [t for t in all_tickers if t in prices.columns]
+
+    hist: dict = {}
+    prev_w = None
+    for j, t in enumerate(grid):
+        snap = _snap_for(t)
+        if snap is not None and (prev_w is None or _snap_for(t) is not _snap_for(grid[j - 1])):
+            w = pd.Series({k: float(snap[k]) for k in secs if k in snap})
+            w = w / w.sum()
+        elif prev_w is None:
+            # Before the first observation there is nothing causal to say; hold the earliest
+            # observed vector flat rather than invent one.
+            first = obs[min(obs)]
+            w = pd.Series({k: float(first[k]) for k in secs if k in first})
+            w = w / w.sum()
+        else:
+            w = prev_w * (1.0 + _qret(grid[j - 1], t))
+            w = w / w.sum()
+        hist[t] = w
+        prev_w = w
 
     out = pd.Series(hist).sort_index()
     _NEUTRAL_CACHE[key] = out

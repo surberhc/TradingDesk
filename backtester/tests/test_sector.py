@@ -14,6 +14,23 @@ from strategies import config
 from strategies.parts import sector
 
 
+@pytest.fixture(autouse=True)
+def _legacy_broad_beta_path():
+    """These tests cover the ORIGINAL broad-beta + sector-tilt path.
+
+    That path is still live and still correct, but it only runs when the 11-sector neutral is
+    OFF - and the neutral was ARMED in production on 2026-08-24. Pin the flag off here so this
+    module keeps testing what it was written to test, rather than silently testing the neutral.
+    """
+    prev = config.SECTOR_NEUTRAL_ENABLED
+    config.SECTOR_NEUTRAL_ENABLED = False
+    sector._NEUTRAL_CACHE.clear()
+    yield
+    config.SECTOR_NEUTRAL_ENABLED = prev
+    sector._NEUTRAL_CACHE.clear()
+
+
+
 def _frame(n=400):
     """SPY/VTI/RSP rising broad beta + all sectors (one leader, rest laggards)."""
     idx = pd.bdate_range("2012-01-02", periods=n)

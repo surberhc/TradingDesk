@@ -77,12 +77,52 @@ SECTORS = ["XLC", "XLY", "XLP", "XLE", "XLF", "XLV",
 # de-drifting / drifting that anchor with realized sector returns (parts/sector.neutral_weights).
 # Reconstruction degrades going back (the Jun-2018 XLC spin-off is invisible to it), biasing
 # early-period weights toward UNDERweighting eventual winners - i.e. conservative, not flattering.
-SECTOR_NEUTRAL_ENABLED = False       # STUDY FLAG. True replaces EQUITY_CORE in the equity sleeve.
-SECTOR_NEUTRAL_ANCHOR_DATE = "2026-08-21"
-SECTOR_NEUTRAL_ANCHOR = {            # 50/50 cap/equal blend, Aug 2026 (Andrew's memo section 3)
-    "XLK": 0.274, "XLF": 0.133, "XLI": 0.119, "XLV": 0.110, "XLY": 0.099,
-    "XLC": 0.067, "XLP": 0.055, "XLU": 0.039, "XLE": 0.038, "XLRE": 0.037,
-    "XLB": 0.029,
+SECTOR_NEUTRAL_ENABLED = True        # ARMED 2026-08-24 by Andrew. Replaces EQUITY_CORE
+                                     # (SPY/RSP) with the 11-sector drifting neutral.
+                                     # Adopted on NON-return grounds: Phase 1 measured it
+                                     # performance-neutral (8.49% vs 8.60% baseline, inside
+                                     # the noise band). It is held for sector
+                                     # de-concentration (~27% tech vs SPY's ~34%), a real
+                                     # management surface, and a defensible client book.
+                                     # NOT risk diversification - the 11 SPDRs partition
+                                     # the S&P 500. Whole-share checked before arming: at
+                                     # a $25,000 account it drifts 2.26% vs 2.39% for the
+                                     # SPY/RSP sleeve it replaces, and no holding rounds
+                                     # to zero shares.
+# OBSERVED ANCHORS. The neutral is re-anchored whenever we have a real observation of the
+# 50/50 cap/equal sector blend, and DRIFTS FORWARD on realized returns between observations.
+# This is the memo section 3 quarterly-recalculation rule expressed directly, and it is
+# STRICTLY CAUSAL: at any date T the code takes the latest observation dated ON OR BEFORE T,
+# so appending a future observation cannot change a past weight.
+#
+# WHY IT IS A LIST. An earlier version used a single 2026 anchor and de-drifted BACKWARD to
+# reach earlier dates. That failed tests/test_no_lookahead.py -- a backward walk makes every
+# historical weight a function of data that did not exist yet (XLB at 2018-02 moved
+# 2.37% -> 1.96% when future bars were truncated). Backward reconstruction is GONE.
+#
+# 2018-06-29 -- ESTIMATE, not an observation. Derived once by de-drifting the 2026 table back,
+#   then frozen as a literal so nothing re-derives it. It carries known error: XLK 13.6% where
+#   the true blend was likely ~17-18%, because de-drifting cannot see index reconstitutions
+#   (the 2018-06 XLC spin-off out of XLK/XLY). The error UNDERweights the period's biggest
+#   winner, so it biases backtests DOWN, not up. It exists to give the backtest a causal
+#   starting point, and it is the FIRST quarter in which all 11 sectors exist.
+# 2026-08-21 -- OBSERVED. Andrew's own Aug-2026 table (memo section 3). This is what the LIVE
+#   book uses, because it is a real reading of the current blend rather than eight years of
+#   accumulated drift error.
+#
+# TO RE-ANCHOR: add a dated entry with the then-current blend. Never edit an existing one --
+# that would silently rewrite history and re-introduce the look-ahead this structure removed.
+SECTOR_NEUTRAL_OBSERVED = {
+    "2018-06-29": {   # ESTIMATE (see above)
+        "XLF": 0.149612, "XLK": 0.136406, "XLV": 0.129824, "XLY": 0.120332,
+        "XLI": 0.117155, "XLC": 0.078001, "XLP": 0.075279, "XLRE": 0.057955,
+        "XLU": 0.052298, "XLE": 0.045258, "XLB": 0.037881,
+    },
+    "2026-08-21": {   # OBSERVED -- Andrew's table, memo section 3
+        "XLK": 0.274, "XLF": 0.133, "XLI": 0.119, "XLV": 0.110, "XLY": 0.099,
+        "XLC": 0.067, "XLP": 0.055, "XLU": 0.039, "XLE": 0.038, "XLRE": 0.037,
+        "XLB": 0.029,
+    },
 }
 SECTOR_NEUTRAL_REBUILD = "QE"        # quarterly re-derivation of the neutral (memo section 3)
 
