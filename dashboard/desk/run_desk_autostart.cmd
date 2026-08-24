@@ -25,5 +25,5 @@ if not defined TRADINGDESK_CRM_DSN (
 )
 
 set "PYTHONPATH=C:\TradingDesk-Local\venv\Lib\site-packages;%PYTHONPATH%"
-start "" /b "C:\Users\andre\AppData\Local\Programs\Python\Python312\pythonw.exe" -m streamlit run desk_app.py --server.port 8502 --server.headless true --server.address 0.0.0.0 --browser.gatherUsageStats=false
+start "" /b "C:\Users\andre\AppData\Local\Programs\Python\Python312\pythonw.exe" -m streamlit run desk_app.py --server.port 8502 --server.headless true --server.address 127.0.0.1 --browser.gatherUsageStats=false
 exit /b 0
