@@ -10,7 +10,9 @@ non-bypassable safety envelope AND the 2026-07-28 rebuild:
   3. conform=True adds a full-liquidation SELL for each ALIEN holding.
   4. sells are sequenced BEFORE buys in the ordered leg list.
   5. total BUY notional > investable -> refuse (no transmit).
-  6. a single order > 50% of NetLiq -> refuse (no transmit).
+  6. a single order past the per-order fat-finger rail (BUY > 2x the model's own target
+     dollars for that symbol) -> refuse; a never-invested account's FIRST deploy at full
+     model weight (85% of NetLiq) is PERMITTED.
   7. wrong account (not U14438624) -> refuse.
   8. arm token required (and conform alone, without arming, transmits nothing).
   9. kill switch present -> preview only.
@@ -276,11 +278,14 @@ def test_total_buy_over_investable_refuses(monkeypatch):
     assert config.DRY_RUN is True and config.READONLY is True
 
 
-# --- 6. a single order > 50% of NetLiq -> refuse ------------------------------------
-def test_per_order_over_half_netliq_refuses(monkeypatch):
-    plan = _fake_plan(orders={"VTI": 1}, alien_lines=[], investable=98_500.0,
+# --- 6. per-order fat-finger rail: refuses a bloated BUY, permits a first deploy -----
+def test_per_order_over_model_multiple_refuses(monkeypatch):
+    # Model wants 10% of NetLiq in VTI ($10,000); the leg is 200 x $250 = $50,000, i.e. 5x
+    # the model's own target for that symbol. Still under investable, so the rail is what
+    # blocks it.
+    plan = _fake_plan(orders={"VTI": 200}, alien_lines=[], investable=98_500.0,
                       net_liq=100_000.0)
-    tgt = _fake_target(weights={"VTI": 1.0}, prices={"VTI": 60_000.0})
+    tgt = _fake_target(weights={"VTI": 0.1}, prices={"VTI": 250.0})
     _patch_common(monkeypatch, plan=plan, target=tgt)
     fake = _TxFakeIB(_summary(), [])
     _wire_connections(monkeypatch, fake)
@@ -289,6 +294,28 @@ def test_per_order_over_half_netliq_refuses(monkeypatch):
 
     assert rc == 0
     assert fake.placed == []
+    assert config.DRY_RUN is True and config.READONLY is True
+
+
+def test_never_invested_first_deploy_transmits(monkeypatch):
+    """THE U5721712 CASE (2026-08-25): a never-invested account deploying into its model buys
+    the dominant leg at ~85% of NetLiq BY CONSTRUCTION. The old flat 50%-of-NetLiq cap made
+    that a hard block on every such account even when fully armed; end-to-end it must now go
+    through (owner decision D3, 2026-08-19)."""
+    plan = _fake_plan(orders={"SCHB": 27, "USFR": 2}, alien_lines=[],
+                      investable=957.10, net_liq=957.10)
+    tgt = _fake_target(weights={"SCHB": 0.85, "USFR": 0.15},
+                       prices={"SCHB": 29.65, "USFR": 50.0})
+    _patch_common(monkeypatch, plan=plan, target=tgt)
+    fake = _TxFakeIB(_summary(net_liq="957.10", buying_power="957.10",
+                             total_cash="957.10"), [])
+    _wire_connections(monkeypatch, fake)
+
+    rc = dep.main(armed=True, conform=True)
+
+    assert rc == 0
+    schb = [o for o in fake.placed if o.action == "BUY" and float(o.totalQuantity) == 27]
+    assert schb, f"the 85%-weight first-deploy leg must transmit; placed={fake.placed}"
     assert config.DRY_RUN is True and config.READONLY is True
 
 

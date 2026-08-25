@@ -81,9 +81,39 @@ STATUS_BLOCKED = "BLOCKED"
 _ARM_TOKEN_HINT = "--arm-i-understand"
 _CONFORM_FLAG_HINT = "--conform"
 
-# NOTIONAL SANITY CAP default (sized for a real deploy, not a tiny test): no single order's
-# notional may exceed this fraction of NetLiq (fat-finger / bad-price backstop).
-MAX_ORDER_NOTIONAL_PCT_NLV = 0.50
+# PER-ORDER FAT-FINGER RAIL (2026-08-25 rebuild — owner decision D3, 2026-08-19: "NO ORDER
+# CAPS. %NLV and max-notional caps just create issues").
+#
+# WHAT WAS HERE: MAX_ORDER_NOTIONAL_PCT_NLV = 0.50 — no single order's notional could exceed
+# 50% of NetLiq. That rail is STRUCTURALLY wrong for this desk: a never-invested account's
+# FIRST deploy buys the model's largest leg at its full model weight, which is ~85% of NetLiq
+# BY CONSTRUCTION (Growth (Small) = SCHB 85% + USFR 15%). It therefore blocked the initial
+# deploy of EVERY never-invested account even when fully armed — observed 2026-08-25 in the
+# read-only whole-roster preview on U5721712 (NetLiq 957.10, zero positions):
+#     order BUY SCHB x27 notional 800.55 > 50% of NetLiq (478.55)
+#
+# WHAT REPLACES IT: a rail measured against what the PLAN ITSELF calls for, not against an
+# arbitrary slice of NetLiq. It cannot false-block a legitimate order of any size, and it is
+# strictly TIGHTER than the old rail in the direction that can actually hurt:
+#   * BUY  — notional may not exceed MAX_ORDER_MODEL_MULTIPLE x the model's own target dollars
+#            for that symbol (weight x managed NetLiq), floored at one share so a single share
+#            is always permitted. Catches BOTH fat-finger classes on the only side that can
+#            overspend: a 10x quantity and a 10x limit price both blow through the multiple.
+#   * SELL — quantity may not exceed the shares the account ACTUALLY HOLDS. This desk never
+#            shorts, and by construction |delta| <= int(actual_shares) for a sell (an alien
+#            liquidation is exactly int(actual_shares)), so this is an exact invariant check:
+#            zero false blocks, and it catches a corrupted quantity the %NLV cap would have
+#            waved through whenever the position was under half of NetLiq. A too-high SELL
+#            limit simply does not fill (limit orders protect), so notional is not the risk
+#            on that side and never was.
+# The plan-level total-BUY-<=-investable cap (ExecutionCaps.total_buy_le_investable) is
+# untouched: it is an arithmetic consistency check against over-deploying, not a "cap" in the
+# sense D3 refused, and it already bounds every BUY leg by the account's investable capital.
+MAX_ORDER_MODEL_MULTIPLE = 2.0
+# Sell legs on a plan carrying no per-symbol holding record (a synthetic/partial plan) have no
+# share count to check against; they fall back to this multiple of managed NetLiq as a pure
+# implausibility backstop. A real AccountPlan always carries `lines` / `alien_lines`.
+MAX_SELL_NOTIONAL_NLV_MULTIPLE = 2.0
 
 # TWO-PHASE / RE-PRICE / CASH-GATE tuning (2026-07-28 rebuild). All bounded so a run always
 # terminates and never blocks on the wire.
@@ -119,11 +149,16 @@ DEPLOY_REF_TAG = "deploy"
 # ========================================================================================
 @dataclass
 class ExecutionCaps:
-    """The per-run notional sanity caps. `per_order_notional_pct_nlv`: no single order's
-    notional may exceed this fraction of NetLiq. `total_buy_le_investable`: total BUY notional
-    must not exceed the plan's investable. `max_total_notional`: an optional absolute ceiling
-    on total notional (None = not enforced; the investable cap already bounds deployment)."""
-    per_order_notional_pct_nlv: float = MAX_ORDER_NOTIONAL_PCT_NLV
+    """The per-run sanity rails. `per_order_model_multiple`: a BUY leg's notional may not
+    exceed this multiple of the model's own target dollars for that symbol (weight x managed
+    NetLiq) — the fat-finger rail, measured against the plan rather than against a flat slice
+    of NetLiq (see MAX_ORDER_MODEL_MULTIPLE for why the old %NLV cap was removed, owner
+    decision D3 2026-08-19). `total_buy_le_investable`: total BUY notional must not exceed the
+    plan's investable. `max_total_notional`: an optional absolute ceiling on total notional
+    (None = not enforced; the investable cap already bounds deployment).
+
+    SELL legs are rails-checked against the shares actually held, which needs no knob."""
+    per_order_model_multiple: float = MAX_ORDER_MODEL_MULTIPLE
     total_buy_le_investable: bool = True
     max_total_notional: float | None = None
 
@@ -412,6 +447,75 @@ def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool):
     # SELLS (plan sells + alien liquidations) BEFORE BUYS — raise cash first.
     legs = sells + alien_sells + buys
     return legs, aliens_left, unpriceable
+
+
+# ========================================================================================
+# PER-ORDER FAT-FINGER RAIL — measured against the PLAN, not a flat slice of NetLiq.
+# ========================================================================================
+def _held_shares(plan, symbol: str) -> float | None:
+    """The shares of `symbol` the account actually holds, off the plan's own reconciliation
+    (`lines` for managed holdings, `alien_lines` for review-only ones). None when the plan
+    carries no record for that symbol — a synthetic/partial plan; the caller then falls back
+    to an implausibility backstop rather than pretending to know. PURE."""
+    best: float | None = None
+    for ln in list(getattr(plan, "lines", None) or []) + \
+            list(getattr(plan, "alien_lines", None) or []):
+        if getattr(ln, "symbol", None) != symbol:
+            continue
+        try:
+            shares = float(getattr(ln, "actual_shares", 0.0) or 0.0)
+        except (TypeError, ValueError):
+            continue
+        best = shares if best is None else max(best, shares)
+    return best
+
+
+def per_order_rail_reasons(legs, plan, target, *, managed_net_liq: float,
+                           model_multiple: float = MAX_ORDER_MODEL_MULTIPLE) -> list[str]:
+    """PURE. The per-order fat-finger rail: return one blocking reason per leg that fails it
+    (empty list = every leg is plausible). Builds and transmits nothing.
+
+    BUY  — notional <= model_multiple x (target weight x managed NetLiq), floored at one
+           share's limit so a single share is never refused. A first deploy into a full model
+           weight (85% of NetLiq for Growth (Small)) passes by construction; a 10x quantity or
+           a 10x limit price does not.
+    SELL — quantity <= the shares actually held (this desk never shorts). Falls back to
+           notional <= MAX_SELL_NOTIONAL_NLV_MULTIPLE x managed NetLiq only when the plan
+           carries no holding record for the symbol.
+    """
+    weights = getattr(target, "weights", None)
+    reasons: list[str] = []
+    for l in legs:
+        if l.side == "BUY":
+            try:
+                w = float(weights.get(l.symbol, 0.0)) if weights is not None else 0.0
+            except (TypeError, ValueError):
+                w = 0.0
+            if w != w:                       # NaN weight -> treat as no allocation
+                w = 0.0
+            allowance = max(w * managed_net_liq * model_multiple, float(l.limit))
+            if l.notional > allowance:
+                reasons.append(
+                    f"order BUY {l.symbol} x{l.qty} notional {l.notional:,.2f} exceeds "
+                    f"{model_multiple:g}x the model's target for {l.symbol} "
+                    f"({w*100:.2f}% of managed NetLiq {managed_net_liq:,.2f} = "
+                    f"{w*managed_net_liq:,.2f}; allowed {allowance:,.2f}) — "
+                    f"fat-finger / bad-price rail")
+            continue
+        held = _held_shares(plan, l.symbol)
+        if held is None:
+            ceiling = MAX_SELL_NOTIONAL_NLV_MULTIPLE * managed_net_liq
+            if l.notional > ceiling:
+                reasons.append(
+                    f"order SELL {l.symbol} x{l.qty} notional {l.notional:,.2f} exceeds "
+                    f"{MAX_SELL_NOTIONAL_NLV_MULTIPLE:g}x managed NetLiq "
+                    f"({ceiling:,.2f}) and the plan carries no holding record for "
+                    f"{l.symbol} to size against — fat-finger rail")
+        elif l.qty > held + 1e-6:
+            reasons.append(
+                f"order SELL {l.symbol} x{l.qty} exceeds the {held:,.4f} share(s) actually "
+                f"held — this desk never shorts; fat-finger rail")
+    return reasons
 
 
 def _scale_buys_to_cash(buy_legs, available_cash: float, *,
@@ -710,14 +814,17 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     net_liq = req.net_liq
     summary = req.summary
     caps = req.caps
-    per_order_pct = caps.per_order_notional_pct_nlv
+    model_multiple = caps.per_order_model_multiple
+    # The model's weights apply to the MANAGED sleeve (net_liq minus any held-aside block),
+    # so that — not the whole account — is the denominator the per-order rail sizes against.
+    # AccountPlan normalizes managed_net_liq to net_liq when nothing is held aside.
+    managed_net_liq = float(getattr(plan, "managed_net_liq", None) or net_liq)
 
     # [7] Build the full ordered DEPLOY order list (sells first, then buys; conform adds the
     # ALIEN liquidations). Whole-share, price-guarded caps.
     legs, aliens_left, unpriceable = build_deploy_legs(plan, quotes, prices, conform=conform)
     total_buy = sum(l.notional for l in legs if l.side == "BUY")
     total_sell = sum(l.notional for l in legs if l.side == "SELL")
-    per_order_cap = per_order_pct * net_liq
 
     print(f"\n[7] DEPLOY order list ({len(legs)} leg(s); sells first, then buys) — "
           f"conform={'ON' if conform else 'off'}:")
@@ -760,12 +867,13 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     if unpriceable:
         reasons.append(f"{len(unpriceable)} leg(s) have no usable price (deploy must be "
                        f"complete): {unpriceable}")
-    # Per-order sanity cap: no single order's notional may exceed 50% of NetLiq.
-    for l in legs:
-        if l.notional > per_order_cap:
-            reasons.append(f"order {l.side} {l.symbol} x{l.qty} notional {l.notional:,.2f} "
-                           f"> {per_order_pct*100:.0f}% of NetLiq "
-                           f"({per_order_cap:,.2f})")
+    # Per-order fat-finger rail, measured against the PLAN (BUY: <= model_multiple x the
+    # model's target dollars for the symbol; SELL: <= the shares actually held). Replaces the
+    # flat 50%-of-NetLiq cap, which blocked every never-invested account's first deploy by
+    # construction — owner decision D3 (2026-08-19), evidence U5721712 2026-08-25.
+    reasons.extend(per_order_rail_reasons(legs, plan, target,
+                                          managed_net_liq=managed_net_liq,
+                                          model_multiple=model_multiple))
     # Total-notional sanity cap: total BUY notional must not exceed investable. (The two-phase
     # cash gate re-sizes buys to realized cash at transmit time; this is the plan-level cap.)
     if caps.total_buy_le_investable and total_buy > plan.investable:

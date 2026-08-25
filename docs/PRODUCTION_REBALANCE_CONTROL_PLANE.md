@@ -131,7 +131,7 @@ execute_plan(plan_request, *, mode) -> ExecutionResult
 | `target` | the `Target` (for reconcile + weights) |
 | `quotes` / `prices` | fresh, sane market data (stale/None/zero rejected at build) |
 | `allowed_accounts` | the account wall — single id or an allow-list/roster; ANY other refused |
-| `caps` | `per_order_notional_pct_nlv`, `total_buy_le_investable`, `max_total_notional` |
+| `caps` | `per_order_model_multiple` (BUY notional <= Nx the model's target dollars for that symbol; SELL legs are rails-checked against shares actually held — replaced the flat `per_order_notional_pct_nlv` %NLV cap 2026-08-25 per owner decision D3), `total_buy_le_investable`, `max_total_notional` |
 | `conform` | opt-in: turn ALIEN holdings into liquidation sells (deploy only; default off) |
 | `run_id` | per-run stamp (idempotency namespace) |
 

@@ -39,6 +39,14 @@ ACCT = "U14438624"
 OTHER = "U5721712"
 
 
+def _per_order_rail_reasons(result):
+    """Every blocking reason that came from the PER-ORDER rail — the new plan-relative one
+    AND the retired flat 50%-of-NetLiq cap, so a 'this order is permitted' assertion fails
+    loudly against either implementation instead of passing vacuously."""
+    return [r for r in result.reasons
+            if "fat-finger" in r or "never shorts" in r or "of NetLiq" in r]
+
+
 # --- leak guard (mirrors the deploy suite) ------------------------------------------
 @pytest.fixture(autouse=True)
 def _no_config_flag_leak():
@@ -80,17 +88,26 @@ def _open_order(symbol, side):
                            contract=SimpleNamespace(symbol=symbol))
 
 
-def _plan(*, orders=None, alien_lines=None, investable=98_500.0, net_liq=100_000.0):
+def _line(symbol, actual_shares):
+    """A reconcile.Line stand-in — the per-order SELL rail reads `.symbol`/`.actual_shares`
+    off the plan's own reconciliation to know how many shares are actually held."""
+    return SimpleNamespace(symbol=symbol, actual_shares=float(actual_shares),
+                           target_weight=0.0, target_shares=0, actual_weight=0.0,
+                           drift_weight=0.0, status="DRIFTED")
+
+
+def _plan(*, orders=None, alien_lines=None, investable=98_500.0, net_liq=100_000.0,
+          lines=None):
     return SimpleNamespace(
         account=ACCT, version="Growth", net_liq=net_liq, reserve=0.0,
-        investable=investable, lines=[], needs_rebalance=True,
+        investable=investable, lines=list(lines or []), needs_rebalance=True,
         orders=orders if orders is not None else {"VTI": 10, "USFR": 5, "BIL": -3},
         alien_lines=alien_lines if alien_lines is not None else [])
 
 
-def _caps(per_order=se.MAX_ORDER_NOTIONAL_PCT_NLV, total_buy_le_investable=True,
+def _caps(per_order=se.MAX_ORDER_MODEL_MULTIPLE, total_buy_le_investable=True,
           max_total_notional=None):
-    return se.ExecutionCaps(per_order_notional_pct_nlv=per_order,
+    return se.ExecutionCaps(per_order_model_multiple=per_order,
                             total_buy_le_investable=total_buy_le_investable,
                             max_total_notional=max_total_notional)
 
@@ -230,16 +247,62 @@ def test_transmit_phase_fails_closed_under_readonly():
     assert results and results[0]["status"] == "BLOCKED" and results[0]["skipped"] is True
 
 
-# --- 4. caps: per-order > %NLV, and total buy > investable --------------------------
-def test_per_order_cap_blocks():
-    # One VTI buy at $60k > 50% of $100k NetLiq.
-    tgt = _target(weights={"VTI": 1.0}, prices={"VTI": 60_000.0})
-    req = _request(plan=_plan(orders={"VTI": 1}, alien_lines=[]), target=tgt, armed=True)
+# --- 4. rails: per-order fat-finger, and total buy > investable ---------------------
+def test_per_order_buy_over_model_multiple_blocks():
+    # Model wants 10% of NetLiq in VTI ($10,000 of $100,000); the leg is 200 x $250 =
+    # $50,000 — 5x the model's own target, i.e. a fat-finger. Under the investable cap
+    # ($98,500) so nothing else can mask the rail.
+    tgt = _target(weights={"VTI": 0.1}, prices={"VTI": 250.0})
+    req = _request(plan=_plan(orders={"VTI": 200}, alien_lines=[]), target=tgt, armed=True)
     ib = _TxFakeIB(_summary())
     res = se.execute_plan(req, mode=se.MODE_ARMED, ib=ib)
     assert res.status == se.STATUS_BLOCKED
     assert ib.placed == []
-    assert any("% of NetLiq" in r for r in res.reasons)
+    assert any("fat-finger" in r and "BUY VTI" in r for r in res.reasons)
+
+
+def test_never_invested_first_deploy_is_permitted():
+    """THE U5721712 CASE (2026-08-25). A never-invested cash account's FIRST deploy buys the
+    model's dominant leg at its full model weight — 85% of NetLiq by construction for
+    Growth (Small) = SCHB 85% + USFR 15%. The old flat 50%-of-NetLiq cap blocked it
+    ('BUY SCHB x27 notional 800.55 > 50% of NetLiq (478.55)'); the model-relative rail must
+    not. Rail-only assertion: 'not armed' is still a reason on a preview."""
+    tgt = _target(weights={"SCHB": 0.85, "USFR": 0.15},
+                  prices={"SCHB": 29.65, "USFR": 50.0})
+    plan = _plan(orders={"SCHB": 27, "USFR": 2}, alien_lines=[],
+                 investable=957.10, net_liq=957.10)
+    req = _request(plan=plan, target=tgt, armed=False, net_liq=957.10)
+    res = se.execute_plan(req, mode=se.MODE_PREVIEW)
+    assert any(l.symbol == "SCHB" and l.side == "BUY" and l.qty == 27 for l in res.legs)
+    assert _per_order_rail_reasons(res) == [], res.reasons
+
+
+def test_sell_over_shares_held_blocks():
+    # The account holds 40 BIL; a corrupted plan asks to sell 400. This desk never shorts.
+    tgt = _target(weights={"VTI": 1.0}, prices={"VTI": 250.0, "BIL": 91.0})
+    plan = _plan(orders={"BIL": -400}, alien_lines=[],
+                 lines=[_line("BIL", 40)])
+    req = _request(plan=plan, target=tgt, armed=True)
+    ib = _TxFakeIB(_summary())
+    res = se.execute_plan(req, mode=se.MODE_ARMED, ib=ib)
+    assert res.status == se.STATUS_BLOCKED
+    assert ib.placed == []
+    assert any("never shorts" in r and "SELL BIL" in r for r in res.reasons)
+
+
+def test_ongoing_rebalance_sell_down_and_buy_up_still_permitted():
+    """An ongoing REBALANCE that trims a big overweight and tops up another holding must be
+    unaffected: the sell is within the shares held and the buy is within the model's target.
+    Under the OLD %NLV cap the $60,000 GDX sell-down (60% of a $100k account) was a block."""
+    tgt = _target(weights={"VTI": 0.6, "USFR": 0.4},
+                  prices={"VTI": 250.0, "USFR": 50.0, "GDX": 30.0})
+    plan = _plan(orders={"GDX": -2000, "VTI": 200}, alien_lines=[],
+                 lines=[_line("GDX", 2000), _line("VTI", 40)])
+    req = _request(plan=plan, target=tgt, armed=False, conform=False)
+    res = se.execute_plan(req, mode=se.MODE_PREVIEW)
+    assert {(l.side, l.symbol, l.qty) for l in res.legs} == {
+        ("SELL", "GDX", 2000), ("BUY", "VTI", 200)}
+    assert _per_order_rail_reasons(res) == [], res.reasons
 
 
 def test_total_buy_over_investable_blocks():

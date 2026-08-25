@@ -42,7 +42,8 @@ aggregate summary, and transmits NOTHING. To actually transmit, a human must lin
   * NO kill-switch sentinel present,
   * every target account IN the enrolled roster (any other refused — the account wall),
   * every leg whole-share, priced, through order_router's HARD price guard,
-  * each account's own caps (total BUY <= investable, per-order <= 50% NetLiq) + margin
+  * each account's own rails (total BUY <= investable; per-order BUY <= 2x the model's own
+    target dollars for that symbol; per-order SELL <= the shares actually held) + margin
     pre-flight passing, AND
   * the Gateway physically ARMED (Read-Only API toggle OFF — measured live per account with
     the zero-transmission cancel-a-fabricated-order probe).

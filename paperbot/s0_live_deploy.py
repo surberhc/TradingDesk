@@ -79,8 +79,9 @@ nothing. To actually transmit, a human must line up ALL of:
   * NO kill-switch sentinel present,
   * the target account is EXACTLY U14438624 (any other refused — single-account wall),
   * every leg whole-share, priced, and through order_router's HARD price guard,
-  * total BUY notional <= investable (never over-deploy / no margin), AND no single order's
-    notional > 50% of NetLiq (fat-finger / bad-price catch), and
+  * total BUY notional <= investable (never over-deploy / no margin), AND every order past
+    the per-order fat-finger rail (BUY <= 2x the model's own target dollars for that symbol;
+    SELL <= the shares actually held), and
   * the Gateway physically ARMED (Read-Only API toggle OFF — measured live with the
     zero-transmission cancel-a-fabricated-order probe).
 Miss ANY one and the run is a preview that transmits nothing and prints WHY.
@@ -116,7 +117,7 @@ from safe_execute import (
     _working_order_present, _transmit_phase, _report_phase, _probe_gateway_readonly,
     _buying_power, _total_cash_value, _buying_power_ok, _trade_done, _cum_filled,
     _deploy_ref, _run_id, DEPLOY_REF_TAG,
-    MAX_ORDER_NOTIONAL_PCT_NLV, PHASE_TERMINAL_TIMEOUT_SEC, REPRICE_AFTER_SEC,
+    MAX_ORDER_MODEL_MULTIPLE, PHASE_TERMINAL_TIMEOUT_SEC, REPRICE_AFTER_SEC,
     REPRICE_MAX_ATTEMPTS, POLL_SEC, CASH_SETTLE_SEC, CASH_SAFETY_BUFFER_PCT,
     _TERMINAL_STATUSES,
 )
@@ -191,8 +192,9 @@ def _safety_banner(armed: bool, conform: bool, kill: bool) -> None:
     print(f"# account={EXEC_ACCOUNT}   target=S0 {DEPLOY_VERSION} tier   "
           f"gateway=Live-Trade port 4003")
     print(f"#   (single-account wall: refuses ANY account other than {ALLOWED_ACCOUNT})")
-    print(f"# CAPS   total BUY notional <= investable   per-order notional <= "
-          f"{MAX_ORDER_NOTIONAL_PCT_NLV*100:.0f}% of NetLiq   whole-share   price-guarded")
+    print(f"# RAILS  total BUY notional <= investable   per-order BUY <= "
+          f"{MAX_ORDER_MODEL_MULTIPLE:g}x the model's target dollars for that symbol   "
+          f"per-order SELL <= shares actually held   whole-share   price-guarded")
     print(f"# EXECUTION   two-phase cash-gated (sells -> re-read TotalCashValue -> buys sized "
           f"to REALIZED cash)   straggler re-price x{REPRICE_MAX_ATTEMPTS:.0f}")
     if permit_intent:
@@ -318,7 +320,7 @@ def _run_session(ib, target, *, armed: bool, conform: bool,
         quotes=quotes,
         prices=prices,
         allowed_accounts=[ALLOWED_ACCOUNT],
-        caps=ExecutionCaps(per_order_notional_pct_nlv=MAX_ORDER_NOTIONAL_PCT_NLV,
+        caps=ExecutionCaps(per_order_model_multiple=MAX_ORDER_MODEL_MULTIPLE,
                            total_buy_le_investable=True, max_total_notional=None),
         conform=conform,
         run_id=None,
