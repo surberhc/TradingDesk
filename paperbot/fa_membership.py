@@ -32,13 +32,15 @@ GROUPS XML shape (as revealed by set_group_contracts_or_shares): a root holding 
 elements, each with a <name>, a <defaultMethod>, and a <ListOfAccts> holding <Account>
 elements, each with <acct> (the account number) and <amount> (the ContractsOrShares value).
 
-The LIVE glue — requestFA(1) -> parse_group_membership -> membership_diff vs
-CRMBrain.group_membership() -> backup_fa_groups -> apply_membership -> replaceFA(1), behind
-the arm gate — is the gateway-gated follow-on and is NOT built here.
+The LIVE glue — requestFA(1) -> parse_group_membership -> membership_diff vs the desired
+membership -> backup -> apply_membership -> replaceFA(1), behind the arm gate — lives in
+``fa_group_sync.py`` (built 2026-08-25). This module stays PURE; ``fa_group_sync`` is the only
+side of the pair that touches a broker.
 """
 
 from __future__ import annotations
 
+import difflib
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Mapping, Set
 
@@ -70,6 +72,41 @@ def _iter_groups(root):
     for grp in root.iter():
         if _local(grp.tag) == "group":
             yield grp
+
+
+def pretty_xml(xml: str) -> str:
+    """Best-effort pretty-print of a GROUPS XML string, for a line-oriented HUMAN-REVIEW diff.
+
+    Falls back to the raw string when the XML cannot be parsed — the pretty form is review
+    sugar and is NEVER what gets written (the writer always sends the real serialized XML).
+
+    Same idiom as live_fa_block_execute._pretty_xml; kept here so the pure half owns it and
+    the glue module does not have to import the heavy execution module just to render a diff.
+    """
+    import xml.dom.minidom as minidom
+    try:
+        return minidom.parseString(str(xml or "").strip()).toprettyxml(indent="  ")
+    except Exception:
+        return str(xml or "")
+
+
+def membership_diff_text(current_xml: str, new_xml: str, *, label: str = "") -> str:
+    """Unified diff of pretty-printed ``current_xml`` vs ``new_xml``, for human review before
+    a replaceFA. PURE — renders text only, writes nothing.
+
+    File labels MATCH live_fa_block_execute.group_write_plan exactly ("groups.xml (current)"
+    vs "groups.xml (after replaceFA: <label>)") so a reviewer sees ONE convention across both
+    write paths. Identical inputs give the empty string — which is the caller's cue that there
+    is NOTHING to write.
+    """
+    old_pp = pretty_xml(current_xml)
+    new_pp = pretty_xml(new_xml)
+    return "\n".join(difflib.unified_diff(
+        old_pp.splitlines(), new_pp.splitlines(),
+        fromfile="groups.xml (current)",
+        tofile=f"groups.xml (after replaceFA: {label})" if label
+        else "groups.xml (after replaceFA)",
+        lineterm=""))
 
 
 def parse_group_membership(groups_xml: str) -> Dict[str, Set[str]]:
