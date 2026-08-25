@@ -206,6 +206,22 @@ SMALL_TIER_TICKERS = ["SCHB"]   # the small-account equity proxy; see SMALL_TIER
                                 # USFR is already in DEFENSIVE_ASSETS, so only SCHB is new.
 ALL_TICKERS = (EQUITY_CORE + SECTORS + DEFENSIVE_ASSETS + REAL_ASSETS + SMALL_TIER_TICKERS)
 
+# ---------------------------------------------------------------------------
+# Custom (Andrew-authored) allocation tickers — DOWNLOAD ONLY, NEVER S0's universe
+# ---------------------------------------------------------------------------
+# Instruments that appear ONLY in a hand-authored CRM allocation (paperbot/custom_target.py),
+# never in a computed S0 book. The desk cannot size an order for a ticker it has no price
+# history for — data_loader.load_prices() raises KeyError on it and the whole custom target
+# fails closed — so their history has to be on disk.
+#
+# THEY ARE DELIBERATELY *NOT* IN ALL_TICKERS. ALL_TICKERS is S0's own tradeable universe: it
+# feeds the validated backtest engine (asset selection, per-asset caps, the regime overlays),
+# so adding an instrument to it would CHANGE S0's model. This list is unioned into the
+# DOWNLOAD universe by backtester/src/download_data.py and nowhere else — no engine, no
+# strategy, no overlay reads it. Adding or removing a ticker here changes only which parquet
+# files exist on disk.
+CUSTOM_ALLOCATION_TICKERS = ["JAAA", "BUCK", "SGDM", "GDXJ", "SILJ"]
+
 # Benchmarks for the report (SPEC §2, §14, §15)
 BENCHMARK_SPY = "SPY"
 BENCHMARK_6040 = ("SPY", "AGG")   # 60/40 blend: S&P 500 + total US bond market

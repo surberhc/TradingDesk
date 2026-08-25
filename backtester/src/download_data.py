@@ -46,6 +46,16 @@ MANIFEST_PATH = _m if _m.is_absolute() else PROJECT_ROOT / _m
 # so the credit/yield proxies can be built later (DATA.md §"Also needed").
 MACRO_PROXY_TICKERS = ["HYG"]  # high-yield ETF for the HY-vs-Treasury credit proxy
 
+# Custom-allocation extras: tickers that appear ONLY in an ANDREW-AUTHORED CRM allocation
+# (paperbot/custom_target.py), never in a computed S0 book. They are downloaded because the
+# desk cannot size an order for a ticker it has no price history for (data_loader.load_prices
+# raises KeyError and the whole custom target fails closed).
+#
+# They are deliberately NOT in config.ALL_TICKERS. That list is S0's OWN tradeable universe
+# and feeds the validated backtest engine, so putting an instrument in it would change S0's
+# model. This union — the DOWNLOAD universe only — is the single place they enter anything.
+CUSTOM_ALLOCATION_TICKERS = list(getattr(config, "CUSTOM_ALLOCATION_TICKERS", []))
+
 # Be a good citizen on the free tier: a short pause between symbol requests.
 _REQUEST_PAUSE_SECONDS = 0.8
 _HTTP_TIMEOUT_SECONDS = 30
@@ -308,8 +318,43 @@ def _max_consecutive_gap(have: pd.DatetimeIndex, expected: pd.DatetimeIndex) -> 
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
-def main() -> None:
-    """Download all tickers, write manifest, run QC, print a summary."""
+def download_universe() -> list[str]:
+    """Every symbol a FULL run downloads, in order: S0's own universe, then the
+    custom-allocation extras, then the macro proxies. Deduplicated, order preserved.
+
+    S0's universe (config.ALL_TICKERS) is passed through UNTOUCHED — the extras are unioned
+    on HERE, in the downloader, and never inside config.ALL_TICKERS itself, so nothing the
+    backtest engine reads changes."""
+    ordered = list(config.ALL_TICKERS) + CUSTOM_ALLOCATION_TICKERS + MACRO_PROXY_TICKERS
+    return list(dict.fromkeys(ordered))
+
+
+def _role_for(symbol: str) -> str:
+    """The manifest `role` for one symbol."""
+    if symbol in MACRO_PROXY_TICKERS:
+        return "macro_proxy"
+    if symbol in CUSTOM_ALLOCATION_TICKERS:
+        return "custom_allocation"
+    return "universe"
+
+
+def _load_manifest_tickers() -> dict[str, dict]:
+    """The existing manifest's per-ticker block, or {} if there is none / it is unreadable.
+    Only used by a TARGETED (`only=`) run, which must not erase the other 40+ entries."""
+    try:
+        return dict(json.loads(MANIFEST_PATH.read_text()).get("tickers", {}))
+    except Exception:  # noqa: BLE001 — no manifest yet, or corrupt: start clean
+        return {}
+
+
+def main(only: list[str] | None = None) -> None:
+    """Download tickers, write the manifest, run QC, print a summary.
+
+    `only` restricts the run to the named symbols — a TARGETED refresh (e.g. adding a new
+    custom-allocation ticker) that must not re-pull, and therefore cannot disturb, the 40+
+    series already on disk. In that mode the existing manifest is MERGED into rather than
+    replaced, and the macro series (Treasury 10y / VIX / HY OAS) are left exactly as they
+    are. `only=None` (the default, and every scheduled caller) is the unchanged full run."""
     # Windows cmd defaults to cp1252; force UTF-8 so console prints never crash.
     try:
         import sys
@@ -323,10 +368,15 @@ def main() -> None:
     start = config.DATA_START
     end = config.BACKTEST_END or date.today().isoformat()
 
-    universe = list(config.ALL_TICKERS) + MACRO_PROXY_TICKERS
-    print(f"Downloading {len(universe)} tickers from {start} to {end} ...\n")
+    targeted = only is not None
+    if targeted:
+        universe = list(dict.fromkeys(str(s).strip().upper() for s in only if str(s).strip()))
+    else:
+        universe = download_universe()
+    print(f"Downloading {len(universe)} tickers from {start} to {end} "
+          f"{'(TARGETED refresh — every other series on disk is left untouched)' if targeted else ''}...\n")
 
-    manifest: dict[str, dict] = {}
+    manifest: dict[str, dict] = _load_manifest_tickers() if targeted else {}
     skipped: list[str] = []
     all_flags: dict[str, list[str]] = {}
     now_iso = datetime.now(timezone.utc).isoformat()
@@ -351,17 +401,19 @@ def main() -> None:
         if flags:
             all_flags[symbol] = flags
 
-        is_proxy = symbol in MACRO_PROXY_TICKERS
+        role = _role_for(symbol)
         manifest[symbol] = {
             "first_date": frame.index.min().date().isoformat(),
             "last_date": frame.index.max().date().isoformat(),
             "rows": int(len(frame)),
             "downloaded_at": now_iso,
             "source": "tiingo_adjClose",
-            "role": "macro_proxy" if is_proxy else "universe",
+            "role": role,
             "qc_flags": flags,
         }
-        tag = " (macro proxy)" if is_proxy else ""
+        tag = ("" if role == "universe"
+               else " (macro proxy)" if role == "macro_proxy"
+               else " (custom allocation)")
         print(
             f"  + {symbol}{tag}: {len(frame)} rows, "
             f"{manifest[symbol]['first_date']} -> {manifest[symbol]['last_date']}"
@@ -369,6 +421,55 @@ def main() -> None:
         )
         time.sleep(_REQUEST_PAUSE_SECONDS)
 
+    if targeted:
+        # A targeted refresh touches ONLY the named tickers. The macro series
+        # (_treasury_10y / _vix / _hy_oas) are left byte-for-byte as they are, and their
+        # manifest entries survive because the manifest was merged, not rebuilt.
+        print("\nTARGETED refresh: macro series (Treasury 10y / VIX / HY credit spread) "
+              "left untouched.")
+    else:
+        _refresh_macro_series(start, end, manifest, now_iso)
+
+    # --- Write manifest ---
+    manifest_payload = {
+        "generated_at": now_iso,
+        "data_start": start,
+        "data_end": end,
+        "tickers": manifest,
+    }
+    MANIFEST_PATH.write_text(json.dumps(manifest_payload, indent=2))
+
+    # --- Summary ---
+    downloaded = [s for s in universe if s not in skipped]
+    earliest = min(
+        (m["first_date"] for m in manifest.values() if "first_date" in m),
+        default="n/a",
+    )
+    print("\n" + "=" * 60)
+    print("DOWNLOAD SUMMARY")
+    print("=" * 60)
+    print(f"Downloaded : {len(downloaded)} tickers")
+    print(f"Earliest   : {earliest}")
+    if skipped:
+        print(f"Skipped    : {', '.join(skipped)} (unavailable)")
+    if all_flags:
+        print(f"QC flags   : {len(all_flags)} ticker(s) flagged —")
+        for sym, flags in all_flags.items():
+            print(f"             {sym}: {'; '.join(flags)}")
+        print(
+            "\nReview the flags above. Do NOT run a backtest on a dataset with "
+            "unresolved critical errors (zero/negative prices, bad splits)."
+        )
+    else:
+        print("QC flags   : none — data looks clean")
+    print(f"\nManifest   : {MANIFEST_PATH}")
+    print("data/ is now READ-ONLY. Re-run this script to refresh.")
+
+
+def _refresh_macro_series(start: str, end: str, manifest: dict, now_iso: str) -> None:
+    """Fetch the macro series (Treasury 10y, VIX, HY credit spread) and record them in
+    `manifest`. Unchanged FULL-run behavior, lifted verbatim into a function so a targeted
+    ticker refresh can skip it without re-pulling or re-labeling anything."""
     # --- Treasury 10y yield: real source first, labeled proxy fallback ---
     print("\nFetching 10-year Treasury yield ...")
     yield_df, source_label = _fetch_treasury_10y(start, end)
@@ -433,41 +534,23 @@ def main() -> None:
         note = "add a free FRED_API_KEY to .env to upgrade" if oas_src == "no_fred_key" else oas_src
         print(f"  ! HY credit spread unavailable ({note}); using {proxy} ratio PROXY")
 
-    # --- Write manifest ---
-    manifest_payload = {
-        "generated_at": now_iso,
-        "data_start": start,
-        "data_end": end,
-        "tickers": manifest,
-    }
-    MANIFEST_PATH.write_text(json.dumps(manifest_payload, indent=2))
 
-    # --- Summary ---
-    downloaded = [s for s in universe if s not in skipped]
-    earliest = min(
-        (m["first_date"] for m in manifest.values() if "first_date" in m),
-        default="n/a",
-    )
-    print("\n" + "=" * 60)
-    print("DOWNLOAD SUMMARY")
-    print("=" * 60)
-    print(f"Downloaded : {len(downloaded)} tickers")
-    print(f"Earliest   : {earliest}")
-    if skipped:
-        print(f"Skipped    : {', '.join(skipped)} (unavailable)")
-    if all_flags:
-        print(f"QC flags   : {len(all_flags)} ticker(s) flagged —")
-        for sym, flags in all_flags.items():
-            print(f"             {sym}: {'; '.join(flags)}")
-        print(
-            "\nReview the flags above. Do NOT run a backtest on a dataset with "
-            "unresolved critical errors (zero/negative prices, bad splits)."
-        )
-    else:
-        print("QC flags   : none — data looks clean")
-    print(f"\nManifest   : {MANIFEST_PATH}")
-    print("data/ is now READ-ONLY. Re-run this script to refresh.")
+def cli(argv: list[str] | None = None) -> None:
+    """CLI entry. No arguments -> the unchanged FULL download. `--only SYM[,SYM...]`
+    (repeatable) -> a targeted refresh of just those tickers."""
+    import sys as _sys
+
+    argv = _sys.argv[1:] if argv is None else list(argv)
+    only: list[str] = []
+    i = 0
+    while i < len(argv):
+        if argv[i] == "--only" and i + 1 < len(argv):
+            only.extend(s for s in argv[i + 1].replace(" ", ",").split(",") if s)
+            i += 2
+        else:
+            i += 1
+    main(only=only or None)
 
 
 if __name__ == "__main__":
-    main()
+    cli()
