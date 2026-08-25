@@ -40,6 +40,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
+import deskproc  # one place that starts a process with no flashing console window
 import theme
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
@@ -325,11 +326,136 @@ def _preview_parse_warning(parsed: dict) -> str | None:
     return " ".join(parts)
 
 
-def _audit_preview() -> None:
-    """Best-effort durable audit that a read-only preview was built. Lazily imports the
-    event log; swallows ALL errors — logging must never break the page."""
+# =========================================================================== #
+# DID THE PREVIEW ACTUALLY RUN? — the positive-evidence test the gate needs.   #
+# =========================================================================== #
+# THE DEFECT THIS CLOSES. Nothing on this page ever looked at the preview subprocess's
+# RETURN CODE. A preview whose executor crashed printed nothing, parsed to zero legs, and was
+# stored with a fresh wall-clock timestamp — indistinguishable from a healthy preview of an
+# account that simply has nothing to trade. So the top-of-page verdict rendered the GREEN
+# "In line — nothing to trade" card (its branch was a bare `else` on "no legs", consulting no
+# error state at all), and the arm gate — a freshness check AND a typed confirm, where
+# freshness was only an age check on that unconditionally-stored timestamp — was satisfied.
+# The operator could arm and send off a check that never read the account.
+#
+# THE RULE NOW. A preview is trusted only on POSITIVE evidence: the program exited cleanly
+# AND printed either an order list or its own "already conforms" confirmation. Anything short
+# of that is a FAILURE, and the failure is stored in session state next to `built_at` (see
+# _store_last_preview) so it survives every rerun — the operator cannot click once more and
+# be shown only the green card. This only ever TIGHTENS the gate; it can never enable a
+# transmit the old preview+confirm gate would have blocked.
+_UNRECORDED_PREVIEW_FAILURE = (
+    "The last check on this rail was not recorded as a completed read of the account, so "
+    "nothing may be sent from it. Build the preview again."
+)
+
+
+def _preview_failure(parsed: dict, returncode: int | None) -> str | None:
+    """Plain-English reason this preview must NOT be armed from, or reported as 'in line',
+    or None when it ran cleanly and produced a readable plan. Pure (no Streamlit) so it can
+    be tested directly. Spelled out in full words — this is the sentence that stops an
+    operator sending against a check that never happened."""
+    rc = None
+    if returncode is not None:
+        try:
+            rc = int(returncode)
+        except (TypeError, ValueError):
+            rc = None
+    if rc is not None and rc != 0:
+        return (
+            f"The preview program stopped with an error instead of finishing normally "
+            f"(exit code {rc}). Nothing on this page can tell you what the account holds or "
+            f"what would trade. Read the full preview log below for what it managed to "
+            f"report, then build the preview again."
+        )
+    if not isinstance(parsed, dict):
+        return _UNRECORDED_PREVIEW_FAILURE
+    err = parsed.get("parse_error")
+    if err:
+        return (
+            "Reading the preview output stopped early because of an unexpected problem "
+            f"({err}), so the plan shown may be incomplete. Read the full preview log below, "
+            "which is the source of truth, and build the preview again."
+        )
+    if parsed.get("legs"):
+        return None
+    if parsed.get("already_conforms"):
+        return None
+    return (
+        "The preview produced no readable plan: it listed no orders, and it did not confirm "
+        "that the account already matches its target. That is not the same as nothing to "
+        "trade — as far as this page can tell, the account was never read. Read the full "
+        "preview log below and build the preview again."
+    )
+
+
+def _stored_preview_failure(key: str) -> str | None:
+    """The stored failure note for the last preview on one rail — ``cp_last_preview`` (single
+    account) or ``cp_batch_last_preview`` (batch) — or None when the stored preview ran
+    cleanly. FAIL-CLOSED: a stored preview carrying no explicit success marker counts as
+    failed. Returns None when there is NO stored preview at all, because 'not checked yet' is
+    its own state, already blocked by the no-preview path, and must not be reported as a
+    failed check."""
+    last = st.session_state.get(key)
+    if not isinstance(last, dict):
+        return None
+    note = last.get("failure")
+    if note:
+        return str(note)
+    if not last.get("ok"):
+        return _UNRECORDED_PREVIEW_FAILURE
+    return None
+
+
+def _preview_is_armable(is_fresh: bool, failure: str | None) -> bool:
+    """The preview half of the arm gate, as one pure decision both rails use: a preview may be
+    armed from ONLY when it is inside the freshness window AND it was recorded as a completed
+    read. Was `preview_fresh` alone, which a crashed run satisfied because the timestamp was
+    stored unconditionally."""
+    return bool(is_fresh) and failure is None
+
+
+def _store_failed_preview(key: str, note: str) -> None:
+    """Record that a preview ATTEMPT did not produce a reviewable plan, under the SAME
+    session key the arm gate reads. Overwriting is the whole point: a failed attempt must
+    RETIRE the previous preview rather than leave an older, still-fresh one armable behind a
+    failure card. Never raises."""
+    try:
+        now = datetime.now()
+        st.session_state[key] = {
+            "built_at": now,
+            "built_at_str": now.strftime("%H:%M"),
+            "n_legs": 0, "sells": "—", "buys": "—",
+            "account": PREVIEW_ACCOUNT, "net_liq": None,
+            "already_conforms": False,
+            "n_out_of_spec": None, "n_roster": None, "total_legs": None,
+            "returncode": None,
+            "ok": False,
+            "failure": note,
+            "summary": "the last check did not complete",
+        }
+    except Exception:  # noqa: BLE001 — recording a failure must never break the page
+        pass
+
+
+def _audit_preview(failure: str | None = None) -> None:
+    """Best-effort durable audit that a read-only preview was ATTEMPTED. Lazily imports the
+    event log; swallows ALL errors — logging must never break the page. A run that did not
+    produce a reviewable plan is logged as exactly that, not as a built preview: the audit
+    trail must not claim a read of the account that did not happen."""
     try:
         from eventlog import record_event
+        if failure:
+            record_event(
+                ts=datetime.now().isoformat(timespec="seconds"),
+                source="Control Plane",
+                category="control_plane_preview",
+                message=("A read-only Strategy 0 rebalance preview for account U14438624 "
+                         f"did NOT complete: {failure} Nothing was transmitted, and nothing "
+                         "may be sent from it."),
+                severity="warn",
+            )
+            return
         record_event(
             ts=datetime.now().isoformat(timespec="seconds"),
             source="Control Plane",
@@ -342,12 +468,20 @@ def _audit_preview() -> None:
         pass
 
 
-def _store_last_preview(stdout: str) -> None:
-    """Bind the arm/execute controls to the LAST reviewed read-only preview. Parses the
+def _store_last_preview(stdout: str, returncode: int | None = None) -> None:
+    """Bind the arm/execute controls to the LAST read-only preview ATTEMPT. Parses the
     executor's PREVIEW stdout into a compact, plain summary + a wall-clock timestamp and
     stores it in session state under ``cp_last_preview``. Never raises — a parse miss
     simply yields a sparser summary; the executor recomputes authoritatively at fire time
-    regardless, so this is a review-binding aid, not the source of truth."""
+    regardless, so this is a review-binding aid, not the source of truth.
+
+    WHY A FAILED RUN IS STORED, NOT DROPPED. The obvious fix for a crashed preview is to
+    refuse to store it — but refusing leaves the PREVIOUS preview in session state, and if
+    that one is still inside the freshness window the operator can arm off it while the crash
+    shows only as a transient note that the next rerun wipes. So a failed run is stored, with
+    an explicit ``ok``/``failure`` marker that BOTH the arm gate (_stored_preview_failure) and
+    the top-of-page verdict consult. Storing retires the older preview and makes the failure
+    survive every rerun, which is exactly what the gate needs."""
     try:
         parsed = _parse_preview(stdout or "")
         n_legs = len(parsed.get("legs") or [])
@@ -355,6 +489,7 @@ def _store_last_preview(stdout: str) -> None:
         total_buy = parsed.get("total_buy")
         sells = f"${total_sell:,.2f}" if total_sell is not None else "—"
         buys = f"${total_buy:,.2f}" if total_buy is not None else "—"
+        failure = _preview_failure(parsed, returncode)
         now = datetime.now()
         st.session_state["cp_last_preview"] = {
             "built_at": now,                       # datetime — used for the 30-min age check
@@ -364,10 +499,20 @@ def _store_last_preview(stdout: str) -> None:
             "buys": buys,
             "account": parsed.get("account") or PREVIEW_ACCOUNT,
             "net_liq": parsed.get("net_liq"),
+            # POSITIVE EVIDENCE the account was read and is in line — the ONLY thing the
+            # green "nothing to trade" verdict is allowed to be drawn from.
+            "already_conforms": bool(parsed.get("already_conforms")),
+            "returncode": returncode,
+            "ok": failure is None,
+            "failure": failure,
             "summary": f"{n_legs} leg(s), sells {sells}, buys {buys}",
         }
-    except Exception:  # noqa: BLE001 — binding is best-effort; never break the preview
-        pass
+    except Exception as exc:  # noqa: BLE001 — binding is best-effort; never break the preview
+        # A binding that dies must not leave the PREVIOUS preview standing as armable.
+        _store_failed_preview(
+            "cp_last_preview",
+            f"The last check could not be recorded because of an unexpected problem "
+            f"({type(exc).__name__}). Build the preview again.")
 
 
 def _render_leg_table(legs: list[dict]) -> None:
@@ -402,11 +547,32 @@ def _render_leg_table(legs: list[dict]) -> None:
         st.dataframe(df, hide_index=True, use_container_width=True)
 
 
-def _render_preview_result(stdout: str, stderr: str) -> None:
+def _render_preview_result(stdout: str, stderr: str,
+                           returncode: int | None = None) -> None:
     """Turn the executor's PREVIEW output into a plain-English summary + leg table, then
-    ALWAYS show the full raw log in an expander (the raw text is the source of truth)."""
+    ALWAYS show the full raw log in an expander (the raw text is the source of truth).
+
+    ``returncode`` is passed ONLY by the read-only preview path. The guarded execute path
+    calls this exactly as before (no return code), so its rendering is unchanged."""
     parsed = _parse_preview(stdout)
     _preview_warning = _preview_parse_warning(parsed)
+
+    # THE RUN ITSELF — did it finish and read the account? Said first, in red, above
+    # everything else. (The same judgement is stored in session state, so it also survives
+    # into the top-of-page verdict on every later rerun.)
+    if returncode is not None:
+        _run_failure = _preview_failure(parsed, returncode)
+        if _run_failure:
+            st.markdown(
+                theme.status_card(
+                    "Read-only preview",
+                    "bad",
+                    "This check did not complete — there is nothing to review",
+                    _run_failure + " Nothing was transmitted, and nothing can be sent until "
+                                   "a preview completes.",
+                ),
+                unsafe_allow_html=True,
+            )
 
     # Account context line (from [4]).
     if parsed["account"]:
@@ -491,6 +657,9 @@ def _render_verdict_and_tiles() -> None:
     nothing."""
     last = st.session_state.get("cp_last_preview")
     age_secs, fresh = _preview_freshness()
+    # The stored verdict on whether that preview actually ran. Read every rerun, so a failed
+    # check keeps saying so instead of decaying into the green card on the next click.
+    failure = _stored_preview_failure("cp_last_preview")
     c1, c2, c3 = st.columns([2, 1, 1])
 
     with c1:
@@ -508,7 +677,21 @@ def _render_verdict_and_tiles() -> None:
         else:
             n_legs = last.get("n_legs") or 0
             checked = last.get("built_at_str", "—")
-            if n_legs and n_legs > 0:
+            if failure:
+                # The check did not complete. Say that — never the green card, and never a
+                # count of legs read out of output that was never produced.
+                st.markdown(
+                    theme.status_card(
+                        "Rebalance status", "bad",
+                        "The last check did not complete — the account was not read",
+                        f"The {checked} check did not produce a plan to review, so this page "
+                        f"cannot tell you what the account holds or whether it is in line "
+                        f"with its target. {failure} Nothing has transmitted, and the Send "
+                        f"button stays off until a check completes.",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            elif n_legs and n_legs > 0:
                 headline = f"{n_legs} trade(s) to rebalance"
                 base = (f"About {last.get('sells', '—')} to sell then "
                         f"{last.get('buys', '—')} to buy · checked {checked}.")
@@ -526,7 +709,10 @@ def _render_verdict_and_tiles() -> None:
                         ),
                         unsafe_allow_html=True,
                     )
-            else:
+            elif last.get("already_conforms"):
+                # GREEN ONLY ON POSITIVE EVIDENCE: the executor itself printed that the
+                # account already conforms. The ABSENCE of legs is not evidence of anything —
+                # a preview that never ran has no legs either.
                 st.markdown(
                     theme.status_card(
                         "Rebalance status", "good",
@@ -534,6 +720,20 @@ def _render_verdict_and_tiles() -> None:
                         f"As of the {checked} check the account already matches the "
                         f"Strategy 0 Growth target — there is nothing to trade. Nothing "
                         f"has transmitted.",
+                    ),
+                    unsafe_allow_html=True,
+                )
+            else:
+                # No legs, no conformance confirmation, and no recorded failure — a shape
+                # nothing should produce. Backstop, and it never reads as 'in line'.
+                st.markdown(
+                    theme.status_card(
+                        "Rebalance status", "warn",
+                        "Not confirmed in line — check again",
+                        f"The {checked} check listed no trades, but it also did not confirm "
+                        f"that the account matches the Strategy 0 Growth target, so this "
+                        f"page cannot say the account is in line. Build the preview again. "
+                        f"Nothing has transmitted.",
                     ),
                     unsafe_allow_html=True,
                 )
@@ -556,6 +756,19 @@ def _render_verdict_and_tiles() -> None:
                 theme.card("Last checked",
                            f'<span style="color:{theme.MUTED}">—</span>',
                            "No preview has been built yet this session."),
+                unsafe_allow_html=True,
+            )
+        elif failure:
+            # A young timestamp on a check that never completed must not read as "fresh".
+            st.markdown(
+                theme.card(
+                    "Last checked",
+                    f'<span style="color:{theme.TIER["bad"]["c"]};font-weight:650">'
+                    f'{theme._esc(str(last.get("built_at_str", "—")))} · did not complete'
+                    f'</span>',
+                    "The last check did not produce a plan to review, so there is nothing to "
+                    "arm from. Build the preview again.",
+                ),
                 unsafe_allow_html=True,
             )
         elif fresh:
@@ -588,11 +801,13 @@ def _render_verdict_and_tiles() -> None:
 # Read-only preview run — the byte-identical old Step-1 handler body.          #
 # =========================================================================== #
 def _run_preview_and_render() -> None:
-    """Run the hardened S0 executor in PREVIEW mode (no args) and render the plan. This is
-    the byte-identical body of the old Step-1 handler — same existence check, same
-    subprocess call, same _render_preview_result / _store_last_preview / _audit_preview — the
-    only change is that the surrounding per-step status cards were lifted out into the
-    verdict tiles + the Step-1 freshness pill. Transmits nothing."""
+    """Run the hardened S0 executor in PREVIEW mode (no args) and render the plan. Same
+    existence check, same subprocess call, same arguments/timeout, same parsing as before.
+    What changed: the run's RETURN CODE is now carried into the render and into the stored
+    preview, and every path that ends WITHOUT a reviewable plan (missing executor, timeout,
+    launch failure, non-zero exit) records that failure under the arm gate's session key —
+    so a failed attempt retires the previous preview instead of leaving an older, still-fresh
+    one armable. Transmits nothing."""
     if not os.path.exists(VENV_PYTHON) or not _DEPLOY_SCRIPT.exists():
         st.markdown(
             theme.status_card(
@@ -604,12 +819,16 @@ def _run_preview_and_render() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _store_failed_preview(
+            "cp_last_preview",
+            "The preview could not start: the executor or its Python could not be found on "
+            "this machine.")
         return
 
     try:
         with st.spinner("Building the read-only preview (reading the live-trade "
                         "gateway on port 4003)…"):
-            proc = subprocess.run(
+            proc = deskproc.run(
                 [VENV_PYTHON, str(_DEPLOY_SCRIPT)],
                 cwd=str(_DEPLOY_CWD),
                 capture_output=True,
@@ -617,6 +836,7 @@ def _run_preview_and_render() -> None:
                 timeout=_PREVIEW_TIMEOUT_SEC,
             )
         stdout, stderr = proc.stdout or "", proc.stderr or ""
+        returncode = proc.returncode
     except subprocess.TimeoutExpired:
         st.markdown(
             theme.status_card(
@@ -628,6 +848,10 @@ def _run_preview_and_render() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _store_failed_preview(
+            "cp_last_preview",
+            "The preview did not finish in time, so the account was never read. The "
+            "live-trade Gateway on port 4003 may be down or not logged in.")
         return
     except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
         st.markdown(
@@ -640,11 +864,17 @@ def _run_preview_and_render() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _store_failed_preview(
+            "cp_last_preview",
+            f"The preview could not be run ({type(exc).__name__}), so the account was never "
+            f"read. The live-trade Gateway on port 4003 may be down or not logged in.")
         return
 
-    _render_preview_result(stdout, stderr)
-    _store_last_preview(stdout)  # bind the arm/execute step to THIS reviewed preview
-    _audit_preview()  # best-effort durable audit; never breaks the page
+    _render_preview_result(stdout, stderr, returncode)
+    # Bind the arm/execute step to THIS attempt — including, deliberately, a FAILED one, so a
+    # crash retires the previous preview and keeps saying so on every rerun.
+    _store_last_preview(stdout, returncode)
+    _audit_preview(_stored_preview_failure("cp_last_preview"))  # best-effort durable audit
 
 
 # =========================================================================== #
@@ -708,7 +938,7 @@ def _run_arm_probe_and_render() -> None:
     try:
         with st.spinner("Checking the port-4003 Gateway's armed state (read-only, "
                         "transmits nothing)…"):
-            proc = subprocess.run(
+            proc = deskproc.run(
                 [VENV_PYTHON, str(_ARM_PROBE_SCRIPT)],
                 cwd=str(_ARM_PROBE_CWD),
                 capture_output=True,
@@ -824,7 +1054,7 @@ def _run_execute_and_render(can_press: bool, pressed: bool) -> None:
     try:
         with st.spinner("Transmitting the S0 rebalance to the live-trade Gateway "
                         "(port 4003) — this runs the two-phase cash-gated deploy…"):
-            proc = subprocess.run(
+            proc = deskproc.run(
                 [VENV_PYTHON, str(_DEPLOY_SCRIPT), arm_token, conform_flag],
                 cwd=str(_DEPLOY_CWD),
                 capture_output=True,
@@ -1196,6 +1426,71 @@ def _parse_batch_preview(stdout: str) -> dict:
     return out
 
 
+def _batch_reconciliation_parts(parsed: dict) -> list[str]:
+    """The plain-English sentences describing where the batch TOTALS line disagrees with the
+    account rows rendered under it — empty when the two agree. Pure.
+
+    WHY THIS EXISTS. The four tiles at the top of the batch panel are read from the
+    BATCH-SUMMARY line; the table beneath them is built from the BATCH-ACCOUNT lines. Nothing
+    compared the two, so a summary claiming three out-of-spec accounts over a table holding
+    two rows rendered clean and armed. The executor prints exactly ONE BATCH-ACCOUNT line per
+    out-of-spec account, and its total_legs is the sum of those rows' legs
+    (batch_rebalance_execute.summarize_batch), so the two MUST agree. When they do not, one of
+    them is wrong, this page cannot tell which, and neither may be armed from."""
+    if not isinstance(parsed, dict):
+        return []
+    sm = parsed.get("summary")
+    if not isinstance(sm, dict):
+        return []
+    rows = list(parsed.get("accounts") or [])
+    parts: list[str] = []
+
+    claimed = sm.get("out_of_spec")
+    if isinstance(claimed, int) and claimed != len(rows):
+        parts.append(
+            f"The batch totals say {claimed} "
+            f"{'account is' if claimed == 1 else 'accounts are'} out of spec, but the table "
+            f"below holds {len(rows)} account "
+            f"{'row' if len(rows) == 1 else 'rows'}."
+        )
+
+    claimed_legs = sm.get("total_legs")
+    row_legs = 0
+    for row in rows:
+        try:
+            row_legs += int(row.get("legs") or 0)
+        except (TypeError, ValueError):  # a row we could not read contributes nothing
+            continue
+    if isinstance(claimed_legs, int) and claimed_legs != row_legs:
+        parts.append(
+            f"The batch totals say {claimed_legs} order "
+            f"{'leg' if claimed_legs == 1 else 'legs'} in total, but the account rows in the "
+            f"table below add up to {row_legs}."
+        )
+
+    if parts:
+        parts.append(
+            "The totals above and the table below therefore do not describe the same batch, "
+            "and there is no way to tell from this page which of the two is right."
+        )
+    return parts
+
+
+def _batch_reconciliation_warning(parsed: dict) -> str | None:
+    """The standalone plain-English warning that the batch totals and the batch table
+    disagree, or None when they agree. Pure. Also folded into _batch_parse_warning so the
+    operator sees ONE block of plain English above the table, not two competing ones."""
+    parts = _batch_reconciliation_parts(parsed)
+    if not parts:
+        return None
+    parts.append(
+        "Do not treat this table as the full list of accounts, and do not arm from this "
+        "preview. Read the full batch preview log below, which is the source of truth, and "
+        "build the preview again. Nothing was transmitted."
+    )
+    return " ".join(parts)
+
+
 def _batch_parse_warning(parsed: dict) -> str | None:
     """Plain-English warning about anything the BATCH parser could not read, or None when it
     read everything. Pure (no Streamlit) so it can be tested directly. This is the sentence
@@ -1205,7 +1500,10 @@ def _batch_parse_warning(parsed: dict) -> str | None:
     bad_accts = list(parsed.get("unreadable_account_lines") or [])
     bad_summary = list(parsed.get("unreadable_summary_lines") or [])
     err = parsed.get("parse_error")
-    if not bad_accts and not bad_summary and not err:
+    # Rows that disagree with the totals belong in the SAME plain-English block as rows that
+    # could not be read: both mean "this table is not the batch you think it is".
+    reconcile = _batch_reconciliation_parts(parsed)
+    if not bad_accts and not bad_summary and not err and not reconcile:
         return None
     parts: list[str] = []
     if bad_accts:
@@ -1225,6 +1523,7 @@ def _batch_parse_warning(parsed: dict) -> str | None:
             "Reading the preview output stopped early because of an unexpected problem "
             f"({err}), so this table may be incomplete."
         )
+    parts.extend(reconcile)
     parts.append(
         "Do not treat this table as the full list of accounts. Read the full batch preview "
         "log below, which is the source of truth. Nothing was transmitted."
@@ -1232,13 +1531,54 @@ def _batch_parse_warning(parsed: dict) -> str | None:
     return " ".join(parts)
 
 
-def _store_batch_last_preview(stdout: str) -> None:
-    """Bind the batch arm/send controls to the LAST reviewed batch preview. Stores a compact
-    summary + a wall-clock timestamp under ``cp_batch_last_preview`` (the freshness key). Never
-    raises — the executor recomputes authoritatively at fire time regardless."""
+def _batch_failure(parsed: dict, returncode: int | None) -> str | None:
+    """Plain-English reason this BATCH preview must NOT be armed from, or None when it ran
+    cleanly and its totals agree with its table. Pure. Same positive-evidence rule as the
+    single-account rail (_preview_failure), plus the tiles-versus-table reconciliation."""
+    rc = None
+    if returncode is not None:
+        try:
+            rc = int(returncode)
+        except (TypeError, ValueError):
+            rc = None
+    if rc is not None and rc != 0:
+        return (
+            f"The batch preview program stopped with an error instead of finishing normally "
+            f"(exit code {rc}). No roster account was read, so there is nothing to review. "
+            f"Read the full batch preview log below, then build the batch preview again."
+        )
+    if not isinstance(parsed, dict):
+        return _UNRECORDED_PREVIEW_FAILURE
+    err = parsed.get("parse_error")
+    if err:
+        return (
+            "Reading the batch preview output stopped early because of an unexpected problem "
+            f"({err}), so the account list shown may be incomplete. Build the batch preview "
+            "again."
+        )
+    if not isinstance(parsed.get("summary"), dict):
+        # No BATCH-SUMMARY line at all: there is nothing to check the table against, and no
+        # confirmation the executor finished its pass over the roster.
+        return (
+            "The batch preview printed no totals line, so this page cannot confirm that the "
+            "executor finished reading the roster, and there is nothing to check the account "
+            "table against. Read the full batch preview log below and build the batch "
+            "preview again."
+        )
+    return _batch_reconciliation_warning(parsed)
+
+
+def _store_batch_last_preview(stdout: str, returncode: int | None = None) -> None:
+    """Bind the batch arm/send controls to the LAST batch preview ATTEMPT. Stores a compact
+    summary + a wall-clock timestamp under ``cp_batch_last_preview`` (the freshness key), plus
+    the same explicit ``ok``/``failure`` marker the single-account rail stores, so a crashed
+    run or a totals-versus-table mismatch keeps refusing the arm gate on every rerun instead
+    of decaying into a clean-looking preview. Never raises — the executor recomputes
+    authoritatively at fire time regardless."""
     try:
         parsed = _parse_batch_preview(stdout or "")
         sm = parsed.get("summary") or {}
+        failure = _batch_failure(parsed, returncode)
         now = datetime.now()
         st.session_state["cp_batch_last_preview"] = {
             "built_at": now,                       # datetime — used for the 30-min age check
@@ -1246,9 +1586,16 @@ def _store_batch_last_preview(stdout: str) -> None:
             "n_out_of_spec": sm.get("out_of_spec"),
             "n_roster": sm.get("roster"),
             "total_legs": sm.get("total_legs"),
+            "returncode": returncode,
+            "ok": failure is None,
+            "failure": failure,
         }
-    except Exception:  # noqa: BLE001 — binding is best-effort; never break the preview
-        pass
+    except Exception as exc:  # noqa: BLE001 — binding is best-effort; never break the preview
+        # A binding that dies must not leave the PREVIOUS batch preview standing as armable.
+        _store_failed_preview(
+            "cp_batch_last_preview",
+            f"The last batch check could not be recorded because of an unexpected problem "
+            f"({type(exc).__name__}). Build the batch preview again.")
 
 
 def _batch_preview_freshness(now: datetime | None = None) -> tuple[float | None, bool]:
@@ -1260,12 +1607,32 @@ def _batch_preview_freshness(now: datetime | None = None) -> tuple[float | None,
     return _freshness_of(built_at, now or datetime.now())
 
 
-def _render_batch_preview_result(stdout: str, stderr: str) -> None:
+def _render_batch_preview_result(stdout: str, stderr: str,
+                                 returncode: int | None = None) -> None:
     """Turn the batch executor's stdout into a per-account table + margin pre-flight column +
-    aggregate summary, then ALWAYS show the raw log (the source of truth)."""
+    aggregate summary, then ALWAYS show the raw log (the source of truth).
+
+    ``returncode`` is passed ONLY by the read-only batch preview path; the guarded batch
+    execute path calls this exactly as before, so its rendering is unchanged."""
     parsed = _parse_batch_preview(stdout)
     sm = parsed.get("summary")
     batch_warning = _batch_parse_warning(parsed)
+
+    # THE RUN ITSELF — did it finish and read the roster? Said first, in red, above the tiles,
+    # because a crashed batch preview used to render as a clean, armable, empty roster.
+    if returncode is not None:
+        _run_failure = _batch_failure(parsed, returncode)
+        if _run_failure:
+            st.markdown(
+                theme.status_card(
+                    "Batch read-only preview",
+                    "bad",
+                    "This batch check did not complete — there is nothing to review",
+                    _run_failure + " Nothing was transmitted, and nothing can be sent until "
+                                   "a batch preview completes.",
+                ),
+                unsafe_allow_html=True,
+            )
 
     if sm is not None:
         t1, t2, t3, t4 = st.columns(4)
@@ -1356,16 +1723,21 @@ def _run_batch_preview_and_render() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _store_failed_preview(
+            "cp_batch_last_preview",
+            "The batch preview could not start: the batch executor or its Python could not "
+            "be found on this machine.")
         return
     try:
         with st.spinner("Building the read-only BATCH preview (reading every roster account "
                         "on the port-4003 gateway)…"):
-            proc = subprocess.run(
+            proc = deskproc.run(
                 [VENV_PYTHON, str(_BATCH_SCRIPT)],
                 cwd=str(_BATCH_CWD), capture_output=True, text=True,
                 timeout=_BATCH_PREVIEW_TIMEOUT_SEC,
             )
         stdout, stderr = proc.stdout or "", proc.stderr or ""
+        returncode = proc.returncode
     except subprocess.TimeoutExpired:
         st.markdown(
             theme.status_card(
@@ -1375,6 +1747,10 @@ def _run_batch_preview_and_render() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _store_failed_preview(
+            "cp_batch_last_preview",
+            "The batch preview did not finish in time, so the roster was never fully read. "
+            "The live-trade Gateway on port 4003 may be down or not logged in.")
         return
     except Exception as exc:  # noqa: BLE001 — any failure is a plain-English card, never a crash
         st.markdown(
@@ -1385,15 +1761,24 @@ def _run_batch_preview_and_render() -> None:
             ),
             unsafe_allow_html=True,
         )
+        _store_failed_preview(
+            "cp_batch_last_preview",
+            f"The batch preview could not be run ({type(exc).__name__}), so the roster was "
+            f"never read. The live-trade Gateway on port 4003 may be down or not logged in.")
         return
 
-    _render_batch_preview_result(stdout, stderr)
-    _store_batch_last_preview(stdout)
+    _render_batch_preview_result(stdout, stderr, returncode)
+    # Bind the batch arm/send step to THIS attempt — including, deliberately, a failed one.
+    _store_batch_last_preview(stdout, returncode)
+    _batch_note = _stored_preview_failure("cp_batch_last_preview")
     _arm_execute_audit(
         category="control_plane_batch_preview",
-        message=("Built a read-only multi-account BATCH rebalance preview across the blessed "
-                 "roster — nothing was transmitted."),
-        severity="info")
+        message=(("A read-only multi-account BATCH rebalance preview across the blessed "
+                  f"roster did NOT complete: {_batch_note} Nothing was transmitted, and "
+                  "nothing may be sent from it.") if _batch_note else
+                 ("Built a read-only multi-account BATCH rebalance preview across the "
+                  "blessed roster — nothing was transmitted.")),
+        severity=("warn" if _batch_note else "info"))
 
 
 def _classify_batch_output(stdout: str, stderr: str) -> str:
@@ -1440,7 +1825,7 @@ def _run_batch_execute_and_render(can_press: bool, pressed: bool) -> None:
     try:
         with st.spinner("Transmitting the BATCH rebalance to the live-trade Gateway "
                         "(port 4003) — per-account two-phase cash-gated across the roster…"):
-            proc = subprocess.run(
+            proc = deskproc.run(
                 [VENV_PYTHON, str(_BATCH_SCRIPT), arm_token],
                 cwd=str(_BATCH_CWD), capture_output=True, text=True,
                 timeout=_BATCH_EXECUTE_TIMEOUT_SEC,
@@ -1560,11 +1945,19 @@ def _render_batch_rebalance() -> None:
             _run_batch_preview_and_render()
 
     batch_age_secs, batch_fresh = _batch_preview_freshness()
+    # ...and whether that batch preview completed AND its totals agree with its table. Read
+    # from session state, so a crash or a mismatch keeps refusing across reruns.
+    batch_failure = _stored_preview_failure("cp_batch_last_preview")
+    batch_usable = _preview_is_armable(batch_fresh, batch_failure)
     has_batch_preview = isinstance(st.session_state.get("cp_batch_last_preview"), dict)
     with cols[0]:
         if not has_batch_preview:
             st.markdown(theme.pill("No batch preview yet — press Build", "unknown"),
                         unsafe_allow_html=True)
+        elif batch_failure:
+            st.markdown(
+                theme.pill("The last batch check did not complete — build it again", "bad"),
+                unsafe_allow_html=True)
         elif batch_fresh:
             st.markdown(
                 theme.pill(f"Preview fresh (under {int(PREVIEW_FRESHNESS_SECS // 60)} min)",
@@ -1602,10 +1995,15 @@ def _render_batch_rebalance() -> None:
     # Step 3 · Send.
     with cols[2]:
         st.markdown(theme.section("Step 3 · Send"), unsafe_allow_html=True)
-        can_press = batch_fresh and confirmed
+        # THE GATE. A batch preview must be young, a completed read of the roster, AND
+        # internally consistent (its totals matching its table) before it can be armed from.
+        can_press = batch_usable and confirmed
         pressed = st.button("Send batch rebalance to IBKR", key="cp_batch_execute_btn",
                             disabled=not can_press, use_container_width=True)
-        if batch_fresh:
+        if batch_failure:
+            step1_mark = ("• the last batch check did not complete, or its totals did not "
+                          "match its table — build the batch preview again")
+        elif batch_fresh:
             step1_mark = "✓ fresh batch preview reviewed"
         elif batch_age_secs is not None:
             step1_mark = (f"• expired — rebuild the batch preview "
@@ -1673,11 +2071,20 @@ def render_control_plane() -> None:
 
     # Freshness now reflects any just-built preview.
     preview_age_secs, preview_fresh = _preview_freshness()
+    # ...and whether that preview actually completed. A young timestamp on a crashed run is
+    # not a reviewed preview; this is read from session state, so it survives every rerun.
+    preview_failure = _stored_preview_failure("cp_last_preview")
+    preview_usable = _preview_is_armable(preview_fresh, preview_failure)
     has_preview = isinstance(st.session_state.get("cp_last_preview"), dict)
     with cols[0]:
         if not has_preview:
             st.markdown(theme.pill("No preview yet — press Build", "unknown"),
                         unsafe_allow_html=True)
+        elif preview_failure:
+            st.markdown(
+                theme.pill("The last check did not complete — build the preview again",
+                           "bad"),
+                unsafe_allow_html=True)
         elif preview_fresh:
             st.markdown(
                 theme.pill(f"Preview fresh (under {int(PREVIEW_FRESHNESS_SECS // 60)} min)",
@@ -1719,14 +2126,19 @@ def render_control_plane() -> None:
     # (preview_fresh AND confirmed), same guarded handler; only the label reads "Send".
     with cols[2]:
         st.markdown(theme.section("Step 3 · Send"), unsafe_allow_html=True)
-        can_press = preview_fresh and confirmed
+        # THE GATE. A preview must be BOTH young AND a completed read of the account before
+        # it can be armed from — a crashed run stores a failure marker and refuses here.
+        can_press = preview_usable and confirmed
         pressed = st.button(
             "Send order to IBKR",
             key="cp_execute_btn",
             disabled=not can_press,
             use_container_width=True,
         )
-        if preview_fresh:
+        if preview_failure:
+            step1_mark = ("• the last check did not complete — build the preview again "
+                          "(nothing can be sent from a check that did not read the account)")
+        elif preview_fresh:
             step1_mark = "✓ fresh preview reviewed"
         elif preview_age_secs is not None:
             step1_mark = (f"• expired — rebuild the preview "

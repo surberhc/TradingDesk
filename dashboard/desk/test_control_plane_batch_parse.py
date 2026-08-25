@@ -45,6 +45,21 @@ _SUMMARY_LINE = ("    BATCH-SUMMARY roster=4 out_of_spec=2 in_spec=1 skipped=1 "
                  "total_legs=6 total_sells=12345.67 total_buys=8910.11")
 
 
+def _summary_line(roster, out_of_spec, in_spec, skipped, total_legs):
+    """A BATCH-SUMMARY line that AGREES with the account rows the test prints alongside it.
+
+    The executor prints exactly one BATCH-ACCOUNT line per out-of-spec account, and its
+    total_legs is the sum of those rows' legs (batch_rebalance_execute.summarize_batch), so a
+    fixture whose summary contradicts its rows is output the executor could never produce.
+    Two tests below reused the shared _SUMMARY_LINE while printing a different number of rows
+    — harmless while the only thing under test was row parsing, but the Control Plane now
+    reconciles the tiles against the table, so each of those fixtures states its own
+    consistent summary."""
+    return (f"    BATCH-SUMMARY roster={roster} out_of_spec={out_of_spec} in_spec={in_spec} "
+            f"skipped={skipped} total_legs={total_legs} total_sells=12345.67 "
+            f"total_buys=8910.11")
+
+
 # --------------------------------------------------------------------------- #
 # 1. Every real model label parses, spaces and brackets included.              #
 # --------------------------------------------------------------------------- #
@@ -86,8 +101,14 @@ def test_spaced_label_keeps_every_other_field_correct():
 def test_mixed_roster_returns_every_account():
     """A roster holding plain, small-tier and custom labels loses nobody."""
     labels = ["Growth", "Growth (Small)", "Growth (Custom)", "Conservative (Small, Custom)"]
+    # FOUR out-of-spec rows at the _acct_line default of 3 legs each = 12 legs, so the summary
+    # says out_of_spec=4 and total_legs=12 (roster 4 out of spec + 1 in spec + 1 skipped = 6).
+    # This fixture used the shared _SUMMARY_LINE, which claims 2 out-of-spec accounts and 6
+    # legs — a contradiction the reconciliation now catches. The test's purpose (every label
+    # survives the round trip, nobody is dropped) is untouched.
+    summary = _summary_line(roster=6, out_of_spec=4, in_spec=1, skipped=1, total_legs=12)
     stdout = "\n".join(
-        _acct_line(lb, account=f"U{i}") for i, lb in enumerate(labels)) + "\n" + _SUMMARY_LINE
+        _acct_line(lb, account=f"U{i}") for i, lb in enumerate(labels)) + "\n" + summary
     parsed = cp._parse_batch_preview(stdout)
     assert [a["version"] for a in parsed["accounts"]] == labels
     assert [a["account"] for a in parsed["accounts"]] == [f"U{i}" for i in range(len(labels))]
@@ -158,7 +179,13 @@ def test_unreadable_summary_line_is_surfaced():
 
 
 def test_clean_output_produces_no_warning():
-    stdout = _acct_line("Growth (Small)") + "\n" + _SUMMARY_LINE
+    # ONE out-of-spec row at the _acct_line default of 3 legs, so the summary says
+    # out_of_spec=1 and total_legs=3 (roster 1 out of spec + 2 in spec + 1 skipped = 4). This
+    # fixture used the shared _SUMMARY_LINE, which claims 2 out-of-spec accounts and 6 legs
+    # over a single row — a contradiction, and no longer "clean output". The test's purpose
+    # (readable output raises no warning) is untouched.
+    stdout = (_acct_line("Growth (Small)") + "\n"
+              + _summary_line(roster=4, out_of_spec=1, in_spec=2, skipped=1, total_legs=3))
     assert cp._batch_parse_warning(cp._parse_batch_preview(stdout)) is None
 
 
