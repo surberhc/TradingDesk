@@ -33,6 +33,32 @@ if exist "%BASE_PY%" (
   echo [run_live_trade_gateway_open.cmd] WARN: interpreter not found: "%BASE_PY%" -- skipping orphan reap.
 )
 
+REM --- 1b) Do NOT launch if a live-trade gateway PROCESS already exists -------------
+REM  WHY: the port-4003 check in step 2 is BLIND during login/2FA. A gateway sitting at the
+REM  IBKR 2FA prompt has not bound 4003 yet, so step 2 sees "no listener" and launches a
+REM  RIVAL instance. Each rival fires its OWN 2FA push, and because config.ini sets
+REM  ExistingSessionDetectedAction=primary, whichever session logs in LAST evicts the one
+REM  the human just approved -- so approving a push immediately kicks you out and the next
+REM  launch re-prompts. That is the 2026-08-25 post-power-loss 2FA doom loop: the boot
+REM  trigger, the logon trigger and the 10-minute repetition all fired within seconds of
+REM  the 13:24 reboot, producing two gateways 17s apart (pids 16968 / 5276) and a push
+REM  treadmill until s8_gateway_reap killed the orphan.
+REM
+REM  The PROCESS is the right ground truth here, not the port: s8_gateway_reap (step 1) has
+REM  already guaranteed that at most one C:\IBC-Live-Trade gateway survives, and that an
+REM  in-progress 2FA is explicitly SPARED (its LOGIN_GRACE_SECS rule). So "a live-trade
+REM  gateway process exists" is sufficient reason not to start another -- bound or not.
+REM
+REM  FAIL-OPEN, like step 2: only the definite "one exists" answer (exit 11) suppresses the
+REM  launch. A probe that cannot run falls through and still cold-starts, so a genuine
+REM  gateway-less morning is never left without a gateway.
+powershell -NoProfile -NonInteractive -Command "$ErrorActionPreference='SilentlyContinue'; $g=@(Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'java.exe' -and $_.CommandLine -like '*C:\IBC-Live-Trade*' }); if ($g.Count -gt 0) { exit 11 } else { exit 0 }"
+if "%ERRORLEVEL%"=="11" (
+  echo [run_live_trade_gateway_open.cmd] a live-trade gateway process already exists -- it may still be completing login/2FA. NOT launching a second one.
+  set "RC=0"
+  goto :finish
+)
+
 REM --- 2) Only launch if port 4003 has NO listener (idempotent cold start) ---
 powershell -NoProfile -NonInteractive -Command "if (Get-NetTCPConnection -LocalPort 4003 -State Listen -ErrorAction SilentlyContinue) { exit 10 } else { exit 0 }"
 if "%ERRORLEVEL%"=="10" (
