@@ -416,7 +416,8 @@ def parse_task_history() -> list[dict]:
     plain event ('Nightly status email ran successfully at 9:00 PM'). Degrades to
     [] on any failure (no PowerShell, no match, bad output)."""
     import json
-    import subprocess
+
+    import deskproc  # starts the process with no flashing console window
 
     # Reuse deskdata's curated task -> plain-description map + result phrasing.
     try:
@@ -440,7 +441,7 @@ def parse_task_history() -> list[dict]:
         "| ConvertTo-Json -Compress"
     )
     try:
-        proc = subprocess.run(
+        proc = deskproc.run(
             ["powershell.exe", "-NoProfile", "-Command", cmd],
             capture_output=True, text=True, timeout=25)
         data = json.loads(proc.stdout) if proc.stdout.strip() else []

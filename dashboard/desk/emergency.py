@@ -30,8 +30,9 @@ spells out, in full sentences, exactly what it does.
 from __future__ import annotations
 
 import json
-import subprocess
 from datetime import datetime
+
+import deskproc  # one place that starts a process with no flashing console window
 
 # --- Durable event log — imported defensively (may be authored in parallel). --
 try:
@@ -256,7 +257,7 @@ def build_process_status_command(markers: list[str]) -> str:
 def _run_powershell(script: str, timeout: int = 30) -> dict:
     """Run a PowerShell command, returning {rc, stdout, stderr}. Never raises."""
     try:
-        proc = subprocess.run(
+        proc = deskproc.run(
             ["powershell.exe", "-NoProfile", "-NonInteractive", "-Command", script],
             capture_output=True, text=True, timeout=timeout,
         )

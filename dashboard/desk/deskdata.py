@@ -12,12 +12,13 @@ from __future__ import annotations
 
 import json
 import socket
-import subprocess
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import streamlit as st
+
+import deskproc  # one place that starts a process with no flashing console window
 
 CT_ZONE = ZoneInfo("America/Chicago")
 STATUS_DIR = Path(r"C:\TradingDesk-Local\state\dailyreport\status")
@@ -214,7 +215,7 @@ def _raw_task_info() -> dict:
         "LastTaskResult = $i.LastTaskResult } } | ConvertTo-Json -Compress"
     )
     try:
-        out = subprocess.run(
+        out = deskproc.run(
             ["powershell.exe", "-NoProfile", "-Command", cmd],
             capture_output=True, text=True, timeout=25)
         data = json.loads(out.stdout) if out.stdout.strip() else []
