@@ -213,3 +213,85 @@ def funded_account_ids(account_ids: Iterable[str], conn=None) -> set[str]:
         if own:
             conn.close()
     return funded
+
+
+# --- Andrew-authored ("custom") model allocations -------------------------------
+# The CRM view that publishes Andrew's own hand-authored model portfolios (ticker +
+# percentage) to the desk. READ-ONLY, granted to `tradingdesk_readonly`. Its contract, which
+# the desk relies on and does NOT re-implement:
+#   * one row per (model, ticker) of the CURRENT PUBLISHED version only;
+#   * drafts and future-dated versions NEVER appear;
+#   * a model with no published allocation returns NO ROWS at all (never a zero-weight row);
+#   * weights are PERCENTAGES that sum to exactly 100 per model (DB triggers enforce it, and
+#     a published version is immutable).
+# Columns: strategy_name, strategy_code, ticker, weight_pct, version_number, effective_from,
+#          published_at, version_id, strategy_id.
+CUSTOM_ALLOCATIONS_VIEW = "v_tradingdesk_custom_allocations"
+
+_CUSTOM_ALLOCATION_COLUMNS = ("strategy_name", "strategy_code", "ticker", "weight_pct",
+                              "version_number", "effective_from", "published_at",
+                              "version_id", "strategy_id")
+
+
+def fetch_custom_allocations(strategy_names: Optional[Iterable[str]] = None,
+                             conn=None) -> list[dict]:
+    """Read the current published custom allocations from ``v_tradingdesk_custom_allocations``.
+
+    ``strategy_names`` optionally restricts the read to specific model LABELS — the same
+    strings that appear as ``v_tradingdesk_roster.model`` (e.g. "Growth (Custom)"). None reads
+    every published custom model. Passing an EMPTY iterable is an explicit "nothing to ask
+    for" and returns ``[]`` without touching the database.
+
+    Returns a list of plain dicts, ordered by model then ticker. A model with no published
+    allocation simply contributes no rows — callers must treat that as "no allocation", never
+    as an empty allocation (an empty target would liquidate an account). READ-ONLY. Raises
+    CrmRosterUnavailable if the CRM is not reachable/configured."""
+    names: Optional[list[str]] = None
+    if strategy_names is not None:
+        names = [str(n) for n in strategy_names]
+        if not names:
+            return []
+
+    sql = (f"select {', '.join(_CUSTOM_ALLOCATION_COLUMNS)} "
+           f"from {CUSTOM_ALLOCATIONS_VIEW}")
+    params: list = []
+    if names is not None:
+        sql += " where strategy_name = any(%s::text[])"
+        params.append(names)
+    sql += " order by strategy_name, ticker"
+
+    own = conn is None
+    conn = conn or _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(sql, params)
+            return _rows_as_dicts(cur)
+    except CrmRosterUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise CrmRosterUnavailable(f"CRM custom-allocation query failed: {exc}") from exc
+    finally:
+        if own:
+            conn.close()
+
+
+def custom_allocation_labels(conn=None) -> set[str]:
+    """The set of model labels that CURRENTLY have a published custom allocation.
+
+    This is the desk's SOURCE-BASED test for "is this model one Andrew authored?" — the only
+    safe one. A NAME-based test (does the label say "Custom"? does it end in " (Small)"?) is
+    one CRM rename away from routing a hand-authored model into the S0 backtester, or into
+    small_tier.collapse, and silently throwing the whole allocation away. READ-ONLY."""
+    own = conn is None
+    conn = conn or _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(f"select distinct strategy_name from {CUSTOM_ALLOCATIONS_VIEW}")
+            return {str(r[0]) for r in cur.fetchall()}
+    except CrmRosterUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise CrmRosterUnavailable(f"CRM custom-allocation label query failed: {exc}") from exc
+    finally:
+        if own:
+            conn.close()

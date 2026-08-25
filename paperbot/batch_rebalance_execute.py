@@ -73,8 +73,10 @@ import sys
 import config
 import crm_execute
 import crm_roster
+import custom_target
 from strategies import small_tier
 from strategies import config as config_s
+import ledger
 import live_quotes
 import rebalance_engine
 import roster
@@ -129,13 +131,93 @@ def _kill_switch_present() -> bool:
 _TIER_MISMATCHES: dict[str, tuple] = {}
 
 
+def split_versions(labels) -> tuple[list[str], list[str]]:
+    """Partition model labels into (CUSTOM, NON-CUSTOM) by the allocation's SOURCE — one CRM
+    read for the whole batch. Thin wrapper over ``custom_target.split_labels`` (which asks
+    "does this label have rows in v_tradingdesk_custom_allocations?"), with ONE addition: when
+    the CRM connection is not configured at all there are, by definition, no published custom
+    allocations, so every label is non-custom and we do not attempt a read. That is the
+    config.ENROLLMENT fallback environment the S0-only book already runs in.
+
+    A CONFIGURED-but-failing CRM deliberately RAISES (crm_roster.CrmRosterUnavailable) rather
+    than answering "non-custom": "I cannot tell whether this is a book Andrew authored by
+    hand" must never silently resolve to "treat it as an S0 model". Both callers below turn
+    that raise into a loud refusal that connects to nothing.
+
+    NEVER keys on the label's SPELLING. A CRM rename ("Growth (Custom)" -> anything, including
+    something ending in " (Small)") must not be able to re-point an account onto an S0 model
+    or into small_tier's NAV re-tiering."""
+    wanted = [str(v) for v in labels]
+    if not wanted or not crm_roster.is_configured():
+        return [], wanted
+    return custom_target.split_labels(wanted)
+
+
+class TargetBuildFailed(RuntimeError):
+    """One model label's Target could not be built. Carries the LABEL so the caller can print
+    the same ``COULD NOT BUILD TARGET for <label>`` refusal it always has, whether the label
+    was an S0 model or an Andrew-authored custom allocation."""
+
+    def __init__(self, label: str, cause: Exception):
+        self.label = str(label)
+        self.cause = cause
+        super().__init__(str(cause))
+
+
+def build_targets(distinct_versions) -> tuple[dict, dict]:
+    """``({label: Target}, {label: AllocationMeta})`` for every distinct roster model label.
+
+    DISPATCH BY SOURCE (:func:`split_versions`), never by the label's spelling:
+      * CUSTOM labels are built by ``custom_target.custom_targets_with_meta`` — ONE CRM read
+        for the whole batch — and keep their published-version identity for the Stage 6 audit
+        record. ``Target.version`` is the label VERBATIM, so ``targets[plan.version]`` in
+        crm_execute.py resolves (a decorated version is a hard KeyError there, not a skip).
+      * every other label is built by ``strategy_target.current_target`` exactly as before.
+
+    FAIL CLOSED. Any label that cannot be built raises :class:`TargetBuildFailed` naming it —
+    including a custom label that came back with no rows (a model that IS custom must never
+    fall through to the S0 backtester, and an empty book would liquidate the account).
+    Metas contains ONLY custom labels; an S0 label is simply absent from it.
+
+    Read-only: reads the CRM view and local price/strategy data. No broker, no order."""
+    wanted = [str(v) for v in distinct_versions]
+    custom_versions, s0_versions = split_versions(wanted)
+
+    targets: dict = {}
+    metas: dict = {}
+    if custom_versions:
+        try:
+            built = custom_target.custom_targets_with_meta(custom_versions)
+        except Exception as exc:  # noqa: BLE001
+            label = getattr(exc, "label", None) or ", ".join(custom_versions)
+            raise TargetBuildFailed(label, exc) from exc
+        for label in custom_versions:
+            if label not in built:
+                # split_versions said this label HAS a published allocation and the builder
+                # returned none for it — the two CRM reads disagree. Refuse; do not fall
+                # through to strategy_target with a hand-authored label.
+                raise TargetBuildFailed(label, custom_target.NoCustomAllocation(
+                    f"custom model {label!r} has a published allocation per "
+                    f"{crm_roster.CUSTOM_ALLOCATIONS_VIEW} but produced no Target — refusing "
+                    f"to size the account against anything else."))
+            targets[label], metas[label] = built[label]
+
+    for v in s0_versions:
+        try:
+            targets[v] = strategy_target.current_target(version=v)
+        except Exception as exc:  # noqa: BLE001
+            raise TargetBuildFailed(v, exc) from exc
+    return targets, metas
+
+
 def resolve_roster_versions(roster_accounts: list[str]) -> dict[str, str]:
     """Map each blessed roster account -> its model version, from the SAME source the roster
     derives from. Prefer the CRM roster ``model`` (v_tradingdesk_roster), fall back to the
     local config.ENROLLMENT map, then to config.STRATEGY_VERSION for anything still unmapped.
 
-    Pure/read-only: SELECTs from the read-only CRM role when configured, else reads config;
-    contacts no broker, builds no order."""
+    An ANDREW-AUTHORED (custom) allocation is EXEMPT from the NAV re-tiering below — see the
+    inline note. Pure/read-only: SELECTs from the read-only CRM role when configured, else
+    reads config; contacts no broker, builds no order."""
     crm_models: dict[str, str] = {}
     crm_navs: dict[str, float] = {}
     if crm_roster.is_configured():
@@ -148,10 +230,30 @@ def resolve_roster_versions(roster_accounts: list[str]) -> dict[str, str]:
                     crm_navs[acct] = float(nav)
         except crm_roster.CrmRosterUnavailable:
             crm_models, crm_navs = {}, {}   # CRM unreachable -> config fallback below
-    out: dict[str, str] = {}
+    raw: dict[str, str] = {}
     for a in roster_accounts:
-        label = (crm_models.get(a) or config.ENROLLMENT.get(a)
-                 or config.STRATEGY_VERSION)
+        raw[a] = (crm_models.get(a) or config.ENROLLMENT.get(a)
+                  or config.STRATEGY_VERSION)
+
+    # SOURCE-BASED CUSTOM EXCLUSION (one CRM read for the whole roster). Everything below is
+    # the S0 NAV re-tiering; a hand-authored book must never enter it.
+    custom_labels = set(split_versions(sorted(set(raw.values())))[0])
+
+    out: dict[str, str] = {}
+    for a, label in raw.items():
+        # CUSTOM ALLOCATION -> NO NAV OVERRIDE. Andrew authored these tickers and percentages
+        # himself; there is no "parent" model to collapse onto and no whole-share proxy to
+        # promote/demote into. Letting small_tier see one is a real hazard: parent_version()
+        # and tier_for() are SPELLING-based, so a CRM rename to anything ending in " (Small)"
+        # would make tier_for() REWRITE the account's label onto an S0 model — silently
+        # discarding the whole hand-authored book. It is safe TODAY only because
+        # "Growth (Small, Custom)" happens not to end in " (Small)"; that is a coincidence of
+        # naming, not a control. This exclusion asks the allocation's SOURCE instead, so a
+        # rename cannot re-point the account. (The CRM's own re-tiering job excludes custom
+        # models for the same reason — this is the desk-side half of the same rule.)
+        if label in custom_labels:
+            out[a] = label
+            continue
         # PRE-TRADE TIER CHECK (authoritative). The CRM's stored label is a RECORD, and a
         # record can be stale — the nightly tier scan might not have run. NAV is the thing
         # that actually decides which model an account can hold whole-share, and we have it
@@ -190,7 +292,7 @@ def fa_block_whatif_preflight(*_args, **_kwargs):
 # PURE request assembly + per-account margin pre-flight line (#57) — unit-testable offline.
 # ========================================================================================
 def build_batch_requests(plans: list, *, targets, quotes, prices, roster_accounts,
-                         summaries=None, armed=False, kill=False) -> list:
+                         summaries=None, armed=False, kill=False, run_id=None) -> list:
     """PURE: turn the per-account sized plans into per-account ExecutionRequests by REUSING
     crm_execute.requests_from_crm_plan (no re-implementation).
 
@@ -198,11 +300,51 @@ def build_batch_requests(plans: list, *, targets, quotes, prices, roster_account
     in the {"plans": [...]} shape that crm_execute expects and delegate. That helper SKIPS any
     account whose orders are all-zero (already in-band), so the returned requests are exactly
     the OUT-OF-SPEC subset. Every request carries allowed_accounts=the roster (the account
-    wall), purpose=REBALANCE, conform=False. Builds and transmits nothing."""
+    wall), purpose=REBALANCE, conform=False. Builds and transmits nothing.
+
+    `run_id` (v0.37.0, the audit trail) is stamped onto EVERY request so the whole batch shares
+    ONE run identifier. safe_execute.execute_plan honours `req.run_id` (it only invents one
+    when None), and every orderRef it puts on the wire ends in `:{run_id}` — so the single
+    ledger record this batch writes joins back to each IBKR order, and forward to the exact
+    model / published allocation version that produced it. crm_execute stays untouched (it
+    builds requests with run_id=None for every caller); the stamp is applied here."""
     crm_result = {"plans": list(plans), "blocks": [], "routes": []}
-    return crm_execute.requests_from_crm_plan(
+    requests = crm_execute.requests_from_crm_plan(
         crm_result, targets=targets, quotes=quotes, prices=prices,
         roster=roster_accounts, summaries=summaries or {}, armed=armed, kill=kill)
+    if run_id:
+        for req in requests:
+            req.run_id = run_id
+    return requests
+
+
+def account_universe(target, meta, held, base=None):
+    """The tradeable universe to hand ``rebalance_engine.plan_account(universe=...)`` for ONE
+    account. PURE.
+
+    S0 MODEL (`meta` is None) -> `base` (S0's ALL_TICKERS) exactly as before. Unchanged.
+
+    CUSTOM ALLOCATION (`meta` is an AllocationMeta) -> the allocation's OWN tickers plus this
+    account's currently-held symbols, via ``custom_target.universe_for(target, held=held)``.
+
+    WHY THE S0 UNIVERSE IS A TRAP HERE. reconcile classifies a HELD symbol the model weights
+    at 0 as ROTATE_OUT if it is IN the universe and ALIEN if it is not, and ALIEN is in
+    rebalance_engine._NO_AUTOTRADE_STATUSES: an ALIEN line never breaches the band and never
+    produces a delta. Pass S0's universe to a custom account and any ticker Andrew REMOVES
+    from his allocation is instantly ALIEN — it would sit in the account forever, never sold,
+    with no error anywhere. The rotation would silently do nothing. That is the whole reason
+    this function exists.
+
+    THE TRADE-OFF, STATED. Putting the account's held symbols in the universe also takes those
+    symbols OUT of ALIEN review, so a corporate-action holding in a custom account becomes
+    eligible for an automatic SELL instead of being parked for a human. That is the intended
+    rotation set for a hand-authored book — the desk cannot otherwise know that a held ticker
+    belonged to a PREVIOUS version of the allocation — and the sizing loop prints exactly
+    which symbols it applies to on every run. `base` is deliberately NOT unioned in for a
+    custom account: the universe is the intended rotation set, not something broader."""
+    if meta is None:
+        return base
+    return custom_target.universe_for(target, held=list(held or ()))
 
 
 def margin_preflight_line(request, result) -> tuple[bool, str]:
@@ -236,6 +378,125 @@ def summarize_batch(plans: list, requests: list, results: list) -> dict:
         "total_sells": total_sells,
         "total_buys": total_buys,
         "total_legs": total_legs,
+    }
+
+
+# ========================================================================================
+# THE AUDIT TRAIL (v0.37.0) — "when I made allocation changes, when the trades happened,
+# and keep all the data".
+# ========================================================================================
+# THE GAP THIS CLOSES. This executor — the one the Control Plane actually shells out to —
+# wrote NO ledger record at all. ledger.record_run is called by execution_engine,
+# rebalance_execute, live_fa_block_execute and others, but never here, so a batch run left
+# only the per-leg transmit_journal and the orderRef on the wire: no stored target weights,
+# no model label, and nothing at all tying a fill back to the book that asked for it.
+#
+# AND WHY THE orderRef ALONE IS NOT ENOUGH FOR A CUSTOM MODEL. The ref encodes
+# `target.as_of`, which for a custom allocation is the version's effective_from — a DATE.
+# Two allocations published on the same day are therefore INDISTINGUISHABLE on the wire. The
+# thing that actually identifies the book Andrew authored is the allocation's version_number
+# / version_id, and that only exists if we write it down here.
+def order_refs_for(request, result, run_id: str) -> list[str]:
+    """The exact orderRefs this account's legs carry on the wire, in leg order.
+
+    REUSES safe_execute._deploy_ref with the same (account, target.as_of, side, symbol,
+    run_id) the transmit phase uses, so the recorded ref is byte-identical to the transmitted
+    one — never a re-implementation of the ref format. Recorded for a PREVIEW too: it is then
+    the ref the run WOULD have used, which is what makes a preview reviewable."""
+    return [safe_execute._deploy_ref(request.account, request.target.as_of, l.side, l.symbol,
+                                     run_id)
+            for l in (result.legs or [])]
+
+
+def run_id_from_order_ref(order_ref: str) -> str | None:
+    """The run_id an orderRef carries — the FIRST hop of the audit join, going backwards from
+    an IBKR order to the run record. Every ref this lane transmits is
+    ``paperbot:{account}:{as_of}:{side}:{symbol}:deploy:{run_id}``, so the run stamp is the
+    last colon-delimited field. None if the ref carries no run stamp (a pre-v0.34 ref, or a
+    ref built with run_id=None)."""
+    parts = str(order_ref).split(":")
+    if len(parts) < 2 or parts[-2] != safe_execute.DEPLOY_REF_TAG:
+        return None
+    return parts[-1] or None
+
+
+def account_audit_record(request, result, *, model_label, target, meta, run_id,
+                         margin_ok=None) -> dict:
+    """The per-account slice of the batch audit record.
+
+    Modelled on execution_engine._run_record (the only existing shape that stores the actual
+    TARGET WEIGHTS — the thing that makes a record re-derivable years later), plus the two
+    fields this lane needs and that one has no concept of: the account's MODEL LABEL, and —
+    where that model is an Andrew-authored custom allocation — the published allocation's
+    version_number / version_id (via AllocationMeta.stamp(), so the field names match the rest
+    of the desk). `meta` is None for an S0 model; the custom_* fields are then absent, which
+    is itself the record of "this was a computed model, not a hand-authored book"."""
+    legs = result.legs or []
+    record = {
+        "account": request.account,
+        "model": str(model_label),
+        "is_custom_allocation": meta is not None,
+        "target_as_of": str(getattr(target.as_of, "date", lambda: target.as_of)()),
+        "target_price_date": str(getattr(target.price_date, "date",
+                                         lambda: target.price_date)()),
+        "target_weights": {str(k): round(float(v), 6) for k, v in target.weights.items()},
+        "nav": None if request.net_liq is None else round(float(request.net_liq), 2),
+        "status": result.status,
+        "legs": [{"side": l.side, "sym": l.symbol, "qty": l.qty, "limit": l.limit,
+                  "notional": round(float(l.notional), 2)} for l in legs],
+        "n_legs": len(legs),
+        "order_refs": order_refs_for(request, result, run_id),
+        "reasons": list(result.reasons or []),
+        "sell_results": list(result.sell_results or []),
+        "buy_results": list(result.buy_results or []),
+        "n_transmitted": len(result.sell_results or []) + len(result.buy_results or []),
+        "margin_preflight_ok": margin_ok,
+    }
+    if meta is not None:
+        record.update(meta.stamp())
+    return record
+
+
+def batch_run_record(*, run_id, mode, accounts, summary, skipped, armed, kill,
+                     permitted) -> dict:
+    """The ONE ledger record per batch run. `accounts` are account_audit_record dicts.
+
+    Top-level keys mirror what ledger.record_run's human log line reads (mode/account/nav/
+    n_intents/n_approved/n_transmitted/halted) so `paperbot.log` stays scannable, and
+    `run_id` is the join key: every orderRef this run put on the wire ends in it, and
+    ledger.find_run(run_id) brings an examiner back here from any one of them.
+
+    Written for an S0-only batch exactly as for a custom one — the trail must not exist only
+    for the new feature."""
+    n_legs = sum(a["n_legs"] for a in accounts)
+    return {
+        "mode": mode,
+        "account": f"<batch of {len(accounts)} account(s)>",
+        "run_id": run_id,
+        "nav": round(sum(a["nav"] or 0.0 for a in accounts), 2),
+        "daily_pnl": 0.0,
+        # execution_engine's record is single-account and stores ONE target_as_of/weights set.
+        # A batch spans models, so the per-account entries carry those; these two are kept at
+        # the top level only so the record's SHAPE stays recognisable to an existing reader.
+        "target_as_of": "per-account (see accounts[].target_as_of)",
+        "target_weights": {},
+        "accounts": accounts,
+        "n_intents": n_legs,
+        "n_approved": n_legs,
+        "n_transmitted": sum(a["n_transmitted"] for a in accounts),
+        "halted": False,
+        "halt_reason": "",
+        "order_vetoes": [],
+        "batch_vetoes": [],
+        "n_roster": summary.get("n_roster"),
+        "n_out_of_spec": summary.get("n_out_of_spec"),
+        "n_in_spec": summary.get("n_in_spec"),
+        "skipped_accounts": list(skipped),
+        "total_sells": round(float(summary.get("total_sells") or 0.0), 2),
+        "total_buys": round(float(summary.get("total_buys") or 0.0), 2),
+        "gate": {"armed": armed, "kill_switch": kill, "permitted": permitted,
+                 "port": LIVE_TRADE_PORT},
+        **version.stamp(),
     }
 
 
@@ -285,7 +546,15 @@ def main(armed: bool = False, today: object = None) -> int:
         print("    The enrolled execution roster is EMPTY — nothing to rebalance. Nothing "
               "connected, nothing transmitted.")
         return 0
-    versions = resolve_roster_versions(roster_accounts)
+    try:
+        versions = resolve_roster_versions(roster_accounts)
+    except Exception as exc:  # noqa: BLE001 — nothing is connected yet; refuse loudly
+        # Reachable when the CRM IS configured but the custom-allocation read fails: we then
+        # cannot tell an Andrew-authored book from an S0 model, and guessing either way is a
+        # mis-sized account. Fail closed.
+        print(f"    COULD NOT RESOLVE PER-ACCOUNT MODEL VERSIONS: {type(exc).__name__}: "
+              f"{exc}. Nothing connected, nothing transmitted.")
+        return 2
     if _TIER_MISMATCHES:
         # The desk overrode the CRM's stored model for these accounts. That is the pre-trade
         # check doing its job, but it also means the system of record is STALE — say so here
@@ -307,17 +576,27 @@ def main(armed: bool = False, today: object = None) -> int:
     distinct_versions = sorted(set(versions.values()))
     print(f"\n[2] Computing target(s) for {len(distinct_versions)} distinct version(s) "
           f"(shared brain; stale-data guarded)...")
-    targets: dict = {}
+    try:
+        targets, metas = build_targets(distinct_versions)
+    except TargetBuildFailed as exc:
+        # SAME fail-closed contract as before: a target that cannot be built stops the run
+        # before anything connects. A CUSTOM target fails exactly as loudly as an S0 one —
+        # it must never fall through to the S0 backtester or to an empty book.
+        print(f"    COULD NOT BUILD TARGET for {exc.label!r}: {exc}. Nothing connected, "
+              f"nothing transmitted.")
+        return 2
+    except Exception as exc:  # noqa: BLE001
+        print(f"    COULD NOT BUILD TARGET for {distinct_versions!r}: {exc}. Nothing "
+              f"connected, nothing transmitted.")
+        return 2
     for v in distinct_versions:
-        try:
-            targets[v] = strategy_target.current_target(version=v)
-        except Exception as exc:  # noqa: BLE001
-            print(f"    COULD NOT BUILD TARGET for {v!r}: {exc}. Nothing connected, nothing "
-                  f"transmitted.")
-            return 2
         t = targets[v]
+        meta = metas.get(v)
+        stamp = ("" if meta is None
+                 else f"  [CUSTOM allocation v{meta.version_number} "
+                      f"version_id={meta.version_id}]")
         print(f"    {t.version:13s} as_of={t.as_of.date()}  price_date={t.price_date.date()}"
-              f"  ({len(t.weights)} holdings)")
+              f"  ({len(t.weights)} holdings){stamp}")
 
     kill = _kill_switch_present()
     permit_intent = armed and not kill
@@ -354,7 +633,8 @@ def main(armed: bool = False, today: object = None) -> int:
 
     try:
         return run_batch_session(ib, roster_accounts, versions, targets,
-                                 armed=armed, armed_conn=armed_conn, kill=kill)
+                                 armed=armed, armed_conn=armed_conn, kill=kill,
+                                 metas=metas)
     finally:
         try:
             ib.disconnect()
@@ -364,10 +644,21 @@ def main(armed: bool = False, today: object = None) -> int:
 
 
 def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
-                      targets: dict, *, armed: bool, armed_conn: bool, kill: bool) -> int:
+                      targets: dict, *, armed: bool, armed_conn: bool, kill: bool,
+                      metas: dict | None = None) -> int:
     """Read each blessed account off the ONE 4003 login, size it with the frozen engine, and
     drive safe_execute.execute_plan per OUT-OF-SPEC account (PREVIEW or ARMED). Reads the
-    broker; every transmit decision lives inside the shared engine's gate."""
+    broker; every transmit decision lives inside the shared engine's gate.
+
+    `metas` maps a CUSTOM model label -> its custom_target.AllocationMeta (absent for an S0
+    label). It is the SOURCE-based "is this account on a hand-authored book?" test for the two
+    things this function then does differently: the per-account tradeable universe, and the
+    allocation version stamped into the audit record."""
+    metas = metas or {}
+    # ONE run identifier for the whole batch. Stamped onto every ExecutionRequest, so every
+    # orderRef on the wire ends in it, and written into the single ledger record below — the
+    # join key between an IBKR order and the book that produced it.
+    run_id = safe_execute._run_id()
     strat_universe = sp._strategy_universe()
 
     # [4] Read the whole login's account summary + positions ONCE, then filter per account.
@@ -438,9 +729,18 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
                   f"— SKIPPED (nothing sized, nothing transmitted).")
             skipped.append(account)
             continue
+        acct_universe = account_universe(target, metas.get(v), st["positions"],
+                                         base=strat_universe)
+        if metas.get(v) is not None:
+            lost_alien_review = sorted(set(st["positions"]) - set(target.weights.index))
+            if lost_alien_review:
+                print(f"      custom-allocation universe: {len(acct_universe)} symbol(s). "
+                      f"ROTATABLE (held but not in the published allocation, so they can be "
+                      f"SOLD rather than sitting there forever as ALIEN): "
+                      f"{', '.join(lost_alien_review)}")
         plan = rebalance_engine.plan_account(
             account, target.version, net_liq, st["positions"], target,
-            prices=prices, universe=strat_universe, sec_types=st["sec_types"])
+            prices=prices, universe=acct_universe, sec_types=st["sec_types"])
         plans.append(plan)
         summaries[account] = st["summary"]
         print(f"    {account} [{v}]: NetLiq={net_liq:,.2f}  positions={len(st['positions'])}"
@@ -464,7 +764,8 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     # request carries allowed_accounts=the roster (the independent account wall).
     requests = build_batch_requests(
         plans, targets=targets, quotes=quotes, prices=prices,
-        roster_accounts=roster_accounts, summaries=summaries, armed=armed, kill=kill)
+        roster_accounts=roster_accounts, summaries=summaries, armed=armed, kill=kill,
+        run_id=run_id)
     out_of_spec_accounts = [r.account for r in requests]
     in_spec_accounts = [p.account for p in plans if p.account not in out_of_spec_accounts]
 
@@ -480,6 +781,7 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     # then we print the self-computed per-account margin pre-flight (#57).
     mode = MODE_ARMED if armed_conn else MODE_PREVIEW
     results: list = []
+    margin_flags: list = []
     for req in requests:
         print("\n" + "-" * 92)
         print(f"--- BATCH ACCOUNT {req.account} [{req.strategy_version}] "
@@ -487,6 +789,7 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
         result = safe_execute.execute_plan(req, mode=mode, ib=ib)
         results.append(result)
         mg_ok, mg_reason = margin_preflight_line(req, result)
+        margin_flags.append(mg_ok)
         print(f"    margin_preflight_ok={mg_ok}   (#57 self-computed per-account pre-flight)"
               + (f"   reason: {mg_reason}" if not mg_ok else ""))
         # A parseable per-account line for the Control Plane's batch preview.
@@ -505,6 +808,35 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
           f"{summary['n_out_of_spec']} in_spec={summary['n_in_spec']} skipped={len(skipped)} "
           f"total_legs={summary['total_legs']} total_sells={summary['total_sells']:.2f} "
           f"total_buys={summary['total_buys']:.2f}")
+
+    # [10] THE AUDIT RECORD — one ledger row per batch run, PREVIEW or ARMED. This executor
+    # wrote nothing to the ledger before v0.37.0, so a batch left only the per-leg
+    # transmit_journal and the orderRef: no stored weights, no model label, and — for an
+    # Andrew-authored book — no way at all to tell which published allocation version produced
+    # a fill (the ref carries only a DATE, and two allocations can be published the same day).
+    # Never let a ledger-write failure affect the trading outcome: the trades are already
+    # decided and (if armed) already sent.
+    try:
+        record = batch_run_record(
+            run_id=run_id,
+            mode=("BATCH_REBALANCE_ARMED" if armed_conn else "BATCH_REBALANCE_PREVIEW"),
+            accounts=[
+                account_audit_record(
+                    req, res,
+                    model_label=versions.get(req.account, req.strategy_version),
+                    target=req.target,
+                    meta=metas.get(versions.get(req.account, req.strategy_version)),
+                    run_id=run_id, margin_ok=mg)
+                for req, res, mg in zip(requests, results, margin_flags)],
+            summary=summary, skipped=skipped, armed=armed, kill=kill,
+            permitted=armed_conn)
+        ledger.record_run(record)
+        print(f"    BATCH-LEDGER run_id={run_id} accounts={len(record['accounts'])} "
+              f"(every orderRef this run uses ends in ':{run_id}'; "
+              f"ledger.find_run('{run_id}') returns this record)")
+    except Exception as exc:  # noqa: BLE001
+        print(f"    !! COULD NOT WRITE THE BATCH AUDIT RECORD: {type(exc).__name__}: {exc}. "
+              f"The run itself is unaffected; the trail for run_id={run_id} is INCOMPLETE.")
 
     # Terminal batch verdict: transmitted anything, or preview-only.
     any_transmitted = any(
