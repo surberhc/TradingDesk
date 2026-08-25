@@ -106,13 +106,20 @@ class RiskReport:
                 and all(v.ok for v in self.order_verdicts))
 
 
-def evaluate(nav, daily_pnl, positions, orders, target, limits=None) -> RiskReport:
+def evaluate(nav, daily_pnl, positions, orders, target, limits=None,
+             cash_reserve_pct=None) -> RiskReport:
     """Run every guard over the intended orders and return a RiskReport.
 
     positions : {symbol: shares} currently held.
     orders    : list of execution_engine.IntendedOrder (duck-typed: symbol, side,
                 quantity, limit_price).
     target    : strategy_target.Target (for prices + the per-position weights).
+    cash_reserve_pct : THIS model's standing reserve, the floor the liquid-reserve /
+                no-leverage batch guard enforces. None -> the existing resolution order
+                (an explicit `limits["cash_reserve_pct"]`, else the global buffer), so
+                every pre-existing caller is byte-identical. A book SIZED against a 1%
+                reserve must be CHECKED against 1%: check it against 1.5% and the guard
+                vetoes a correctly-sized custom account for being 0.5% over-invested.
     """
     limits = limits or config.RISK_LIMITS
     halted, halt_reason = check_kill_switch(nav, daily_pnl, limits)
@@ -161,10 +168,14 @@ def evaluate(nav, daily_pnl, positions, orders, target, limits=None) -> RiskRepo
         # `limits` override still wins (preserves the existing override seam). When
         # `limits` is the default config, limits["cash_reserve_pct"] == buffer_pct() — so
         # this is behavior-identical to the previous limits["cash_reserve_pct"].
-        reserve = limits.get("cash_reserve_pct", _investable.buffer_pct())
+        # An explicit per-model reserve wins over both (it IS what the book was sized to).
+        reserve = (float(cash_reserve_pct) if cash_reserve_pct is not None
+                   else limits.get("cash_reserve_pct", _investable.buffer_pct()))
         if liquid_reserve_pct < reserve - 1e-9:
             batch_reasons.append(
-                f"liquid reserve {liquid_reserve_pct * 100:.1f}% < required {reserve * 100:.0f}% "
+                # .2f, not .0f: the reserves in play are now 1.00% and 1.50%, and .0f
+                # rendered 1.5% as "2%" — a veto message that misstates its own threshold.
+                f"liquid reserve {liquid_reserve_pct * 100:.2f}% < required {reserve * 100:.2f}% "
                 f"(book over-invested / leveraged)")
 
     approved = ([] if (halted or batch_reasons)

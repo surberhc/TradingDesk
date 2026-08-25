@@ -194,7 +194,7 @@ def min_nav_for_whole_book(weights, prices) -> float | None:
 
 
 def scan_accounts_for_model(target, roster_rows, holdings_by_account,
-                            universe=None) -> dict:
+                            universe=None, cash_reserve_pct=None) -> dict:
     """Drift + would-trade preview for the accounts assigned to ONE custom model. PURE-ish:
     it runs the UNCHANGED pure engine and contacts nothing.
 
@@ -208,12 +208,23 @@ def scan_accounts_for_model(target, roster_rows, holdings_by_account,
     ``universe`` is the tradeable set (custom_target trap 4). Passing it matters: a symbol
     outside the universe is classified ALIEN and can never produce a would-trade leg, so a
     preview built with the wrong universe would show "nothing to do" for an account that
-    actually needs rotating."""
-    import crm_outofspec
+    actually needs rotating.
 
+    ``cash_reserve_pct`` is the model's standing cash reserve. Every target this page hands
+    in was built from rows in the CRM custom-allocation view — that IS the source-based test
+    — so it defaults to the CUSTOM reserve (1%), which is what a hand-authored book actually
+    deploys against. Leaving it at the desk-wide 1.5% here would show every correctly-
+    invested custom account as permanently 0.5% adrift on cash and over-state every
+    would-trade BUY."""
+    import crm_outofspec
+    import investable
+
+    if cash_reserve_pct is None:
+        cash_reserve_pct = investable.buffer_pct_for(is_custom=True)
     return crm_outofspec.scan_out_of_spec(
         list(roster_rows), dict(holdings_by_account), {str(target.version): target},
-        universe=universe)
+        universe=universe,
+        cash_reserve_pct_by_version={str(target.version): float(cash_reserve_pct)})
 
 
 def _fmt_date(value) -> str:

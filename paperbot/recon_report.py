@@ -72,12 +72,21 @@ class AccountPlan:
     blocked_reasons: list = field(default_factory=list)  # non-empty -> orders deliberately
                           # withheld (a held-aside holding could not be priced/reconciled);
                           # the account is still fully reported, it just cannot be sized.
+    # --- per-model cash reserve (2026-08-25) ---
+    cash_reserve_pct: float | None = None   # THIS account's model's standing cash reserve,
+                          # the fraction of the managed sleeve deliberately left uninvested
+                          # (1% for an Andrew-authored custom allocation, 1.5% otherwise).
+                          # Recorded on the plan so a reviewer can see WHICH reserve sized
+                          # this book without re-deriving it. None -> the global default;
+                          # normalized in __post_init__ so consumers never special-case it.
 
     def __post_init__(self):
         # An account with no held-aside holdings has a managed sleeve equal to the whole
         # account — normalizing here keeps every legacy 9-arg construction correct.
         if self.managed_net_liq is None:
             self.managed_net_liq = self.net_liq
+        if self.cash_reserve_pct is None:
+            self.cash_reserve_pct = _investable.buffer_pct()
 
     @property
     def unclassified(self) -> list:
@@ -157,7 +166,8 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target,
                  universe: set[str] | None = None,
                  sec_types: dict | None = None,
-                 values: dict | None = None) -> AccountPlan:
+                 values: dict | None = None,
+                 cash_reserve_pct: float | None = None) -> AccountPlan:
     """Reconcile one account against its tier model, reserving its distribution cash.
 
     `universe` (the strategy's tradeable symbols) refines a held, model-weight-0 symbol
@@ -169,16 +179,24 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     removed from NetLiq and reported on the plan, and the model's weights apply to the
     remaining sleeve as its own 100%. None (the default) carves out nothing and this readout
     is byte-identical to before. `values` is the optional broker-reported market-value
-    fallback for pricing a held-aside holding."""
+    fallback for pricing a held-aside holding.
+
+    `cash_reserve_pct` is THIS model's standing cash reserve (1% for an Andrew-authored
+    custom allocation, 1.5% otherwise). None -> the global default, so every pre-existing
+    caller is unchanged. It goes to BOTH compute_investable (sizing) and reconcile (the
+    CASH bucket's target), exactly as rebalance_engine.plan_account does — this readout
+    must claim the same reserve the engine actually deploys against, or the report shows
+    drift the engine will never act on."""
     carve = holding_class.carve_out(net_liq, positions, sec_types=sec_types,
                                     prices=None, values=values)
     managed_positions = carve.managed_positions
     managed_net_liq = carve.managed_net_liq
     reserve = cashflows.reserve_for(account, net_liq)
-    investable = _investable.compute_investable(managed_net_liq, reserve)
+    investable = _investable.compute_investable(managed_net_liq, reserve, cash_reserve_pct)
     lines = reconcile.reconcile(target, managed_net_liq, managed_positions,
                                 tolerance_w=config.REBALANCE_BAND_PCT,
-                                investable=investable, universe=universe)
+                                investable=investable, universe=universe,
+                                cash_reserve_pct=cash_reserve_pct)
     # NO-TRADE BAND — ACCOUNT-LEVEL, all-or-nothing. Mirrors rebalance_engine.plan_account
     # exactly so this readout's REBALANCE/in-band labels match what the engine actually does.
     # The breach test keys on the SIZE OF THE TRADE the rebalance would make
@@ -220,7 +238,8 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                        managed_net_liq=carve.managed_net_liq,
                        held_aside_value=carve.held_aside_value,
                        held_aside=list(carve.held_aside),
-                       blocked_reasons=list(carve.blocked_reasons))
+                       blocked_reasons=list(carve.blocked_reasons),
+                       cash_reserve_pct=cash_reserve_pct)
 
 
 def aggregate_blocks(plans: list[AccountPlan]) -> list[BlockOrder]:

@@ -15,18 +15,68 @@ so importing them back would create a cycle. Keeping this a leaf keeps it cycle-
 Slice 1 was a pure consolidation: ZERO behavior change. Because the buffer now lives in
 exactly one place (config.RISK_LIMITS["cash_reserve_pct"]), Slice 2 re-based it 0.05 ->
 0.015 by editing that single knob — every site below reads the new value automatically.
+
+PER-MODEL RESERVE (2026-08-25)
+------------------------------
+The buffer stopped being ONE number and became a number PER MODEL, defaulting to the
+global for anything that does not name its own. Today exactly one model family names its
+own: an Andrew-authored ("custom") allocation reserves 1% instead of 1.5%. S0 is validated
+at 1.5% and does not move.
+
+Two rules keep this from becoming five disagreeing numbers again:
+  * the VALUES still live only in config.RISK_LIMITS, read only through the accessors
+    below — no site hardcodes a percentage;
+  * this module never decides WHICH model an account is on. It takes a boolean the caller
+    resolved SOURCE-based (does the label have rows in the CRM custom-allocation view —
+    custom_target.is_custom_allocation), never a label spelling, and never a CRM read of
+    its own. That keeps this a pure leaf and keeps a CRM rename from being able to change
+    an account's reserve.
+
+The value must reach EVERY consumer, not just the sizing site. If a plan SIZES against 1%
+while its drift/CASH line is MEASURED against 1.5%, the account carries a permanent 0.5%
+phantom drift on its cash bucket, reads as out-of-spec forever, and churns. Hence both
+compute_investable() and cash_line() take the same override, and every caller in the chain
+(rebalance_engine.plan_account -> reconcile.reconcile -> cash_line) threads one value.
 """
 from __future__ import annotations
 
 import config
+
+# Key of the per-model override in config.RISK_LIMITS. Named here so no consumer spells
+# the string itself.
+CUSTOM_RESERVE_KEY = "custom_allocation_cash_reserve_pct"
 
 
 def buffer_pct() -> float:
     """The single standing cash-reserve buffer fraction (config.RISK_LIMITS).
 
     One accessor so every site that needs the buffer reads the SAME config value, and a
-    future change to where/how the buffer is stored is a one-line edit here."""
+    future change to where/how the buffer is stored is a one-line edit here.
+
+    This is the DEFAULT / S0 value. For a model that names its own, use
+    :func:`buffer_pct_for`."""
     return config.RISK_LIMITS["cash_reserve_pct"]
+
+
+def custom_buffer_pct() -> float:
+    """The reserve an Andrew-authored (custom) allocation holds: 1%.
+
+    Falls back to the global default if the key is ever removed from config, so a missing
+    override degrades to today's behavior rather than to zero reserve (a 0% reserve is the
+    fully-invested account that the fee deduction overdraws)."""
+    return float(config.RISK_LIMITS.get(CUSTOM_RESERVE_KEY, buffer_pct()))
+
+
+def buffer_pct_for(is_custom: bool = False) -> float:
+    """The cash-reserve buffer for ONE model, resolved from a SOURCE-based flag.
+
+    ``is_custom`` must come from the allocation's source (does the label have rows in the
+    CRM custom-allocation view — ``custom_target.is_custom_allocation`` /
+    ``custom_target.split_labels``), NEVER from the label's spelling. This module does not
+    and must not read the CRM; it is a leaf over config.
+
+    False (the default) -> the global buffer, which is S0's 1.5% and is unchanged."""
+    return custom_buffer_pct() if is_custom else buffer_pct()
 
 
 def compute_investable(net_liq: float, reserve: float,

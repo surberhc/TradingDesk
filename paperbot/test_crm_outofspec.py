@@ -124,7 +124,8 @@ def test_scan_runs_pure_engine_via_injected_targets(monkeypatch):
     we stub build_plan so the test needs no backtest, and assert the wiring."""
     captured = {}
 
-    def fake_build_plan(account_inputs, targets, band_pct=None, universe=None):
+    def fake_build_plan(account_inputs, targets, band_pct=None, universe=None,
+                        cash_reserve_pct_by_version=None):
         captured["account_inputs"] = account_inputs
         captured["targets"] = targets
         plans = [SimpleNamespace(account=ai["account"], net_liq=ai["net_liq"],
@@ -390,7 +391,8 @@ def test_nav_mismatch_tiny_account_below_reference_floor_not_flagged():
 def test_scan_excludes_mismatch_account_from_verdicts_and_surfaces_it(monkeypatch):
     """scan_out_of_spec must NEVER size/arm a mismatched account: it is absent from verdicts
     and surfaced on `excluded` with n_excluded. A healthy account still runs."""
-    def fake_build_plan(account_inputs, targets, band_pct=None, universe=None):
+    def fake_build_plan(account_inputs, targets, band_pct=None, universe=None,
+                        cash_reserve_pct_by_version=None):
         plans = [SimpleNamespace(account=ai["account"], net_liq=ai["net_liq"],
                                  needs_rebalance=False, orders={}, alien_lines=[])
                  for ai in account_inputs]

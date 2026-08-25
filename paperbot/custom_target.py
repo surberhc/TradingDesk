@@ -168,6 +168,41 @@ def split_labels(labels: Iterable[str], conn=None) -> tuple[list[str], list[str]
     return custom, other
 
 
+# --- the per-model cash reserve (trap 5) ----------------------------------------
+def reserve_pct_for_labels(labels: Iterable[str], conn=None) -> dict[str, float]:
+    """``{label: cash_reserve_pct}`` for the CUSTOM labels among ``labels`` — ONE CRM read.
+
+    A FIFTH TRAP, operational rather than arithmetic. A custom allocation reserves 1% of
+    NAV in real uninvested cash, not the desk-wide 1.5%. The reserve itself is not
+    cosmetic: IBKR deducts its advisory fee from account CASH, and client distributions are
+    paid from cash, so a FULLY-invested account is overdrawn the moment a fee posts — that
+    is the 2026-07-28 negative-balance incident exactly. 1% is Andrew's call: enough
+    fee/distribution headroom while leaving less of the client's money undeployed.
+
+    Non-custom labels are ABSENT from the result, never mapped to a number. Every consumer
+    resolves with ``.get(version)`` -> None -> the global default, which is S0's validated
+    1.5% and does not move. So a batch mixing S0 and custom accounts resolves each one
+    independently, and a CRM read that returns nothing degrades to today's behavior rather
+    than to a 0% reserve (a 0% reserve IS the overdrawn account).
+
+    SOURCE-based, like every other dispatch decision here (trap 1): membership is "does this
+    label have rows in the custom-allocation view?", never a spelling test. The VALUE comes
+    from config via ``investable.buffer_pct_for`` — nothing here hardcodes a percentage."""
+    import investable as _investable   # local import: keep the module-import surface small
+
+    custom, _other = split_labels(labels, conn=conn)
+    return {label: _investable.buffer_pct_for(is_custom=True) for label in custom}
+
+
+def reserve_pct_for(label: str, conn=None) -> float:
+    """The cash reserve for ONE label — 1% if it has a published custom allocation, else the
+    global default. Convenience wrapper (still one CRM read); prefer
+    :func:`reserve_pct_for_labels` when you have a batch of labels."""
+    import investable as _investable
+
+    return _investable.buffer_pct_for(is_custom=is_custom_allocation(label, conn=conn))
+
+
 # --- row -> Target --------------------------------------------------------------
 def _rows_by_label(rows: Iterable[Mapping]) -> dict[str, list[dict]]:
     grouped: dict[str, list[dict]] = {}

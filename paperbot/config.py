@@ -52,6 +52,19 @@ RISK_LIMITS = {
                                       # reserve is respected by construction. Slice 2 of the
                                       # account-cashflow build re-based this 5%->1.5% so risk
                                       # positions size ~3.5% of NAV closer to the model.
+                                      # This is the DEFAULT for every model that does not
+                                      # name its own, and it is S0's value. S0 is validated
+                                      # at 1.5% and DOES NOT MOVE.
+    # PER-MODEL OVERRIDE: Andrew-authored ("custom") allocations hold 1%, not 1.5%.
+    # WHY A RESERVE AT ALL (operational, not cosmetic): IBKR deducts its advisory fee from
+    # account CASH, and client distributions are paid from cash. A fee deducted from a
+    # fully-invested account overdraws it — that is exactly the 2026-07-28 negative-balance
+    # incident. WHY 1%: Andrew's call — enough fee/distribution headroom on a hand-authored
+    # book while leaving less of the client's money undeployed.
+    # Resolved SOURCE-based (does the label have rows in the CRM custom-allocation view),
+    # NEVER by the label's spelling — see investable.buffer_pct_for /
+    # custom_target.reserve_pct_by_label.
+    "custom_allocation_cash_reserve_pct": 0.01,
     # per_trade_max_loss: defined per-strategy later (e.g. condor max loss = wing width).
 }
 

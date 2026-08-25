@@ -321,7 +321,8 @@ def scan_out_of_spec(roster_rows: list[Mapping],
                      holdings_by_account: Mapping[str, list[Mapping]],
                      targets: Mapping,
                      band_pct: Optional[float] = None,
-                     universe: Optional[set] = None) -> dict:
+                     universe: Optional[set] = None,
+                     cash_reserve_pct_by_version: Optional[Mapping] = None) -> dict:
     """Whole-book out-of-spec read: assemble inputs, run the UNCHANGED pure
     ``rebalance_engine.build_plan``, and return per-account verdicts.
 
@@ -337,6 +338,12 @@ def scan_out_of_spec(roster_rows: list[Mapping],
     guard (recorded NAV wildly below holdings+cash — a departed/closed account or a data
     desync). Excluded accounts are NEVER sized or armed; they surface for manual review only.
 
+    ``cash_reserve_pct_by_version`` maps version -> that model's standing cash reserve, for
+    models that name their own (Andrew-authored custom allocations, 1%). A version not in the
+    map gets the global default, which is S0's validated 1.5%. It is threaded straight into
+    build_plan, which applies it to BOTH the sizing and the CASH-line drift for that account,
+    so this readout claims the same reserve the executor would deploy against.
+
     Builds and transmits NOTHING (``build_plan`` is the pure engine; no ``ib``, no arming)."""
     account_inputs, skipped, excluded = account_inputs_from_roster(
         roster_rows, holdings_by_account)
@@ -346,7 +353,9 @@ def scan_out_of_spec(roster_rows: list[Mapping],
                 "n_with_held_aside": 0, "n_blocked": 0, "held_aside_value": 0.0}
 
     result = rebalance_engine.build_plan(
-        account_inputs, dict(targets), band_pct=band_pct, universe=universe)
+        account_inputs, dict(targets), band_pct=band_pct, universe=universe,
+        cash_reserve_pct_by_version=(dict(cash_reserve_pct_by_version)
+                                     if cash_reserve_pct_by_version else None))
     verdicts = verdicts_from_plans(result["plans"], account_inputs)
     n_oos = sum(1 for v in verdicts if v["out_of_spec"])
     return {

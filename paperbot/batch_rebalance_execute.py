@@ -347,6 +347,27 @@ def account_universe(target, meta, held, base=None):
     return custom_target.universe_for(target, held=list(held or ()))
 
 
+def account_reserve_pct(meta):
+    """The standing CASH RESERVE for ONE account's model, as a fraction of NAV. PURE.
+
+    S0 MODEL (`meta` is None) -> the global default, 1.5%. S0 is validated at 1.5% and does
+    NOT move. CUSTOM ALLOCATION (`meta` is an AllocationMeta) -> 1%.
+
+    WHY THERE IS A RESERVE AT ALL: IBKR deducts its advisory fee from account CASH, and
+    client distributions are paid from cash. A fully-invested account is overdrawn the moment
+    a fee posts — the 2026-07-28 negative-balance incident. WHY 1% ON A HAND-AUTHORED BOOK:
+    Andrew's call; enough fee/distribution headroom, less of the client's money undeployed.
+
+    SOURCE-based by construction, and deliberately reuses the SAME `meta` signal the universe
+    and the audit stamp already key on: `metas` is populated only from labels that have rows
+    in v_tradingdesk_custom_allocations, so a CRM RENAME cannot move an account's reserve, and
+    this needs no extra CRM read. The percentages live in config and are read through
+    investable — nothing here hardcodes one."""
+    import investable as _investable
+
+    return _investable.buffer_pct_for(is_custom=meta is not None)
+
+
 def margin_preflight_line(request, result) -> tuple[bool, str]:
     """Self-computed per-account MARGIN pre-flight (#57), surfaced for the preview. REUSES
     safe_execute._margin_preflight_ok with the account's own plan/target/summary and the
@@ -731,6 +752,12 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
             continue
         acct_universe = account_universe(target, metas.get(v), st["positions"],
                                          base=strat_universe)
+        # Per-model CASH RESERVE, from the same source-based `meta` signal as the universe:
+        # 1% for a hand-authored allocation, the global 1.5% for S0. ONE value per account,
+        # handed to the engine once — the engine then uses it for BOTH sizing and the CASH
+        # line's drift target, so the account can never be sized to one reserve and measured
+        # against another.
+        acct_reserve = account_reserve_pct(metas.get(v))
         if metas.get(v) is not None:
             lost_alien_review = sorted(set(st["positions"]) - set(target.weights.index))
             if lost_alien_review:
@@ -740,10 +767,12 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
                       f"{', '.join(lost_alien_review)}")
         plan = rebalance_engine.plan_account(
             account, target.version, net_liq, st["positions"], target,
-            prices=prices, universe=acct_universe, sec_types=st["sec_types"])
+            prices=prices, universe=acct_universe, sec_types=st["sec_types"],
+            cash_reserve_pct=acct_reserve)
         plans.append(plan)
         summaries[account] = st["summary"]
         print(f"    {account} [{v}]: NetLiq={net_liq:,.2f}  positions={len(st['positions'])}"
+              f"  cash reserve held back={acct_reserve * 100:.2f}%"
               f"  would-trade legs={sum(1 for d in plan.orders.values() if int(d) != 0)}")
         # Held-aside holdings are priced, counted and named here — never folded silently
         # into NAV, and never a leg. The model sized the MANAGED sleeve only.

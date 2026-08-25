@@ -289,22 +289,29 @@ def test_drift_scan_produces_a_would_trade_preview_for_a_custom_model():
     assert legs["SCHB"]["side"] == "SELL"
     assert legs["USFR"]["side"] == "BUY"
     # A hand-authored book goes through the engine's STANDING CASH BUFFER exactly like a
-    # computed one — 40% of the INVESTABLE amount, not of NAV. Derived from the shared knob
-    # so this asserts the carve-out actually applied, without hardcoding its size.
+    # computed one — 40% of the INVESTABLE amount, not of NAV — but at the CUSTOM reserve
+    # (1%), not the desk-wide default (1.5%). Derived from the shared knob so this asserts
+    # the carve-out actually applied, without hardcoding its size.
     import investable
 
-    expected = int((100_000.0 * (1.0 - investable.buffer_pct()) * 0.4) // 50.0)
+    custom_buffer = investable.buffer_pct_for(is_custom=True)
+    assert custom_buffer != investable.buffer_pct()   # the two really are different numbers
+    expected = int((100_000.0 * (1.0 - custom_buffer) * 0.4) // 50.0)
     assert legs["USFR"]["shares"] == expected
+    # And the preview is NOT using the global default — proving the per-model reserve
+    # reached this readout rather than only the executor.
+    assert legs["USFR"]["shares"] != int((100_000.0 * (1.0 - investable.buffer_pct())
+                                          * 0.4) // 50.0)
 
 
 def test_drift_scan_reports_in_line_when_the_account_already_matches():
     """The same account, already holding exactly what the custom book asks for (after the
-    engine's standing cash buffer): nothing would trade."""
+    custom model's 1% cash buffer): nothing would trade."""
     import investable
 
     target = _synthetic_target()
     roster, _ = _synthetic_book()
-    invested = 100_000.0 * (1.0 - investable.buffer_pct())
+    invested = 100_000.0 * (1.0 - investable.buffer_pct_for(is_custom=True))
     schb = int((invested * 0.6) // 30.0)
     usfr = int((invested * 0.4) // 50.0)
     holdings = {

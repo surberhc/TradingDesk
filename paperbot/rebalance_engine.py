@@ -145,7 +145,8 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  band_pct: float | None = None,
                  universe: set[str] | None = None,
                  sec_types: dict | None = None,
-                 values: dict | None = None) -> AccountPlan:
+                 values: dict | None = None,
+                 cash_reserve_pct: float | None = None) -> AccountPlan:
     """Reconcile ONE account against its tier model and emit the share deltas to fix it.
 
     Steps (all pure):
@@ -185,7 +186,25 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     normally instead of being benched.
 
     `sec_types=None` (the default, and every pre-existing caller) carves out NOTHING and
-    every number below is exactly what it was before this existed."""
+    every number below is exactly what it was before this existed.
+
+    PER-MODEL CASH RESERVE (`cash_reserve_pct`, 2026-08-25)
+    ------------------------------------------------------
+    THIS model's standing cash reserve as a fraction of NAV — 1% for an Andrew-authored
+    custom allocation, 1.5% (the global default) for S0 and everything else. None keeps
+    the global, so every pre-existing caller is byte-identical.
+
+    The caller resolves it SOURCE-based (does the label have rows in the CRM
+    custom-allocation view) and never from the label's spelling; the engine stays pure and
+    reads no CRM. It is threaded to BOTH sites that must agree:
+      * compute_investable(), which SIZES the book, and
+      * reconcile(), which MEASURES the CASH bucket's drift.
+    Sizing at 1% while measuring at 1.5% would leave the account permanently 0.5% adrift
+    on cash by construction — the account would never read in-spec. The risk lines' own
+    drift is unaffected (they are always measured against the raw model weight), and the
+    no-trade band keys on trade SIZE, not drift, so this cannot change a breach decision
+    for a correctly-sized account — it changes how much gets deployed and what the cash
+    readout claims to want."""
     if band_pct is None:
         band_pct = config.REBALANCE_BAND_PCT
 
@@ -200,7 +219,7 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     # a client's scheduled distribution), so it is still computed on net_liq — but it is
     # carved out of the managed sleeve, the only place cash can actually be raised.
     reserve = cashflows.reserve_for(account, net_liq)
-    investable = compute_investable(managed_net_liq, reserve)
+    investable = compute_investable(managed_net_liq, reserve, cash_reserve_pct)
 
     # tolerance_w=band_pct so reconcile classifies a holding MATCHED iff it's inside the
     # band; DRIFTED/MISSING/ROTATE_OUT mean it breached and is eligible for a delta. When
@@ -209,9 +228,11 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     # None, it stays UNTRACKED (behavior-preserving default — backtester untouched).
     # Reconcile the MANAGED sleeve against the model as its own 100%: managed_net_liq is
     # the denominator for every weight/drift, and only managed positions are lines at all.
+    # The SAME cash_reserve_pct goes to the measurement side as went to the sizing side
+    # above — one value per account, never two (phantom-drift guard).
     lines = reconcile.reconcile(target, managed_net_liq, managed_positions, prices=prices,
                                tolerance_w=band_pct, investable=investable,
-                               universe=universe)
+                               universe=universe, cash_reserve_pct=cash_reserve_pct)
 
     # NO-TRADE BAND — ACCOUNT-LEVEL, all-or-nothing (Andrew's decision 2026-06-27): leave
     # the whole account alone unless it genuinely needs work; if it does, rebalance EVERY
@@ -258,13 +279,17 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                        managed_net_liq=carve.managed_net_liq,
                        held_aside_value=carve.held_aside_value,
                        held_aside=list(carve.held_aside),
-                       blocked_reasons=list(carve.blocked_reasons))
+                       blocked_reasons=list(carve.blocked_reasons),
+                       cash_reserve_pct=(_investable.buffer_pct()
+                                         if cash_reserve_pct is None
+                                         else float(cash_reserve_pct)))
 
 
 def plan_accounts(account_inputs: list[dict],
                   targets: dict,
                   band_pct: float | None = None,
-                  universe: set[str] | None = None) -> list[AccountPlan]:
+                  universe: set[str] | None = None,
+                  cash_reserve_pct_by_version: dict | None = None) -> list[AccountPlan]:
     """Plan many accounts at once. `account_inputs` is a list of dicts, each:
         {account, version, net_liq, positions, prices(optional),
          sec_types(optional), values(optional)}
@@ -279,15 +304,25 @@ def plan_accounts(account_inputs: list[dict],
     alien corp-action holding ALIEN (review). None (default) preserves legacy UNTRACKED
     behavior for every account — nothing changes for callers that don't pass it.
 
+    `cash_reserve_pct_by_version` maps version -> that model's standing cash reserve, for
+    the models that name their own (today: Andrew-authored custom allocations at 1%). A
+    version ABSENT from the map — or a map of None — gets the global default (1.5%, S0's
+    value). Per-VERSION, not per-account, because the reserve is a property of the model,
+    and looked up with .get() so a mixed batch of S0 and custom accounts resolves each
+    account independently: adding a custom model to a batch cannot move an S0 account's
+    reserve, and a missing entry fails toward today's behavior rather than toward 0.
+
     This is the seam the live recon_report fills from accounts.discover()+ib.positions();
     keeping it dict-driven means the engine is testable with synthetic data and never
     has to touch a broker itself."""
+    reserves = dict(cash_reserve_pct_by_version or {})
     plans: list[AccountPlan] = []
     for a in sorted(account_inputs, key=lambda x: x["account"]):
         plans.append(plan_account(
             a["account"], a["version"], a["net_liq"], a["positions"],
             targets[a["version"]], prices=a.get("prices"), band_pct=band_pct,
-            universe=universe, sec_types=a.get("sec_types"), values=a.get("values")))
+            universe=universe, sec_types=a.get("sec_types"), values=a.get("values"),
+            cash_reserve_pct=reserves.get(a["version"])))
     return plans
 
 
@@ -386,7 +421,8 @@ def route_blocks(blocks: list[BlockOrder],
 def build_plan(account_inputs: list[dict], targets: dict,
                band_pct: float | None = None,
                tier_groups: dict | None = None,
-               universe: set[str] | None = None) -> dict:
+               universe: set[str] | None = None,
+               cash_reserve_pct_by_version: dict | None = None) -> dict:
     """End-to-end PURE pipeline: per-account plans -> blocks -> route plans.
 
     Returns {"plans", "blocks", "routes"} — a complete, reviewable what-if of every
@@ -401,8 +437,14 @@ def build_plan(account_inputs: list[dict], targets: dict,
     HELD-ASIDE holdings (per-account `sec_types`) produce NO route either, and by a stronger
     mechanism than ALIEN: they never become reconcile lines at all, so there is no delta to
     aggregate and no path by which a block could ever contain one. They are carried on each
-    AccountPlan.held_aside for the reporting surfaces."""
-    plans = plan_accounts(account_inputs, targets, band_pct=band_pct, universe=universe)
+    AccountPlan.held_aside for the reporting surfaces.
+
+    `cash_reserve_pct_by_version` is threaded straight into plan_accounts (see there): the
+    per-model cash reserve, keyed by version, defaulting to the global for any version not
+    named. It changes how much each account deploys and what its CASH line targets; it
+    changes nothing about block aggregation or routing."""
+    plans = plan_accounts(account_inputs, targets, band_pct=band_pct, universe=universe,
+                          cash_reserve_pct_by_version=cash_reserve_pct_by_version)
     blocks = aggregate_blocks(plans)
     routes = route_blocks(blocks, tier_groups=tier_groups)
     return {"plans": plans, "blocks": blocks, "routes": routes}

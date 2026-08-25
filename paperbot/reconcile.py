@@ -102,13 +102,23 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
               prices: dict | None = None, tolerance_w: float = 0.01,
               investable: float | None = None,
               universe: set[str] | None = None,
-              whitelist: set[str] | None = None) -> list[Line]:
+              whitelist: set[str] | None = None,
+              cash_reserve_pct: float | None = None) -> list[Line]:
     """Compare the strategy's target book against actual positions. `prices` (symbol->
     price) overrides the strategy-data close for valuation (e.g. live quotes).
 
     `investable` overrides the capital sized against (default NAV*(1-cash_reserve)).
     The multi-account engine passes (NAV - distribution_reserve)*(1-cash_reserve) so a
     client's upcoming distribution is carved out before any buy is sized.
+
+    `cash_reserve_pct` is THIS MODEL's cash reserve (1% for an Andrew-authored custom
+    allocation, 1.5% for S0 and everything else). None -> the global default, so every
+    pre-existing caller is byte-identical. It does TWO things and both matter:
+      * it is the buffer used for the synthetic CASH line's TARGET weight, and
+      * it is the buffer in the default `investable` when no explicit one is passed.
+    Passing the sizing reserve here is not optional bookkeeping: if the plan is SIZED
+    against 1% (rebalance_engine) but the CASH line is MEASURED against 1.5%, the account
+    reads a permanent 0.5% phantom drift on cash, never reconciles, and churns.
 
     `universe` (the strategy's tradeable symbols) OPT-IN refines the single UNTRACKED
     status into ROTATE_OUT / ALIEN / FRACTIONAL / SWEEP (see module docstring). When
@@ -119,8 +129,9 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
         whitelist = set(getattr(config, "SWEEP_WHITELIST", set()))
     if investable is None:
         # Shared formula (investable module) with no distribution reserve carved out —
-        # behavior-identical to the previous inline nav*(1-cash_reserve_pct).
-        investable = _investable.compute_investable(nav, 0.0)
+        # behavior-identical to the previous inline nav*(1-cash_reserve_pct) when
+        # cash_reserve_pct is None.
+        investable = _investable.compute_investable(nav, 0.0, cash_reserve_pct)
     lines: list[Line] = []
     for sym in sorted(set(target.weights.index) | set(positions)):
         weight = float(target.weights.get(sym, 0.0))
@@ -155,10 +166,15 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
     #
     # This is READOUT-ONLY: no shares are sized here (target_shares=0, actual_shares=0.0),
     # and the loop above is untouched, so order quantities are exactly what Slice 2 produced.
+    #
+    # PER-MODEL: the CASH target is THIS model's reserve, the same number the plan sized
+    # against — not the global default. Measuring cash against a buffer the account was
+    # never sized to is permanent phantom drift (see the `cash_reserve_pct` note above).
     risk_value = sum(ln.actual_shares * float((prices or {}).get(ln.symbol,
                      target.prices.get(ln.symbol, 0.0)))
                      for ln in lines)
-    cash_target_w, cash_actual_w = _investable.cash_line(nav, risk_value)
+    cash_target_w, cash_actual_w = _investable.cash_line(nav, risk_value,
+                                                        buffer=cash_reserve_pct)
     cash_drift_w = cash_actual_w - cash_target_w
     cash_status = "MATCHED" if abs(cash_drift_w) <= tolerance_w else "DRIFTED"
     lines.append(Line(_investable.CASH_SYMBOL, cash_target_w, 0, 0.0,

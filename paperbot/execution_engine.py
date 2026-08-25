@@ -95,19 +95,26 @@ def _run_record(account, nav, daily_pnl, target, orders, report, transmitted) ->
 
 
 def compute_intended_orders(nav: float, positions: dict, target: strategy_target.Target,
-                            quotes: dict | None = None) -> list[IntendedOrder]:
+                            quotes: dict | None = None,
+                            cash_reserve_pct: float | None = None) -> list[IntendedOrder]:
     """Diff the strategy's target book against actual paper positions -> orders.
 
     Positions are sized against INVESTABLE capital = NAV*(1-cash_reserve_pct) and
     floored to whole shares, so the cash reserve is respected by construction and the
     book never levers up. The relative weights still match the validated strategy.
 
+    `cash_reserve_pct` is THIS model's standing reserve (1% for an Andrew-authored custom
+    allocation, 1.5% otherwise). None -> the global default, so this single-account S0 path
+    is byte-identical to before. A caller that passes it here MUST pass the same value to
+    risk_manager.evaluate, or the reserve guard will veto the very book this sized.
+
     Sizing + limit prices use LIVE quotes when available (read-only market data) and
     fall back to the strategy-data close per symbol if a quote is missing.
     """
     # Shared formula (investable module), no distribution reserve carved out here —
-    # behavior-identical to the previous inline nav*(1-cash_reserve_pct).
-    investable = _investable.compute_investable(nav, 0.0)
+    # behavior-identical to the previous inline nav*(1-cash_reserve_pct) when
+    # cash_reserve_pct is None.
+    investable = _investable.compute_investable(nav, 0.0, cash_reserve_pct)
     orders: list[IntendedOrder] = []
     symbols = set(target.weights.index) | set(positions)
     for sym in sorted(symbols):
