@@ -223,6 +223,12 @@ _RE_LEG = re.compile(
 _RE_NO_LEGS = re.compile(r"no legs\b.*(already conforms|nothing to trade)", re.IGNORECASE)
 # [9] the final preview-only confirmation.
 _RE_BLOCKED = re.compile(r"TRANSMISSION BLOCKED", re.IGNORECASE)
+# FAIL LOUD, NOT SILENT. _RE_LEG used to be the only test of "is this a leg line?", so a leg
+# the pattern could not read simply VANISHED from the table with no trace — the operator saw
+# a plan that looked complete and was not. This deliberately-loose marker asks the weaker
+# question "does this line LOOK like an order leg?"; anything that looks like one but does
+# not parse is counted and surfaced as a plain-English warning instead of being dropped.
+_RE_LEG_MARKER = re.compile(r"^\s*(?:SELL|BUY)\s+\S+\s+.*LIMIT ~")
 
 
 def _fmt_num(raw: str) -> float | None:
@@ -237,11 +243,14 @@ def _parse_preview(stdout: str) -> dict:
     """Best-effort structured view of the executor's PREVIEW stdout. NEVER raises —
     every field is optional and a caller falls back to the raw log if parsing missed
     anything. Returns keys: account, net_liq, open_positions, legs (list of dicts),
-    total_sell, total_buy, already_conforms (bool), transmission_blocked (bool)."""
+    total_sell, total_buy, already_conforms (bool), transmission_blocked (bool),
+    unreadable_leg_lines (list of raw lines that looked like order legs but could not be
+    read — surfaced to the operator, never silently dropped), parse_error (str or None)."""
     out: dict = {
         "account": None, "net_liq": None, "open_positions": None,
         "legs": [], "total_sell": None, "total_buy": None,
         "already_conforms": False, "transmission_blocked": False,
+        "unreadable_leg_lines": [], "parse_error": None,
     }
     try:
         m = _RE_ACCOUNT.search(stdout)
@@ -257,6 +266,11 @@ def _parse_preview(stdout: str) -> dict:
         for line in stdout.splitlines():
             lm = _RE_LEG.match(line)
             if not lm:
+                # A line that LOOKS like an order leg but does not parse is recorded, not
+                # skipped — an order that quietly does not appear is the failure this rail
+                # exists to prevent.
+                if _RE_LEG_MARKER.match(line):
+                    out["unreadable_leg_lines"].append(line.strip())
                 continue
             legs.append({
                 "side": lm.group(1),
@@ -275,9 +289,40 @@ def _parse_preview(stdout: str) -> dict:
         if not legs and _RE_NO_LEGS.search(stdout):
             out["already_conforms"] = True
         out["transmission_blocked"] = bool(_RE_BLOCKED.search(stdout))
-    except Exception:  # noqa: BLE001 — parsing is best-effort; raw log is source of truth
-        pass
+    except Exception as exc:  # noqa: BLE001 — best-effort; raw log is the source of truth
+        # Record it. A parse that died half way through leaves a SHORT leg list, which is
+        # indistinguishable from a small plan unless we say so out loud.
+        out["parse_error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+def _preview_parse_warning(parsed: dict) -> str | None:
+    """Plain-English warning about anything the preview parser could NOT read, or None when
+    it read everything. Pure (no Streamlit) so it can be tested directly. Spelled out in full
+    words — this is the sentence that stops an operator trusting an incomplete table."""
+    if not isinstance(parsed, dict):
+        return None
+    bad = list(parsed.get("unreadable_leg_lines") or [])
+    err = parsed.get("parse_error")
+    if not bad and not err:
+        return None
+    parts: list[str] = []
+    if bad:
+        n = len(bad)
+        parts.append(
+            f"{n} order line{'s' if n != 1 else ''} could not be read from the preview "
+            f"output and {'are' if n != 1 else 'is'} missing from the table above."
+        )
+    if err:
+        parts.append(
+            "Reading the preview output stopped early because of an unexpected problem "
+            f"({err}), so the table above may be incomplete."
+        )
+    parts.append(
+        "Do not treat the table above as the full plan. Read the full preview log below, "
+        "which is the source of truth. Nothing was transmitted."
+    )
+    return " ".join(parts)
 
 
 def _audit_preview() -> None:
@@ -361,6 +406,7 @@ def _render_preview_result(stdout: str, stderr: str) -> None:
     """Turn the executor's PREVIEW output into a plain-English summary + leg table, then
     ALWAYS show the full raw log in an expander (the raw text is the source of truth)."""
     parsed = _parse_preview(stdout)
+    _preview_warning = _preview_parse_warning(parsed)
 
     # Account context line (from [4]).
     if parsed["account"]:
@@ -376,6 +422,10 @@ def _render_preview_result(stdout: str, stderr: str) -> None:
             ),
             unsafe_allow_html=True,
         )
+
+    # ANYTHING THE PARSER COULD NOT READ — said out loud, above the table, every time.
+    if _preview_warning:
+        st.error(_preview_warning)
 
     # The plan itself.
     if parsed["already_conforms"]:
@@ -1077,9 +1127,19 @@ def _render_whole_book_outofspec() -> None:
 # =========================================================================== #
 # BATCH-ACCOUNT line: "    BATCH-ACCOUNT account=U... version=Growth status=... legs=3
 #                       sells=2 buys=1 margin_preflight_ok=True"
+# version= is the CRM's MODEL LABEL and real labels contain spaces and brackets —
+# "Growth (Small)", "Growth (Custom)", "Balanced (Small, Custom)". The field is therefore read
+# non-greedily up to its next known delimiter (" status=") rather than as \S+; \S+ stopped at
+# the first space, the whole line failed to match, and every account on a spaced label was
+# dropped from the table without a trace. The producer's line format is left alone on purpose:
+# other consumers read it, and " status=" is already an unambiguous delimiter.
 _RE_BATCH_ACCT = re.compile(
-    r"BATCH-ACCOUNT\s+account=(\S+)\s+version=(\S+)\s+status=(\S+)\s+legs=(\d+)\s+"
+    r"BATCH-ACCOUNT\s+account=(\S+)\s+version=(.+?)\s+status=(\S+)\s+legs=(\d+)\s+"
     r"sells=(\d+)\s+buys=(\d+)\s+margin_preflight_ok=(\w+)")
+# Deliberately-loose markers: "does this line CLAIM to be a batch account/summary row?".
+# Anything that claims to be one but does not parse gets counted and shown, never skipped.
+_RE_BATCH_ACCT_MARKER = re.compile(r"BATCH-ACCOUNT")
+_RE_BATCH_SUMMARY_MARKER = re.compile(r"BATCH-SUMMARY")
 # BATCH-SUMMARY line: "    BATCH-SUMMARY roster=2 out_of_spec=1 in_spec=1 skipped=0
 #                       total_legs=3 total_sells=... total_buys=..."
 _RE_BATCH_SUMMARY = re.compile(
@@ -1092,8 +1152,13 @@ _RE_BATCH_BLOCKED = re.compile(r"BATCH TRANSMISSION BLOCKED|PREVIEW ONLY", re.IG
 def _parse_batch_preview(stdout: str) -> dict:
     """Best-effort structured view of the batch executor's stdout. NEVER raises — every field
     is optional and the caller falls back to the raw log. Returns keys: accounts (list of
-    per-account dicts), summary (dict or None), transmission_blocked (bool)."""
-    out: dict = {"accounts": [], "summary": None, "transmission_blocked": False}
+    per-account dicts), summary (dict or None), transmission_blocked (bool),
+    unreadable_account_lines / unreadable_summary_lines (raw lines that announced themselves
+    as batch rows but could not be read — counted and surfaced, NEVER silently dropped) and
+    parse_error (str or None)."""
+    out: dict = {"accounts": [], "summary": None, "transmission_blocked": False,
+                 "unreadable_account_lines": [], "unreadable_summary_lines": [],
+                 "parse_error": None}
     try:
         for line in stdout.splitlines():
             m = _RE_BATCH_ACCT.search(line)
@@ -1107,6 +1172,13 @@ def _parse_batch_preview(stdout: str) -> dict:
                     "buys": int(m.group(6)),
                     "margin_preflight_ok": m.group(7) == "True",
                 })
+            elif _RE_BATCH_ACCT_MARKER.search(line):
+                # It said BATCH-ACCOUNT and we could not read it. That account is NOT in the
+                # table below; say so rather than letting it disappear.
+                out["unreadable_account_lines"].append(line.strip())
+            if (_RE_BATCH_SUMMARY_MARKER.search(line)
+                    and not _RE_BATCH_SUMMARY.search(line)):
+                out["unreadable_summary_lines"].append(line.strip())
         sm = _RE_BATCH_SUMMARY.search(stdout)
         if sm:
             out["summary"] = {
@@ -1119,9 +1191,45 @@ def _parse_batch_preview(stdout: str) -> dict:
                 "total_buys": _fmt_num(sm.group(7)),
             }
         out["transmission_blocked"] = bool(_RE_BATCH_BLOCKED.search(stdout))
-    except Exception:  # noqa: BLE001 — parsing is best-effort; raw log is source of truth
-        pass
+    except Exception as exc:  # noqa: BLE001 — best-effort; raw log is the source of truth
+        out["parse_error"] = f"{type(exc).__name__}: {exc}"
     return out
+
+
+def _batch_parse_warning(parsed: dict) -> str | None:
+    """Plain-English warning about anything the BATCH parser could not read, or None when it
+    read everything. Pure (no Streamlit) so it can be tested directly. This is the sentence
+    that stops an operator arming off a table that quietly omits accounts."""
+    if not isinstance(parsed, dict):
+        return None
+    bad_accts = list(parsed.get("unreadable_account_lines") or [])
+    bad_summary = list(parsed.get("unreadable_summary_lines") or [])
+    err = parsed.get("parse_error")
+    if not bad_accts and not bad_summary and not err:
+        return None
+    parts: list[str] = []
+    if bad_accts:
+        n = len(bad_accts)
+        parts.append(
+            f"{n} account row{'s' if n != 1 else ''} could not be read from the preview "
+            f"output and {'are' if n != 1 else 'is'} missing from this table."
+        )
+    if bad_summary:
+        n = len(bad_summary)
+        parts.append(
+            f"{n} batch total line{'s' if n != 1 else ''} could not be read, so the "
+            "account counts and dollar totals shown may be wrong."
+        )
+    if err:
+        parts.append(
+            "Reading the preview output stopped early because of an unexpected problem "
+            f"({err}), so this table may be incomplete."
+        )
+    parts.append(
+        "Do not treat this table as the full list of accounts. Read the full batch preview "
+        "log below, which is the source of truth. Nothing was transmitted."
+    )
+    return " ".join(parts)
 
 
 def _store_batch_last_preview(stdout: str) -> None:
@@ -1157,6 +1265,7 @@ def _render_batch_preview_result(stdout: str, stderr: str) -> None:
     aggregate summary, then ALWAYS show the raw log (the source of truth)."""
     parsed = _parse_batch_preview(stdout)
     sm = parsed.get("summary")
+    batch_warning = _batch_parse_warning(parsed)
 
     if sm is not None:
         t1, t2, t3, t4 = st.columns(4)
@@ -1171,6 +1280,16 @@ def _render_batch_preview_result(stdout: str, stderr: str) -> None:
                else "")
             + "Read-only preview — nothing transmitted."
         )
+
+    # ANYTHING THE PARSER COULD NOT READ — said out loud, above the table, every time, and
+    # in every branch below (including the "nothing to trade" one, where a dropped account
+    # row is the single most dangerous thing that could go unmentioned).
+    if batch_warning:
+        st.error(batch_warning)
+        with st.expander("Show the account rows that could not be read"):
+            for raw in ((parsed.get("unreadable_account_lines") or [])
+                        + (parsed.get("unreadable_summary_lines") or [])):
+                st.code(raw, language=None)
 
     accts = parsed.get("accounts") or []
     if accts:
