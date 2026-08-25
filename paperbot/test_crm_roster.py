@@ -36,6 +36,43 @@ def test_fetch_roster_without_dsn_raises(monkeypatch):
         crm_roster.fetch_roster()
 
 
+def test_fetch_roster_selects_both_custom_tier_history_columns():
+    """The SELECT list is EXPLICIT, so a column added to v_tradingdesk_roster alone never
+    reaches the desk. custom_tier's ladder needs both — has_prior_custom_assignment decides
+    plain-boundary vs band, prior_custom_risk_level recovers the risk level off the shared
+    Starter book — so pin that they are named. No DB: the SQL is captured, not run."""
+    import custom_tier
+
+    seen = {}
+
+    class _Cur:
+        description = ()
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            seen["sql"] = sql
+
+        def fetchall(self):
+            return []
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    assert crm_roster.fetch_roster(advisor_name=None, conn=_Conn()) == []
+    assert custom_tier.HAS_PRIOR_FIELD in seen["sql"]
+    assert custom_tier.PRIOR_RISK_FIELD in seen["sql"]
+    assert "v_tradingdesk_roster" in seen["sql"]
+
+
 def test_enrolled_roster_falls_back_to_config_when_crm_unset(monkeypatch):
     """No DSN wired -> enrolled_roster returns the local config allow-list unchanged."""
     monkeypatch.delenv(crm_roster.DSN_ENV, raising=False)

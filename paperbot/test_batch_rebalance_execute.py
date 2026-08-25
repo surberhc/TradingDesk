@@ -23,6 +23,7 @@ import batch_rebalance_execute as bre
 import config
 import crm_roster
 import custom_target
+import custom_tier
 import ledger
 import rebalance_engine
 import roster
@@ -355,25 +356,32 @@ def test_main_refuses_and_connects_nothing_when_a_custom_target_fails(monkeypatc
 
 
 # -------------------------------------------------------------------------------------
-# STAGE 5 (2) — a CUSTOM label is NEVER re-tiered by the small-account NAV override.
-# The exclusion is SOURCE-based, so a CRM RENAME cannot re-point the account onto an S0
-# model. The pair below uses the SAME label string and the SAME NAV: the only difference
-# is whether the CRM says an allocation is published under it.
+# STAGE 5 (2) — a CUSTOM label NEVER enters the S0 (small_tier) NAV override. The split is
+# SOURCE-based, so a CRM RENAME cannot re-point the account onto an S0 model. The pair below
+# uses the SAME label string and the SAME NAV: the only difference is whether the CRM says an
+# allocation is published under it.
+#
+# 0.39.0: "not small_tier" is not "no check". A custom account is now re-tiered by its OWN
+# ladder (custom_tier), which can only ever emit one of the seven custom labels. See the
+# STAGE 5 (2b) block below.
 # -------------------------------------------------------------------------------------
 RENAMED_CUSTOM = "Growth (Small)"      # what a careless CRM rename could produce
 
 
-def _tier_setup(monkeypatch, model, nav, *, published):
+def _tier_setup(monkeypatch, model, nav, *, published, row_extra=None):
     bre._TIER_MISMATCHES.clear()
     _fake_crm(monkeypatch, published)
     row = {"account_number": CUSTOM_ACCT, "model": model, "total_value": nav}
+    row.update(row_extra or {})
     monkeypatch.setattr(crm_roster, "fetch_roster",
                         lambda advisor_name=None, model=None, conn=None: [row])
 
 
 def test_custom_label_is_never_re_tiered_by_nav(monkeypatch):
-    # A $5M account on a label that LOOKS like the small tier. Because the CRM publishes an
-    # allocation under it, it is Andrew's hand-authored book and the NAV override is skipped.
+    # A $5M account on a label that LOOKS like the S0 small tier. Because the CRM publishes an
+    # allocation under it, it is Andrew's hand-authored book: the S0 override is skipped, and
+    # custom_tier refuses it too (the label is not one of the seven), so it passes through
+    # VERBATIM. This is the original hazard, still nailed shut.
     _tier_setup(monkeypatch, RENAMED_CUSTOM, 5_000_000.0, published={RENAMED_CUSTOM})
     versions = bre.resolve_roster_versions([CUSTOM_ACCT])
     assert versions == {CUSTOM_ACCT: RENAMED_CUSTOM}
@@ -390,14 +398,137 @@ def test_same_label_is_re_tiered_when_it_is_not_a_custom_allocation(monkeypatch)
     bre._TIER_MISMATCHES.clear()
 
 
-def test_custom_small_label_is_not_demoted_either(monkeypatch):
-    # The other direction: a tiny-NAV account on a custom label is not demoted onto the
-    # whole-share proxy — there is no parent model to collapse a hand-authored book onto.
+def test_custom_small_label_is_not_demoted_onto_an_s0_proxy(monkeypatch):
+    # WAS "is not demoted either" (pre-0.39.0, when a custom label skipped the check
+    # entirely). A tiny-NAV custom account IS now re-tiered — down the custom ladder to the
+    # 2-line Starter book, which is the whole reason that book exists. What must still never
+    # happen is a collapse onto the S0 whole-share proxy "Growth (Small)".
     _tier_setup(monkeypatch, "Growth (Small, Custom)", 1_000.0,
+                published={"Growth (Small, Custom)"})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {CUSTOM_ACCT: "Starter (Custom)"}
+    assert bre._TIER_MISMATCHES[CUSTOM_ACCT] == (
+        "Growth (Small, Custom)", "Starter (Custom)", 1_000.0)
+    bre._TIER_MISMATCHES.clear()
+
+
+# -------------------------------------------------------------------------------------
+# STAGE 5 (2b) / 0.39.0-0.40.0 — the CUSTOM ladder wired into resolve_roster_versions. The
+# pure rule itself is pinned threshold-by-threshold in test_custom_tier.py; these pin the
+# WIRING: the right inputs (NAV + BOTH CRM history columns) reach it, its answer is used, and
+# the mismatch is surfaced.
+# -------------------------------------------------------------------------------------
+def test_custom_account_in_the_band_is_left_alone(monkeypatch):
+    # $24,000 on the small book sits INSIDE the 22,500/27,500 band: below the plain 25,000
+    # boundary a first assignment would use, and below the 27,500 promote level. The
+    # incumbent holds and nothing is flagged as stale — that is the band doing its job.
+    _tier_setup(monkeypatch, "Balanced (Small, Custom)", 24_000.0,
+                published={"Balanced (Small, Custom)"})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {
+        CUSTOM_ACCT: "Balanced (Small, Custom)"}
+    assert bre._TIER_MISMATCHES == {}
+
+
+def test_custom_account_is_promoted_to_the_full_book_and_flagged(monkeypatch):
+    _tier_setup(monkeypatch, "Conservative (Small, Custom)", 30_000.0,
+                published={"Conservative (Small, Custom)"})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {
+        CUSTOM_ACCT: "Conservative (Custom)"}      # risk level preserved
+    assert bre._TIER_MISMATCHES[CUSTOM_ACCT] == (
+        "Conservative (Small, Custom)", "Conservative (Custom)", 30_000.0)
+    bre._TIER_MISMATCHES.clear()
+
+
+def test_starter_account_promoted_with_no_history_goes_to_growth(monkeypatch):
+    # prior_custom_risk_level NULL -> Andrew's GROWTH default (2026-08-25), applied silently
+    # and deliberately: never flagged, never skipped.
+    _tier_setup(monkeypatch, "Starter (Custom)", 6_000.0, published={"Starter (Custom)"},
+                row_extra={custom_tier.HAS_PRIOR_FIELD: True,
+                           custom_tier.PRIOR_RISK_FIELD: None})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {
+        CUSTOM_ACCT: "Growth (Small, Custom)"}
+    bre._TIER_MISMATCHES.clear()
+
+
+def test_starter_account_promoted_recovers_the_risk_level_from_the_crm(monkeypatch):
+    _tier_setup(monkeypatch, "Starter (Custom)", 6_000.0, published={"Starter (Custom)"},
+                row_extra={custom_tier.HAS_PRIOR_FIELD: True,
+                           custom_tier.PRIOR_RISK_FIELD: "Balanced"})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {
+        CUSTOM_ACCT: "Balanced (Small, Custom)"}
+    bre._TIER_MISMATCHES.clear()
+
+
+def test_starter_funded_to_30000_jumps_straight_to_the_full_book(monkeypatch):
+    # 0.40.0, Andrew's call: two rungs -> direct, no band, ONE step. The old ladder would
+    # have traded this account into the 11-line small book tonight and the 15-line full book
+    # tomorrow — spread paid twice for a book nobody chose.
+    _tier_setup(monkeypatch, "Starter (Custom)", 30_000.0, published={"Starter (Custom)"},
+                row_extra={custom_tier.HAS_PRIOR_FIELD: True,
+                           custom_tier.PRIOR_RISK_FIELD: "Balanced"})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {CUSTOM_ACCT: "Balanced (Custom)"}
+    assert bre._TIER_MISMATCHES[CUSTOM_ACCT] == (
+        "Starter (Custom)", "Balanced (Custom)", 30_000.0)
+    bre._TIER_MISMATCHES.clear()
+
+
+def test_full_book_collapsed_to_1000_drops_straight_to_starter(monkeypatch):
+    _tier_setup(monkeypatch, "Growth (Custom)", 1_000.0, published={"Growth (Custom)"},
+                row_extra={custom_tier.HAS_PRIOR_FIELD: True})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {CUSTOM_ACCT: "Starter (Custom)"}
+    bre._TIER_MISMATCHES.clear()
+
+
+def test_a_freshly_assigned_4900_account_matches_the_crm(monkeypatch):
+    # THE DIVERGENCE has_prior_custom_assignment FIXES. Same label, same NAV; only the flag
+    # differs. False = first assignment -> plain 5,000 boundary -> Starter, which is what the
+    # CRM scan produces. True = incumbent -> the 4,500 band -> stay. Before 0.40.0 the desk
+    # always took the second branch and disagreed with the CRM on a brand-new account.
+    _tier_setup(monkeypatch, "Growth (Small, Custom)", 4_900.0,
+                published={"Growth (Small, Custom)"},
+                row_extra={custom_tier.HAS_PRIOR_FIELD: False})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {CUSTOM_ACCT: "Starter (Custom)"}
+    bre._TIER_MISMATCHES.clear()
+
+    _tier_setup(monkeypatch, "Growth (Small, Custom)", 4_900.0,
+                published={"Growth (Small, Custom)"},
+                row_extra={custom_tier.HAS_PRIOR_FIELD: True})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {
+        CUSTOM_ACCT: "Growth (Small, Custom)"}
+    assert bre._TIER_MISMATCHES == {}
+
+
+def test_a_lagging_roster_view_fails_toward_the_incumbent(monkeypatch):
+    # Neither history column present (the view lags the code). The account holds a label, so
+    # it is treated as an INCUMBENT and the band applies — it is NOT silently re-tiered off a
+    # plain boundary. Nothing raises.
+    _tier_setup(monkeypatch, "Growth (Small, Custom)", 4_900.0,
                 published={"Growth (Small, Custom)"})
     assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {
         CUSTOM_ACCT: "Growth (Small, Custom)"}
     assert bre._TIER_MISMATCHES == {}
+
+
+def test_a_custom_account_with_no_nav_is_left_alone(monkeypatch):
+    # No NAV to decide with -> no re-tier. Never guess a model from a missing balance.
+    _tier_setup(monkeypatch, "Growth (Custom)", None, published={"Growth (Custom)"})
+    assert bre.resolve_roster_versions([CUSTOM_ACCT]) == {CUSTOM_ACCT: "Growth (Custom)"}
+    assert bre._TIER_MISMATCHES == {}
+
+
+def test_the_custom_ladder_never_emits_an_s0_model(monkeypatch):
+    # Sweep every custom incumbent across every boundary through the REAL wiring; nothing
+    # that comes out may be an S0 label.
+    s0 = {"Growth", "Balanced", "Conservative",
+          "Growth (Small)", "Balanced (Small)", "Conservative (Small)"}
+    for label in ("Growth (Custom)", "Balanced (Custom)", "Conservative (Custom)",
+                  "Growth (Small, Custom)", "Balanced (Small, Custom)",
+                  "Conservative (Small, Custom)", "Starter (Custom)"):
+        for nav in (0.0, 4_499.0, 4_500.0, 5_500.0, 22_499.0, 27_500.0, 5_000_000.0):
+            _tier_setup(monkeypatch, label, nav, published={label})
+            got = bre.resolve_roster_versions([CUSTOM_ACCT])[CUSTOM_ACCT]
+            assert got not in s0, f"{label} @ {nav} -> {got}"
+            assert custom_tier.is_custom_family(got)
+    bre._TIER_MISMATCHES.clear()
 
 
 # -------------------------------------------------------------------------------------

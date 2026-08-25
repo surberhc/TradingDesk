@@ -110,8 +110,17 @@ def fetch_roster(advisor_name: Optional[str] = DEFAULT_ADVISOR,
     if model is not None:
         where.append("model = %s")
         params.append(model)
+    # The two CUSTOM-TIER history columns at the end are what the desk's pre-trade size-tier
+    # check (custom_tier) needs and cannot derive: whether this account has ever held another
+    # custom model (a FIRST assignment uses the plain boundaries, not the band) and which risk
+    # level it came from before the shared, risk-level-free Starter book. Both are computed
+    # CRM-side by the same job that runs the SQL half of that ladder. This SELECT list is
+    # EXPLICIT, so adding them to the view alone would never reach the desk — they have to be
+    # named here too. DEPLOY ORDER MATTERS: the view must carry both columns before this
+    # ships, or every roster read raises and the desk falls back to config.ENROLLMENT.
     sql = ("select account_number, master_name, ib_entity, model, advisor_name, advisor_id, "
-           "entity, no_trade, keep_open, total_value, nav_as_of, custodian, account_id "
+           "entity, no_trade, keep_open, total_value, nav_as_of, custodian, account_id, "
+           "has_prior_custom_assignment, prior_custom_risk_level "
            "from v_tradingdesk_roster")
     if where:
         sql += " where " + " and ".join(where)

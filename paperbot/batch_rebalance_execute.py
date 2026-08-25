@@ -74,6 +74,7 @@ import config
 import crm_execute
 import crm_roster
 import custom_target
+import custom_tier
 from strategies import small_tier
 from strategies import config as config_s
 import ledger
@@ -215,11 +216,13 @@ def resolve_roster_versions(roster_accounts: list[str]) -> dict[str, str]:
     derives from. Prefer the CRM roster ``model`` (v_tradingdesk_roster), fall back to the
     local config.ENROLLMENT map, then to config.STRATEGY_VERSION for anything still unmapped.
 
-    An ANDREW-AUTHORED (custom) allocation is EXEMPT from the NAV re-tiering below — see the
-    inline note. Pure/read-only: SELECTs from the read-only CRM role when configured, else
-    reads config; contacts no broker, builds no order."""
+    An ANDREW-AUTHORED (custom) allocation is re-tiered by its OWN ladder (custom_tier), never
+    by small_tier — see the inline note. Pure/read-only: SELECTs from the read-only CRM role
+    when configured, else reads config; contacts no broker, builds no order, WRITES NOTHING."""
     crm_models: dict[str, str] = {}
     crm_navs: dict[str, float] = {}
+    crm_prior_risk: dict[str, str] = {}
+    crm_has_prior: dict[str, bool] = {}
     if crm_roster.is_configured():
         try:
             for r in crm_roster.fetch_roster(advisor_name=crm_roster.DEFAULT_ADVISOR):
@@ -228,30 +231,61 @@ def resolve_roster_versions(roster_accounts: list[str]) -> dict[str, str]:
                 nav = r.get("total_value")
                 if nav is not None:
                     crm_navs[acct] = float(nav)
+                # The two custom-tier history facts the CRM computes for us. Read
+                # DEFENSIVELY: a view lagging the code leaves them absent, and custom_tier
+                # then falls back the safe way — GROWTH for a missing risk level, and a
+                # labelled account treated as an INCUMBENT (band applies) rather than
+                # re-tiered off a plain boundary.
+                prior = custom_tier.prior_risk_from_row(r)
+                if prior:
+                    crm_prior_risk[acct] = prior
+                has_prior = custom_tier.has_prior_assignment_from_row(r)
+                if has_prior is not None:
+                    crm_has_prior[acct] = has_prior
         except crm_roster.CrmRosterUnavailable:
             crm_models, crm_navs = {}, {}   # CRM unreachable -> config fallback below
+            crm_prior_risk, crm_has_prior = {}, {}
     raw: dict[str, str] = {}
     for a in roster_accounts:
         raw[a] = (crm_models.get(a) or config.ENROLLMENT.get(a)
                   or config.STRATEGY_VERSION)
 
-    # SOURCE-BASED CUSTOM EXCLUSION (one CRM read for the whole roster). Everything below is
-    # the S0 NAV re-tiering; a hand-authored book must never enter it.
+    # SOURCE-BASED CUSTOM SPLIT (one CRM read for the whole roster). Everything below the
+    # custom branch is the S0 NAV re-tiering; a hand-authored book must never enter it.
     custom_labels = set(split_versions(sorted(set(raw.values())))[0])
 
     out: dict[str, str] = {}
     for a, label in raw.items():
-        # CUSTOM ALLOCATION -> NO NAV OVERRIDE. Andrew authored these tickers and percentages
-        # himself; there is no "parent" model to collapse onto and no whole-share proxy to
-        # promote/demote into. Letting small_tier see one is a real hazard: parent_version()
-        # and tier_for() are SPELLING-based, so a CRM rename to anything ending in " (Small)"
-        # would make tier_for() REWRITE the account's label onto an S0 model — silently
-        # discarding the whole hand-authored book. It is safe TODAY only because
-        # "Growth (Small, Custom)" happens not to end in " (Small)"; that is a coincidence of
-        # naming, not a control. This exclusion asks the allocation's SOURCE instead, so a
-        # rename cannot re-point the account. (The CRM's own re-tiering job excludes custom
-        # models for the same reason — this is the desk-side half of the same rule.)
+        # CUSTOM ALLOCATION -> ITS OWN LADDER, NEVER small_tier. Andrew authored these tickers
+        # and percentages himself; there is no "parent" model to collapse onto. Letting
+        # small_tier see one is a real hazard: parent_version() and tier_for() are
+        # SPELLING-based, so a CRM rename to anything ending in " (Small)" would make
+        # tier_for() REWRITE the account's label onto an S0 model — silently discarding the
+        # whole hand-authored book. It is safe TODAY only because "Growth (Small, Custom)"
+        # happens not to end in " (Small)"; that is a coincidence of naming, not a control.
+        # This branch asks the allocation's SOURCE first, so a rename cannot re-point the
+        # account into the S0 path at all.
+        #
+        # But "not small_tier" is not the same as "no check". The custom family ships in
+        # THREE whole-share sizes (15-line full / 11-line small / 2-line Starter) precisely
+        # BECAUSE NAV decides what an account can hold: at $2,000 the 11-line small book
+        # deploys just 76.2% of the account — its 3% long-Treasury and gold slices are worth
+        # less than one share, so those orders are never created — while the 2-line Starter
+        # book deploys 95.9%. So a custom account gets the SAME authoritative pre-trade
+        # re-check an S0 account gets, from custom_tier's own closed label table: it can only
+        # ever emit one of the seven custom labels, so it can never rewrite a hand-authored
+        # book onto an S0 model, and it refuses outright to touch a label outside the family
+        # (a renamed custom book passes through UNCHANGED). The CRM runs the identical ladder
+        # in SQL; the two must agree or an account oscillates every day.
         if label in custom_labels:
+            if custom_tier.is_custom_family(label) and a in crm_navs:
+                effective = custom_tier.tier_for(
+                    crm_navs[a], current_label=label,
+                    prior_risk=crm_prior_risk.get(a),
+                    has_prior_assignment=crm_has_prior.get(a))
+                if effective != label:
+                    _TIER_MISMATCHES[a] = (label, effective, crm_navs[a])
+                label = effective
             out[a] = label
             continue
         # PRE-TRADE TIER CHECK (authoritative). The CRM's stored label is a RECORD, and a
