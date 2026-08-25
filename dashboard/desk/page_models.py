@@ -152,41 +152,58 @@ def _render_frozen_banner() -> None:
     )
 
 
-def _render_holdings_table(rows: list[tuple], *, proposed: bool = False) -> None:
+def _render_holdings_table(rows: list[tuple], *, proposed: bool = False,
+                           show_sleeve: bool = True) -> None:
     """Render a ticker -> sleeve -> weight table from `rows` = [(ticker, weight, sleeve?)].
-    For live models sleeve is looked up from config; for proposed models it is passed in."""
+    For live models sleeve is looked up from config; for proposed models it is passed in.
+
+    `show_sleeve=False` drops the sleeve column entirely and expects 2-tuples. It exists for
+    books that HAVE no sleeve concept — a hand-authored ("custom") allocation, where Andrew
+    picks the tickers directly (page_custom_alloc.py). `_sleeve_of` maps a ticker to one of
+    Strategy 0's four sleeves and returns a dash for everything else, so such a book would
+    otherwise render an always-blank column; omitting the column is honest, a column of
+    dashes is not. The default is unchanged, so every existing caller renders identically."""
+    sleeve_th = (
+        f'<th style="text-align:left;padding:.4rem .6rem;color:{theme.MUTED};'
+        f'font-weight:600;border-bottom:1px solid {theme.BORDER}">Sleeve</th>'
+    ) if show_sleeve else ""
     header = (
         '<tr>'
         f'<th style="text-align:left;padding:.4rem .6rem;color:{theme.MUTED};'
         f'font-weight:600;border-bottom:1px solid {theme.BORDER}">Ticker</th>'
-        f'<th style="text-align:left;padding:.4rem .6rem;color:{theme.MUTED};'
-        f'font-weight:600;border-bottom:1px solid {theme.BORDER}">Sleeve</th>'
+        f'{sleeve_th}'
         f'<th style="text-align:right;padding:.4rem .6rem;color:{theme.MUTED};'
         f'font-weight:600;border-bottom:1px solid {theme.BORDER}">Target weight</th></tr>'
     )
     body = []
     total = 0.0
     for entry in rows:
-        if proposed:
+        sleeve = ""
+        if not show_sleeve:
+            tkr, wt = entry
+        elif proposed:
             tkr, wt, sleeve = entry
         else:
             tkr, wt = entry
             sleeve = _sleeve_of(tkr)
         total += wt
+        sleeve_td = (
+            f'<td style="padding:.45rem .6rem;border-bottom:1px solid {theme.BORDER};'
+            f'color:{theme.MUTED};font-size:12.5px">{theme._esc(sleeve)}</td>'
+        ) if show_sleeve else ""
         body.append(
             '<tr>'
             f'<td style="padding:.45rem .6rem;border-bottom:1px solid {theme.BORDER};'
             f'color:{theme.TEXT};font-family:monospace;font-weight:650">{theme._esc(tkr)}</td>'
-            f'<td style="padding:.45rem .6rem;border-bottom:1px solid {theme.BORDER};'
-            f'color:{theme.MUTED};font-size:12.5px">{theme._esc(sleeve)}</td>'
+            f'{sleeve_td}'
             f'<td style="padding:.45rem .6rem;border-bottom:1px solid {theme.BORDER};'
             f'color:{theme.TEXT};text-align:right;font-weight:650">{wt * 100:.3f}%</td></tr>'
         )
     body.append(
         '<tr>'
         f'<td style="padding:.45rem .6rem;color:{theme.MUTED}">Total</td>'
-        f'<td style="padding:.45rem .6rem"></td>'
-        f'<td style="padding:.45rem .6rem;color:{theme.MUTED};text-align:right">'
+        + (f'<td style="padding:.45rem .6rem"></td>' if show_sleeve else "")
+        + f'<td style="padding:.45rem .6rem;color:{theme.MUTED};text-align:right">'
         f'{total * 100:.1f}%</td></tr>'
     )
     st.markdown(
