@@ -113,6 +113,7 @@ import live_quotes        # noqa: E402
 import order_router       # noqa: E402
 import rebalance_execute  # noqa: E402  (backup_fa_groups + the shared group-XML primitives)
 import rebalance_run      # noqa: E402  (resolve_tier_groups + build_preview + prices_for)
+import recon_report       # noqa: E402  (_portfolio_values — the ONE held-aside pricing reader)
 import s0_live            # noqa: E402  (filter_account_summary — the per-account summary filter)
 import strategy_target    # noqa: E402
 import version            # noqa: E402
@@ -328,12 +329,200 @@ def margin_preflight_over_split(route, account_inputs: list, targets: dict,
 
 def _plan_for(account_input: dict, targets: dict):
     """Re-derive ONE account's sized AccountPlan from its engine input (for the margin
-    pre-flight's investable/NAV read). Pure: rebalance_engine.plan_account, no broker."""
+    pre-flight's investable/NAV read). Pure: rebalance_engine.plan_account, no broker.
+
+    `sec_types`/`values` are threaded through so this re-derivation is BYTE-IDENTICAL to the
+    plan build_plan already produced. Without them a bond-holding account would be re-planned
+    against its FULL NetLiq here while the routed block was sized against the managed sleeve —
+    two different investables for the same account inside one run."""
     import rebalance_engine
     return rebalance_engine.plan_account(
         account_input["account"], account_input["version"], account_input["net_liq"],
         account_input["positions"], targets[account_input["version"]],
-        prices=account_input.get("prices"))
+        prices=account_input.get("prices"),
+        sec_types=account_input.get("sec_types"), values=account_input.get("values"))
+
+
+# ========================================================================================
+# PATTERN-DAY-TRADER (PDT) pre-flight over the split.
+#
+# WHY THIS EXISTS. A US margin account under $25,000 that IBKR has flagged a PATTERN DAY
+# TRADER rejects ORDINARY orders — not just orders that would themselves create a day trade.
+# EVIDENCE (2026-07-28): account U5721712 bounced a plain BUY of 1 USFR (~$50) with no
+# offsetting sell. So the question this gate asks is NOT "does this run create a day trade"
+# (an order-shape analyzer would be the wrong tool); it is "has the broker already flagged
+# this account". IBKR answers that directly with the DayTradesRemaining accountSummary tag.
+#
+# SCALE. 113 of the 304 roster accounts are margin under $25,000 (53 in Andrew's book), none
+# flagged no_trade. Today's only mitigation is that S0 trades ONE hand-picked PDT-clear
+# account; that evaporates the moment the book-wide block rail (owner decision D1) runs.
+#
+# ZERO NEW BROKER READS. ib_async requests DayTradesRemaining by DEFAULT, so the tag is
+# already sitting in the per-account `summaries` this lane holds. VERIFIED READ-ONLY against
+# the live-trade gateway (port 4003, 2026-08-25): the tag comes back PER SUB-ACCOUNT — not
+# master-only, and NOT on the aggregate 'All' scope — U14438624 = '-1' (unrestricted),
+# U5721712 = '0' (the account that actually bounced).
+#
+# SEMANTICS: -1 = unlimited / not PDT-restricted; 0 = none left; n>0 = n day trades remain.
+# MISSING OR UNPARSEABLE FAILS CLOSED (this lane's stance everywhere else — the unknown-side
+# refusal, the unreadable-cash zero — NOT _buying_power_ok's fail-open).
+# ========================================================================================
+PDT_TAG = "DayTradesRemaining"
+
+
+def day_trades_remaining(summary_rows) -> int | None:
+    """PURE: IBKR's DayTradesRemaining for ONE account, read off the accountSummary rows this
+    lane already holds. Accepts either the row-object list ib.accountSummary() returns or the
+    {tag: value} dict shape s0_live.filter_account_summary can produce.
+
+    Returns the integer, or None when the tag is absent, blank or unparseable — the CALLER
+    treats None as REFUSE (fail closed). Never raises."""
+    raw = None
+    if isinstance(summary_rows, dict):
+        raw = summary_rows.get(PDT_TAG)
+    else:
+        for row in (summary_rows or []):
+            if str(getattr(row, "tag", "")) == PDT_TAG:
+                raw = getattr(row, "value", None)
+                break
+    if raw is None:
+        return None
+    try:
+        return int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def pdt_account_ok(summary_rows) -> tuple[bool, str]:
+    """PURE: the PDT verdict for ONE account. (True, "") when the broker says the account is
+    not day-trade-restricted (-1 unlimited, or a positive count remaining); (False, reason)
+    when it says 0 — and (False, reason) when the tag cannot be read at all (FAIL CLOSED: an
+    account we cannot clear is an account we do not trade)."""
+    n = day_trades_remaining(summary_rows)
+    if n is None:
+        return False, (f"{PDT_TAG} is absent/unparseable in this account's accountSummary — "
+                       f"cannot confirm the account is not pattern-day-trader restricted. "
+                       f"FAILING CLOSED.")
+    if n == -1:
+        return True, ""
+    if n > 0:
+        return True, ""
+    return False, (f"{PDT_TAG}={n} — IBKR has flagged this account pattern-day-trader "
+                   f"restricted with no day trades left. Such an account rejects ORDINARY "
+                   f"orders regardless of order shape (2026-07-28, U5721712: a plain BUY of "
+                   f"1 USFR was bounced). REFUSING to include it.")
+
+
+def pdt_blocked_in_split(route, summaries: dict | None = None) -> list[dict]:
+    """PURE: every account in a block's split the PDT gate refuses, as
+    [{account, shares, day_trades_remaining, reason}] sorted by account. Empty list = the
+    whole split clears. No broker — reads only the summaries the lane already holds."""
+    summaries = summaries or {}
+    blocked: list[dict] = []
+    for acct in sorted(route.per_account_split):
+        rows = summaries.get(acct, [])
+        ok, reason = pdt_account_ok(rows)
+        if ok:
+            continue
+        blocked.append({"account": acct,
+                        "shares": int(route.per_account_split.get(acct, 0)),
+                        "day_trades_remaining": day_trades_remaining(rows),
+                        "reason": reason})
+    return blocked
+
+
+def pdt_preflight_over_split(route, summaries: dict | None = None) -> tuple[bool, str]:
+    """PURE per-account PDT pre-flight over a block's split — the BLOCK-level verdict.
+
+    A PDT-blocked account is DROPPED from the split (see pdt_drop_blocked_from_split), NOT
+    treated as a veto: one $957 restricted account must never refuse a 60-account rebalance.
+    So this returns (False, reason) ONLY when EVERY account in the split is blocked and the
+    split would empty — there is then no block left to place. Otherwise (True, "").
+
+    Sibling of margin_preflight_over_split; same shape, same fail-closed instinct."""
+    blocked = pdt_blocked_in_split(route, summaries)
+    if not blocked:
+        return True, ""
+    if len(blocked) < len(route.per_account_split):
+        return True, ""
+    detail = "; ".join(f"{b['account']} ({PDT_TAG}={b['day_trades_remaining']!r})"
+                       for b in blocked)
+    return False, (f"EVERY account in this block's split is pattern-day-trader blocked "
+                   f"[{detail}] — the split empties, so there is no block to place. "
+                   f"REFUSING the block.")
+
+
+def pdt_drop_blocked_from_split(route, summaries: dict | None = None) -> tuple:
+    """PURE: re-issue `route` with every PDT-blocked account REMOVED from per_account_split
+    and total_qty recomputed off the survivors (dataclasses.replace, exactly as
+    resize_buy_routes_to_realized_cash does — the engine's original route is untouched).
+
+    Returns (route, dropped) where `dropped` is pdt_blocked_in_split's list. The CALLER MUST
+    surface `dropped` loudly, in the printed run report AND in the ledger record: an account
+    that quietly did not get rebalanced is precisely the failure mode that let an $826k
+    rollover sit idle 131 days. A silent drop is a bug.
+
+    Callers must run pdt_preflight_over_split FIRST — this function does not defend against
+    the split emptying (it would return a zero-quantity route)."""
+    dropped = pdt_blocked_in_split(route, summaries)
+    if not dropped:
+        return route, []
+    blocked_accts = {d["account"] for d in dropped}
+    split = {a: int(q) for a, q in route.per_account_split.items()
+             if a not in blocked_accts}
+    return (dc_replace(route, per_account_split=dict(sorted(split.items())),
+                       total_qty=int(sum(split.values()))),
+            dropped)
+
+
+# ========================================================================================
+# ENGINE INPUTS — the ONE place this lane turns broker state into rebalance_engine input.
+# ========================================================================================
+def build_account_inputs(ib, clients, targets, quotes: dict | None = None) -> tuple:
+    """Read each enrolled+funded client sub off the ONE FA-master login and build BOTH the
+    engine's per-account input dicts AND the per-account accountSummary rows every gate reads.
+
+    Returns (account_inputs, summaries).
+
+    HELD-ASIDE (owner decision D6): each input carries `sec_types` (the broker's OWN
+    contract.secType per held symbol) and `values` (broker-reported market values). Without
+    them rebalance_engine.plan_account's carve_out short-circuits to "nothing held aside" and
+    a bond-holding account is sized against its FULL NetLiq — the bond silently INSIDE the
+    target allocation, when D6 puts it outside and applies the model to the remaining managed
+    sleeve as its own 100%. The per-account batch rail (batch_rebalance_execute.py) has always
+    built sec_types this way; this lane did not, which is the defect this function closes.
+
+    `values` reuses recon_report's ONE portfolio reader; any failure there degrades to {} and
+    the plan then reports the holding UNPRICED and withholds orders (fail closed).
+
+    `quotes` defaults to the module quote cache the connected driver populated.
+    Broker reads only — nothing is built, armed or transmitted here."""
+    quotes = _quotes_cache if quotes is None else quotes
+    account_inputs: list[dict] = []
+    summaries: dict = {}
+    all_summary = ib.accountSummary()
+    for info in sorted(clients, key=lambda x: x.number):
+        # Keep the RAW position objects: the carve-out needs each contract's secType, which a
+        # {symbol: position} comprehension throws away.
+        positions_raw = [p for p in ib.positions(info.number) if p.position != 0]
+        positions = {p.contract.symbol: p.position for p in positions_raw}
+        sec_types = {p.contract.symbol: getattr(p.contract, "secType", None)
+                     for p in positions_raw}
+        values = recon_report._portfolio_values(ib, info.number)
+        tier_prices = targets[info.version].prices
+        prices = {}
+        for sym in set(tier_prices.index) | set(positions):
+            q = quotes.get(sym)
+            ref = live_quotes.reference_price(q) if q else None
+            prices[sym] = ref if (ref and ref > 0) else float(
+                tier_prices.get(sym, float("nan")))
+        account_inputs.append({
+            "account": info.number, "version": info.version,
+            "net_liq": info.net_liq, "positions": positions, "prices": prices,
+            "sec_types": sec_types, "values": values})
+        summaries[info.number] = [r for r in all_summary
+                                  if getattr(r, "account", None) == info.number]
+    return account_inputs, summaries
 
 
 # ========================================================================================
@@ -570,6 +759,8 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
                        permit: bool, summaries: dict | None, phase_label: str,
                        run_id: str | None = None) -> dict:
     """Run ONE fa_block route: account wall over the split, margin pre-flight over the split,
+    the PDT pre-flight over the split (blocked accounts DROPPED, block refused only if the split
+    empties — both BEFORE the group diff, so a refused account never causes a replaceFA write),
     the would-write group DIFF, then (armed+permitted) the lockstep replaceFA + block place, or
     (preview) build-only. This is the UNCHANGED per-route body — every gate in the same order,
     with the same fail-closed `SKIP` semantics — lifted into a function so the phase runner can
@@ -585,7 +776,8 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
     res = {"symbol": r.symbol, "side": r.side, "requested": float(r.total_qty), "filled": 0.0,
            "status": "PREVIEW" if not permit else "NOT_PLACED", "reprices": 0, "skipped": False,
            "reason": "", "group": r.fa_group, "split": dict(sorted(r.per_account_split.items())),
-           "limit": None, "replace_fa": 0, "fills": [], "order_ref": "", "phase": phase_label}
+           "limit": None, "replace_fa": 0, "fills": [], "order_ref": "", "phase": phase_label,
+           "pdt_dropped": []}
 
     print("\n" + "-" * 88)
     print(f"    [{phase_label}][fa_block] {r.side} {r.symbol} x{r.total_qty}  "
@@ -609,6 +801,31 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
     if not mg_ok:
         print("      SKIP — margin pre-flight refused this block.")
         return _skip("SKIPPED_MARGIN", mg_reason)
+
+    # PATTERN-DAY-TRADER gate over the split. MUST run BEFORE the group-XML diff and before
+    # set_group_contracts_or_shares, so a refused account can never cause a replaceFA write.
+    # A blocked account is DROPPED (not a veto); the block is refused only if the split empties.
+    pdt_ok, pdt_reason = pdt_preflight_over_split(r, summaries)
+    if not pdt_ok:
+        print(f"      SKIP — PDT pre-flight refused this block: {pdt_reason}")
+        return _skip("SKIPPED_PDT", pdt_reason)
+    r, pdt_dropped = pdt_drop_blocked_from_split(r, summaries)
+    res["pdt_dropped"] = pdt_dropped
+    if pdt_dropped:
+        # LOUD by design. A silently omitted account is the failure mode that let an $826k
+        # rollover sit idle 131 days — never let a drop pass without saying so.
+        print(f"      !! PDT DROP (LOUD) — {len(pdt_dropped)} account(s) are PATTERN-DAY-TRADER "
+              f"blocked and are NOT rebalanced by this block. THEY NEED HUMAN REVIEW:")
+        for d in pdt_dropped:
+            print(f"        -> account={d['account']} shares_dropped={d['shares']} "
+                  f"{PDT_TAG}={d['day_trades_remaining']!r} :: {d['reason']}")
+        print(f"      block RE-SIZED after the PDT drop: total_qty "
+              f"{int(res['requested'])} -> {r.total_qty}  "
+              f"split={dict(sorted(r.per_account_split.items()))}")
+        res["requested"] = float(r.total_qty)
+        res["split"] = dict(sorted(r.per_account_split.items()))
+    else:
+        print("      pdt_preflight_over_split ok=True (no account PDT-blocked)")
 
     # Surface the exact would-write group DIFF (both preview and armed) for human review.
     try:
@@ -691,7 +908,11 @@ def _notional_by_account(routes_with_limits, results) -> dict:
     """PURE: per-account dollars a phase ACTUALLY transacted — the account's split shares x the
     block limit x the block's FILL FRACTION (a block allocates pro-rata to its ContractsOrShares
     split, so a partial block fill lands pro-rata too). Skipped/refused blocks contribute zero.
-    Used for BOTH the sell phase's realized proceeds and the buy phase's placed notional."""
+    Used for BOTH the sell phase's realized proceeds and the buy phase's placed notional.
+
+    The split read is the RESULT's (`res["split"]`), not the incoming route's: the PDT gate can
+    drop an account from a block after routing, and a dropped account transacted NOTHING. Falls
+    back to the route's own split when a result carries none (older/synthetic result dicts)."""
     out: dict = {}
     for (r, _limit), res in zip(routes_with_limits, results):
         if res.get("skipped"):
@@ -700,7 +921,8 @@ def _notional_by_account(routes_with_limits, results) -> dict:
         frac = min(max((float(res.get("filled", 0.0) or 0.0) / requested)
                        if requested > 0 else 0.0, 0.0), 1.0)
         lim = float(res.get("limit") or 0.0)
-        for acct, q in r.per_account_split.items():
+        split = res.get("split") or r.per_account_split
+        for acct, q in split.items():
             out[acct] = out.get(acct, 0.0) + float(q) * lim * frac
     return out
 
@@ -761,7 +983,8 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     Returns a summary dict. The original keys are UNCHANGED for existing callers —
     {n_blocks, n_direct_skipped, replace_fa_writes, placed_fills, backup} — and are EXTENDED
     with {refused, refused_reason, n_sell_blocks, n_buy_blocks, sell_results, buy_results,
-    realized_cash, buy_resize, dropped_buy_blocks, uninvested, run_id}."""
+    realized_cash, buy_resize, dropped_buy_blocks, uninvested, pdt_dropped,
+    pdt_refused_blocks, run_id}."""
     fa_routes = [r for r in routes if r.route == "fa_block"]
     direct_routes = [r for r in routes if r.route != "fa_block"]
     placed_fills: list[dict] = []
@@ -773,7 +996,8 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
                 "replace_fa_writes": 0, "placed_fills": placed_fills, "backup": backup_path,
                 "refused": False, "refused_reason": "", "n_sell_blocks": 0, "n_buy_blocks": 0,
                 "sell_results": [], "buy_results": [], "realized_cash": {}, "buy_resize": {},
-                "dropped_buy_blocks": [], "uninvested": [], "run_id": run_id}
+                "dropped_buy_blocks": [], "uninvested": [], "pdt_dropped": [],
+                "pdt_refused_blocks": [], "run_id": run_id}
         base.update(extra)
         return base
 
@@ -884,7 +1108,42 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     replace_fa_writes = sum(res.get("replace_fa", 0)
                             for res in (sell_results + buy_results))
 
-    # [6] LOUD reporting. Armed runs get safe_execute's phase reporter verbatim (same format the
+    # [6a] PDT EXCEPTION REPORT — PREVIEW AND ARMED ALIKE. Every account any block dropped for
+    # pattern-day-trader restriction, and every block refused outright because its whole split
+    # was blocked. An account that quietly did not get rebalanced is the failure mode that let
+    # an $826k rollover sit idle 131 days, so this prints on every run, not just armed ones.
+    all_results = sell_results + buy_results
+    pdt_dropped: list = []
+    seen_drop: set = set()
+    for res in all_results:
+        for d in res.get("pdt_dropped", []) or []:
+            row = dict(d)
+            row["symbol"], row["side"] = res.get("symbol"), res.get("side")
+            row["group"], row["phase"] = res.get("group"), res.get("phase")
+            pdt_dropped.append(row)
+            seen_drop.add(d["account"])
+    pdt_refused_blocks = [{"symbol": res.get("symbol"), "side": res.get("side"),
+                           "group": res.get("group"), "phase": res.get("phase"),
+                           "reason": res.get("reason", "")}
+                          for res in all_results if res.get("status") == "SKIPPED_PDT"]
+    if pdt_dropped or pdt_refused_blocks:
+        print("\n    !! PATTERN-DAY-TRADER EXCEPTIONS (LOUD — these accounts were NOT "
+              "rebalanced; needs human review):")
+        for row in pdt_dropped:
+            print(f"      -> account={row['account']} DROPPED from {row['phase']} block "
+                  f"{row['side']} {row['symbol']} group={row['group']} "
+                  f"shares_dropped={row['shares']} "
+                  f"{PDT_TAG}={row['day_trades_remaining']!r}")
+        for row in pdt_refused_blocks:
+            print(f"      -> BLOCK REFUSED {row['phase']} {row['side']} {row['symbol']} "
+                  f"group={row['group']}: {row['reason']}")
+        print(f"      {len(seen_drop)} distinct account(s) dropped, "
+              f"{len(pdt_refused_blocks)} block(s) refused outright.")
+    else:
+        print("\n    Pattern-day-trader check: CLEAN — every account in every block's split "
+              "cleared IBKR's DayTradesRemaining.")
+
+    # [6b] LOUD reporting. Armed runs get safe_execute's phase reporter verbatim (same format the
     # per-account lane prints) plus the uninvested-proceeds exception report.
     uninvested: list = []
     if permit:
@@ -915,7 +1174,8 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
                     sell_results=sell_results, buy_results=buy_results,
                     realized_cash=realized_cash, buy_resize=buy_resize,
                     dropped_buy_blocks=[r.symbol for r, _l in dropped],
-                    uninvested=uninvested)
+                    uninvested=uninvested,
+                    pdt_dropped=pdt_dropped, pdt_refused_blocks=pdt_refused_blocks)
 
 
 # Module-level quote cache the route loop reads for marketable-cap block pricing (reuses
@@ -1045,24 +1305,7 @@ def _run_session(target: TargetGateway, targets: dict, *, armed: bool) -> int:
         print(f"\n[3] Fetching live quotes for {len(universe)} symbol(s)...")
         _quotes_cache = live_quotes.fetch(ib, universe)
 
-        account_inputs: list[dict] = []
-        summaries: dict = {}
-        all_summary = ib.accountSummary()
-        for info in sorted(clients, key=lambda x: x.number):
-            positions = {p.contract.symbol: p.position
-                         for p in ib.positions(info.number) if p.position != 0}
-            tier_prices = targets[info.version].prices
-            prices = {}
-            for sym in set(tier_prices.index) | set(positions):
-                q = _quotes_cache.get(sym)
-                ref = live_quotes.reference_price(q) if q else None
-                prices[sym] = ref if (ref and ref > 0) else float(
-                    tier_prices.get(sym, float("nan")))
-            account_inputs.append({
-                "account": info.number, "version": info.version,
-                "net_liq": info.net_liq, "positions": positions, "prices": prices})
-            summaries[info.number] = [r for r in all_summary
-                                      if getattr(r, "account", None) == info.number]
+        account_inputs, summaries = build_account_inputs(ib, clients, targets)
 
         # [4] Resolve version -> FA group. Live membership (fail-closed) for paper; an explicit
         # group_names map (e.g. live 'Growth') when the target supplies one.
@@ -1147,6 +1390,11 @@ def _ledger(target, armed, permit, why, routes, result, backup_path) -> None:
                    "realized_cash": result.get("realized_cash", {}),
                    "dropped_buy_blocks": result.get("dropped_buy_blocks", []),
                    "uninvested": result.get("uninvested", [])},
+        # PATTERN-DAY-TRADER gate (v0.36.0). TOP-LEVEL, not buried in phases: an account the
+        # gate dropped did NOT get rebalanced, and that omission has to be as findable in the
+        # audit trail as it is loud on the console. Empty list = nothing was dropped.
+        "pdt_dropped": result.get("pdt_dropped", []),
+        "pdt_refused_blocks": result.get("pdt_refused_blocks", []),
         "halted": bool(result.get("refused")),
         "halt_reason": result.get("refused_reason", ""),
         "gate": {"target": target.name, "port": target.port,

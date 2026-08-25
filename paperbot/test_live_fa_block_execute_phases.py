@@ -164,9 +164,25 @@ def armed_env(monkeypatch):
     monkeypatch.setattr(lx, "_quotes_cache", {})
 
 
-def _run(ib, routes, *, permit):
-    return lx.execute_fa_block_routes(ib, routes, _account_inputs(), _targets(),
-                                      _target_gateway(), permit=permit, summaries={})
+def _pdt_rows(values=None, accounts=(A1, A2)):
+    """accountSummary rows carrying DayTradesRemaining, in the shape ib_async returns.
+
+    The PDT gate (v0.36.0) FAILS CLOSED on a missing tag, so the phase runner must be handed
+    real rows rather than {} — which keeps the REAL gate running through every phase test
+    instead of stubbing it out. Default '-1' = IBKR's "unlimited / not PDT-restricted"
+    (VERIFIED read-only on the live 4003 master, U14438624, 2026-08-25). Pass
+    `values={A2: "0"}` to make one account PDT-blocked."""
+    values = values or {}
+    return {a: [SimpleNamespace(account=a, tag="DayTradesRemaining",
+                                value=str(values.get(a, "-1"))),
+                SimpleNamespace(account=a, tag="NetLiquidation", value="1000000")]
+            for a in accounts}
+
+
+def _run(ib, routes, *, permit, summaries=None):
+    return lx.execute_fa_block_routes(
+        ib, routes, _account_inputs(), _targets(), _target_gateway(),
+        permit=permit, summaries=_pdt_rows() if summaries is None else summaries)
 
 
 # ========================================================================================
