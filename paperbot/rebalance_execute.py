@@ -19,13 +19,15 @@ typo `--armed`; the executor refuses to flip the flags without the exact token.
 
 ARMED FLOW (each step logged to the ledger), mirroring MONDAY_RUNBOOK steps B–G but
 fully in code:
-  * connect NON-read-only, PINNED to a DU sub-account (flatten_accounts pattern) so the
-    session can transmit AND so ib_async never hangs on the FA master's account stream;
+  * connect NON-read-only, PINNED to one specific DU sub-account — so the session can
+    transmit, so a mis-pointed connection cannot reach a different account, AND so
+    ib_async never hangs on the FA master's account stream;
   * accounts.discover -> live NetLiq + positions for every enrolled+funded sub;
   * live quotes -> per-symbol reference/limit price (fall back to the strategy close);
   * rebalance_engine.build_plan -> plans / blocks / routes (pure);
   * resolve_tier_groups via requestFA(1) — FAIL CLOSED on any ambiguity;
-  * risk_manager.evaluate per account BEFORE any transmit (kill switch + guards);
+  * risk_manager.evaluate per account BEFORE any transmit (per-order caps + cash reserve;
+    there is NO automated daily-loss halt — removed 2026-08-25 by owner decision);
   * read the LIVE FA-groups XML once, BACK IT UP to a timestamped file (like the prior
     fa_groups_backup.xml), then for each FA-block route set ONLY that tier group's
     ContractsOrShares to the RoutePlan per_account_split via replaceFA (a serialized
@@ -67,9 +69,15 @@ from ib_async import IB   # noqa: E402
 
 import accounts          # noqa: E402
 import config            # noqa: E402
+# Reuse, don't duplicate: the per-account engine already owns the ONE daily-P&L reader
+# (IBKR reqPnL). This lane imports it for the ledger's audit figure — nothing halts on it.
+import execution_engine  # noqa: E402
 import ledger            # noqa: E402
 import live_quotes       # noqa: E402
 import order_router      # noqa: E402
+# recon_report owns the ONE strategy-universe accessor (and its refusing variant) used to
+# tell a corp-action holding apart from a symbol the model dropped.
+import recon_report      # noqa: E402
 import risk_manager      # noqa: E402
 import version           # noqa: E402
 from connections import clientids, ibkr_paper   # noqa: E402
@@ -289,6 +297,66 @@ def _net_liq(summary, account: str):
                  if r.account == account and r.tag == "NetLiquidation"), None)
 
 
+def guarded_preview(account_inputs: list[dict], targets: dict, tier_groups: dict | None):
+    """rebalance_run.build_preview WITH the corp-action guard switched on. (v0.41.0)
+
+    This lane used to call build_preview with no `universe`, which left
+    reconcile.classify_untracked in its legacy single-bucket mode: a spinoff, a rename, a
+    client's own holding or a money-market sweep all came back UNTRACKED, an ALWAYS-BREACH
+    status that sizes as delta = 0 - held — a FULL LIQUIDATION of something nobody decided
+    to sell. Passing the universe splits those into ALIEN/FRACTIONAL/SWEEP (no auto-trade,
+    parked for human review) and keeps only a genuine ROTATE_OUT as a sell.
+
+    Raises recon_report.CorpActionGuardUnavailable if the universe cannot be resolved. This
+    lane TRANSMITS, so it fails closed rather than sizing with the guard off."""
+    return rebalance_run.build_preview(
+        account_inputs, targets, tier_groups=tier_groups,
+        universe=recon_report.strategy_universe_or_refuse())
+
+
+def evaluate_risk_guards(ib, account_inputs: list[dict], plans_by_acct: dict,
+                         targets: dict) -> tuple[bool, str]:
+    """Run risk_manager per account BEFORE any transmit. Returns (halted, halt_reason).
+
+    NO AUTOMATED DAILY-LOSS HALT (owner decision, Andrew, 2026-08-25). The v0.41.0 strict
+    P&L wiring on this lane existed solely to feed a -2%-of-NAV breaker that was never
+    authorized; both are gone. An account's daily P&L is still read — best-effort, via
+    execution_engine._daily_pnl — and handed to risk_manager.evaluate PURELY so the run's
+    ledger record keeps carrying the day's figure. It gates nothing, and an UNREADABLE P&L
+    no longer refuses the account (it records 0.0 and the account trades normally).
+
+    The guards that DO decide here are unchanged: risk_manager's per-order caps, order
+    sanity and the cash-reserve / no-leverage batch check.
+
+    An account with no orders is skipped (nothing to guard, and no broker call for it)."""
+    halted, halt_reason = False, ""
+    for ai in account_inputs:
+        p = plans_by_acct.get(ai["account"])
+        if not p or not p.orders:
+            continue
+        # Best-effort, LEDGER-ONLY figure. 0.0 on any read failure is fine: nothing
+        # downstream branches on it.
+        daily_pnl = execution_engine._daily_pnl(ib, ai["account"])
+        intents = [rebalance_run._DirectIntent(
+            sym, "BUY" if d > 0 else "SELL", abs(d),
+            round(float(ai["prices"].get(sym, float("nan"))), 2))
+            for sym, d in p.orders.items()]
+        rep = risk_manager.evaluate(ai["net_liq"], daily_pnl, ai["positions"], intents,
+                                    targets[ai["version"]])
+        if rep.halted:
+            halted, halt_reason = True, rep.halt_reason
+            print(f"    {ai['account']}: HALTED — {rep.halt_reason}")
+        elif not rep.all_clear:
+            vetoes = [f"{v.symbol}:{','.join(v.reasons)}"
+                      for v in rep.order_verdicts if not v.ok] + rep.batch_reasons
+            halted, halt_reason = True, f"{ai['account']} risk veto: {vetoes}"
+            print(f"    {ai['account']}: VETO — {vetoes}")
+        else:
+            print(f"    {ai['account']}: clear ({len(intents)} order(s), "
+                  f"dailyPnL={daily_pnl:,.2f} on NetLiq {ai['net_liq']:,.2f})")
+    return halted, halt_reason
+
+
 def execute_armed(armed: bool, only_account: str | None = None,
                   only_tier: str | None = None,
                   token_present: bool | None = None) -> int:
@@ -377,8 +445,10 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
     on the wire joins back to this run."""
     run_id = _run_id()
     print(f"\n    RUN ID {run_id} — stamped onto every orderRef this run builds.")
-    # Connect NON-read-only, pinned to a DU account (flatten_accounts.py pattern). This is
-    # the only way the session can transmit; pinning dodges the master account-stream hang.
+    # Connect NON-read-only, pinned to this one specific DU sub-account. Non-read-only is
+    # the only way the session can transmit; pinning to a single account means a
+    # mis-pointed connection cannot reach another account, and it dodges the master
+    # account-stream hang.
     print(f"\n[2] Connecting NON-readonly pinned to {PIN_ACCOUNT} "
           f"(clientId={clientids.get('paperbot_rebalance_exec')})...")
     ib = IB()
@@ -411,15 +481,18 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
             positions = {p.contract.symbol: p.position
                          for p in ib.positions(info.number) if p.position != 0}
             tier_prices = targets[info.version].prices
-            prices = {}
-            for sym in set(tier_prices.index) | set(positions):
-                q = quotes.get(sym)
-                ref = live_quotes.reference_price(q) if q else None
-                prices[sym] = ref if (ref and ref > 0) else float(
-                    tier_prices.get(sym, float("nan")))
+            # LIVE QUOTE ONLY (owner decision, v0.42.0). This rail TRANSMITS, so the
+            # tier's stored daily close is never substituted for a quote IBKR would not
+            # give — see live_quotes.execution_prices.
+            prices, unquoted = live_quotes.execution_prices(
+                quotes, set(tier_prices.index) | set(positions))
+            if unquoted:
+                print(f"    {info.number}: no live IBKR quote for {len(unquoted)} "
+                      f"symbol(s): {', '.join(unquoted)} — they will NOT be traded.")
             account_inputs.append({
                 "account": info.number, "version": info.version,
-                "net_liq": info.net_liq, "positions": positions, "prices": prices})
+                "net_liq": info.net_liq, "positions": positions, "prices": prices,
+                "strict_prices": True})
 
         # [4] Resolve version -> FA group by LIVE membership (fail closed).
         print("\n[4] Resolving version->FA group via requestFA(1) (fail-closed)...")
@@ -432,8 +505,15 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
         for v, g in sorted(tier_groups.items()):
             print(f"    {v:13s} -> group '{g}'")
 
-        # [5] Preview (pure) + the plan we will act on.
-        out = rebalance_run.build_preview(account_inputs, targets, tier_groups=tier_groups)
+        # [5] Preview (pure) + the plan we will act on. The corp-action guard is ON: the
+        # strategy universe goes into reconcile so an ALIEN holding is parked for review
+        # instead of being sized as a full liquidation. FAILS CLOSED if it can't resolve.
+        try:
+            out = guarded_preview(account_inputs, targets, tier_groups)
+        except recon_report.CorpActionGuardUnavailable as exc:
+            print(f"\n[5] REFUSING — {exc}\n    Nothing sized, nothing transmitted, no FA "
+                  f"config written.")
+            return 2
         routes = out["routes"]
 
         # [5b] SCOPE FILTER (optional) — narrow to one account/tier, AFTER build_plan so the
@@ -457,29 +537,14 @@ def _run_armed_session(armed: bool, only_account: str | None, only_tier: str | N
                         halted=False, halt_reason="", run_id=run_id)
                 return 0
 
-        # [6] RISK GUARDS per account BEFORE any transmit (kill switch + per-order caps).
-        print("\n[6] Risk guards (risk_manager) per account, pre-transmit...")
+        # [6] RISK GUARDS per account BEFORE any transmit (per-order caps + cash reserve).
+        # There is NO automated daily-loss halt — removed 2026-08-25 by owner decision. Each
+        # account's daily P&L is read best-effort for the audit ledger only.
+        print("\n[6] Risk guards (risk_manager: per-order caps / cash reserve) per account, "
+              "pre-transmit...")
         plans_by_acct = {p.account: p for p in out["plans"]}
-        for ai in account_inputs:
-            p = plans_by_acct.get(ai["account"])
-            if not p or not p.orders:
-                continue
-            intents = [rebalance_run._DirectIntent(
-                sym, "BUY" if d > 0 else "SELL", abs(d),
-                round(float(ai["prices"].get(sym, float("nan"))), 2))
-                for sym, d in p.orders.items()]
-            rep = risk_manager.evaluate(ai["net_liq"], 0.0, ai["positions"], intents,
-                                        targets[ai["version"]])
-            if rep.halted:
-                halted, halt_reason = True, rep.halt_reason
-                print(f"    {ai['account']}: HALTED — {rep.halt_reason}")
-            elif not rep.all_clear:
-                vetoes = [f"{v.symbol}:{','.join(v.reasons)}"
-                          for v in rep.order_verdicts if not v.ok] + rep.batch_reasons
-                halted, halt_reason = True, f"{ai['account']} risk veto: {vetoes}"
-                print(f"    {ai['account']}: VETO — {vetoes}")
-            else:
-                print(f"    {ai['account']}: clear ({len(intents)} order(s))")
+        halted, halt_reason = evaluate_risk_guards(ib, account_inputs, plans_by_acct,
+                                                   targets)
         if halted:
             print("\n    SAFETY STOP: risk guard halted/vetoed — NOTHING transmitted, no "
                   "FA config written.")

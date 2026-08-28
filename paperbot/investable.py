@@ -141,3 +141,26 @@ def cash_line(net_liq: float, risk_positions_value: float,
         buffer = buffer_pct()
     actual = (net_liq - risk_positions_value) / net_liq if net_liq else 0.0
     return float(buffer), float(actual)
+
+
+# --- THE price gate: "unpriced" is NOT the number zero (v0.42.0) ----------------
+# Lives HERE, in the leaf, for the same reason the buffer does: before this, four modules
+# each re-derived "do we have a price?" inline and they did not agree. reconcile said
+# `price == price and price > 0`; risk_manager said `float(target.prices.get(sym, 0.0)) or
+# fallback` — which turns a MISSING price into 0.0 and passes a NaN straight through into
+# comparisons that are then all False. Both mistakes have the same shape: an input the code
+# could not read became a permissive NUMBER instead of a refusal.
+def usable_price(value) -> float | None:
+    """The usable price in `value`, or None. NEVER 0.0, NEVER NaN.
+
+    None, NaN, a non-numeric, and any non-positive number all collapse to ONE answer —
+    None, meaning UNPRICED. Zero is deliberately not a price: conflating "the number zero"
+    with "no number at all" is the exact defect this function exists to remove. Callers
+    MUST branch on `is None`; a caller that falls through to 0.0 has reintroduced it."""
+    try:
+        px = float(value)
+    except (TypeError, ValueError):
+        return None
+    if px != px or px <= 0:        # NaN, or non-positive
+        return None
+    return px

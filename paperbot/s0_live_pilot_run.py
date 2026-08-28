@@ -46,6 +46,7 @@ from datetime import date
 import config
 import live_quotes
 import rebalance_engine
+import recon_report
 import s0_live
 import strategy_target
 import version
@@ -268,24 +269,38 @@ def _run_session(ib, target) -> int:
 
     positions_raw = s0_live.filter_positions(ib.positions())
     positions = {p.contract.symbol: p.position for p in positions_raw if p.position != 0}
+    # HELD-ASIDE classification input (owner decision D6): the broker's OWN contract.secType
+    # ("STK", "BOND", ...), never a guess off the ticker text. Without it
+    # holding_class.carve_out short-circuits to "nothing held aside" and an individual bond
+    # is sized INSIDE the target allocation — so this preview would disagree with what the
+    # deploy and batch rails would actually do for the same account. This rail is
+    # PILOT_MODE / zero-transmit, so this is a REPORTING accuracy fix, not a money-safety one.
+    sec_types = {p.contract.symbol: getattr(p.contract, "secType", None)
+                 for p in positions_raw if p.position != 0}
     print(f"    account={account}   NetLiq={net_liq:,.2f}   open_positions={len(positions)}")
 
     # [5] Prices: fetch live real-time quotes on the 4003 connection over the union of the
-    # target's symbols and any held symbol; prefer a fresh quote (>0) and fall back to the
-    # target's strategy-data close — exactly the merge morning_execute / nightly_monitor use.
+    # target's symbols and any held symbol. LIVE QUOTE ONLY (owner decision, v0.42.0): the
+    # strategy-data close is no longer substituted for a quote IBKR would not give — this
+    # pilot mirrors the real deploy rail, so it must mirror its pricing rule too.
     universe = sorted(set(target.weights.index) | set(positions))
     print(f"\n[5] Fetching live quotes for {len(universe)} symbol(s) on port 4003...")
     quotes = live_quotes.fetch(ib, universe)
-    prices: dict = {}
-    for sym in universe:
-        q = quotes.get(sym)
-        ref = live_quotes.reference_price(q) if q else None
-        prices[sym] = ref if (ref and ref > 0) else float(target.prices.get(sym, float("nan")))
+    prices, unquoted = live_quotes.execution_prices(quotes, universe)
+    print(f"    priced from live IBKR quotes: {len(prices)} of {len(universe)} symbol(s).")
+    live_quotes.report_unquoted(unquoted)
 
     # [6] The strategy's tradeable universe (same accessor nightly_monitor uses), threaded
     # into plan_account so a held symbol the model dropped is ROTATE_OUT (sell) vs an ALIEN
     # holding is surfaced for review, never auto-traded.
     strat_universe = _strategy_universe()
+
+    # Held-aside PRICING fallback: an individual bond has no strategy close and no model
+    # weight, so nothing else here knows what it is worth. recon_report._portfolio_values is
+    # the ONE reader for it (read-only; any failure degrades to {} and the plan then reports
+    # the holding UNPRICED and withholds orders — fail closed, not a silent zero). This rail
+    # is single-account, so it fetches unconditionally exactly as the deploy rail does.
+    values = recon_report._portfolio_values(ib, account)
 
     # [7] Size the REAL account against the target with the UNCHANGED engine. band_pct=None
     # lets the engine use config.REBALANCE_BAND_PCT. NOTE: U5721712 is not in
@@ -293,7 +308,13 @@ def _run_session(ib, target) -> int:
     # this account ever needs a distribution carve-out it gets added to cashflows.SCHEDULE.
     print("\n[7] Sizing the plan with rebalance_engine.plan_account (UNCHANGED engine)...")
     plan = rebalance_engine.plan_account(account, target.version, net_liq, positions,
-                                         target, prices=prices, universe=strat_universe)
+                                         target, prices=prices, universe=strat_universe,
+                                         sec_types=sec_types, values=values,
+                                         strict_prices=True)
+    for reason in getattr(plan, "blocked_reasons", None) or []:
+        print(f"    ORDERS HELD BACK: {reason}")
+    for reason in getattr(plan, "unpriced_reasons", []) or []:
+        print(f"    NOT IN SPEC (cannot conform): {reason}")
 
     # [8] Build + print + email the 'WOULD HAVE TRANSMITTED' report. Nothing is built or sent.
     breached = plan.needs_rebalance

@@ -77,9 +77,11 @@ import custom_target
 import custom_tier
 from strategies import small_tier
 from strategies import config as config_s
+import holding_class
 import ledger
 import live_quotes
 import rebalance_engine
+import recon_report
 import roster
 import s0_live
 import safe_execute
@@ -714,7 +716,21 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     # orderRef on the wire ends in it, and written into the single ledger record below — the
     # join key between an IBKR order and the book that produced it.
     run_id = safe_execute._run_id()
+    # CORP-ACTION GUARD, FAIL CLOSED (v0.41.0). sp._strategy_universe() swallows every
+    # exception and returns None — justified in ITS docstring because the s0 pilot preview is
+    # zero-transmit. This rail is not that rail: it sizes and can transmit for the whole
+    # roster, and with universe=None reconcile collapses every unrecognised holding into
+    # UNTRACKED, which ALWAYS breaches the band and sizes as delta = 0 - held (a FULL
+    # LIQUIDATION of a spinoff / rename / client holding / sweep). One failed import must not
+    # silently disarm that here, in PREVIEW either — a preview whose classification is wrong
+    # is what a human then arms. Refuse before the broker is even read.
     strat_universe = sp._strategy_universe()
+    if not strat_universe:
+        print("\n    REFUSING: the strategy's tradeable universe could not be resolved, so a "
+              "spinoff, a rename, a client's own holding or a money-market sweep cannot be "
+              "told apart from a symbol the model dropped — every one of them would size as "
+              "a FULL LIQUIDATION. Nothing read, nothing sized, nothing transmitted.")
+        return 2
 
     # [4] Read the whole login's account summary + positions ONCE, then filter per account.
     print(f"\n[4] Reading account summary + positions for {len(roster_accounts)} roster "
@@ -753,19 +769,13 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     print(f"\n[5] Fetching live quotes for {len(universe)} symbol(s) on port "
           f"{LIVE_TRADE_PORT}...")
     quotes = live_quotes.fetch(ib, universe)
-    prices: dict = {}
-    for sym in universe:
-        q = quotes.get(sym)
-        ref = live_quotes.reference_price(q) if q else None
-        if ref and ref > 0:
-            prices[sym] = ref
-        else:
-            # Fall back to any version's target close for the symbol.
-            for t in targets.values():
-                px = t.prices.get(sym)
-                if px is not None and float(px) == float(px):
-                    prices[sym] = float(px)
-                    break
+    # LIVE QUOTE ONLY (owner decision, v0.42.0). This loop used to fall back to any version's
+    # stored daily CLOSE, and then silently drop the key with no tally when even that was
+    # missing — a dropped key sized as target 0 shares, i.e. a FULL LIQUIDATION. IBKR is the
+    # price source: no quote, no trade, and the symbols are named out loud.
+    prices, unquoted = live_quotes.execution_prices(quotes, universe)
+    print(f"    priced from live IBKR quotes: {len(prices)} of {len(universe)} symbol(s).")
+    live_quotes.report_unquoted(unquoted)
 
     # [6] Size each roster account with the UNCHANGED engine. Refuse (skip) an account with no
     # readable positive NetLiq — an unfunded/invisible account cannot be acted on.
@@ -799,10 +809,37 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
                       f"ROTATABLE (held but not in the published allocation, so they can be "
                       f"SOLD rather than sitting there forever as ALIEN): "
                       f"{', '.join(lost_alien_review)}")
+        # HELD-ASIDE PRICING (owner decision D6). An individual bond has no strategy close
+        # and no model weight, so nothing else on this rail knows what it is worth:
+        # recon_report._portfolio_values is the ONE reader for it (the deploy rail already
+        # passes it). Without it the carve-out cannot value the holding, raises
+        # holding_class.UNPRICED_BLOCK_REASON and withholds the WHOLE account's orders —
+        # fail-closed and visible, but it benches an account the deploy rail handles fine.
+        #
+        # WHY THIS IS CONDITIONAL. _portfolio_values is a broker round-trip PER ACCOUNT, and
+        # unlike the single-account deploy rail this one loops the whole roster (186 accounts
+        # today). So it is paid ONLY by an account that actually holds a held-aside
+        # candidate. The test is holding_class's OWN predicate — is_held_aside(), i.e. "not a
+        # MANAGED instrument type" — never a locally-invented list of secTypes, so a type
+        # added to HELD_ASIDE_TYPES later is picked up here for free and the carve-out can
+        # never hold something aside this fetch decided to skip. An account holding nothing
+        # but STK makes NO extra broker call and plans exactly as it did before (the kwarg is
+        # not even passed).
+        #
+        # Any failure inside _portfolio_values degrades to {} — the plan then reports the
+        # holding UNPRICED and withholds orders, which is the intended fail-closed behavior,
+        # never a silent zero.
+        held_aside_kwargs: dict = {}
+        if any(holding_class.is_held_aside(t) for t in st["sec_types"].values()):
+            held_aside_kwargs["values"] = recon_report._portfolio_values(ib, account)
         plan = rebalance_engine.plan_account(
             account, target.version, net_liq, st["positions"], target,
             prices=prices, universe=acct_universe, sec_types=st["sec_types"],
-            cash_reserve_pct=acct_reserve)
+            cash_reserve_pct=acct_reserve,
+            **held_aside_kwargs,
+            # EXECUTION RAIL: the live IBKR quotes above are the ONLY price source. The
+            # model's stored close is never substituted for a quote we could not get.
+            strict_prices=True)
         plans.append(plan)
         summaries[account] = st["summary"]
         print(f"    {account} [{v}]: NetLiq={net_liq:,.2f}  positions={len(st['positions'])}"
@@ -821,6 +858,12 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
                       f"  value={mv:>16s}   {h.reason}")
         for reason in plan.blocked_reasons:
             print(f"      ORDERS HELD BACK: {reason}")
+        # NOT-IN-SPEC-AND-CANNOT-CONFORM: a model symbol IBKR would not quote, that this
+        # account holds none of. Its sleeve stays in cash and the rest of the account still
+        # rebalances (isolate, don't bench) — but the account is NOT in spec, and saying so
+        # here is the whole point: before v0.42.0 it read "already conform, nothing to trade".
+        for reason in getattr(plan, "unpriced_reasons", []) or []:
+            print(f"      NOT IN SPEC (cannot conform): {reason}")
 
     # [7] Map the sized plans -> per-account ExecutionRequests (PURE; REUSES crm_execute). The
     # helper SKIPS in-band accounts, so `requests` is exactly the OUT-OF-SPEC subset. Every
@@ -830,7 +873,15 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
         roster_accounts=roster_accounts, summaries=summaries, armed=armed, kill=kill,
         run_id=run_id)
     out_of_spec_accounts = [r.account for r in requests]
-    in_spec_accounts = [p.account for p in plans if p.account not in out_of_spec_accounts]
+    # An account with no legs is NOT automatically "in spec". It is in spec only if there
+    # was also nothing we failed to price and nothing withheld: an account missing a sleeve
+    # IBKR would not quote conforms to nothing (v0.42.0).
+    cannot_confirm = [p.account for p in plans
+                      if (getattr(p, "unpriced_reasons", None)
+                          or getattr(p, "blocked_reasons", None))]
+    in_spec_accounts = [p.account for p in plans
+                        if p.account not in out_of_spec_accounts
+                        and p.account not in cannot_confirm]
 
     print(f"\n[7] Out-of-spec roster accounts to rebalance: "
           f"{len(out_of_spec_accounts)} of {len(plans)} sized "
@@ -838,6 +889,10 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     if in_spec_accounts:
         print(f"    In-spec (already conform — nothing to trade): "
               f"{', '.join(in_spec_accounts)}")
+    not_conform = [a for a in cannot_confirm if a not in out_of_spec_accounts]
+    if not_conform:
+        print(f"    NOT in spec and CANNOT be confirmed in spec (a model symbol had no live "
+              f"IBKR quote, or orders were withheld): {', '.join(not_conform)}")
 
     # [8] Drive the shared engine per out-of-spec account. PREVIEW unless the whole run is
     # armed on the transmit lane. Each account prints its own [7]/[8]/[9] order list + gate,

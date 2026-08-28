@@ -147,6 +147,17 @@ def test_main_alerts_and_returns_1_when_connect_never_succeeds(monkeypatch, tmp_
     assert any("gateway connect FAILED" in s for s in alerts)
 
 
+def _live_quotes_for(ib, universe):
+    """A live IBKR quote for every symbol asked for.
+
+    v0.42.0 removed the stale-close fallback on the execution path, so a rail handed NO
+    quotes now (correctly) prices nothing — and rebalance_guard's turnover check then fails
+    closed for want of a price. These tests are about the STAGING/guard wiring, not pricing,
+    so they supply the quotes a real run would have."""
+    return {sym: nmr.live_quotes.Quote(symbol=sym, bid=None, ask=None, last=100.0,
+                                       close=100.0, md_type=1) for sym in universe}
+
+
 # --- in-band fleet: nothing staged ------------------------------------------------
 def test_in_band_fleet_stages_nothing(monkeypatch, tmp_path):
     _patch_common(monkeypatch, tmp_path)
@@ -157,7 +168,7 @@ def test_in_band_fleet_stages_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(nmr.accounts, "discover", lambda ib: [
         SimpleNamespace(number="DU8922142", version="Balanced", net_liq=1_000_000.0,
                         enrolled=True, funded=True, is_master=False)])
-    monkeypatch.setattr(nmr.live_quotes, "fetch", lambda ib, universe: {})
+    monkeypatch.setattr(nmr.live_quotes, "fetch", _live_quotes_for)
 
     # build_plan says nothing needs rebalancing.
     plan = SimpleNamespace(account="DU8922142", needs_rebalance=False)
@@ -181,7 +192,7 @@ def test_drifted_fleet_with_passing_guard_stages_file(monkeypatch, tmp_path):
     monkeypatch.setattr(nmr.accounts, "discover", lambda ib: [
         SimpleNamespace(number="DU8922142", version="Balanced", net_liq=1_000_000.0,
                         enrolled=True, funded=True, is_master=False)])
-    monkeypatch.setattr(nmr.live_quotes, "fetch", lambda ib, universe: {})
+    monkeypatch.setattr(nmr.live_quotes, "fetch", _live_quotes_for)
 
     plan = SimpleNamespace(account="DU8922142", needs_rebalance=True)
     route = SimpleNamespace(route="direct", version="Balanced", symbol="SPY", side="BUY",
@@ -230,7 +241,7 @@ def test_drifted_fleet_with_failing_guard_stages_nothing(monkeypatch, tmp_path):
     monkeypatch.setattr(nmr.accounts, "discover", lambda ib: [
         SimpleNamespace(number="DU8922142", version="Balanced", net_liq=1_000_000.0,
                         enrolled=True, funded=True, is_master=False)])
-    monkeypatch.setattr(nmr.live_quotes, "fetch", lambda ib, universe: {})
+    monkeypatch.setattr(nmr.live_quotes, "fetch", _live_quotes_for)
 
     plan = SimpleNamespace(account="DU8922142", needs_rebalance=True)
     route = SimpleNamespace(route="direct", version="Balanced", symbol="ZZZBOGUS", side="BUY",

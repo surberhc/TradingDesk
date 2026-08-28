@@ -11,7 +11,9 @@ Pipeline:
   [1] strategy_target  -> the book the validated strategy wants now (read-only compute)
   [2] connect (read-only) + confirm the paper account, read NAV / positions / daily P&L
   [3] diff target vs actual -> intended orders (sized against NAV*(1-cash_reserve))
-  [4] risk_manager     -> kill switch + per-order + cash-reserve guards (vetoes)
+  [4] risk_manager     -> per-order + cash-reserve guards (vetoes). NO daily-loss halt:
+                          removed 2026-08-25 by owner decision; the day's P&L is read for
+                          the audit ledger only and gates nothing.
   [5] order_router     -> build the exact IBKR limit orders, log them, transmit nothing
 
 Safety posture (enforced here): READONLY + DRY_RUN required; account must end in
@@ -33,6 +35,7 @@ import investable as _investable
 import ledger
 import live_quotes
 import order_router
+import reconcile
 import risk_manager
 import strategy_target
 from connections import clientids, ibkr_paper
@@ -61,15 +64,26 @@ def _net_liq(summary, account: str) -> float | None:
 
 
 def _daily_pnl(ib, account: str) -> float:
-    """Best-effort today's P&L for the kill switch. 0.0 if unavailable (e.g. flat)."""
+    """Best-effort today's realized+unrealized P&L for `account` (IBKR reqPnL).
+
+    AN AUDIT FIGURE, NOT A BREAKER INPUT. Nothing on this desk halts on the day's P&L —
+    the automated daily-loss halt was removed 2026-08-25 by owner decision — so this
+    number's ONLY job is to be printed and recorded in the ledger's audit record for the
+    run. It is deliberately best-effort: any broker/API failure, or a NaN, returns 0.0,
+    because an unreadable audit figure is not a reason to refuse to trade.
+
+    (The strict reader that used to sit behind this — read_daily_pnl / DailyPnlUnavailable
+    — existed only to feed that breaker and was removed with it.)"""
     try:
         pnl = ib.reqPnL(account)
         ib.sleep(1.5)
         value = float(pnl.dailyPnL)
         ib.cancelPnL(account)
-        return value if value == value else 0.0   # nan -> 0.0
-    except Exception:
+    except Exception:   # noqa: BLE001 — any broker/API shape failure just means "no figure"
         return 0.0
+    if value != value:  # NaN — the subscription answered with no number
+        return 0.0
+    return value
 
 
 def _run_record(account, nav, daily_pnl, target, orders, report, transmitted) -> dict:
@@ -108,43 +122,66 @@ def compute_intended_orders(nav: float, positions: dict, target: strategy_target
     is byte-identical to before. A caller that passes it here MUST pass the same value to
     risk_manager.evaluate, or the reserve guard will veto the very book this sized.
 
-    Sizing + limit prices use LIVE quotes when available (read-only market data) and
-    fall back to the strategy-data close per symbol if a quote is missing.
+    PRICING — LIVE IBKR QUOTE ONLY ON THE EXECUTION PATH (owner decision, v0.42.0)
+    ------------------------------------------------------------------------------
+    When a `quotes` dict is supplied this is a real execution path: the live quote is the
+    ONLY price source and the model's stored daily close is NEVER substituted for a quote
+    IBKR would not give. With `quotes=None` (the offline what-if / unit-test shape) there is
+    no broker in the picture and no execution to protect, so the strategy-data close is still
+    used — that is the model's own price series doing its legitimate job.
+
+    "UNPRICED" IS NOT "TARGET ZERO". This function used to compute `target_shares = 0` for
+    "not in target (or no price)" — one number for two opposite meanings — and the delta that
+    followed (0 - held) was a FULL LIQUIDATION of a position the model wanted to KEEP. A
+    symbol we cannot price now produces NO order at all and is named in a printed warning.
+    A symbol with weight == 0 AND a usable price still sells: legitimate rotation, unchanged.
+    The limit price likewise can no longer fall through to 0.0 — every emitted order carries
+    a real, positive limit.
     """
     # Shared formula (investable module), no distribution reserve carved out here —
     # behavior-identical to the previous inline nav*(1-cash_reserve_pct) when
     # cash_reserve_pct is None.
     investable = _investable.compute_investable(nav, 0.0, cash_reserve_pct)
     orders: list[IntendedOrder] = []
+    unpriced: list[str] = []
+    live_only = quotes is not None      # a quotes dict means "we are executing"
     symbols = set(target.weights.index) | set(positions)
     for sym in sorted(symbols):
         weight = float(target.weights.get(sym, 0.0))
-        data_close = float(target.prices.get(sym, float("nan")))
         q = quotes.get(sym) if quotes else None
-        live_ref = live_quotes.reference_price(q) if q else None
+        live_ref = live_quotes.reference_price(q) if q is not None else None
 
-        if live_ref and live_ref > 0:
-            size_price, source = live_ref, "LIVE"
-        else:
-            size_price, source = data_close, "CLOSE"
+        size_price = reconcile.usable_price(live_ref)
+        source = "LIVE"
+        if size_price is None and not live_only:
+            size_price = reconcile.usable_price(target.prices.get(sym, None))
+            source = "CLOSE"
         current = float(positions.get(sym, 0.0))
 
-        if weight > 0 and size_price == size_price and size_price > 0:
+        if size_price is None:
+            # No price at all. Refuse to act on it in EITHER direction: we cannot size a buy,
+            # and we cannot responsibly price a sell. Report it; never silently size it to 0.
+            if weight > 0 or current != 0:
+                unpriced.append(sym)
+            continue
+
+        if weight > 0:
             target_dollars = weight * investable
             target_shares = int(target_dollars / size_price)   # floor: never over-allocate
         else:
             target_dollars = 0.0
-            target_shares = 0  # not in target (or no price) -> close the position
+            target_shares = 0   # model wants none of it AND we have a price -> SELL (rotation)
 
         delta = target_shares - current
         if abs(delta) < 1:
             continue
 
         side = "BUY" if delta > 0 else "SELL"
-        limit = live_quotes.limit_price(side, q) if q else None
+        limit = live_quotes.limit_price(side, q) if q is not None else None
         if limit is None:
-            limit = round(size_price, 2) if size_price == size_price else 0.0
-            source = "CLOSE"
+            # size_price is guaranteed real and positive here, so this can never be 0.0.
+            limit = round(size_price, 2)
+            source = source if source == "LIVE" else "CLOSE"
 
         orders.append(IntendedOrder(
             symbol=sym,
@@ -156,6 +193,11 @@ def compute_intended_orders(nav: float, positions: dict, target: strategy_target
             current_shares=current,
             price_source=source,
         ))
+    if unpriced:
+        # Counted and surfaced, never a silent omission.
+        print(f"    !! NO USABLE PRICE for {len(unpriced)} symbol(s): {', '.join(unpriced)}. "
+              f"NO order was generated for them in either direction. The book is NOT in "
+              f"spec — it is missing/holding a sleeve that cannot be sized.")
     return orders
 
 
@@ -233,11 +275,15 @@ def main() -> int:
                       f"{o.target_dollars:>13,.2f}  {o.current_shares:>8,.0f}")
             print("    " + "-" * 72)
 
-        # [4] RISK GUARDS — kill switch + per-order + cash reserve (vetoes).
-        print("\n[4] Risk checks (kill switch / per-order caps / cash reserve)...")
+        # [4] RISK GUARDS — per-order caps + cash reserve (vetoes). There is NO automated
+        # daily-loss halt: removed 2026-08-25 by owner decision. daily_pnl is passed for
+        # the ledger's audit record only and gates nothing.
+        print("\n[4] Risk checks (per-order caps / cash reserve)...")
         report = risk_manager.evaluate(nav, daily_pnl, positions, orders, target)
         if report.halted:
-            print(f"    KILL SWITCH ENGAGED -> HALT. {report.halt_reason}")
+            # risk_manager never sets this any more; kept because RiskReport.halted is a
+            # public field a caller could still set.
+            print(f"    RISK REPORT HALTED -> no orders routed. {report.halt_reason}")
             print("    No order may be routed while halted. (DRY RUN: nothing was sent.)")
             ledger.record_run(_run_record(account, nav, daily_pnl, target, orders, report, 0))
             return 0

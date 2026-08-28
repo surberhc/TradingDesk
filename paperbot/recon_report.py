@@ -70,8 +70,18 @@ class AccountPlan:
     held_aside: list = field(default_factory=list)     # holding_class.HeldAsidePosition's:
                           # PRICED, COUNTED, REPORTED — and never a leg, never an ALIEN.
     blocked_reasons: list = field(default_factory=list)  # non-empty -> orders deliberately
-                          # withheld (a held-aside holding could not be priced/reconciled);
+                          # withheld (a held-aside holding could not be priced/reconciled,
+                          # or a HELD model holding could not be priced);
                           # the account is still fully reported, it just cannot be sized.
+    # --- unpriced model holdings the account does NOT hold (v0.42.0) ---
+    unpriced_reasons: list = field(default_factory=list)  # non-empty -> at least one symbol
+                          # the model WANTS could not be priced. Unlike blocked_reasons this
+                          # does NOT withhold the account's other orders (nothing of ours is
+                          # tied up in a symbol we hold none of, so the rest of the book can
+                          # still be rebalanced safely — it just ends under-invested, never
+                          # levered). What it DOES do is stop the account being reported
+                          # "in spec, nothing to trade": it is not in spec, it is missing a
+                          # sleeve, and it cannot conform until a price exists.
     # --- per-model cash reserve (2026-08-25) ---
     cash_reserve_pct: float | None = None   # THIS account's model's standing cash reserve,
                           # the fraction of the managed sleeve deliberately left uninvested
@@ -99,6 +109,18 @@ class AccountPlan:
         """True iff order emission was withheld for a data reason (see blocked_reasons)."""
         return bool(self.blocked_reasons)
 
+    @property
+    def has_unpriced(self) -> bool:
+        """True iff some symbol the model wants could not be priced. The account is NOT in
+        spec even when it emitted no legs — it is missing a sleeve it cannot size."""
+        return bool(self.unpriced_reasons)
+
+    @property
+    def needs_attention(self) -> bool:
+        """The one thing a surface should ask before drawing a green "nothing to trade":
+        a band breach, a withheld account, or a sleeve we could not price all mean NO."""
+        return bool(self.needs_rebalance or self.blocked_reasons or self.unpriced_reasons)
+
 
 @dataclass
 class BlockOrder:
@@ -115,7 +137,7 @@ class BlockOrder:
 # rebalance_engine's so this readout's REBALANCE/in-band labels match the engine's
 # actual decisions. (Replicated, not imported: rebalance_engine imports AccountPlan
 # FROM this module, so importing it back would be circular.)
-_NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP"})
+_NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP", reconcile.UNPRICED})
 _ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT"})
 
 
@@ -127,6 +149,31 @@ def _strategy_universe() -> set[str] | None:
         return s0_universe()
     except Exception:
         return None
+
+
+class CorpActionGuardUnavailable(RuntimeError):
+    """The strategy universe could not be resolved, so the corp-action guard is OFF.
+
+    Without a universe, reconcile.classify_untracked collapses every unrecognised holding —
+    spinoff, rename, a client's own position, a money-market sweep — into UNTRACKED, which
+    is an ALWAYS-BREACH status and sizes as delta = 0 - held, i.e. a FULL LIQUIDATION. A
+    read-only readout can absorb that (it places nothing); an order-generating lane cannot."""
+
+
+def strategy_universe_or_refuse() -> set[str]:
+    """The strategy universe for an ORDER-GENERATING lane. Raises rather than returning None.
+
+    Same accessor as _strategy_universe, opposite failure posture: a readout may degrade to
+    legacy UNTRACKED labels because it transmits nothing, but a lane that turns a plan into
+    orders must stop instead of silently liquidating a corp-action holding (v0.41.0)."""
+    universe = _strategy_universe()
+    if not universe:
+        raise CorpActionGuardUnavailable(
+            "could not resolve the strategy's tradeable universe, so a spinoff, a rename, a "
+            "client's own holding or a money-market sweep cannot be told apart from a symbol "
+            "the model dropped. Every one of them would size as a FULL LIQUIDATION. "
+            "Refusing to size or trade.")
+    return universe
 
 
 def _portfolio_values(ib, account: str) -> dict:
@@ -211,8 +258,8 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     def _trade_weight(ln) -> float:
         # No live `prices` override in this readout's signature; size off the strategy close.
         # Denominator is the MANAGED sleeve (== net_liq when nothing is held aside).
-        price = float(target.prices.get(ln.symbol, float("nan")))
-        if not (price == price and price > 0) or not managed_net_liq:
+        price = reconcile.usable_price(target.prices.get(ln.symbol, None))
+        if price is None or not managed_net_liq:
             return 0.0
         return abs(ln.target_shares - int(ln.actual_shares)) * price / managed_net_liq
 
@@ -227,9 +274,19 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
             delta = ln.target_shares - int(ln.actual_shares)
             if abs(delta) >= 1:
                 orders[ln.symbol] = delta
+    # UNPRICED MODEL HOLDINGS (v0.42.0) — identical split to rebalance_engine.plan_account
+    # (see reconcile.split_unpriced): a HELD unpriced model symbol BLOCKS the account, one we
+    # hold none of is ISOLATED and merely reported so the account cannot read "in spec".
+    held_unpriced, wanted_unpriced = reconcile.split_unpriced(lines)
+    blocked_reasons = list(carve.blocked_reasons)
+    blocked_reasons += [reconcile.UNPRICED_HELD_REASON.format(
+        symbol=ln.symbol, shares=ln.actual_shares) for ln in held_unpriced]
+    unpriced_reasons = [reconcile.UNPRICED_WANTED_REASON.format(
+        symbol=ln.symbol, weight=ln.target_weight) for ln in wanted_unpriced]
+
     # FAIL CLOSED, mirroring rebalance_engine: an unpriceable held-aside holding makes the
     # managed sleeve's size a guess -> report everything, propose nothing.
-    if carve.blocked_reasons:
+    if blocked_reasons:
         orders = {}
         breached = False
     alien_lines = [ln for ln in lines if ln.status == "ALIEN"]

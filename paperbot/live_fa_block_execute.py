@@ -340,7 +340,10 @@ def _plan_for(account_input: dict, targets: dict):
         account_input["account"], account_input["version"], account_input["net_liq"],
         account_input["positions"], targets[account_input["version"]],
         prices=account_input.get("prices"),
-        sec_types=account_input.get("sec_types"), values=account_input.get("values"))
+        sec_types=account_input.get("sec_types"), values=account_input.get("values"),
+        # Carry the execution lane's live-quote-only rule, or this re-derivation would be
+        # sized off the stored close while the routed block was sized off live quotes.
+        strict_prices=bool(account_input.get("strict_prices", False)))
 
 
 # ========================================================================================
@@ -510,16 +513,20 @@ def build_account_inputs(ib, clients, targets, quotes: dict | None = None) -> tu
                      for p in positions_raw}
         values = recon_report._portfolio_values(ib, info.number)
         tier_prices = targets[info.version].prices
-        prices = {}
-        for sym in set(tier_prices.index) | set(positions):
-            q = quotes.get(sym)
-            ref = live_quotes.reference_price(q) if q else None
-            prices[sym] = ref if (ref and ref > 0) else float(
-                tier_prices.get(sym, float("nan")))
+        # LIVE QUOTE ONLY (owner decision, v0.42.0): the tier's stored daily close is no
+        # longer substituted for a quote IBKR would not give. A symbol with no live quote
+        # does not trade on this lane and is named in the tally below.
+        prices, unquoted = live_quotes.execution_prices(
+            quotes, set(tier_prices.index) | set(positions))
+        if unquoted:
+            print(f"    {info.number}: no live IBKR quote for {len(unquoted)} symbol(s): "
+                  f"{', '.join(unquoted)} — they will NOT be traded.")
         account_inputs.append({
             "account": info.number, "version": info.version,
             "net_liq": info.net_liq, "positions": positions, "prices": prices,
-            "sec_types": sec_types, "values": values})
+            "sec_types": sec_types, "values": values,
+            # EXECUTION LANE: `prices` above is the ONLY price source for sizing.
+            "strict_prices": True})
         summaries[info.number] = [r for r in all_summary
                                   if getattr(r, "account", None) == info.number]
     return account_inputs, summaries
@@ -1328,8 +1335,18 @@ def _run_session(target: TargetGateway, targets: dict, *, armed: bool) -> int:
         for v, g in sorted(tier_groups.items()):
             print(f"    {v:13s} -> group '{g}'")
 
-        # [5] Size + route (pure engine).
-        out = build_plan(account_inputs, targets, tier_groups=tier_groups)
+        # [5] Size + route (pure engine). The corp-action guard is ON: without the strategy
+        # universe reconcile collapses every unrecognised holding to UNTRACKED, which ALWAYS
+        # breaches the band and sizes as delta = 0 - held — a FULL LIQUIDATION of a spinoff /
+        # rename / client holding / sweep. FAILS CLOSED (v0.41.0).
+        try:
+            strat_universe = recon_report.strategy_universe_or_refuse()
+        except recon_report.CorpActionGuardUnavailable as exc:
+            print(f"\n[5] REFUSING — {exc}\n    No orders built, nothing transmitted, no FA "
+                  f"config written.")
+            return 2
+        out = build_plan(account_inputs, targets, tier_groups=tier_groups,
+                         universe=strat_universe)
         routes = out["routes"]
 
         # [6] The FULL armed gate: code gate AND a physically write-enabled gateway.

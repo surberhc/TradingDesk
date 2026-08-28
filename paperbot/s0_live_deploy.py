@@ -103,6 +103,9 @@ import sys
 
 import live_quotes
 import rebalance_engine
+# recon_report owns the ONE held-aside pricing reader (_portfolio_values) — the same one the
+# block rail uses. Imported, never re-implemented.
+import recon_report
 import s0_live
 import strategy_target
 import version
@@ -288,26 +291,54 @@ def _run_session(ib, target, *, armed: bool, conform: bool,
         return 1
     positions_raw = s0_live.filter_positions(ib.positions(), account=account)
     positions = {p.contract.symbol: p.position for p in positions_raw if p.position != 0}
+    # HELD-ASIDE classification input (v0.41.0): the broker's OWN contract.secType ("STK",
+    # "BOND", ...), never a guess off the ticker text. The same input the block rail and the
+    # batch rail already pass. Without it holding_class.carve_out short-circuits to "nothing
+    # held aside" and an individual bond is sized INSIDE the target allocation — contrary to
+    # owner decision D6, which puts held-aside holdings OUTSIDE it and applies the model to
+    # the remaining sleeve as its own 100%.
+    sec_types = {p.contract.symbol: getattr(p.contract, "secType", None)
+                 for p in positions_raw if p.position != 0}
     print(f"    account={account}   NetLiq={net_liq:,.2f}   open_positions={len(positions)}")
 
     # [5] Live prices over the union of target + held symbols (same merge the pilot uses).
     universe = sorted(set(target.weights.index) | set(positions))
     print(f"\n[5] Fetching live quotes for {len(universe)} symbol(s) on port 4003...")
     quotes = live_quotes.fetch(ib, universe)
-    prices: dict = {}
-    for sym in universe:
-        q = quotes.get(sym)
-        ref = live_quotes.reference_price(q) if q else None
-        prices[sym] = ref if (ref and ref > 0) else float(
-            target.prices.get(sym, float("nan")))
+    # LIVE QUOTE ONLY (owner decision, v0.42.0): IBKR is the price source on the execution
+    # path. The stored strategy close is no longer substituted for a quote we could not get
+    # — a stale daily close is not a price this rail can trade at.
+    prices, unquoted = live_quotes.execution_prices(quotes, universe)
+    print(f"    priced from live IBKR quotes: {len(prices)} of {len(universe)} symbol(s).")
+    live_quotes.report_unquoted(unquoted)
 
     # [6] Size the REAL account with the UNCHANGED engine (identical call to the pilot /
     # tiny-test). ALIEN (non-S0) holdings land on plan.alien_lines; plan.orders has the
     # sells+buys to reach the GROWTH target.
+    # CORP-ACTION GUARD, FAIL CLOSED (v0.41.0): with no universe every unrecognised holding
+    # is UNTRACKED, an ALWAYS-BREACH status that sizes as delta = 0 - held. This is the rail
+    # that has traded REAL money on the funded trust account — it refuses instead.
     strat_universe = sp._strategy_universe()
+    if not strat_universe:
+        print("\n[6] REFUSING: the strategy's tradeable universe could not be resolved, so a "
+              "spinoff, a rename, a client's own holding or a money-market sweep cannot be "
+              "told apart from a symbol the model dropped — every one of them would size as "
+              "a FULL LIQUIDATION. Nothing sized, nothing transmitted.")
+        return 2
+    # Held-aside PRICING fallback: an individual bond has no strategy close and no model
+    # weight, so nothing else here knows what it is worth. recon_report._portfolio_values is
+    # the ONE reader for it (read-only; any failure degrades to {} and the plan then reports
+    # the holding UNPRICED and withholds orders — fail closed, not a silent zero).
+    values = recon_report._portfolio_values(ib, account)
     print("\n[6] Sizing the plan with rebalance_engine.plan_account (UNCHANGED engine)...")
     plan = rebalance_engine.plan_account(account, target.version, net_liq, positions,
-                                         target, prices=prices, universe=strat_universe)
+                                         target, prices=prices, universe=strat_universe,
+                                         sec_types=sec_types, values=values,
+                                         strict_prices=True)
+    for reason in getattr(plan, "blocked_reasons", None) or []:
+        print(f"    ORDERS HELD BACK: {reason}")
+    for reason in getattr(plan, "unpriced_reasons", []) or []:
+        print(f"    NOT IN SPEC (cannot conform): {reason}")
 
     # [7]-[9] Delegate the ordered leg build, the full pre-flight gate, and the two-phase
     # cash-gated transmit to the shared engine. This is the extracted logic — moved, not

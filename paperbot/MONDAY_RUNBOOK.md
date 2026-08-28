@@ -180,9 +180,8 @@ re-run `accounts.py` to confirm the feed is healthy in the locked state.
 1. **Stop sending.** `Ctrl-C` the executor (it prints a disarm reminder) / do not place the next block.
 2. Cancel any working (unfilled) orders in the GUI.
 3. **DISARM immediately** (`arming.disarm()`) — restores ReadOnlyApi=yes + restart.
-4. If a block already filled and is wrong, flatten the affected accounts back to flat with
-   `flatten_accounts.py` (own clientId 34; review it first — it places real paper sells),
-   then re-run `recon_report.py` to confirm flat, and re-diagnose with the dry-run
+4. If a block already filled and is wrong, close the affected positions back to flat by hand
+   in the GUI, then re-run `recon_report.py` to confirm flat, and re-diagnose with the dry-run
    (`rebalance_execute.py` with no token, or `rebalance_run.py`) before any retry. The FA
    config backup lives in `state\paperbot\fa_backups\` if a group's split needs restoring.
 5. Re-run `accounts.py` to confirm the feed is healthy before walking away.

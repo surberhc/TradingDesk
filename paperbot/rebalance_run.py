@@ -52,13 +52,22 @@ from rebalance_engine import build_plan
 # --- preview (PURE — no broker, no I/O beyond printing) ------------------------
 def build_preview(account_inputs: list[dict], targets: dict,
                   band_pct: float | None = None,
-                  tier_groups: dict | None = None) -> dict:
+                  tier_groups: dict | None = None,
+                  universe: set[str] | None = None) -> dict:
     """Run the engine and print the full per-account + per-block + per-route report.
 
     PURE: calls rebalance_engine.build_plan only (which touches no broker), then prints.
     Returns the same {"plans", "blocks", "routes"} dict build_plan returns so a caller
-    can keep working with it. Nothing is built as an order object and nothing is sent."""
-    out = build_plan(account_inputs, targets, band_pct=band_pct, tier_groups=tier_groups)
+    can keep working with it. Nothing is built as an order object and nothing is sent.
+
+    `universe` (the strategy's tradeable symbols) is threaded STRAIGHT into build_plan — see
+    there. It is what lets reconcile tell a symbol the model DROPPED (ROTATE_OUT, sell) apart
+    from a corp-action / alien holding (ALIEN, parked for review). Without one, every
+    unrecognised holding is UNTRACKED — an ALWAYS-BREACH status that sizes as
+    delta = 0 - held, a FULL LIQUIDATION — so an order-generating caller MUST pass one.
+    None preserves the legacy behavior for the review-only callers (v0.41.0)."""
+    out = build_plan(account_inputs, targets, band_pct=band_pct, tier_groups=tier_groups,
+                     universe=universe)
     plans, blocks, routes = out["plans"], out["blocks"], out["routes"]
 
     band = config.REBALANCE_BAND_PCT if band_pct is None else band_pct
@@ -311,14 +320,16 @@ def _run_gateway_session(armed: bool, targets: dict) -> int:
                          for p in ib.positions(info.number) if p.position != 0}
             # Live reference price per symbol if available, else the tier's strategy close.
             tier_prices = targets[info.version].prices
-            prices = {}
-            for sym in set(tier_prices.index) | set(positions):
-                q = quotes.get(sym)
-                ref = live_quotes.reference_price(q) if q else None
-                prices[sym] = ref if (ref and ref > 0) else float(tier_prices.get(sym, float("nan")))
+            # LIVE QUOTE ONLY (owner decision, v0.42.0) — see live_quotes.execution_prices.
+            prices, unquoted = live_quotes.execution_prices(
+                quotes, set(tier_prices.index) | set(positions))
+            if unquoted:
+                print(f"    {info.number}: no live IBKR quote for {len(unquoted)} "
+                      f"symbol(s): {', '.join(unquoted)} — they will NOT be traded.")
             account_inputs.append({
                 "account": info.number, "version": info.version,
-                "net_liq": info.net_liq, "positions": positions, "prices": prices})
+                "net_liq": info.net_liq, "positions": positions, "prices": prices,
+                "strict_prices": True})
 
         # [4] Resolve version->FA group by LIVE membership (fail closed on ambiguity).
         print("\n[4] Resolving version->FA group via requestFA(1) (membership match, "

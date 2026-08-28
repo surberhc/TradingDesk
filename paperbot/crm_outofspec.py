@@ -285,6 +285,10 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
         held = [h.as_dict() if hasattr(h, "as_dict") else dict(h)
                 for h in (getattr(p, "held_aside", None) or [])]
         blocked_reasons = list(getattr(p, "blocked_reasons", None) or [])
+        # A model symbol IBKR would not quote, that this account holds none of. Orders for
+        # the REST of the account still stand (isolate, don't bench), but the account is NOT
+        # in spec and cannot be made in spec until a price exists (v0.42.0).
+        unpriced_reasons = list(getattr(p, "unpriced_reasons", None) or [])
         net_liq = float(getattr(p, "net_liq", ai.get("net_liq", 0.0)) or 0.0)
         held_value = float(getattr(p, "held_aside_value", 0.0) or 0.0)
         managed_net_liq = float(getattr(p, "managed_net_liq", None) or (net_liq - held_value))
@@ -292,7 +296,7 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
         # treat any would-trade leg as out-of-spec too (defensive — orders only fill when
         # the band is breached), and a blocked account as needing attention.
         out_of_spec = (bool(getattr(p, "needs_rebalance", False))
-                       or bool(legs) or bool(blocked_reasons))
+                       or bool(legs) or bool(blocked_reasons) or bool(unpriced_reasons))
         verdicts.append({
             "account": account,
             "version": ai.get("version"),
@@ -312,6 +316,8 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
             "n_unclassified": sum(1 for h in held if h.get("needs_classification")),
             "blocked": bool(blocked_reasons),
             "blocked_reasons": blocked_reasons,
+            "unpriced": bool(unpriced_reasons),
+            "unpriced_reasons": unpriced_reasons,
         })
     verdicts.sort(key=lambda v: (not v["out_of_spec"], -v["net_liq"]))
     return verdicts

@@ -550,7 +550,10 @@ mid-build:
    instrument. (Low probability given S0-ETF vs S8-options, but unhandled today.)
 
 6. **No margin/buying-power pre-check for a blended, multi-sleeve account — and IBKR will not help.**
-   `risk_manager.evaluate` checks per-account NAV/position/daily-loss limits, but there is **no**
+   `risk_manager.evaluate` checks per-account order-notional sanity (one order may not exceed NAV),
+   the cash-reserve / no-leverage batch guard and max-legs — it does **not** check per-position or
+   daily-loss limits (both were removed 2026-08-25 by owner decision and no longer exist). And there
+   is **no**
    check that an account's **ExcessLiquidity/BuyingPower** can carry an **added options sleeve** on
    top of its existing ETF sleeve. §6 step 6's margin headroom check is net-new — and per §13.4 it
    must be **entirely self-computed**, because `whatIfOrder` gives no margin preview for an FA block

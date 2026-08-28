@@ -47,7 +47,7 @@ Every box must be **GO** before §4's arm step. Any single NO-GO ⇒ stop.
 | 4 | **Paper gateway healthy** | `python paperbot/arming.py verify` (reports READ-ONLY/WRITE-ENABLED + `config.ini` value, transmits nothing); or `connections.ibkr_paper.gateway_running()` | check at run time |
 | 5 | **Gateway currently LOCKED (read-only)** — the safe resting state | `arming.py verify` shows `READ-ONLY (locked)`; `paperbot/config.py` committed `READONLY=True`, `DRY_RUN=True` | should be GO (committed defaults are safe) |
 | 6 | **Single-process gateway mutex available** — no other desk process (monitor/rebalance/collector) will operate the gateway during the run | `paperbot/gateway_lock.py` — acquire with `on_busy="refuse"` (names the holder) | procedural |
-| 7 | **Kill switch + risk guards present** | `paperbot/risk_manager.py` (`max_daily_loss_pct_nav` = −2%, per-position cap, cash reserve) — evaluate per account BEFORE any transmit | exists; wire into the CAN SLIM path (§3) |
+| 7 | **Order/batch sanity guards present** | `paperbot/risk_manager.py` — order-notional ("exceeds NAV") sanity, cash-reserve / no-leverage batch guard, max-legs, fail-closed price resolution — evaluate per account BEFORE any transmit. **NOTE (2026-08-25):** the automated daily-loss halt (`max_daily_loss_pct_nav` = −2%) and the per-position cap were **removed by owner decision** and no longer exist; this row no longer asserts any automatic P&L breaker. The operator stop is the MANUAL, file-based one (`AUTOTRADE_DISABLED` sentinel / KILL_SWITCH label). | guards exist; wire into the CAN SLIM path (§3) |
 | 8 | **Dry-run rehearsal green** | `cd canslim` → `python execution_engine.py` (compute-only day-by-day plan); `pytest tests/test_execution_engine.py -q` | run at rehearsal time |
 | 9 | **Andrew present** | — | mandatory for §2 and §4 |
 
@@ -188,8 +188,13 @@ executor refuses to flip the flags without the exact token. There is no auto-arm
 **Instant abort (any time):**
 - **DISARM** the gateway: `python paperbot/arming.py disarm` → verifies read-only lock; the
   API then **physically cannot** transmit. This is the master off-switch.
-- **Kill switch:** `risk_manager` halts ALL trading at `max_daily_loss_pct_nav` = −2% on the
-  day; per-position and cash-reserve guards run **before** every transmit.
+- **Operator stop:** the MANUAL, file-based stop (the `AUTOTRADE_DISABLED` sentinel /
+  KILL_SWITCH label) plus DISARM above. **There is NO automated daily-loss halt** — the −2%
+  `max_daily_loss_pct_nav` breaker and the per-position cap were **removed 2026-08-25 by
+  owner decision (Andrew)** and no longer exist; nothing stops trading automatically on a
+  down day. `risk_manager`'s remaining guards — order-notional ("exceeds NAV") sanity,
+  cash-reserve / no-leverage, max-legs, fail-closed pricing — still run **before** every
+  transmit, but they veto individual orders/batches, they do not halt the desk.
 - **Resting stops stay working:** because protective stops rest **server-side (GTC)**, they
   keep protecting open positions even after we disarm/disconnect (that is the §2 guarantee).
 - **Cancel a specific order** by its deterministic `orderRef` (read-once-then-cancel).

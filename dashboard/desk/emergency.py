@@ -1,24 +1,31 @@
-"""emergency.py — the desk's break-glass emergency controls (Halt + inert Flatten).
+"""emergency.py — the desk's break-glass emergency control (HALT, and HALT ONLY).
 
 THE MOST SAFETY-CRITICAL FILE ON THE DESK. Read this header before touching it.
 
-Two responsibilities, deliberately kept far apart:
+ONE responsibility:
 
-  1. HALT (real, and it works today) — process/task control ONLY. It stops and
-     turns off the Windows scheduled tasks that drive the desk's automation, and
-     force-kills the matching strategy python processes at the OS level so a HUNG
-     bot is stopped just as reliably as a healthy one. It talks to Windows, never
-     to a broker. It transmits NOTHING. It cannot place, modify, arm, or cancel an
-     order because there is no order code in this file at all.
+  HALT (real, and it works today) — process/task control ONLY. It stops and turns
+  off the Windows scheduled tasks that drive the desk's automation, and
+  force-kills the matching strategy python processes at the OS level so a HUNG bot
+  is stopped just as reliably as a healthy one. It talks to Windows, never to a
+  broker. It transmits NOTHING. It cannot place, modify, arm, or cancel an order
+  because there is no order code in this file at all.
 
-  2. FLATTEN (INERT SCAFFOLD — does nothing today) — the future "get flat / close
-     everything" button. Right now there is NOTHING REAL TO CLOSE: Strategy 8 is a
-     zero-transmit pilot that holds no real positions, and Strategy 0 is on the
-     paper account / real-money gated. So flatten_preview() tells the truth in
-     plain English and flatten_execute() is a hard stub that RAISES. There is
-     ZERO order-transmit code anywhere in this module — no ib.placeOrder, no order
-     router, no arm, no broker connection of any kind. That is by design and must
-     stay that way until a deliberate, gated, HUMAN-armed real-money milestone.
+THE "GET FLAT" (FLATTEN) PANIC BUTTON WAS REMOVED 2026-08-25 BY OWNER DECISION
+(Andrew). There is no emergency-close button on this desk and one must not be
+re-added. WHY: he does not want a panic button — he does not want to be making
+irrational decisions on bad market days, and he is not going to time the market.
+WHAT WAS DELETED: flatten_preview(), flatten_execute(), their plain-English event
+branches, and the "Type FLATTEN to confirm" / "Get flat (emergency close)" UI
+block. There was NEVER order-transmit code behind any of it — flatten_execute
+was a hard stub that raised, there was no ib.placeOrder, no order router, no arm,
+and no broker connection of any kind — so removing it took away a button, not a
+capability. dashboard/desk/kill_switch.py's --flatten-all / --flatten-s8 /
+--flatten-s0 CLI flags went with it in the same pass. HALT is untouched.
+
+(Unrelated and still in force: the MANUAL, file-based operator stop — the
+AUTOTRADE_DISABLED sentinel / KILL_SWITCH label on the paperbot's live-deploy
+rails — is a different control entirely and is not affected by any of this.)
 
 Everything is logged to the durable event store when it is available. eventlog.py
 may be authored in parallel, so record_event is imported defensively and every
@@ -66,14 +73,8 @@ def _plain_message(event: str, fields: dict) -> str:
         return (f"Emergency HALT of {label} {outcome} across "
                 f"{fields.get('actions', 0)} action(s). Nothing was transmitted to "
                 f"any broker.")
-    if event == "emergency_flatten_preview":
-        return (f"Viewed the emergency get-flat preview for {label}. Nothing was "
-                f"closed and no order was sent — there are no live positions to "
-                f"flatten today.")
-    if event == "emergency_flatten_blocked":
-        return (f"An emergency get-flat was requested for {label} but it is not armed "
-                f"— nothing was closed and no order was sent (there are no live "
-                f"positions to flatten today).")
+    # (No get-flat / FLATTEN branches: that button was removed 2026-08-25 by owner
+    # decision and no such event can be emitted any more. Do not re-add.)
     return f"Emergency control event '{event}' for {label}."
 
 
@@ -531,81 +532,16 @@ def halt_status(which: str = "all") -> dict:
 
 
 # --------------------------------------------------------------------------- #
-# FLATTEN — INERT SCAFFOLD. There is NOTHING REAL TO CLOSE today.              #
-# There is NO order-transmit code in this module. flatten_execute() RAISES.    #
-# --------------------------------------------------------------------------- #
-def flatten_preview(which: str = "all") -> dict:
-    """INERT. Return a truthful, plain-English statement that there is nothing
-    real to close today. Opens NO broker connection and builds NO order objects."""
-    which = (which or "all").lower()
-    lines = [
-        "There is nothing real to close right now — the desk holds no live "
-        "positions that can be flattened.",
-        "Strategy 8 is a zero-transmit pilot: it records what it WOULD have "
-        "traded and holds NO real positions.",
-        "Strategy 0 runs on the paper account and is real-money gated — no live "
-        "position exists to close.",
-    ]
-    if which == "s8":
-        headline = ("Strategy 8 holds no real positions (zero-transmit pilot) — "
-                    "nothing to close.")
-    elif which == "s0":
-        headline = ("Strategy 0 is on the paper account / real-money gated — "
-                    "nothing real to close.")
-    else:
-        headline = ("Nothing to close: no live positions exist anywhere on the "
-                    "desk today.")
-    _emit("emergency_flatten_preview", which=which)
-    return {"which": which, "armed": False, "headline": headline, "lines": lines}
-
-
-def flatten_execute(which: str = "all"):
-    """THE STUB. Today this raises — there is nothing real to close and there is
-    ZERO order-transmit code behind it.
-
-    ------------------------------------------------------------------------
-    INTENDED FUTURE DESIGN (NOT built, and not to be built without a deliberate,
-    gated, human-armed real-money milestone):
-
-      * Fired by exactly ONE guarded, deliberate HUMAN press. Never by the AI,
-        never on a schedule, never as a side effect of anything.
-      * A true emergency close of REAL positions:
-          - IBKR global order cancel (reqGlobalCancel) to pull every working
-            order first, then
-          - aggressive closing orders per open position (marketable limits, or
-            market where appropriate) to get flat fast.
-      * PER STRATEGY, because the two books behave very differently:
-          - Strategy 8 = fast 0-days-to-expiry option spreads (close the spread
-            as a unit, mind pin risk / assignment near expiry), whereas
-          - Strategy 0 = a slower, longer-horizon allocation book (unwind the
-            equity/ETF positions in an orderly way).
-      * Confirm flat afterward and report exactly what was sent and filled.
-      * It is ALWAYS the human's finger on the trigger — the same review -> arm
-        -> transmit gate that governs every real order on this desk. Building any
-        part of the transmit path is an architecture change requiring explicit
-        sign-off, and it belongs somewhere with a real order router, NOT here.
-    ------------------------------------------------------------------------
-    """
-    _emit("emergency_flatten_blocked", which=(which or "all").lower())
-    raise NotImplementedError(
-        "Real-money emergency flatten is not armed yet — nothing real to close "
-        "(Strategy 8 pilot holds no real positions; Strategy 0 is paper/gated). "
-        "When real trading is live, this becomes one guarded human press = send "
-        "aggressive closing orders + broker global-cancel. It will never be fired "
-        "by the AI or automatically."
-    )
-
-
-# --------------------------------------------------------------------------- #
 # The persistent, guarded Streamlit control strip (top of every page).         #
 # streamlit + theme are imported LAZILY so this module stays importable (and    #
 # testable, and usable by the standalone kill switch) without Streamlit.        #
 # --------------------------------------------------------------------------- #
 def render_emergency_bar() -> None:
     """A persistent, GUARDED emergency control strip meant to render at the TOP of
-    every page. Collapsed by default; destructive actions require typing an exact
-    confirm word. Everything here is read-only-safe with respect to trading —
-    Halt is OS-level process/task control, Flatten is inert."""
+    every page. Collapsed by default; the halt requires typing an exact confirm
+    word. Everything here is read-only-safe with respect to trading — Halt is
+    OS-level process/task control and is the ONLY control in the bar. (There is no
+    get-flat / emergency-close button: removed 2026-08-25 by owner decision.)"""
     import streamlit as st  # lazy — keeps the module import-light for the CLI
     try:
         import theme as T
@@ -613,7 +549,7 @@ def render_emergency_bar() -> None:
         T = None
 
     with st.expander(
-        "🚨 Emergency controls (open only if you need to stop or flatten)",
+        "🚨 Emergency controls (open only if you need to stop the automation)",
         expanded=False,
     ):
         # --- Current state, in plain English. --------------------------------
@@ -688,34 +624,6 @@ def render_emergency_bar() -> None:
                     icon = "✅" if a["ok"] else ("🔒" if a.get("needs_admin") else "⚠️")
                     st.write(f"{icon} {a['message']}")
 
-        st.divider()
-
-        # --- FLATTEN — inert scaffold. Guarded by typing FLATTEN. -------------
-        st.markdown("#### Get flat (emergency close) — not armed yet")
-        st.caption(
-            "When real-money trading is live, this will close open positions in an "
-            "emergency. TODAY there is nothing real to close: Strategy 8 is a "
-            "zero-transmit pilot holding no real positions, and Strategy 0 is on "
-            "the paper account / real-money gated. This button sends NO orders."
-        )
-        preview = flatten_preview("all")
-        st.info(preview["headline"])
-        flat_word = st.text_input(
-            "Type FLATTEN to confirm (currently does nothing to close)",
-            value="", key="emg_flatten_word", placeholder="type FLATTEN here",
-        )
-        confirmed_flat = flat_word.strip().upper() == "FLATTEN"
-        if st.button("Get flat (emergency close)", key="emg_flatten_btn",
-                     use_container_width=True):
-            if not confirmed_flat:
-                st.warning("Type FLATTEN (all capitals) in the box above to "
-                           "confirm, then press the button again.")
-            else:
-                # Wire the real stub behind the confirm. Today it raises; we catch
-                # it and show the plain-English truth instead of a traceback.
-                try:
-                    flatten_execute("all")
-                except NotImplementedError as exc:
-                    st.info(f"Nothing to flatten yet — {exc}")
-                except Exception as exc:  # defensive; must never crash the page
-                    st.info(f"Nothing to flatten yet — {exc}")
+        # (Halt is the whole bar. The "get flat (emergency close)" button that used
+        # to sit below this was REMOVED 2026-08-25 by owner decision — see the module
+        # docstring. Do not re-add a panic button here.)

@@ -95,6 +95,48 @@ def relative_spread(q: Quote) -> float | None:
     return (q.ask - q.bid) / mid
 
 
+def execution_prices(quotes: dict, symbols) -> tuple[dict, list]:
+    """THE execution-path price map: {symbol: live reference price} plus the list of
+    symbols IBKR would NOT quote. (owner decision, v0.42.0)
+
+    The desk does not maintain prices for execution — IBKR is the price source. If IBKR
+    gives a quote we use it; if IBKR will not quote a symbol, that symbol DOES NOT TRADE
+    and we say so, naming it. This function is the single place that decision is made, so
+    no rail can quietly reintroduce a fallback of its own.
+
+    What this deliberately REMOVED: every execution rail used to fall back to the model's
+    stored daily close when a quote was missing, and the batch rail then silently dropped
+    the key when even that was absent. A stale close is not a price you can trade at, and
+    the silent drop was read downstream as "target 0 shares" — i.e. SELL EVERYTHING.
+
+    The strategy's stored price HISTORY is untouched and still does its real job upstream:
+    computing the model's target WEIGHTS. That is not execution.
+
+    Returns (prices, unquoted); `unquoted` is sorted so a caller can count and print it."""
+    prices: dict = {}
+    unquoted: list = []
+    for sym in sorted(set(symbols)):
+        q = quotes.get(sym)
+        ref = reference_price(q) if q is not None else None
+        if _valid(ref):
+            prices[sym] = float(ref)
+        else:
+            unquoted.append(sym)
+    return prices, unquoted
+
+
+def report_unquoted(unquoted: list, indent: str = "    ") -> None:
+    """Print the no-quote tally LOUDLY. Never a silent omission (v0.42.0): before this the
+    batch rail dropped these symbols with no tally, no counter and no warning."""
+    if not unquoted:
+        return
+    print(f"{indent}!! IBKR RETURNED NO USABLE QUOTE for {len(unquoted)} symbol(s): "
+          f"{', '.join(unquoted)}")
+    print(f"{indent}   These symbols WILL NOT BE TRADED on this run — not bought, not "
+          f"sold. No stored/stale close is substituted for a live quote on the execution "
+          f"path. Any account whose model wants one of them is reported NOT in spec.")
+
+
 def marketable_cap(side: str, q: Quote, k: float | None = None) -> float | None:
     """The WORST-CASE marketable cap for a laddered order: BUY = ask*(1+k),
     SELL = bid*(1-k). This is the hard price a rung will pay to GET DONE; pegs/algos

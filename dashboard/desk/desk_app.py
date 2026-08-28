@@ -7,7 +7,8 @@ never writes to any store/warehouse/config. Gateway reads are cheap TCP port
 probes only (deskdata.py) — no ib_async connection is opened on the Pulse page.
 
 Multipage app via st.navigation / st.Page (function-page callables). A persistent,
-guarded emergency control strip (Halt + inert Flatten) renders at the TOP of every
+guarded emergency control strip (Halt ONLY — the get-flat button was removed
+2026-08-25 by owner decision) renders at the TOP of every
 page, before the page body runs, wrapped so a bar error can never take the app down:
   1. Desk Pulse (home)                        — pulse.render_pulse
   2. Action Center (propose-and-arm inbox)     — page_action_center.render_action_center

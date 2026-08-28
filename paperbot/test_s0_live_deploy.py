@@ -74,9 +74,10 @@ def _summary_row(account, tag, value):
     return SimpleNamespace(account=account, tag=tag, value=value)
 
 
-def _pos_row(account, symbol, position):
-    return SimpleNamespace(account=account, position=position,
-                           contract=SimpleNamespace(symbol=symbol))
+def _pos_row(account, symbol, position, sec_type="STK"):
+    return SimpleNamespace(
+        account=account, position=position,
+        contract=SimpleNamespace(symbol=symbol, secType=sec_type))
 
 
 def _alien(symbol, shares):
@@ -192,7 +193,22 @@ def _patch_common(monkeypatch, *, plan=None, target=None):
     monkeypatch.setattr(dep.strategy_target, "current_target",
                         lambda *a, **k: (target or _fake_target()))
     monkeypatch.setattr(dep.sp, "_strategy_universe", lambda: {"VTI", "RSP", "USFR", "BIL"})
-    monkeypatch.setattr(dep.live_quotes, "fetch", lambda ib, universe: {})
+    # LIVE quotes, not an empty dict. v0.42.0 removed the stale-close fallback on the
+    # execution path: a rail handed NO quotes now (correctly) prices nothing and therefore
+    # transmits nothing. These tests exercise the GATE and the two-phase transmit, not
+    # pricing, so they supply the quotes a real run would have.
+    _tgt = target or _fake_target()
+
+    def _fetch(ib, universe):
+        out = {}
+        for sym in universe:
+            px = _tgt.prices.get(sym)
+            if px is not None and float(px) == float(px) and float(px) > 0:
+                out[sym] = dep.live_quotes.Quote(symbol=sym, bid=None, ask=None,
+                                                 last=float(px), close=float(px), md_type=1)
+        return out
+
+    monkeypatch.setattr(dep.live_quotes, "fetch", _fetch)
     monkeypatch.setattr(dep.rebalance_engine, "plan_account",
                         lambda *a, **k: (plan or _fake_plan()))
     monkeypatch.setattr(dep, "_kill_switch_present", lambda: False)
@@ -557,3 +573,94 @@ def test_deploy_ref_format_and_per_run():
     assert tagged.endswith(":deploy") and tagged != std
     per_run = dep._deploy_ref(ACCT, as_of, "BUY", "USFR", "20260728T120000")
     assert per_run == tagged + ":20260728T120000"
+
+
+# --- 17. HELD-ASIDE CARVE-OUT IS WIRED INTO THIS REAL-MONEY RAIL (v0.41.0) ----------
+# plan_account was called with `universe=` but no `sec_types=`/`values=`, so
+# holding_class.carve_out short-circuited to "nothing held aside" and an individual bond in
+# U14438624 was sized INSIDE the target allocation -- contrary to owner decision D6.
+class _PortfolioFakeIB(_FakeIB):
+    """Adds the portfolio() reader recon_report._portfolio_values uses for held-aside
+    pricing (a bond has no strategy close and no model weight)."""
+
+    def __init__(self, summary_rows, position_rows, portfolio_rows=None):
+        super().__init__(summary_rows, position_rows)
+        self._portfolio = list(portfolio_rows or [])
+
+    def portfolio(self, account=None):
+        return [it for it in self._portfolio
+                if account is None or getattr(it, "account", account) == account]
+
+
+def _pf_row(account, symbol, market_value):
+    return SimpleNamespace(account=account, marketValue=market_value,
+                           contract=SimpleNamespace(symbol=symbol))
+
+
+# Grabbed at import time, BEFORE any monkeypatch can replace the module attribute, so a test
+# can re-run the GENUINE engine over exactly the arguments the rail handed it.
+_REAL_PLAN_ACCOUNT = dep.rebalance_engine.plan_account
+
+
+def _capture_plan_kwargs(monkeypatch):
+    seen = {"real": _REAL_PLAN_ACCOUNT}
+
+    def _spy(*a, **k):
+        seen["args"], seen["kwargs"] = a, k
+        return _fake_plan()
+
+    monkeypatch.setattr(dep.rebalance_engine, "plan_account", _spy)
+    return seen
+
+
+def test_deploy_hands_the_engine_the_held_aside_inputs(monkeypatch):
+    _patch_common(monkeypatch)
+    seen = _capture_plan_kwargs(monkeypatch)
+    positions = [_pos_row(ACCT, "VTI", 100), _pos_row(ACCT, "T 4.5 2031", 50_000,
+                                                      sec_type="BOND")]
+    fake = _PortfolioFakeIB(_summary(), positions,
+                            [_pf_row(ACCT, "VTI", 25_000.0),
+                             _pf_row(ACCT, "T 4.5 2031", 49_500.0)])
+    _wire_connections(monkeypatch, fake)
+
+    rc = dep.main(armed=False, conform=False)
+
+    assert rc == 0
+    kw = seen["kwargs"]
+    assert kw["sec_types"] == {"VTI": "STK", "T 4.5 2031": "BOND"}
+    assert kw["values"]["T 4.5 2031"] == 49_500.0
+
+
+def test_the_wired_inputs_actually_carve_the_bond_out(monkeypatch):
+    # Same call, run through the REAL engine: the bond sits OUTSIDE the allocation and the
+    # model applies to the remaining sleeve as its own 100%.
+    _patch_common(monkeypatch)
+    seen = _capture_plan_kwargs(monkeypatch)
+    positions = [_pos_row(ACCT, "VTI", 100), _pos_row(ACCT, "T 4.5 2031", 50_000,
+                                                      sec_type="BOND")]
+    fake = _PortfolioFakeIB(_summary(), positions,
+                            [_pf_row(ACCT, "VTI", 25_000.0),
+                             _pf_row(ACCT, "T 4.5 2031", 40_000.0)])
+    _wire_connections(monkeypatch, fake)
+    dep.main(armed=False, conform=False)
+
+    plan = seen["real"](*seen["args"], **seen["kwargs"])
+    assert [h.symbol for h in plan.held_aside] == ["T 4.5 2031"]
+    assert plan.held_aside_value == 40_000.0
+    assert plan.managed_net_liq == 60_000.0          # 100,000 NetLiq - the bond
+    assert "T 4.5 2031" not in plan.orders           # never a leg, in either direction
+
+
+def test_deploy_refuses_when_the_strategy_universe_is_unresolvable(monkeypatch):
+    # FAIL CLOSED on the real-money rail: no universe -> every alien holding would size as a
+    # full liquidation, so refuse instead of sizing.
+    _patch_common(monkeypatch)
+    monkeypatch.setattr(dep.sp, "_strategy_universe", lambda: None)
+    boom = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("plan_account must not run without a universe"))
+    monkeypatch.setattr(dep.rebalance_engine, "plan_account", boom)
+    fake = _PortfolioFakeIB(_summary(), [_pos_row(ACCT, "VTI", 100)])
+    _wire_connections(monkeypatch, fake)
+
+    rc = dep.main(armed=False, conform=False)
+    assert rc == 2

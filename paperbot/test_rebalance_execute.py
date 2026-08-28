@@ -664,3 +664,162 @@ def test_ledger_record_carries_the_run_id(monkeypatch):
     rx._ledger(False, [], [], [], "", halted=False, halt_reason="",
                run_id="20260819T090000")
     assert captured["run_id"] == "20260819T090000"
+
+
+# ============================================================================
+# (e) THE DAILY P&L IS AN AUDIT FIGURE, NOT A BREAKER (v0.43.0).
+#
+# There is NO automated daily-loss halt on this desk — removed 2026-08-25 by owner
+# decision. This lane still reads each account's daily P&L, best-effort, and hands it to
+# risk_manager.evaluate purely so the run's ledger record carries the day's figure. An
+# unreadable P&L is 0.0 and refuses nothing. (The v0.41.0 strict reader
+# execution_engine.read_daily_pnl / DailyPnlUnavailable existed only to feed the removed
+# breaker and went with it, along with the tests that asserted that wiring.)
+# ============================================================================
+class _PnlFakeIB:
+    """Serves reqPnL/cancelPnL only. Anything else on it raises."""
+
+    def __init__(self, pnl_by_account=None, raise_on_req=False):
+        self._pnl = dict(pnl_by_account or {})
+        self.raise_on_req = raise_on_req
+        self.requested: list[str] = []
+        self.cancelled: list[str] = []
+
+    def reqPnL(self, account):
+        self.requested.append(account)
+        if self.raise_on_req:
+            raise RuntimeError("no market-data subscription for this account")
+        return SimpleNamespace(dailyPnL=self._pnl[account])
+
+    def sleep(self, *a, **k):
+        return None
+
+    def cancelPnL(self, account):
+        self.cancelled.append(account)
+
+
+def _pnl_case(orders=None, net_liq=100_000.0):
+    """One enrolled account with a plan that WOULD trade -> the risk guard runs on it."""
+    import pandas as pd
+    targets = {"Conservative": SimpleNamespace(
+        as_of="2026-08-25", prices=pd.Series({"BIL": 91.0}),
+        weights=pd.Series({"BIL": 1.0}))}
+    account_inputs = [{"account": "DU8922142", "version": "Conservative",
+                       "net_liq": net_liq, "positions": {}, "prices": {"BIL": 91.0}}]
+    plans = {"DU8922142": SimpleNamespace(
+        account="DU8922142",
+        orders=orders if orders is not None else {"BIL": 10})}
+    return account_inputs, plans, targets
+
+
+def test_engine_daily_pnl_is_best_effort_and_never_raises():
+    # The ONE reader is best-effort by design now: it feeds an audit record, not a breaker,
+    # so an unreadable figure is 0.0 rather than an exception that could refuse an account.
+    import execution_engine
+    assert execution_engine._daily_pnl(_PnlFakeIB(raise_on_req=True), "DU8922142") == 0.0
+    assert execution_engine._daily_pnl(
+        _PnlFakeIB({"DU8922142": float("nan")}), "DU8922142") == 0.0
+    ib = _PnlFakeIB({"DU8922142": -1234.5})
+    assert execution_engine._daily_pnl(ib, "DU8922142") == -1234.5
+    assert ib.cancelled == ["DU8922142"]          # the subscription is released
+
+
+def test_an_unreadable_daily_pnl_no_longer_refuses_the_account(monkeypatch):
+    # THE DECISION: an unreadable P&L used to HALT the account so the -2% breaker could not
+    # be blind-sided. With no breaker there is nothing to be blind about — the account
+    # trades normally and 0.0 is recorded.
+    import risk_manager
+    seen = {}
+
+    def _spy(nav, daily_pnl, positions, orders, target, **kw):
+        seen["daily_pnl"] = daily_pnl
+        return risk_manager.RiskReport(halted=False, halt_reason="", order_verdicts=[],
+                                       batch_reasons=[], approved=[])
+
+    monkeypatch.setattr(rx.risk_manager, "evaluate", _spy)
+    ai, plans, targets = _pnl_case()
+    halted, reason = rx.evaluate_risk_guards(_PnlFakeIB(raise_on_req=True), ai, plans,
+                                             targets)
+    assert (halted, reason) == (False, "")
+    assert seen["daily_pnl"] == 0.0
+
+
+def test_a_catastrophic_daily_loss_does_not_halt_the_lane():
+    # End-to-end through the REAL risk_manager: -30% on the day used to trip the removed
+    # -2% breaker. Nothing halts on P&L any more.
+    ai, plans, targets = _pnl_case()
+    halted, reason = rx.evaluate_risk_guards(_PnlFakeIB({"DU8922142": -30_000.0}), ai,
+                                             plans, targets)
+    assert (halted, reason) == (False, "")
+
+
+def test_an_account_with_no_orders_is_not_pnl_polled():
+    # No trade -> nothing to guard -> no broker call (unchanged skip semantics).
+    ai, plans, targets = _pnl_case(orders={})
+    ib = _PnlFakeIB(raise_on_req=True)
+    halted, reason = rx.evaluate_risk_guards(ib, ai, plans, targets)
+    assert (halted, reason) == (False, "")
+    assert ib.requested == []
+
+
+# ============================================================================
+# (f) THE CORP-ACTION GUARD IS WIRED INTO THIS LANE (v0.41.0).
+#
+# reconcile.classify_untracked needs the strategy's tradeable universe to tell a spinoff /
+# rename / client holding / sweep (ALIEN, FRACTIONAL, SWEEP -> parked for review) apart
+# from a symbol the model genuinely dropped (ROTATE_OUT -> sell). With universe=None every
+# one of them collapsed to UNTRACKED, which ALWAYS breaches the band and produces
+# delta = 0 - held: a FULL LIQUIDATION of a holding nobody decided to sell.
+# ============================================================================
+def _alien_case():
+    import pandas as pd
+    targets = {"Conservative": SimpleNamespace(
+        as_of="2026-08-25", prices=pd.Series({"BIL": 91.0}),
+        weights=pd.Series({"BIL": 1.0}), version="Conservative")}
+    account_inputs = [{"account": "DU8922142", "version": "Conservative",
+                       "net_liq": 100_000.0,
+                       "positions": {"BIL": 500.0, "GDX": 100.0},
+                       "prices": {"BIL": 91.0, "GDX": 30.0}}]
+    return account_inputs, targets
+
+
+def test_build_preview_threads_the_universe_so_an_alien_is_not_liquidated():
+    import rebalance_run
+    ai, targets = _alien_case()
+    plan = rebalance_run.build_preview(ai, targets, universe={"BIL"})["plans"][0]
+    assert "GDX" not in plan.orders                       # NOT sold
+    assert any(ln.symbol == "GDX" and ln.status == "ALIEN" for ln in plan.lines)
+
+
+def test_without_a_universe_the_same_alien_is_fully_liquidated():
+    # The pre-fix behavior, pinned so the difference is not theoretical.
+    import rebalance_run
+    ai, targets = _alien_case()
+    plan = rebalance_run.build_preview(ai, targets)["plans"][0]
+    assert plan.orders.get("GDX") == -100                 # 0 - held == full liquidation
+
+
+def test_executor_preview_passes_a_real_universe(monkeypatch):
+    # The wiring itself: this lane's preview call must carry a non-None universe.
+    import rebalance_run
+    seen = {}
+
+    def _spy(account_inputs, targets, **kw):
+        seen.update(kw)
+        return {"plans": [], "blocks": [], "routes": []}
+
+    monkeypatch.setattr(rebalance_run, "build_preview", _spy)
+    ai, targets = _alien_case()
+    rx.guarded_preview(ai, targets, tier_groups={"Conservative": "tier_cons"})
+    assert seen["universe"]                               # a non-empty set, not None
+    assert "BIL" in seen["universe"]
+
+
+def test_executor_preview_refuses_when_the_universe_cannot_be_resolved(monkeypatch):
+    # FAIL CLOSED: no universe -> the corp-action guard is off -> refuse, rather than run
+    # the preview with None and let a human arm what it shows.
+    import recon_report
+    monkeypatch.setattr(recon_report, "_strategy_universe", lambda: None)
+    ai, targets = _alien_case()
+    with pytest.raises(recon_report.CorpActionGuardUnavailable):
+        rx.guarded_preview(ai, targets, tier_groups={"Conservative": "tier_cons"})

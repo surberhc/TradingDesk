@@ -63,9 +63,10 @@ def _summary_row(account, tag, value):
     return SimpleNamespace(account=account, tag=tag, value=value)
 
 
-def _pos_row(account, symbol, position):
-    return SimpleNamespace(account=account, position=position,
-                           contract=SimpleNamespace(symbol=symbol))
+def _pos_row(account, symbol, position, sec_type="STK"):
+    return SimpleNamespace(
+        account=account, position=position,
+        contract=SimpleNamespace(symbol=symbol, secType=sec_type))
 
 
 class _FakeIB:
@@ -310,3 +311,33 @@ def test_armed_all_gates_pass_transmits_one_order(monkeypatch):
     assert b.order.account == ACCT == "U14438624"          # the single allowed account only
     assert captured["account_kw"] == ACCT
     assert b.order.lmtPrice <= ex.MAX_TEST_NOTIONAL         # within the notional cap for 1 sh
+
+
+# --- HELD-ASIDE CARVE-OUT IS WIRED INTO THE TINY-TEST RAIL TOO (v0.41.0) -------------
+def test_exec_hands_the_engine_the_held_aside_inputs(monkeypatch):
+    _patch_common(monkeypatch, plan_orders={"USFR": 1})
+    seen = {}
+    monkeypatch.setattr(ex.rebalance_engine, "plan_account",
+                        lambda *a, **k: (seen.update(k), _fake_plan())[1])
+    fake = _FakeIB(_armed_summary(),
+                   [_pos_row(ACCT, "USFR", 100),
+                    _pos_row(ACCT, "T 4.5 2031", 50_000, sec_type="BOND")])
+    _wire_connections(monkeypatch, fake)
+
+    rc = ex.main(armed=False)
+
+    assert rc == 0
+    assert seen["sec_types"] == {"USFR": "STK", "T 4.5 2031": "BOND"}
+    assert "values" in seen
+
+
+def test_exec_refuses_when_the_strategy_universe_is_unresolvable(monkeypatch):
+    _patch_common(monkeypatch, plan_orders={"USFR": 1})
+    monkeypatch.setattr(ex.sp, "_strategy_universe", lambda: None)
+    boom = lambda *a, **k: (_ for _ in ()).throw(
+        AssertionError("plan_account must not run without a universe"))
+    monkeypatch.setattr(ex.rebalance_engine, "plan_account", boom)
+    fake = _FakeIB(_armed_summary(), [])
+    _wire_connections(monkeypatch, fake)
+
+    assert ex.main(armed=False) == 2

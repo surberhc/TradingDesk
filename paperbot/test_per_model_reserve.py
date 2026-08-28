@@ -247,10 +247,9 @@ def test_the_single_account_execution_engine_sizes_against_the_per_model_reserve
     assert [(o.symbol, o.side, o.quantity) for o in s0] == [("SPY", "BUY", 9850)]
 
 
-def test_the_risk_manager_reserve_guard_uses_the_per_model_reserve(monkeypatch):
+def test_the_risk_manager_reserve_guard_uses_the_per_model_reserve():
     """A book SIZED to 1% must be CHECKED against 1%. Checked against 1.5% the no-leverage
     guard vetoes a correctly-sized custom account for being 0.5% over-invested."""
-    monkeypatch.setattr(risk_manager, "check_kill_switch", lambda *a, **k: (False, None))
     target = _one_asset_target(CUSTOM_LABEL)
     resulting = {"SPY": 9900}          # 99% invested — exactly the 1% reserve
 

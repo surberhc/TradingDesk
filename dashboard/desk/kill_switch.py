@@ -13,14 +13,13 @@ Usage (run as administrator if a task refuses to turn off):
     python kill_switch.py --halt-s8      Stop and turn off Strategy 8 (live pilot)
     python kill_switch.py --halt-s0      Stop and turn off Strategy 0
 
-    python kill_switch.py --flatten-all  (NOT armed) prints the "nothing to close"
-    python kill_switch.py --flatten-s8    truth and exits non-zero. It transmits
-    python kill_switch.py --flatten-s0    NOTHING — there is no order code here.
-
-Flatten is an inert scaffold today: Strategy 8 is a zero-transmit pilot holding no
-real positions and Strategy 0 is on the paper account / real-money gated, so there
-is nothing real to close. Flatten will only ever become real via a deliberate,
-gated, human-armed milestone in the dashboard — never from this script.
+Those three flags are the WHOLE interface. There is no get-flat / emergency-close
+option: the --flatten-all / --flatten-s8 / --flatten-s0 flags and the inert
+emergency.flatten_preview / flatten_execute scaffold behind them were REMOVED
+2026-08-25 by owner decision (Andrew) — he does not want a panic button, because he
+does not want to be making irrational decisions on bad market days and he is not
+going to time the market. There was never any order-transmit code behind them. Do
+not re-add them here. HALT, above, is untouched.
 """
 from __future__ import annotations
 
@@ -61,28 +60,6 @@ def _do_halt(which: str) -> int:
     return 0 if report.get("ok") else 2
 
 
-def _do_flatten(which: str) -> int:
-    print()
-    print("=" * 70)
-    print("FLATTEN IS NOT ARMED — nothing was transmitted, nothing was closed.")
-    print("=" * 70)
-    preview = emergency.flatten_preview(which)
-    print(preview["headline"])
-    for line in preview["lines"]:
-        print(f"  - {line}")
-    print()
-    print("This break-glass script will NEVER transmit an order. Emergency close "
-          "of real positions, when it exists, will be a deliberate, gated, "
-          "human-armed action inside the dashboard only.")
-    print()
-    # Prove inertness: the real path raises today. We surface it and exit non-zero.
-    try:
-        emergency.flatten_execute(which)
-    except NotImplementedError as exc:
-        print(f"(flatten_execute is a hard stub: {exc})")
-    return 3  # non-zero: nothing was done
-
-
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="kill_switch.py",
@@ -96,13 +73,8 @@ def main(argv: list[str] | None = None) -> int:
                        help="Stop and turn off Strategy 8 (live pilot).")
     group.add_argument("--halt-s0", action="store_true",
                        help="Stop and turn off Strategy 0.")
-    group.add_argument("--flatten-all", action="store_true",
-                       help="(NOT armed) print the 'nothing to close' truth; "
-                            "transmits nothing; exits non-zero.")
-    group.add_argument("--flatten-s8", action="store_true",
-                       help="(NOT armed) same as --flatten-all for Strategy 8.")
-    group.add_argument("--flatten-s0", action="store_true",
-                       help="(NOT armed) same as --flatten-all for Strategy 0.")
+    # NO --flatten-* FLAGS. The get-flat / emergency-close option was removed
+    # 2026-08-25 by owner decision (see the module docstring). Do not re-add it.
     args = parser.parse_args(argv)
 
     if args.halt_all:
@@ -111,12 +83,6 @@ def main(argv: list[str] | None = None) -> int:
         return _do_halt("s8")
     if args.halt_s0:
         return _do_halt("s0")
-    if args.flatten_all:
-        return _do_flatten("all")
-    if args.flatten_s8:
-        return _do_flatten("s8")
-    if args.flatten_s0:
-        return _do_flatten("s0")
     parser.print_help()
     return 1
 

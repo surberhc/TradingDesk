@@ -52,9 +52,9 @@ def _summary_row(account, tag, value):
     return SimpleNamespace(account=account, tag=tag, value=value)
 
 
-def _pos_row(account, symbol, position):
+def _pos_row(account, symbol, position, sec_type="STK"):
     return SimpleNamespace(account=account, position=position,
-                           contract=SimpleNamespace(symbol=symbol))
+                           contract=SimpleNamespace(symbol=symbol, secType=sec_type))
 
 
 class _FakeIB:
@@ -90,7 +90,21 @@ def _patch_common(monkeypatch, *, target=None):
     monkeypatch.setattr(sp.strategy_target, "current_target",
                         lambda *a, **k: (target or _fake_target()))
     monkeypatch.setattr(sp, "_strategy_universe", lambda: {"SPY", "TLT"})
-    monkeypatch.setattr(sp.live_quotes, "fetch", lambda ib, universe: {})
+    # LIVE quotes, not an empty dict: v0.42.0 removed the stale-close fallback on the
+    # execution path, so a rail handed NO quotes now (correctly) prices nothing. These tests
+    # are about wiring, so they supply the quotes a real run would have.
+    tgt = target or _fake_target()
+
+    def _fetch(ib, universe):
+        out = {}
+        for sym in universe:
+            px = tgt.prices.get(sym)
+            if px is not None and float(px) == float(px) and float(px) > 0:
+                out[sym] = sp.live_quotes.Quote(symbol=sym, bid=None, ask=None,
+                                                last=float(px), close=float(px), md_type=1)
+        return out
+
+    monkeypatch.setattr(sp.live_quotes, "fetch", _fetch)
     monkeypatch.setattr(sp, "_write_status", lambda *a, **k: None)
 
 
@@ -207,7 +221,7 @@ def test_plan_account_wired_and_breach_reports_would_trades(monkeypatch):
     monkeypatch.setattr(sp.s0_live, "connect_s0_live", lambda *a, **k: fake)
 
     def _plan_spy(account, ver, net_liq, positions, tgt, prices=None, band_pct=None,
-                  universe=None):
+                  universe=None, **k):
         seen["account"] = account
         seen["target_is"] = tgt is target
         seen["prices"] = prices
@@ -274,3 +288,67 @@ def test_empty_positions_still_sizes(monkeypatch):
     assert rc == 0
     assert seen["positions"] == {}                     # freshly funded, no holdings
     assert fake.disconnected is True
+
+
+# --- 8. HELD-ASIDE inputs reach the engine (owner decision D6) -----------------------
+# This rail used to pass `universe=` only. With neither `sec_types` nor `values`,
+# holding_class.carve_out short-circuits to "nothing held aside" and an individual bond is
+# sized INSIDE the target allocation — so this preview reported something the deploy and
+# batch rails would never do. PILOT_MODE / zero-transmit, so this is a REPORTING accuracy
+# fix, but a readout that disagrees with the real rails is the thing a human then arms.
+BOND_SYM = "912828ZZ9"
+
+
+def test_held_aside_sec_types_and_values_reach_plan_account(monkeypatch):
+    _patch_common(monkeypatch)
+    seen = {}
+
+    fake = _FakeIB([_summary_row(ACCT, "NetLiquidation", "100000")],
+                   [_pos_row(ACCT, "SPY", 8),
+                    _pos_row(ACCT, BOND_SYM, 10_000, sec_type="BOND")])
+    monkeypatch.setattr(sp.s0_live, "connect_s0_live", lambda *a, **k: fake)
+    # recon_report._portfolio_values is the ONE reader for what a held-aside holding is
+    # worth: an individual bond has no live quote, no strategy close and no model weight.
+    monkeypatch.setattr(sp.recon_report, "_portfolio_values",
+                        lambda ib, account: {BOND_SYM: 9_875.0})
+
+    def _plan_spy(account, ver, net_liq, positions, tgt, **k):
+        seen.update(k)
+        return _fake_plan(breached=False, orders={})
+
+    monkeypatch.setattr(sp.rebalance_engine, "plan_account", _plan_spy)
+    monkeypatch.setattr(sp, "_alert_email", lambda *a, **k: None)
+
+    rc = sp.main()
+
+    assert rc == 0
+    # The classification input: the broker's OWN contract.secType, never a ticker-text guess.
+    assert seen["sec_types"] == {"SPY": "STK", BOND_SYM: "BOND"}
+    # The valuation input, without which the bond is UNPRICED and the account is benched.
+    assert seen["values"] == {BOND_SYM: 9_875.0}
+    assert seen["universe"] == {"SPY", "TLT"}          # the corp-action guard is untouched
+
+
+def test_portfolio_values_failure_degrades_to_empty_not_a_guess(monkeypatch):
+    """FAIL CLOSED: the _FakeIB has no portfolio() at all, so the real _portfolio_values
+    degrades to {} — the engine then reports the holding UNPRICED and withholds orders,
+    which is the intended behavior, never a silent zero."""
+    _patch_common(monkeypatch)
+    seen = {}
+
+    fake = _FakeIB([_summary_row(ACCT, "NetLiquidation", "100000")],
+                   [_pos_row(ACCT, BOND_SYM, 10_000, sec_type="BOND")])
+    monkeypatch.setattr(sp.s0_live, "connect_s0_live", lambda *a, **k: fake)
+
+    def _plan_spy(account, ver, net_liq, positions, tgt, **k):
+        seen.update(k)
+        return _fake_plan(breached=False, orders={})
+
+    monkeypatch.setattr(sp.rebalance_engine, "plan_account", _plan_spy)
+    monkeypatch.setattr(sp, "_alert_email", lambda *a, **k: None)
+
+    rc = sp.main()
+
+    assert rc == 0
+    assert seen["values"] == {}
+    assert seen["sec_types"] == {BOND_SYM: "BOND"}

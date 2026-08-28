@@ -546,6 +546,27 @@ class _CarveIB:
         ]
 
 
+def _carve_quotes(t, extra=None):
+    """Live IBKR quotes for every symbol in the model, built off the model's own closes.
+
+    v0.42.0: the execution lane no longer substitutes a stored daily close for a quote IBKR
+    would not give, so a carve-out test that passes `quotes={}` is asserting that an
+    UNQUOTED book still trades — which is exactly the behavior that was removed. These tests
+    are about the BOND CARVE-OUT, not about pricing, so they now supply the quotes a real
+    run would have."""
+    import live_quotes
+    q = {}
+    for sym, px in (extra or {}).items():
+        q[sym] = live_quotes.Quote(symbol=sym, bid=None, ask=None, last=float(px),
+                                   close=float(px), md_type=1)
+    for sym in t.prices.index:
+        px = float(t.prices.get(sym))
+        if px == px and px > 0:
+            q[str(sym)] = live_quotes.Quote(symbol=str(sym), bid=None, ask=None,
+                                            last=px, close=px, md_type=1)
+    return q
+
+
 def _carve_setup():
     """(ib, clients, targets, equity_symbol) for the carve-out tests, on a REAL Balanced
     model so the engine's sizing is the production sizing."""
@@ -562,7 +583,7 @@ def test_build_account_inputs_carries_sec_types_and_values():
     # The wiring itself: the lane must hand the engine the broker's OWN contract.secType per
     # held symbol, plus the broker's reported market values. Missing either is the A.12 bug.
     ib, clients, targets, equity = _carve_setup()
-    account_inputs, summaries = lx.build_account_inputs(ib, clients, targets, quotes={})
+    account_inputs, summaries = lx.build_account_inputs(ib, clients, targets, quotes=_carve_quotes(targets['Balanced']))
 
     assert len(account_inputs) == 2
     for ai in account_inputs:
@@ -576,7 +597,7 @@ def test_block_rail_carves_the_bond_out_of_the_investable_base():
     # END TO END on the block rail's own inputs: the bond's value leaves NetLiq, the model is
     # sized against the REMAINING managed sleeve, and NO block/route is ever emitted for it.
     ib, clients, targets, equity = _carve_setup()
-    account_inputs, _summaries = lx.build_account_inputs(ib, clients, targets, quotes={})
+    account_inputs, _summaries = lx.build_account_inputs(ib, clients, targets, quotes=_carve_quotes(targets['Balanced']))
     out = lx.build_plan(account_inputs, targets, tier_groups={"Balanced": "tier_balanced"})
 
     for plan in out["plans"]:
@@ -602,7 +623,7 @@ def test_without_the_carve_out_the_bond_is_sized_inside_the_allocation():
     # sizes the model against the full NetLiq — a strictly larger investable. This asserts the
     # fix changes the sized numbers, not just the reported ones.
     ib, clients, targets, _equity = _carve_setup()
-    carved, _s = lx.build_account_inputs(ib, clients, targets, quotes={})
+    carved, _s = lx.build_account_inputs(ib, clients, targets, quotes=_carve_quotes(targets['Balanced']))
     naked = [{k: v for k, v in ai.items() if k not in ("sec_types", "values")}
              for ai in carved]
 
@@ -618,7 +639,7 @@ def test_plan_for_rederives_the_same_investable_as_the_engine():
     # bond-holding account against the FULL NetLiq while the routed block was sized against
     # the managed sleeve — two different investables for one account inside one run.
     ib, clients, targets, _equity = _carve_setup()
-    account_inputs, _s = lx.build_account_inputs(ib, clients, targets, quotes={})
+    account_inputs, _s = lx.build_account_inputs(ib, clients, targets, quotes=_carve_quotes(targets['Balanced']))
     engine_plan = lx.build_plan(account_inputs, targets)["plans"][0]
     rederived = lx._plan_for(account_inputs[0], targets)
     assert rederived.investable == pytest.approx(engine_plan.investable)
@@ -817,3 +838,76 @@ def test_clean_run_says_so_and_carries_empty_pdt_lists(monkeypatch, capsys):
     assert result["pdt_dropped"] == [] and result["pdt_refused_blocks"] == []
     assert ib.replace_fa_calls == 1 and len(ib.placed) == 1
     assert "Pattern-day-trader check: CLEAN" in capsys.readouterr().out
+
+
+# ============================================================================
+# (n) THE CORP-ACTION GUARD IS WIRED INTO THE BLOCK LANE (v0.41.0).
+#
+# build_plan was called with no `universe`, so reconcile.classify_untracked collapsed every
+# unrecognised holding to UNTRACKED -- an ALWAYS-BREACH status that produces
+# delta = 0 - held, i.e. a full liquidation of a spinoff / rename / client holding / sweep
+# instead of parking it for a human. The lane now resolves the strategy universe and
+# REFUSES the run if it cannot.
+# ============================================================================
+class _SessionFakeIB(_FakeIB):
+    def managedAccounts(self):
+        return ["DU8922143", "DU8922144"]
+
+    def disconnect(self):
+        pass
+
+
+def _session_targets():
+    """Like _targets() but with real pandas weights — _run_session builds its quote universe
+    off `t.weights.index`."""
+    import pandas as pd
+    return {"Balanced": SimpleNamespace(as_of="2026-08-05", version="Balanced",
+                                        prices=pd.Series({"SPY": 100.0}),
+                                        weights=pd.Series({"SPY": 1.0}))}
+
+
+def _wire_session(monkeypatch, ib):
+    """Neutralize every boundary in _run_session except the sizing call under test."""
+    info = lambda n: SimpleNamespace(number=n, version="Balanced", net_liq=1_000_000.0,
+                                     enrolled=True, funded=True, is_master=False)
+    monkeypatch.setattr(lx, "connect_target", lambda *a, **k: ib)
+    monkeypatch.setattr(lx.accounts, "discover",
+                        lambda _ib: [info("DU8922143"), info("DU8922144")])
+    monkeypatch.setattr(lx.live_quotes, "fetch", lambda _ib, syms: {})
+    monkeypatch.setattr(lx, "build_account_inputs",
+                        lambda *a, **k: (_account_inputs(), {}))
+    monkeypatch.setattr(lx.rebalance_run, "resolve_tier_groups",
+                        lambda *a, **k: {"Balanced": "tier_balanced"})
+    monkeypatch.setattr(lx, "transmission_permitted", lambda *a, **k: (False, "preview"))
+    monkeypatch.setattr(lx, "execute_fa_block_routes", lambda *a, **k: {"backup": ""})
+    monkeypatch.setattr(lx, "_ledger", lambda *a, **k: None)
+
+
+def test_block_lane_sizes_with_a_real_universe(monkeypatch):
+    seen = {}
+
+    def _spy(account_inputs, targets, **kw):
+        seen.update(kw)
+        return {"plans": [], "blocks": [], "routes": []}
+
+    ib = _SessionFakeIB()
+    _wire_session(monkeypatch, ib)
+    monkeypatch.setattr(lx, "build_plan", _spy)
+    rc = lx._run_session(_e2e_target(), _session_targets(), armed=False)
+    assert rc == 0
+    assert seen["universe"]                       # a non-empty set, not None
+    assert "SPY" in seen["universe"]
+
+
+def test_block_lane_refuses_when_the_universe_cannot_be_resolved(monkeypatch):
+    # FAIL CLOSED: with no universe every alien holding would size as a full liquidation.
+    import recon_report
+    called = {"n": 0}
+    ib = _SessionFakeIB()
+    _wire_session(monkeypatch, ib)
+    monkeypatch.setattr(recon_report, "_strategy_universe", lambda: None)
+    monkeypatch.setattr(lx, "build_plan",
+                        lambda *a, **k: called.__setitem__("n", called["n"] + 1))
+    rc = lx._run_session(_e2e_target(), _session_targets(), armed=False)
+    assert rc == 2
+    assert called["n"] == 0                       # nothing was sized at all

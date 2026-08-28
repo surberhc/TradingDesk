@@ -36,16 +36,19 @@ DRY_RUN = True
 
 # --- Risk limits (enforced by paperbot.risk_manager before any transmission) -----
 RISK_LIMITS = {
-    # Per-position ceiling on RISK assets only (equities, sectors, gold, commodities,
-    # long/intermediate Treasuries). Cash-equivalents (T-bills, floating-rate, short
-    # Treasuries) are EXEMPT - concentrating in cash-equivalents is de-risking, not risk.
-    # This is a fat-finger BACKSTOP, not a strategy constraint: Adaptive All-Weather
-    # enforces its own per-asset caps (SPEC §12) and legitimately holds ~26.67% in each
-    # equity-core ETF, so the old 5% placeholder would have vetoed the strategy itself.
-    # 0.35 sits just above S0's largest single risk position. (The tight 5% cap belongs
-    # to the future single-name / options strategies, not the S0 ETF allocation.)
-    "max_position_pct_nav": 0.35,
-    "max_daily_loss_pct_nav": 0.02,   # KILL SWITCH: halt ALL trading at -2% on the day
+    # "max_position_pct_nav": REMOVED 2026-08-25 by owner decision (Andrew). There is NO
+    # per-position ceiling on this desk. It was never authorized: the 0.35 value (and the
+    # 5% placeholder before it) entered in the pre-git baseline snapshot 3b29616 with no
+    # decision record, and its own comment admitted the earlier 5% would have VETOED the
+    # strategy itself — a number retuned to fit the book it was supposed to police is not a
+    # control. The strategy's own per-asset caps (SPEC §12) are the real per-position
+    # constraint. DO NOT RE-ADD. (The single-order-notional sanity check in risk_manager —
+    # one order may not exceed NAV — is a different guard and is untouched.)
+    # "max_daily_loss_pct_nav": REMOVED 2026-08-25 by owner decision (Andrew). There is NO
+    # automated daily-loss halt on this desk. It was never authorized: the -2% value entered
+    # in the pre-git baseline snapshot and no decision record for it ever existed. DO NOT
+    # RE-ADD. (The MANUAL, file-based operator stop — the AUTOTRADE_DISABLED sentinel /
+    # KILL_SWITCH label — is a different thing entirely and is untouched.)
     "max_legs_per_order": 1,          # S0 trades single ETFs; >1 leg = malformed for S0
     "cash_reserve_pct": 0.015,        # keep >= 1.5% of NAV in cash (no leverage + a buffer);
                                       # positions are sized against NAV*(1-this) so the

@@ -699,9 +699,9 @@ class _FakeContract:
 
 
 class _FakePosition:
-    def __init__(self, account, symbol, qty):
+    def __init__(self, account, symbol, qty, sec_type="STK"):
         self.account = account
-        self.contract = _FakeContract(symbol)
+        self.contract = _FakeContract(symbol, sec_type)
         self.position = qty
 
 
@@ -815,3 +815,142 @@ def test_ledger_reader_is_tolerant_and_honest(monkeypatch, tmp_path):
     assert [r["run_id"] for r in ledger.iter_runs()] == ["R1", "R2"]   # torn line skipped
     assert ledger.find_run("R2")["mode"] == "Y"
     assert ledger.find_run("R3") is None
+
+
+# --- THE ARMED BATCH RAIL REFUSES A MISSING STRATEGY UNIVERSE (v0.41.0) --------------
+# sp._strategy_universe() swallows every exception and returns None, justified in its
+# docstring as safe because the s0 pilot preview is zero-transmit. This rail is NOT that
+# rail: one failed import would silently disarm the corp-action guard here, turning every
+# unrecognised holding into a full liquidation. Refuse instead.
+def test_batch_session_refuses_without_a_strategy_universe(monkeypatch, tmp_path):
+    monkeypatch.setattr(ledger, "RUNS_JSONL", os.path.join(str(tmp_path), "runs.jsonl"))
+    monkeypatch.setattr(ledger, "LOG_TXT", os.path.join(str(tmp_path), "paperbot.log"))
+    monkeypatch.setattr(bre.sp, "_strategy_universe", lambda: None)
+
+    class _BoomIB:
+        def accountSummary(self):
+            raise AssertionError("the broker must not be read once the guard is off")
+
+        def positions(self):
+            raise AssertionError("the broker must not be read once the guard is off")
+
+    t, meta = _custom_target_and_meta()
+    rc = bre.run_batch_session(_BoomIB(), [CUSTOM_ACCT], {CUSTOM_ACCT: CUSTOM_LABEL},
+                               {CUSTOM_LABEL: t}, armed=False, armed_conn=False,
+                               kill=False, metas={CUSTOM_LABEL: meta})
+    assert rc == 2
+    assert list(ledger.iter_runs()) == []          # nothing recorded, nothing sized
+
+
+# =====================================================================================
+# HELD-ASIDE PRICING ON THE BATCH RAIL (owner decision D6)
+# -------------------------------------------------------------------------------------
+# The carve-out needs TWO inputs to work: `sec_types` (what the instrument IS) and `values`
+# (what a held-aside holding is WORTH — an individual bond has no live quote, no strategy
+# close and no model weight, so recon_report._portfolio_values is its only reader). This
+# rail already passed sec_types; without `values` a bond-holding account hit
+# holding_class.UNPRICED_BLOCK_REASON and had its WHOLE order set withheld.
+#
+# And the constraint that makes this more than a copy of the single-account deploy rail:
+# _portfolio_values is a broker round-trip PER ACCOUNT and this rail loops the whole roster,
+# so it must be paid ONLY by an account that actually holds a held-aside candidate.
+# =====================================================================================
+BOND_SYM = "912828ZZ9"
+
+
+def _held_aside_session(monkeypatch, tmp_path, positions, portfolio_values):
+    """Drive run_batch_session over ONE account with the given broker positions.
+
+    Returns (plan_account_kwargs, _portfolio_values_call_log, plans)."""
+    monkeypatch.setattr(ledger, "RUNS_JSONL", os.path.join(str(tmp_path), "runs.jsonl"))
+    monkeypatch.setattr(ledger, "LOG_TXT", os.path.join(str(tmp_path), "paperbot.log"))
+    # Flat $100 quotes for every EQUITY. The bond is deliberately NOT quoted — that is the
+    # real-world case `values` exists to cover, and it proves the fallback is wired, not just
+    # the kwarg.
+    monkeypatch.setattr(
+        bre.live_quotes, "fetch",
+        lambda ib, syms: {s: bre.live_quotes.Quote(s, 100.0, 100.0, 100.0, 100.0, 1)
+                          for s in syms if s in S0_UNIVERSE})
+    monkeypatch.setattr(bre.sp, "_strategy_universe", lambda: set(S0_UNIVERSE))
+
+    calls: list[str] = []
+
+    def _values(ib, account):
+        calls.append(account)
+        return dict(portfolio_values)
+
+    monkeypatch.setattr(bre.recon_report, "_portfolio_values", _values)
+
+    seen_kwargs: list[dict] = []
+    plans: list = []
+    real_plan_account = bre.rebalance_engine.plan_account
+
+    def _spy(*a, **k):
+        seen_kwargs.append(dict(k))
+        plan = real_plan_account(*a, **k)      # the REAL engine, unchanged
+        plans.append(plan)
+        return plan
+
+    monkeypatch.setattr(bre.rebalance_engine, "plan_account", _spy)
+
+    t, meta = _custom_target_and_meta()
+    summary = [_row(CUSTOM_ACCT, "NetLiquidation", "110000"),
+               _row(CUSTOM_ACCT, "BuyingPower", "110000"),
+               _row(CUSTOM_ACCT, "TotalCashValue", "0")]
+    rc = bre.run_batch_session(_FakeIB(summary, positions), [CUSTOM_ACCT],
+                               {CUSTOM_ACCT: CUSTOM_LABEL}, {CUSTOM_LABEL: t},
+                               armed=False, armed_conn=False, kill=False,
+                               metas={CUSTOM_LABEL: meta})
+    assert rc == 0
+    assert len(seen_kwargs) == 1
+    return seen_kwargs[0], calls, plans
+
+
+def test_batch_passes_values_for_an_account_holding_a_held_aside_instrument(monkeypatch,
+                                                                           tmp_path):
+    """A BOND position -> exactly one _portfolio_values fetch, and it reaches plan_account,
+    so the bond is PRICED and carved out instead of blocking the account's orders."""
+    positions = [_FakePosition(CUSTOM_ACCT, "SCHB", 600),
+                 _FakePosition(CUSTOM_ACCT, "USFR", 400),
+                 _FakePosition(CUSTOM_ACCT, BOND_SYM, 10_000, sec_type="BOND")]
+    kwargs, calls, plans = _held_aside_session(monkeypatch, tmp_path, positions,
+                                               {BOND_SYM: 10_000.0})
+
+    assert calls == [CUSTOM_ACCT]                       # fetched once, for this account only
+    assert kwargs["sec_types"][BOND_SYM] == "BOND"      # classification input (already wired)
+    assert kwargs["values"] == {BOND_SYM: 10_000.0}     # THE FIX: the valuation input
+
+    # And the consequence that matters: the bond is priced from the broker's reported value,
+    # so the account is NOT benched by UNPRICED_BLOCK_REASON.
+    plan = plans[0]
+    assert [h.symbol for h in plan.held_aside] == [BOND_SYM]
+    assert plan.held_aside[0].market_value == 10_000.0
+    assert plan.blocked_reasons == []
+    # Carve-out arithmetic: the model's 100% applies to what is left, not the whole account.
+    assert plan.managed_net_liq == 100_000.0
+
+
+def test_batch_all_stk_account_makes_no_extra_broker_call(monkeypatch, tmp_path):
+    """PERFORMANCE GUARD. This rail loops 186 roster accounts. An account holding nothing
+    but STK has no held-aside candidate, so _portfolio_values must not be called AT ALL, and
+    its plan_account kwargs must be exactly what they were before the fix."""
+    positions = [_FakePosition(CUSTOM_ACCT, "SCHB", 600),
+                 _FakePosition(CUSTOM_ACCT, "USFR", 400)]
+    kwargs, calls, plans = _held_aside_session(monkeypatch, tmp_path, positions, {})
+
+    assert calls == []                        # NOT called once — zero extra broker round-trips
+    assert "values" not in kwargs             # and the kwarg is not even passed
+    assert set(kwargs) == {"prices", "universe", "sec_types", "cash_reserve_pct",
+                           "strict_prices"}
+    assert plans[0].held_aside == []
+
+
+def test_batch_held_aside_test_reuses_holding_class_predicate():
+    """The conditional fetch must key off holding_class's OWN predicate, never a locally
+    invented list of secTypes — otherwise a type added to HELD_ASIDE_TYPES later would be
+    carved out by the engine but skipped by the fetch, and silently block accounts."""
+    import holding_class
+    assert bre.holding_class is holding_class
+    assert holding_class.is_held_aside("BOND") is True
+    assert holding_class.is_held_aside("STK") is False
+    assert holding_class.is_held_aside(None) is True        # fail closed on unknown

@@ -30,6 +30,29 @@ NEVER auto-liquidating an alien / corporate-action holding:
                (a money-market sweep held by design -> not ALIEN, no order, no page)
 When `universe is None` (backtester / paper callers that don't pass it) the classification
 is IDENTICAL to before: all of the above collapse back to UNTRACKED. Behavior-preserving.
+
+"UNPRICED" IS NOT "ZERO" (v0.42.0)
+----------------------------------
+Until v0.42.0 this module answered "the model wants none of this" and "I could not price
+this" with the SAME number — target_shares = 0 — because the sizing expression fell
+through to 0 whenever `has_price` was false. Downstream, `delta = target_shares -
+actual_shares`, so a model holding we merely failed to quote was sized as a FULL
+LIQUIDATION of a position the model actually wanted to keep; and the far more common
+mirror (a model symbol the account does not hold yet, with no quote) contributed a 0-share
+delta and 0.0 of trade weight, so the account read "in-spec, nothing to trade" while
+holding none of that sleeve.
+
+The two cases are now told apart explicitly:
+  * weight == 0 with a USABLE price  -> target_shares 0, i.e. SELL. Legitimate rotation
+    out of a holding the model no longer wants. UNCHANGED.
+  * weight  > 0 with NO usable price -> status UNPRICED, `priced=False`, and
+    target_shares pinned to int(actual_shares) so the delta is exactly 0. It can never
+    become a sell leg, and it is never silently counted as conforming.
+
+`usable_price()` below is the single definition of "we have a price". None, NaN, a
+non-numeric, and a non-positive number all mean the SAME thing — unpriced — so a NaN
+written into a prices dict (s0_live_deploy / s0_live_exec / live_fa_block_execute do
+exactly that) and an absent key (batch_rebalance_execute drops the key) take one path.
 """
 from __future__ import annotations
 
@@ -48,6 +71,30 @@ ROTATE_OUT = "ROTATE_OUT"
 ALIEN = "ALIEN"
 FRACTIONAL = "FRACTIONAL"
 SWEEP = "SWEEP"
+
+# A symbol the model WANTS (weight > 0) that we could not price. Distinct from every
+# status above: it is not a drift, not a rotation, not an alien holding — it is a DATA
+# GAP, and the desk refuses to size or trade a symbol it cannot see. Never auto-traded.
+UNPRICED = "UNPRICED"
+
+# Plain-English reasons the two consumers (rebalance_engine / recon_report) render. Both
+# name the symbol, because "some price was missing" is not something a human can act on.
+UNPRICED_HELD_REASON = (
+    "model holding {symbol} could not be priced and IS HELD ({shares:,.0f} share(s)) — its "
+    "value is inside NetLiq but unknown, so the rest of the book cannot be sized against a "
+    "base we cannot break down. NO orders are emitted for this account (fail-closed; "
+    "human review)")
+UNPRICED_WANTED_REASON = (
+    "model holding {symbol} (target weight {weight:.2%}) could not be priced, so that "
+    "sleeve was left in cash and NOT traded. The account is NOT in spec — it is missing "
+    "{symbol} — and it cannot conform until a price is available (fail-closed)")
+
+
+# THE definition of "we have a price for this" — one function, in the leaf module, so
+# reconcile / rebalance_engine / recon_report / risk_manager can never disagree about it
+# again (they each had their own inline version, and two of them were wrong). Re-exported
+# here because this is where every sizing caller already looks.
+usable_price = _investable.usable_price
 
 
 def classify_untracked(symbol: str, actual_shares: float,
@@ -96,6 +143,17 @@ class Line:
     actual_weight: float
     drift_weight: float
     status: str
+    # Was this line's symbol PRICED? Defaults True so every pre-existing 7-arg positional
+    # construction (tests, dashboards) is unchanged. False means target_shares /
+    # actual_weight / drift_weight were computed WITHOUT a price and must not be read as
+    # economic facts — the whole point is that downstream can now tell, which it could not
+    # before v0.42.0.
+    priced: bool = True
+
+    @property
+    def unpriced_and_wanted(self) -> bool:
+        """The dangerous case: the model wants this symbol and we could not price it."""
+        return self.status == UNPRICED
 
 
 def reconcile(target: strategy_target.Target, nav: float, positions: dict,
@@ -103,9 +161,23 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
               investable: float | None = None,
               universe: set[str] | None = None,
               whitelist: set[str] | None = None,
-              cash_reserve_pct: float | None = None) -> list[Line]:
+              cash_reserve_pct: float | None = None,
+              strict_prices: bool = False) -> list[Line]:
     """Compare the strategy's target book against actual positions. `prices` (symbol->
     price) overrides the strategy-data close for valuation (e.g. live quotes).
+
+    `strict_prices` — THE EXECUTION-PATH SWITCH (owner decision, v0.42.0)
+    --------------------------------------------------------------------
+    False (default, and every offline caller): `prices` merely OVERRIDES the model's own
+    close, and a symbol absent from it falls back to `target.prices`. That is correct for
+    the backtester and for offline readouts, where the strategy's price HISTORY is the
+    legitimate source — you cannot compute a regime or a momentum weight from one live tick.
+
+    True (every rail that can size or transmit a real order): the broker's live quotes in
+    `prices` are the ONLY price source. The model's stored close is NOT consulted, because
+    a stale daily close is not a price you can trade at, and quietly substituting one turns
+    "IBKR would not quote this" into an order sized off yesterday. A symbol IBKR will not
+    quote simply does not trade, and says so — see UNPRICED below.
 
     `investable` overrides the capital sized against (default NAV*(1-cash_reserve)).
     The multi-account engine passes (NAV - distribution_reserve)*(1-cash_reserve) so a
@@ -135,15 +207,38 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
     lines: list[Line] = []
     for sym in sorted(set(target.weights.index) | set(positions)):
         weight = float(target.weights.get(sym, 0.0))
-        price = float((prices or {}).get(sym, target.prices.get(sym, float("nan"))))
-        has_price = price == price and price > 0
-
-        target_shares = int(weight * investable / price) if (weight > 0 and has_price) else 0
+        # ONE price gate for the whole module. None means UNPRICED — never 0.0, never NaN.
+        # Under strict_prices the stored close is never consulted (execution rails).
+        raw = (prices or {}).get(sym, None)
+        if raw is None and not strict_prices:
+            raw = target.prices.get(sym, None)
+        price = usable_price(raw)
+        has_price = price is not None
         actual_shares = float(positions.get(sym, 0.0))
+
+        if weight > 0 and not has_price:
+            # THE FIX (v0.42.0). We cannot size a symbol we cannot price. Pinning the
+            # target to what is ALREADY held makes the downstream delta
+            # (target_shares - int(actual_shares)) exactly 0, so even a consumer that has
+            # never heard of the UNPRICED status cannot turn this into a liquidation.
+            # Sizing it to 0 — the pre-0.42.0 behavior — meant "sell every share".
+            target_shares = int(actual_shares)
+        elif weight > 0:
+            target_shares = int(weight * investable / price)
+        else:
+            # weight == 0 with a usable price: the model genuinely wants none of this.
+            # target 0 => a SELL. Legitimate rotation-out; deliberately UNCHANGED.
+            target_shares = 0
+
         actual_weight = (actual_shares * price / nav) if (has_price and nav) else 0.0
         drift_w = actual_weight - weight
 
-        if weight > 0 and actual_shares == 0:
+        if weight > 0 and not has_price:
+            # Ranked FIRST so it can never be reported as MISSING (which reads "we just
+            # have not bought it yet") or MATCHED (which reads "conforming"). Neither is
+            # true: we do not know.
+            status = UNPRICED
+        elif weight > 0 and actual_shares == 0:
             status = "MISSING"
         elif weight == 0 and actual_shares != 0:
             # universe=None -> "UNTRACKED" (legacy); otherwise the refined split.
@@ -154,7 +249,7 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
             status = "DRIFTED"
 
         lines.append(Line(sym, weight, target_shares, actual_shares,
-                          actual_weight, drift_w, status))
+                          actual_weight, drift_w, status, priced=has_price))
 
     # --- Slice 3: explicit execution-side CASH bucket -------------------------
     # Each RISK line above measures drift against its TRUE model weight (no haircut),
@@ -170,9 +265,17 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
     # PER-MODEL: the CASH target is THIS model's reserve, the same number the plan sized
     # against — not the global default. Measuring cash against a buffer the account was
     # never sized to is permanent phantom drift (see the `cash_reserve_pct` note above).
-    risk_value = sum(ln.actual_shares * float((prices or {}).get(ln.symbol,
-                     target.prices.get(ln.symbol, 0.0)))
-                     for ln in lines)
+    # usable_price(), not float(...), so a NaN quote cannot poison the sum into NaN and
+    # turn the CASH line's drift comparison into a silent False (requirement: never let a
+    # NaN reach a comparison). An unpriced line contributes nothing here — which is why the
+    # engine BLOCKS an account that holds an unpriced model symbol rather than trusting it.
+    def _valuation_price(sym):
+        raw = (prices or {}).get(sym, None)
+        if raw is None and not strict_prices:
+            raw = target.prices.get(sym, None)
+        return usable_price(raw) or 0.0
+
+    risk_value = sum(ln.actual_shares * _valuation_price(ln.symbol) for ln in lines)
     cash_target_w, cash_actual_w = _investable.cash_line(nav, risk_value,
                                                         buffer=cash_reserve_pct)
     cash_drift_w = cash_actual_w - cash_target_w
@@ -180,6 +283,35 @@ def reconcile(target: strategy_target.Target, nav: float, positions: dict,
     lines.append(Line(_investable.CASH_SYMBOL, cash_target_w, 0, 0.0,
                       cash_actual_w, cash_drift_w, cash_status))
     return lines
+
+
+# --- the one place that decides what an UNPRICED line COSTS the account ----------
+# Two different consequences, and getting the split wrong turns one defect into another:
+#
+#   HELD + unpriced  -> BLOCK the account. Its value sits inside the broker's NetLiq but
+#       we cannot break NetLiq down, so every sibling's target (weight * investable) is
+#       sized against a base we cannot account for. Buy against that and the book can go
+#       levered — and the leverage guard is exactly the guard that cannot see this symbol
+#       either. This is the SAME failure the held-aside carve-out already fails closed on
+#       (holding_class.UNPRICED_BLOCK_REASON), so it takes the SAME road: blocked_reasons.
+#
+#   NOT HELD + unpriced -> ISOLATE, do not block. Nothing of ours is tied up in it, NetLiq
+#       is fully accounted for, and skipping it just leaves that sleeve in cash: the
+#       account ends UNDER-invested, never levered. Benching the whole account for a symbol
+#       we own none of would trade this defect for a different one (an account that cannot
+#       trade at all). It IS reported, and it makes the account read NOT-in-spec.
+def split_unpriced(lines) -> tuple[list, list]:
+    """(held_unpriced, wanted_unpriced) — UNPRICED lines split by whether we hold any.
+
+    ONE definition, imported by both rebalance_engine.plan_account and
+    recon_report.plan_account so the two sizing paths can never disagree about which
+    unpriced symbol benches an account and which one is merely parked."""
+    held, wanted = [], []
+    for ln in lines:
+        if ln.status != UNPRICED:
+            continue
+        (held if int(ln.actual_shares) != 0 else wanted).append(ln)
+    return held, wanted
 
 
 def main() -> int:

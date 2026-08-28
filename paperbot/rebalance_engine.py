@@ -94,14 +94,16 @@ def carve_out_held_aside(net_liq: float, positions: dict,
 # only emits a REBALANCE verdict). Factored here as ONE function so there is a single
 # definition of "does this account breach the band?" — never a copy that can drift.
 def _trade_weight(ln, net_liq: float, target: strategy_target.Target,
-                  prices: dict | None = None) -> float:
+                  prices: dict | None = None, strict_prices: bool = False) -> float:
     """Size of the trade THIS line would require, as a fraction of NetLiq:
     |target_shares - actual_shares| * price / NetLiq. `prices` (symbol->price) overrides
-    the strategy-data close. A missing/non-positive price or zero NetLiq -> 0.0 (no trade
-    weight contributed)."""
-    price = float((prices or {}).get(ln.symbol,
-                                     target.prices.get(ln.symbol, float("nan"))))
-    if not (price == price and price > 0) or not net_liq:
+    the strategy-data close; `strict_prices` makes it the ONLY source (execution rails).
+    A missing/non-positive/NaN price or zero NetLiq -> 0.0 (no trade weight contributed)."""
+    raw = (prices or {}).get(ln.symbol, None)
+    if raw is None and not strict_prices:
+        raw = target.prices.get(ln.symbol, None)
+    price = reconcile.usable_price(raw)
+    if price is None or not net_liq:
         return 0.0
     return abs(ln.target_shares - int(ln.actual_shares)) * price / net_liq
 
@@ -110,7 +112,10 @@ def _trade_weight(ln, net_liq: float, target: strategy_target.Target,
 # an ALIEN (corp-action/manual) holding is surfaced for human review, a FRACTIONAL DRIP
 # stub is recorded but too small to trade, a SWEEP is a whitelisted cash/money-market
 # fund. None of them may (a) count toward the trade-size band or (b) produce a delta.
-_NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP"})
+# UNPRICED joins them (v0.42.0): a symbol the model wants but we could not price has an
+# UNKNOWABLE trade size, and _trade_weight would score it 0.0 — a permissive guess. It is
+# never traded and never counted; it is SURFACED, via blocked_reasons / unpriced_reasons.
+_NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP", reconcile.UNPRICED})
 # Statuses that ALWAYS breach regardless of trade size — a KNOWN held symbol the model
 # dropped to 0% must be cleared. UNTRACKED is the legacy (universe=None) equivalent;
 # ROTATE_OUT is its refined form when a universe is supplied. Both mean "sell it".
@@ -118,7 +123,8 @@ _ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT"})
 
 
 def band_breached(lines, net_liq: float, target: strategy_target.Target,
-                  prices: dict | None = None, band_pct: float | None = None) -> bool:
+                  prices: dict | None = None, band_pct: float | None = None,
+                  strict_prices: bool = False) -> bool:
     """ACCOUNT-LEVEL, all-or-nothing no-trade band test (the single source of truth).
 
     Returns True iff the account needs work: some holding's required TRADE SIZE exceeds
@@ -134,7 +140,7 @@ def band_breached(lines, net_liq: float, target: strategy_target.Target,
     if band_pct is None:
         band_pct = config.REBALANCE_BAND_PCT
     return (any(ln.status in _ALWAYS_BREACH_STATUSES for ln in lines)
-            or any(_trade_weight(ln, net_liq, target, prices) > band_pct
+            or any(_trade_weight(ln, net_liq, target, prices, strict_prices) > band_pct
                    for ln in lines if ln.status not in _NO_AUTOTRADE_STATUSES))
 
 
@@ -146,7 +152,8 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  universe: set[str] | None = None,
                  sec_types: dict | None = None,
                  values: dict | None = None,
-                 cash_reserve_pct: float | None = None) -> AccountPlan:
+                 cash_reserve_pct: float | None = None,
+                 strict_prices: bool = False) -> AccountPlan:
     """Reconcile ONE account against its tier model and emit the share deltas to fix it.
 
     Steps (all pure):
@@ -232,7 +239,8 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     # above — one value per account, never two (phantom-drift guard).
     lines = reconcile.reconcile(target, managed_net_liq, managed_positions, prices=prices,
                                tolerance_w=band_pct, investable=investable,
-                               universe=universe, cash_reserve_pct=cash_reserve_pct)
+                               universe=universe, cash_reserve_pct=cash_reserve_pct,
+                               strict_prices=strict_prices)
 
     # NO-TRADE BAND — ACCOUNT-LEVEL, all-or-nothing (Andrew's decision 2026-06-27): leave
     # the whole account alone unless it genuinely needs work; if it does, rebalance EVERY
@@ -251,7 +259,7 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     # 4% drift in the tradeable half of a half-bond account is a real 4% breach, not a
     # diluted 2% that would never trip.
     breached = band_breached(lines, managed_net_liq, target, prices=prices,
-                             band_pct=band_pct)
+                             band_pct=band_pct, strict_prices=strict_prices)
 
     # ALIEN / FRACTIONAL / SWEEP lines are NEVER auto-traded (corp-action guard): an alien
     # holding is left in place and surfaced for human review, a fractional DRIP stub is too
@@ -266,10 +274,24 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
             if abs(delta) >= 1:
                 orders[ln.symbol] = delta
 
+    # UNPRICED MODEL HOLDINGS (v0.42.0) — the same fail-closed road the held-aside carve-out
+    # already takes, with the isolate-vs-block split documented in reconcile.split_unpriced:
+    #   HELD + unpriced -> BLOCK the account (its value is inside NetLiq but unaccounted for,
+    #                      so every sibling target is sized off a base we cannot break down).
+    #   NOT HELD        -> ISOLATE: that sleeve stays in cash, the rest of the account
+    #                      rebalances normally, and the reason travels on the plan so the
+    #                      account can never be reported "in spec, nothing to trade".
+    held_unpriced, wanted_unpriced = reconcile.split_unpriced(lines)
+    blocked_reasons = list(carve.blocked_reasons)
+    blocked_reasons += [reconcile.UNPRICED_HELD_REASON.format(
+        symbol=ln.symbol, shares=ln.actual_shares) for ln in held_unpriced]
+    unpriced_reasons = [reconcile.UNPRICED_WANTED_REASON.format(
+        symbol=ln.symbol, weight=ln.target_weight) for ln in wanted_unpriced]
+
     # FAIL CLOSED: a held-aside holding we could not price (or one worth more than the whole
     # account) makes the managed sleeve's size a guess. Report everything, emit nothing —
     # the account still surfaces with its reason instead of silently sizing off a bad base.
-    if carve.blocked_reasons:
+    if blocked_reasons:
         orders = {}
         breached = False
 
@@ -279,7 +301,8 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
                        managed_net_liq=carve.managed_net_liq,
                        held_aside_value=carve.held_aside_value,
                        held_aside=list(carve.held_aside),
-                       blocked_reasons=list(carve.blocked_reasons),
+                       blocked_reasons=blocked_reasons,
+                       unpriced_reasons=unpriced_reasons,
                        cash_reserve_pct=(_investable.buffer_pct()
                                          if cash_reserve_pct is None
                                          else float(cash_reserve_pct)))
@@ -322,7 +345,11 @@ def plan_accounts(account_inputs: list[dict],
             a["account"], a["version"], a["net_liq"], a["positions"],
             targets[a["version"]], prices=a.get("prices"), band_pct=band_pct,
             universe=universe, sec_types=a.get("sec_types"), values=a.get("values"),
-            cash_reserve_pct=reserves.get(a["version"])))
+            cash_reserve_pct=reserves.get(a["version"]),
+            # EXECUTION RAILS pass strict_prices=True per account_input: their `prices` dict
+            # is the broker's live quotes and is the ONLY price source. Absent -> False, so
+            # every offline/backtest caller is byte-identical.
+            strict_prices=bool(a.get("strict_prices", False))))
     return plans
 
 

@@ -322,13 +322,17 @@ def _do_work(ib, today: date) -> int:
         positions = {p.contract.symbol: p.position
                     for p in ib.positions(info.number) if p.position != 0}
         tier_prices = targets[info.version].prices
-        prices = {}
-        for sym in set(tier_prices.index) | set(positions):
-            q = quotes.get(sym)
-            ref = live_quotes.reference_price(q) if q else None
-            prices[sym] = ref if (ref and ref > 0) else float(tier_prices.get(sym, float("nan")))
+        # LIVE QUOTE ONLY (owner decision, v0.42.0): the tier's stored daily close is not
+        # substituted for a quote IBKR would not give. A symbol with no live quote is not
+        # sized and not traded; it is named below and reported NOT in spec.
+        prices, unquoted = live_quotes.execution_prices(
+            quotes, set(tier_prices.index) | set(positions))
+        if unquoted:
+            print(f"    {info.number}: no live IBKR quote for {len(unquoted)} symbol(s): "
+                  f"{', '.join(unquoted)} — they will NOT be traded.")
         account_inputs.append({"account": info.number, "version": info.version,
-                              "net_liq": info.net_liq, "positions": positions, "prices": prices})
+                              "net_liq": info.net_liq, "positions": positions, "prices": prices,
+                              "strict_prices": True})
 
     strat_universe = _strategy_universe()
     out = build_plan(account_inputs, targets, universe=strat_universe)

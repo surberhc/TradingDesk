@@ -37,12 +37,20 @@ engine runs the EXACT code the backtester validated.
 - ✅ `execution_engine.py` — **DRY-RUN skeleton**: compute target → connect read-only → read NAV +
   positions → diff vs target → LOG intended limit orders. Verified: 5 BUYs (~$31.9k notional) against
   the flat $31.8k account. Transmits nothing. Enforces READONLY+DRY_RUN and the DU/DF paper guard.
-- ✅ `risk_manager.py` — **RiskManager + kill switch**. Guards: daily-loss **kill switch** (−2%,
-  trips + **persists** to `C:\TradingDesk-Local\state\paperbot\killswitch.json`, survives restart,
-  manual-clear only — verified firing); **cash-reserve / no-leverage**; **per-position cap** (35% on
-  risk assets, cash-equivalents exempt — the old 5% would have vetoed the strategy itself); **max
-  legs**; order sanity. Positions are now sized vs **investable = NAV×(1−1.5%)** so the reserve holds by
-  construction and the book never levers.
+- ✅ `risk_manager.py` — **order/batch sanity guards** (`evaluate()`). What it actually checks:
+  **order-notional sanity** — a single order may not exceed NAV ("exceeds NAV"); **cash-reserve /
+  no-leverage batch guard** — the book that would actually result must still leave ≥ the model's
+  reserve liquid (cash-equivalents count toward it); **max legs per order**; non-positive quantity;
+  and **fail-closed price resolution** — if no usable price can be resolved for a symbol (no live
+  quote, no limit price, never 0.0/NaN), that order is REFUSED rather than passed unchecked, and an
+  unpriceable *position* vetoes the batch guard rather than letting it read as fully reserved.
+  Positions are sized vs **investable = NAV×(1−reserve)** so the reserve holds by construction and
+  the book never levers.
+  **There is NO automated daily-loss halt and NO per-position cap.** Both (`max_daily_loss_pct_nav`
+  = −2% and `max_position_pct_nav` = 0.35) were **removed 2026-08-25 by owner decision (Andrew)** —
+  neither was ever authorized; both entered in the pre-git baseline with no decision record. Do not
+  re-add them. The operator stop on this desk is the **MANUAL, file-based** one (the
+  `AUTOTRADE_DISABLED` sentinel / KILL_SWITCH label), not an automatic P&L breaker.
 - ✅ `order_router.py` — **OrderRouter**: builds the exact IBKR LIMIT orders, **qualifies contracts**
   (real conIds returned), deterministic `orderRef` per (account, as_of, side, symbol) for
   **idempotency**. `transmit=False` always; a `transmit_guard` fails CLOSED (DRY_RUN / READONLY /
