@@ -64,8 +64,8 @@ $descA = 'One-shot morning "still down" alarm for the read-only live-DATA Gatewa
          'a trading day, emails ONE nudge via the dailyreport mailer, then exits. ' +
          'Probe-and-email only: launches nothing, never pushes a 2FA. LogonType=' +
          'Interactive, so it does NOT fire when nobody is logged into Windows. ' +
-         'Registered 2026-08-31 (the task the launcher header claimed since 2026-08-05 ' +
-         'but which was never actually created).'
+         'Registered by hand 2026-08-05 and firing correctly since; this registration ' +
+         'script was checked in 2026-08-31 to make it reproducible.'
 
 Register-ScheduledTask -TaskName 'LiveDataMorningStillDownAlarm_0845CT' -Action $actA `
         -Trigger $trigA -Principal $prin -Settings $set -Description $descA -Force | Out-Null
