@@ -79,6 +79,15 @@ def test_enrolled_roster_falls_back_to_config_when_crm_unset(monkeypatch):
     assert roster.enrolled_roster() == sorted(set(config.ENROLLMENT))
 
 
+def _scan(accounts, **extra):
+    """A crm_enrolled_roster_scan-shaped result. enrolled_roster now reads the SCAN (which also
+    carries the no-trade holds, the unfunded accounts and the model list) and takes its
+    'accounts' key, so the CRM seam these tests patch is the scan, not the thin wrapper."""
+    out = {"accounts": list(accounts), "held": [], "unfunded": [], "models": [], "scope": []}
+    out.update(extra)
+    return out
+
+
 def test_enrolled_roster_falls_back_when_crm_unavailable(monkeypatch):
     """DSN present but the CRM read fails -> still degrades to config, never raises."""
     monkeypatch.setenv(crm_roster.DSN_ENV, "postgresql://unreachable")
@@ -86,14 +95,14 @@ def test_enrolled_roster_falls_back_when_crm_unavailable(monkeypatch):
     def boom(*a, **k):
         raise crm_roster.CrmRosterUnavailable("down")
 
-    monkeypatch.setattr(roster, "crm_enrolled_roster", boom)
+    monkeypatch.setattr(roster, "crm_enrolled_roster_scan", boom)
     assert roster.enrolled_roster() == sorted(set(config.ENROLLMENT))
 
 
 def test_enrolled_roster_uses_crm_when_available(monkeypatch):
     monkeypatch.setenv(crm_roster.DSN_ENV, "postgresql://ok")
-    monkeypatch.setattr(roster, "crm_enrolled_roster",
-                        lambda *a, **k: ["U999", "U111"])
+    monkeypatch.setattr(roster, "crm_enrolled_roster_scan",
+                        lambda *a, **k: _scan(["U999", "U111"]))
     assert roster.enrolled_roster() == ["U999", "U111"]
 
 

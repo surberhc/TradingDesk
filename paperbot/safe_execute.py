@@ -48,6 +48,7 @@ from connections import gateway_probe
 import config
 import live_quotes
 import order_router
+import pdt_guard
 import s0_live
 import s4_risk
 
@@ -903,6 +904,30 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
         mg_ok, mg_reason = _margin_preflight_ok(summary, net_liq, total_buy, plan, target)
         if not mg_ok:
             reasons.append(mg_reason)
+    # Per-account PATTERN-DAY-TRADER (PDT) pre-flight. Until now this check existed ONLY on the
+    # FA block rail (live_fa_block_execute), while the rail the Control Plane actually shells
+    # out to — batch_rebalance_execute -> THIS function, once per account — had none. An account
+    # IBKR has already flagged PDT rejects ORDINARY orders, not just day trades (2026-07-28,
+    # U5721712: a plain BUY of 1 USFR bounced), so the check must sit on every transmit path.
+    #
+    # Same guard shape as the buying-power and margin checks above: armed transmit lane only,
+    # and only once the code-level gates are already clean. ZERO new broker reads — `summary`
+    # is this ONE account's already-filtered accountSummary rows (batch_rebalance_execute puts
+    # ib.accountSummary() through s0_live.filter_account_summary per account, and
+    # crm_execute.build_batch_requests hands each request its own), and ib_async requests
+    # DayTradesRemaining by default.
+    #
+    # The absent-tag rule is the load-bearing design decision here — several real, tradeable
+    # accounts return NO DayTradesRemaining tag at all (measured on 4003, 2026-09-01), so a
+    # naive fail-closed would refuse them. pdt_guard's module header states the rule and its
+    # trade-off in full; read it before changing this.
+    if armed and purpose_ok and armed_conn and not reasons:
+        pdt = pdt_guard.pdt_verdict(account, summary)
+        # NEVER SILENT — the verdict is printed on a clearance as well as on a refusal, so an
+        # armed run always shows which basis each account was let through on.
+        print(f"    PDT pre-flight [{pdt.code}]: {pdt.reason}")
+        if not pdt.ok:
+            reasons.append(pdt.reason)
 
     permit = (armed and purpose_ok and armed_conn and not kill and not reasons)
 

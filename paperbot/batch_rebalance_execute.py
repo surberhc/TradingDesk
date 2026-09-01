@@ -62,6 +62,11 @@ left stubbed (fa_block_whatif_preflight below); the per-account path needs none 
 Run — PREVIEW (default; transmits nothing):
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe batch_rebalance_execute.py
 
+Run — PREVIEW scoped to a SUBSET of the book (exact CRM model labels; still transmits
+nothing). No --models token = the whole book, exactly as before:
+  C:\\TradingDesk-Local\\venv\\Scripts\\python.exe batch_rebalance_execute.py \\
+      --models="Growth (Custom),Balanced (Custom),Growth (Small, Custom)"
+
 Run — ARMED batch rebalance (human-supervised; requires an armed Gateway + no kill switch):
   C:\\TradingDesk-Local\\venv\\Scripts\\python.exe batch_rebalance_execute.py --arm-i-understand
 """
@@ -582,23 +587,69 @@ def _safety_banner(roster_accounts: list[str], versions: dict[str, str], armed: 
     print("#" * 92)
 
 
-def main(armed: bool = False, today: object = None) -> int:
+def main(armed: bool = False, today: object = None, models=None) -> int:
     """BATCH REBALANCE executor. PREVIEW by default; transmits per-account ONLY when armed AND
     every per-account gate passes. `today` is accepted for signature parity with the other
-    runners; the shared brain always runs to the most recent data date."""
+    runners; the shared brain always runs to the most recent data date.
+
+    `models` narrows the run to one or more CRM model LABELS (the scope the Control Plane's
+    selector passes through as ``--models=...``). None / empty means the WHOLE BOOK — the
+    pre-existing behaviour, byte for byte. Scoping happens entirely in the roster resolution
+    below: everything downstream still sees one roster and one account wall, so a scoped run
+    is a smaller allow-list, never a different code path."""
     print("=" * 92)
     print(f"BATCH REBALANCE EXECUTOR (multi-account, roster-scoped) — preview by default, "
           f"per-account two-phase rebalance when armed   [{version.banner()}]")
     print("=" * 92)
 
     # [1] The human-blessed execution roster (allow-list) + each account's model version.
-    print("\n[1] Resolving the human-blessed execution roster (roster.enrolled_roster)...")
+    print("\n[1] Resolving the human-blessed execution roster "
+          "(roster.enrolled_roster_scan)...")
     try:
-        roster_accounts = roster.enrolled_roster()
+        scan = roster.enrolled_roster_scan(models=models)
+    except roster.RosterScopeUnavailable as exc:
+        # A MODEL-SCOPED run whose scope cannot be honoured. Refusing is the whole point: the
+        # degraded config.ENROLLMENT fallback carries no model labels, so falling back would
+        # WIDEN the deliberately narrowed run to the whole fallback allow-list. Fail closed,
+        # exactly like every other pre-connection refusal on this rail.
+        print(f"    REFUSING THE SCOPED RUN: {exc}. Nothing connected, nothing transmitted.")
+        return 2
     except Exception as exc:  # noqa: BLE001 — never crash before the safety banner
         print(f"    COULD NOT RESOLVE ROSTER: {type(exc).__name__}: {exc}. Nothing "
               f"connected, nothing transmitted.")
         return 2
+    roster_accounts = scan["accounts"]
+    scope = scan.get("scope") or []
+    held = scan.get("held") or []
+    unfunded = scan.get("unfunded") or []
+    source = scan.get("source") or "unknown"
+
+    # THE SCOPE, SAID OUT LOUD. An operator who narrowed the run must see the narrowing here,
+    # and an operator who did NOT must see that this is the whole book.
+    print(f"    model scope: {', '.join(scope) if scope else 'WHOLE BOOK (no model scope)'}"
+          f"   (roster source: {source})")
+    # THE NO-TRADE HOLDS, BY NAME. A held account is never a silent omission — the CRM's hold
+    # is the reason it is missing from the allow-list, and the run says so.
+    if held:
+        print("")
+        print(f"    !! NO-TRADE HOLD - {len(held)} account(s) in scope are HELD in the CRM and "
+              f"are EXCLUDED from this run.")
+        print(f"       They are not read, not sized, and independently refused by the account "
+              f"wall. Clear the hold in the CRM to trade them.")
+        for acct in held:
+            print(f"         {acct}: no-trade hold")
+    # IN SCOPE, UNHELD, BUT NOTHING TO ACT ON. Also named — an account the desk cannot see
+    # funded reality for is a data problem, not a clean pass.
+    if unfunded:
+        print("")
+        print(f"    !! NOT FUNDED/VISIBLE - {len(unfunded)} in-scope account(s) have no funded "
+              f"reality and are EXCLUDED from this run.")
+        for acct in unfunded:
+            print(f"         {acct}: no holdings snapshot and no fresh, funded NAV")
+    # ONE machine-parseable line, mirroring the BATCH-SUMMARY convention.
+    print(f"    BATCH-SCOPE models={','.join(scope) if scope else 'ALL'} "
+          f"roster={len(roster_accounts)} held={len(held)} unfunded={len(unfunded)} "
+          f"source={source}")
     if not roster_accounts:
         print("    The enrolled execution roster is EMPTY — nothing to rebalance. Nothing "
               "connected, nothing transmitted.")
@@ -969,11 +1020,47 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     return 0
 
 
+# The optional MODEL-SCOPE token. `--models=Growth (Custom),Balanced (Custom)` narrows the run
+# to those CRM model labels; NO token means the whole book, i.e. exactly today's behaviour.
+MODELS_TOKEN = "--models="
+
+
+def models_requested(argv: list[str]) -> list[str]:
+    """The MODEL SCOPE asked for on the command line, as a list of exact CRM labels. PURE.
+
+    Parses ``--models=Label A,Label B``. Labels are the CRM's own strings, so they contain
+    SPACES, COMMAS INSIDE PARENTHESES ("Growth (Small, Custom)") and brackets — the shell hands
+    the whole assignment over as ONE argv element when it is quoted, and that element is split
+    on commas that are NOT inside parentheses, so a label like "Growth (Small, Custom)" stays
+    whole. Whitespace around each label is stripped; empties are dropped. No token (or an
+    empty one) returns [] — the whole book, unscoped, byte-for-byte the pre-existing run."""
+    out: list[str] = []
+    for arg in argv:
+        if not str(arg).startswith(MODELS_TOKEN):
+            continue
+        raw = str(arg)[len(MODELS_TOKEN):]
+        depth = 0
+        current = ""
+        for ch in raw:
+            if ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth = max(0, depth - 1)
+            if ch == "," and depth == 0:
+                out.append(current)
+                current = ""
+            else:
+                current += ch
+        out.append(current)
+    return [m.strip() for m in out if m.strip()]
+
+
 def cli(argv: list[str] | None = None) -> int:
     """CLI entry: --arm-i-understand sets armed=True (the only thing that arms). No token ->
-    preview that transmits nothing."""
+    preview that transmits nothing. --models=Label A,Label B narrows the run to those CRM
+    model labels; no --models token = the whole book, exactly as before."""
     argv = sys.argv[1:] if argv is None else argv
-    return main(armed=arm_requested(argv))
+    return main(armed=arm_requested(argv), models=models_requested(argv) or None)
 
 
 if __name__ == "__main__":

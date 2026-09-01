@@ -37,6 +37,15 @@ ACCT_Z = "DU9999999"      # not enrolled anywhere
 
 
 # --- synthetic fixtures (NEVER the real CRM DB / broker) ----------------------------
+def _roster_scan(accounts, *, held=(), unfunded=(), models=(), scope=(), source="config"):
+    """A roster.enrolled_roster_scan-shaped result. main() now resolves the roster through the
+    SCAN (the allow-list plus the no-trade holds, the unfunded accounts, the model list and the
+    scope actually applied) so it can report what was excluded, so this is the seam the tests
+    patch."""
+    return {"accounts": list(accounts), "held": list(held), "unfunded": list(unfunded),
+            "models": list(models), "scope": list(scope), "source": source}
+
+
 def _target(version, weights, prices):
     return strategy_target.Target(
         weights=pd.Series(weights), prices=pd.Series(prices),
@@ -338,7 +347,8 @@ def test_build_targets_custom_label_with_no_target_fails_closed(monkeypatch):
 def test_main_refuses_and_connects_nothing_when_a_custom_target_fails(monkeypatch):
     """The pre-existing fail-closed contract (COULD NOT BUILD TARGET -> rc 2, connects to
     nothing) applies identically to a custom allocation."""
-    monkeypatch.setattr(roster, "enrolled_roster", lambda: [CUSTOM_ACCT])
+    monkeypatch.setattr(roster, "enrolled_roster_scan",
+                        lambda models=None: _roster_scan([CUSTOM_ACCT]))
     monkeypatch.setattr(bre, "resolve_roster_versions",
                         lambda accts: {CUSTOM_ACCT: CUSTOM_LABEL})
 
@@ -954,3 +964,125 @@ def test_batch_held_aside_test_reuses_holding_class_predicate():
     assert holding_class.is_held_aside("BOND") is True
     assert holding_class.is_held_aside("STK") is False
     assert holding_class.is_held_aside(None) is True        # fail closed on unknown
+
+
+# =====================================================================================
+# MODEL SCOPE (--models) — narrowing a run to a subset of the book, and the loud report
+# of everything the roster resolution excluded.
+#
+# THE GAP THIS CLOSES. The Control Plane shelled out to this executor with NO account
+# filter at all: the only run available was the whole book. The SQL-side single-`model`
+# filter already existed one layer down in crm_roster.fetch_roster and was never connected
+# to anything. A first live deployment therefore had to be all-or-nothing.
+# =====================================================================================
+def test_models_token_absent_means_the_whole_book():
+    """No --models token -> [] -> main(models=None): byte-for-byte the pre-existing run."""
+    assert bre.models_requested([]) == []
+    assert bre.models_requested(["--arm-i-understand"]) == []
+    assert bre.models_requested(["--models="]) == []
+
+
+def test_models_token_parses_a_simple_comma_list():
+    assert bre.models_requested(["--models=Growth,Balanced"]) == ["Growth", "Balanced"]
+
+
+def test_models_token_parses_labels_with_spaces_and_parentheses():
+    """Real CRM labels contain spaces AND a comma INSIDE the parentheses. The comma in
+    "Growth (Small, Custom)" is part of the label, not a separator — split on it and the run
+    would be scoped to two models that do not exist, silently selecting nobody."""
+    argv = ["--models=Growth (Custom),Balanced (Custom),Growth (Small, Custom)"]
+    assert bre.models_requested(argv) == [
+        "Growth (Custom)", "Balanced (Custom)", "Growth (Small, Custom)"]
+
+
+def test_models_token_strips_whitespace_and_drops_empties():
+    assert bre.models_requested(["--models= Growth (Custom) , ,Balanced (Custom) "]) == [
+        "Growth (Custom)", "Balanced (Custom)"]
+
+
+def test_cli_threads_the_scope_through_to_main(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bre, "main", lambda **kw: seen.update(kw) or 0)
+    bre.cli(["--models=Growth (Small, Custom),Balanced (Custom)"])
+    assert seen["armed"] is False
+    assert seen["models"] == ["Growth (Small, Custom)", "Balanced (Custom)"]
+
+
+def test_cli_with_no_scope_passes_models_none(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(bre, "main", lambda **kw: seen.update(kw) or 0)
+    bre.cli([])
+    assert seen["models"] is None
+
+
+def test_cli_scope_and_arm_token_are_independent(monkeypatch):
+    """The scope token must not arm anything, and the arm token must not widen the scope."""
+    seen = {}
+    monkeypatch.setattr(bre, "main", lambda **kw: seen.update(kw) or 0)
+    bre.cli(["--arm-i-understand", "--models=Growth (Custom)"])
+    assert seen["armed"] is True and seen["models"] == ["Growth (Custom)"]
+
+
+def test_main_passes_the_scope_to_the_roster_resolution(monkeypatch):
+    """The scope narrows the ROSTER ITSELF — the allow-list every downstream wall reads."""
+    seen = {}
+
+    def _scan(models=None):
+        seen["models"] = models
+        return _roster_scan([])
+
+    monkeypatch.setattr(roster, "enrolled_roster_scan", _scan)
+    monkeypatch.setattr(bre.s0_live, "connect_s0_live",
+                        lambda *a, **k: (_ for _ in ()).throw(AssertionError("no connect")))
+    assert bre.main(models=["Growth (Custom)"]) == 0
+    assert seen["models"] == ["Growth (Custom)"]
+
+
+def test_main_refuses_a_scoped_run_the_roster_cannot_honour(monkeypatch):
+    """FAIL CLOSED. A scope that cannot be honoured must refuse, not widen: the degraded
+    config fallback carries no model labels, so falling back would run the WHOLE book after
+    the operator deliberately narrowed it."""
+    def _boom(models=None):
+        raise roster.RosterScopeUnavailable("no model labels in the fallback")
+
+    def _must_not_connect(*a, **k):
+        raise AssertionError("MUST NOT CONNECT after a refused scope")
+
+    monkeypatch.setattr(roster, "enrolled_roster_scan", _boom)
+    monkeypatch.setattr(bre.s0_live, "connect_s0_live", _must_not_connect)
+    monkeypatch.setattr(bre.s0_live, "connect_s0_live_armed", _must_not_connect)
+    assert bre.main(armed=True, models=["Growth (Custom)"]) == 2
+
+
+def test_main_prints_the_scope_line_and_names_every_exclusion(monkeypatch, capsys):
+    """A NO-TRADE HOLD must never be a silent omission: the run names every held account and
+    every in-scope unfunded one, and prints ONE machine-parseable BATCH-SCOPE line."""
+    monkeypatch.setattr(
+        roster, "enrolled_roster_scan",
+        lambda models=None: _roster_scan(
+            [], held=["U111", "U222"], unfunded=["U333"],
+            scope=["Balanced (Custom)", "Growth (Custom)"], source="crm"))
+    assert bre.main(models=["Growth (Custom)", "Balanced (Custom)"]) == 0
+    out = capsys.readouterr().out
+    assert "BATCH-SCOPE models=Balanced (Custom),Growth (Custom) roster=0 held=2 " \
+           "unfunded=1 source=crm" in out
+    assert "NO-TRADE HOLD" in out and "U111" in out and "U222" in out
+    assert "NOT FUNDED/VISIBLE" in out and "U333" in out
+
+
+def test_main_says_whole_book_when_nothing_was_scoped(monkeypatch, capsys):
+    monkeypatch.setattr(roster, "enrolled_roster_scan",
+                        lambda models=None: _roster_scan([], source="config"))
+    assert bre.main() == 0
+    out = capsys.readouterr().out
+    assert "WHOLE BOOK" in out
+    assert "BATCH-SCOPE models=ALL roster=0 held=0 unfunded=0 source=config" in out
+
+
+def test_the_batch_summary_line_is_unchanged(monkeypatch):
+    """The Control Plane parses BATCH-SUMMARY. BATCH-SCOPE is an ADDITIONAL line; the summary's
+    own format must not have moved."""
+    import inspect
+    src = inspect.getsource(bre.run_batch_session)
+    assert 'BATCH-SUMMARY roster=' in src
+    assert 'out_of_spec=' in src and 'in_spec=' in src and 'skipped=' in src

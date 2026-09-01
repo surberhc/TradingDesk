@@ -84,7 +84,86 @@ _BATCH_PREVIEW_TIMEOUT_SEC = 300     # reads + sizes EVERY roster account
 _BATCH_EXECUTE_TIMEOUT_SEC = 600     # per-account two-phase transmit across the roster
 # The deliberate typed confirmation for the batch send (the single-account rail types the
 # account id; the batch spans the whole roster, so it types this fixed phrase instead).
+#
+# SCOPE-AWARE ON PURPOSE. "REBALANCE ALL" is the honest phrase for a whole-book run and an
+# actively MISLEADING one for a run narrowed to a few models — the operator would be typing
+# "ALL" while sending a subset, which is exactly the sort of mismatch between what the screen
+# says and what the machine does that this rail exists to prevent. A scoped run types
+# "REBALANCE SELECTED" instead.
 BATCH_CONFIRM_PHRASE = "REBALANCE ALL"
+BATCH_CONFIRM_PHRASE_SCOPED = "REBALANCE SELECTED"
+
+
+def _scope_key(models) -> list[str]:
+    """The NORMALISED model scope: stripped, de-duped, sorted, empties dropped. PURE.
+
+    One definition, used everywhere a scope is compared, displayed, or handed to the executor,
+    so "Growth (Custom), Balanced (Custom)" and "Balanced (Custom),Growth (Custom)" are the
+    SAME scope and never read as a change of plan. An empty/None selection normalises to ``[]``
+    — the whole book."""
+    return sorted({str(m).strip() for m in (models or ()) if str(m).strip()})
+
+
+def _batch_confirm_phrase(models=None) -> str:
+    """The exact phrase the operator must type for THIS run. PURE. Whole book ->
+    'REBALANCE ALL'; any model scope -> 'REBALANCE SELECTED'. Every display of the phrase and
+    the comparison against what was typed both read this, so the text on screen and the
+    required input can never disagree."""
+    return BATCH_CONFIRM_PHRASE_SCOPED if _scope_key(models) else BATCH_CONFIRM_PHRASE
+
+
+def _batch_models_flag(models=None) -> list[str]:
+    """The extra argv for the batch executor for this scope. PURE. ``[]`` when nothing is
+    selected — the flag is OMITTED entirely, so an unscoped run is the byte-for-byte
+    pre-existing whole-book command line."""
+    scope = _scope_key(models)
+    return [f"--models={','.join(scope)}"] if scope else []
+
+
+def _batch_scope_mismatch(selected, previewed) -> str | None:
+    """The SAFETY PROPERTY, as one pure decision: None when the currently-selected model scope
+    is the same scope the stored batch preview was BUILT with, otherwise the plain-English
+    reason the arm gate refuses.
+
+    Why this gate exists: the preview and the send are two separate button presses, and the
+    scope selector sits between them. Without this, an operator could preview 14 accounts on
+    three models, then widen the selector to the whole book and press Send — arming a 185-
+    account run off a 14-account review. A preview may only ever arm the exact scope it
+    reviewed; changing the scope means building the preview again."""
+    sel = _scope_key(selected)
+    prev = _scope_key(previewed)
+    if sel == prev:
+        return None
+    _name = lambda s: ", ".join(s) if s else "the whole book"  # noqa: E731
+    return (
+        f"The model scope changed after this preview was built. The preview covers "
+        f"{_name(prev)}; the selector now says {_name(sel)}. Nothing can be sent from a "
+        f"preview of a different set of accounts — build the batch preview again for "
+        f"{_name(sel)}, or put the selector back to {_name(prev)}."
+    )
+
+
+def _batch_model_choices() -> list[str]:
+    """Every model label present in the blessed roster, for the scope selector's options.
+
+    Read ONCE from the CRM (the same read-only role and the same advisor book the executor
+    itself scopes to, so the offered choices are exactly the choices that can select
+    accounts) and CACHED in session state, because Streamlit reruns this page on every
+    keystroke in the confirm box. NEVER raises into the page: if the CRM is not configured or
+    is unreachable, the choice list is empty, which the selector renders as "no scope
+    available" — i.e. the whole book, the pre-existing behaviour."""
+    cached = st.session_state.get("cp_batch_model_choices")
+    if isinstance(cached, list):
+        return cached
+    choices: list[str] = []
+    try:
+        import roster
+        scan = roster.crm_enrolled_roster_scan()
+        choices = [str(m) for m in (scan.get("models") or [])]
+    except Exception:  # noqa: BLE001 — a scope selector must never break the page
+        choices = []
+    st.session_state["cp_batch_model_choices"] = choices
+    return choices
 
 # --- Reviewed-preview freshness / expiry (decision D, 2026-07-31) -----------------
 # The operator reviews a read-only preview (Step 1), physically arms the gateway in TWS,
@@ -1568,13 +1647,18 @@ def _batch_failure(parsed: dict, returncode: int | None) -> str | None:
     return _batch_reconciliation_warning(parsed)
 
 
-def _store_batch_last_preview(stdout: str, returncode: int | None = None) -> None:
+def _store_batch_last_preview(stdout: str, returncode: int | None = None,
+                              models=None) -> None:
     """Bind the batch arm/send controls to the LAST batch preview ATTEMPT. Stores a compact
     summary + a wall-clock timestamp under ``cp_batch_last_preview`` (the freshness key), plus
     the same explicit ``ok``/``failure`` marker the single-account rail stores, so a crashed
     run or a totals-versus-table mismatch keeps refusing the arm gate on every rerun instead
     of decaying into a clean-looking preview. Never raises — the executor recomputes
-    authoritatively at fire time regardless."""
+    authoritatively at fire time regardless.
+
+    ``models`` is the MODEL SCOPE this preview was actually built with, stored alongside it so
+    the Step 3 gate can refuse to arm a scope the operator never reviewed
+    (:func:`_batch_scope_mismatch`)."""
     try:
         parsed = _parse_batch_preview(stdout or "")
         sm = parsed.get("summary") or {}
@@ -1587,6 +1671,7 @@ def _store_batch_last_preview(stdout: str, returncode: int | None = None) -> Non
             "n_roster": sm.get("roster"),
             "total_legs": sm.get("total_legs"),
             "returncode": returncode,
+            "scope": _scope_key(models),           # the scope this preview reviewed
             "ok": failure is None,
             "failure": failure,
         }
@@ -1710,10 +1795,15 @@ def _render_batch_preview_result(stdout: str, stderr: str,
         st.code((stdout or "") + (("\n" + stderr) if stderr else ""), language=None)
 
 
-def _run_batch_preview_and_render() -> None:
-    """Run the batch executor in PREVIEW mode (no args) and render the per-account plan.
-    Mirrors _run_preview_and_render: same existence check, same subprocess posture, same
-    plain-English failure cards. Transmits nothing."""
+def _run_batch_preview_and_render(models=None) -> None:
+    """Run the batch executor in PREVIEW mode and render the per-account plan. Mirrors
+    _run_preview_and_render: same existence check, same subprocess posture, same plain-English
+    failure cards. Transmits nothing.
+
+    ``models`` is the operator's MODEL SCOPE. It is passed to the executor as ``--models=...``
+    and stored with the preview, so Step 3 can refuse to arm a different scope than the one
+    reviewed here. Nothing selected -> the flag is omitted and this is the whole-book preview
+    exactly as before."""
     if not os.path.exists(VENV_PYTHON) or not _BATCH_SCRIPT.exists():
         st.markdown(
             theme.status_card(
@@ -1732,7 +1822,7 @@ def _run_batch_preview_and_render() -> None:
         with st.spinner("Building the read-only BATCH preview (reading every roster account "
                         "on the port-4003 gateway)…"):
             proc = deskproc.run(
-                [VENV_PYTHON, str(_BATCH_SCRIPT)],
+                [VENV_PYTHON, str(_BATCH_SCRIPT)] + _batch_models_flag(models),
                 cwd=str(_BATCH_CWD), capture_output=True, text=True,
                 timeout=_BATCH_PREVIEW_TIMEOUT_SEC,
             )
@@ -1768,8 +1858,9 @@ def _run_batch_preview_and_render() -> None:
         return
 
     _render_batch_preview_result(stdout, stderr, returncode)
-    # Bind the batch arm/send step to THIS attempt — including, deliberately, a failed one.
-    _store_batch_last_preview(stdout, returncode)
+    # Bind the batch arm/send step to THIS attempt — including, deliberately, a failed one —
+    # and to the exact model scope this attempt was built with.
+    _store_batch_last_preview(stdout, returncode, models=models)
     _batch_note = _stored_preview_failure("cp_batch_last_preview")
     _arm_execute_audit(
         category="control_plane_batch_preview",
@@ -1794,12 +1885,17 @@ def _classify_batch_output(stdout: str, stderr: str) -> str:
     return "error"
 
 
-def _run_batch_execute_and_render(can_press: bool, pressed: bool) -> None:
+def _run_batch_execute_and_render(can_press: bool, pressed: bool, models=None) -> None:
     """The batch transmit path — modelled on _run_execute_and_render: same
     `if not can_press or not pressed: return` gate, same executor-existence check, same guarded
     audit, same in-handler arm-token construction, same subprocess invocation of the batch
     executor with the token, same result classification + audits. Returns immediately unless
-    BOTH gates hold and the button was pressed."""
+    BOTH gates hold and the button was pressed.
+
+    ``models`` is the MODEL SCOPE, passed to the executor as ``--models=...``. `can_press`
+    already carries the caller's scope gate: it is False whenever the selected scope differs
+    from the one the stored preview was built with, so a widened selector can never fire off
+    a narrower review."""
     if not can_press or not pressed:
         return
     if not os.path.exists(VENV_PYTHON) or not _BATCH_SCRIPT.exists():
@@ -1826,7 +1922,7 @@ def _run_batch_execute_and_render(can_press: bool, pressed: bool) -> None:
         with st.spinner("Transmitting the BATCH rebalance to the live-trade Gateway "
                         "(port 4003) — per-account two-phase cash-gated across the roster…"):
             proc = deskproc.run(
-                [VENV_PYTHON, str(_BATCH_SCRIPT), arm_token],
+                [VENV_PYTHON, str(_BATCH_SCRIPT), arm_token] + _batch_models_flag(models),
                 cwd=str(_BATCH_CWD), capture_output=True, text=True,
                 timeout=_BATCH_EXECUTE_TIMEOUT_SEC,
             )
@@ -1921,8 +2017,9 @@ def _render_batch_rebalance() -> None:
     wall. Nothing sends until the operator refreshes a preview, physically arms the gateway in
     TWS, types the confirm phrase, and presses Send."""
     st.caption(
-        "Rebalance EVERY out-of-spec account on the blessed roster to its model, one account "
-        "at a time, behind the SAME review -> arm -> transmit gate as the single-account lane. "
+        "Rebalance every out-of-spec account on the blessed roster to its model — or only the "
+        "models you select in Step 1 — one account at a time, behind the SAME review -> arm -> "
+        "transmit gate as the single-account lane. "
         "Each account routes through the same fail-closed engine (per-account margin pre-flight "
         "+ two-phase cash-gated transmit). Execution is scoped to the roster allow-list "
         "(roster.enrolled_roster()); it never widens beyond the blessed accounts. Read-only "
@@ -1936,13 +2033,25 @@ def _render_batch_rebalance() -> None:
     # Step 1 · Review.
     with cols[0]:
         st.markdown(theme.section("Step 1 · Review"), unsafe_allow_html=True)
-        st.caption("Build a read-only preview of every out-of-spec roster account. Reads the "
-                   "gateway; transmits nothing.")
+        # THE MODEL SCOPE. Choosing nothing means the whole book (the pre-existing run). This
+        # is the ONLY way to narrow the run, and it narrows the ROSTER itself — the account
+        # wall then refuses everything outside it, so a scoped run cannot reach an account the
+        # operator did not select.
+        _model_choices = _batch_model_choices()
+        selected_models = st.multiselect(
+            "Which models to rebalance (leave empty for every model — the whole book)",
+            options=_model_choices, key="cp_batch_model_scope",
+            placeholder="Every model on the blessed roster (the whole book)")
+        if not _model_choices:
+            st.caption("The list of models could not be read from the client records right "
+                       "now, so this run covers the whole blessed roster.")
+        st.caption("Build a read-only preview of every out-of-spec account in the selected "
+                   "scope. Reads the gateway; transmits nothing.")
         pressed_build = st.button("Build read-only batch preview", key="cp_batch_build_btn")
 
     if pressed_build:
         with plan_slot:
-            _run_batch_preview_and_render()
+            _run_batch_preview_and_render(selected_models)
 
     batch_age_secs, batch_fresh = _batch_preview_freshness()
     # ...and whether that batch preview completed AND its totals agree with its table. Read
@@ -1967,24 +2076,34 @@ def _render_batch_rebalance() -> None:
             st.markdown(theme.pill(f"Preview expired ({_mins} min old) — rebuild it", "warn"),
                         unsafe_allow_html=True)
 
+    # THE SCOPE THE STORED PREVIEW WAS BUILT WITH, and whether the selector still says the same
+    # thing. A preview may only ever arm the exact set of accounts it reviewed.
+    _stored_batch = st.session_state.get("cp_batch_last_preview")
+    previewed_scope = (_stored_batch.get("scope")
+                       if isinstance(_stored_batch, dict) else None)
+    scope_mismatch = _batch_scope_mismatch(selected_models, previewed_scope)
+
     # Step 2 · Arm — reuse the SAME read-only 4003 armed-state probe as the single-account rail,
-    # plus a typed confirm phrase (the batch spans the roster, so it types a fixed phrase).
+    # plus a typed confirm phrase. The phrase is SCOPE-AWARE: the whole book types
+    # "REBALANCE ALL"; a run narrowed to selected models types "REBALANCE SELECTED", so the
+    # words the operator types always describe what is actually about to be sent.
+    confirm_phrase = _batch_confirm_phrase(selected_models)
     with cols[1]:
         st.markdown(theme.section("Step 2 · Arm"), unsafe_allow_html=True)
         st.caption("Uncheck 'Read-Only API' on the port-4003 Gateway in TWS by hand, then "
-                   f"type '{BATCH_CONFIRM_PHRASE}' to confirm you reviewed the batch preview "
+                   f"type '{confirm_phrase}' to confirm you reviewed the batch preview "
                    f"and armed it.")
         pressed_arm = st.button("Check whether the 4003 Gateway is armed",
                                 key="cp_batch_arm_probe_btn")
         confirm_val = st.text_input(
-            f"Type '{BATCH_CONFIRM_PHRASE}' to confirm", value="",
+            f"Type '{confirm_phrase}' to confirm", value="",
             key="cp_batch_execute_confirm",
-            placeholder=f"type {BATCH_CONFIRM_PHRASE} here")
-        confirmed = confirm_val.strip().upper() == BATCH_CONFIRM_PHRASE
+            placeholder=f"type {confirm_phrase} here")
+        confirmed = confirm_val.strip().upper() == confirm_phrase
         if confirmed:
             st.markdown(theme.pill("Confirm phrase typed", "good"), unsafe_allow_html=True)
         else:
-            st.markdown(theme.pill(f"Type {BATCH_CONFIRM_PHRASE} to confirm", "warn"),
+            st.markdown(theme.pill(f"Type {confirm_phrase} to confirm", "warn"),
                         unsafe_allow_html=True)
 
     arm_slot = st.container()
@@ -1995,9 +2114,18 @@ def _render_batch_rebalance() -> None:
     # Step 3 · Send.
     with cols[2]:
         st.markdown(theme.section("Step 3 · Send"), unsafe_allow_html=True)
-        # THE GATE. A batch preview must be young, a completed read of the roster, AND
-        # internally consistent (its totals matching its table) before it can be armed from.
-        can_press = batch_usable and confirmed
+        # THE GATE. A batch preview must be young, a completed read of the roster, internally
+        # consistent (its totals matching its table), AND built with the SAME model scope the
+        # selector still shows, before it can be armed from.
+        can_press = batch_usable and confirmed and scope_mismatch is None
+        if scope_mismatch:
+            st.markdown(
+                theme.status_card(
+                    "Batch send", "warn", "The selected models changed since the preview",
+                    scope_mismatch + " Nothing was transmitted.",
+                ),
+                unsafe_allow_html=True,
+            )
         pressed = st.button("Send batch rebalance to IBKR", key="cp_batch_execute_btn",
                             disabled=not can_press, use_container_width=True)
         if batch_failure:
@@ -2011,10 +2139,16 @@ def _render_batch_rebalance() -> None:
         else:
             step1_mark = "• not yet — build the batch preview"
         step2_mark = ("✓ confirm phrase typed" if confirmed
-                      else f"• not yet — type {BATCH_CONFIRM_PHRASE}")
+                      else f"• not yet — type {confirm_phrase}")
+        step3_mark = ("• the selected models changed — build the batch preview again"
+                      if scope_mismatch else
+                      ("✓ sending only " + ", ".join(_scope_key(selected_models))
+                       if _scope_key(selected_models)
+                       else "✓ sending every model on the blessed roster"))
         st.markdown(
             f"- {step1_mark}\n"
             f"- {step2_mark}\n"
+            f"- {step3_mark}\n"
             f"- Even with both ✓, nothing sends unless the port-4003 Gateway is physically "
             f"armed in TWS ('Read-Only API' unchecked) — the executor measures it per account "
             f"and refuses otherwise. Execution stays scoped to the blessed roster."
@@ -2022,7 +2156,7 @@ def _render_batch_rebalance() -> None:
 
     send_slot = st.container()
     with send_slot:
-        _run_batch_execute_and_render(can_press, pressed)
+        _run_batch_execute_and_render(can_press, pressed, selected_models)
 
 
 # =========================================================================== #

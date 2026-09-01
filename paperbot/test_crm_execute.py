@@ -88,10 +88,20 @@ def test_enrolled_roster_falls_back_to_config_when_crm_unwired(monkeypatch):
     assert ACCT_A in r and ACCT_B in r                    # the human-blessed accounts
 
 
+def _scan(accounts, **extra):
+    """A crm_enrolled_roster_scan-shaped result. enrolled_roster reads the SCAN (accounts +
+    the no-trade holds + the unfunded set + the model list) and takes its 'accounts' key, so
+    the CRM seam these tests patch is the scan, not the thin list wrapper over it."""
+    out = {"accounts": list(accounts), "held": [], "unfunded": [], "models": [], "scope": []}
+    out.update(extra)
+    return out
+
+
 def test_enrolled_roster_prefers_crm_over_config(monkeypatch):
     """CRM wired and returning rows -> the CRM roster IS the allow-list; config is not consulted."""
     monkeypatch.setattr(roster.crm_roster, "is_configured", lambda: True)
-    monkeypatch.setattr(roster, "crm_enrolled_roster", lambda *a, **k: ["U100", "U200"])
+    monkeypatch.setattr(roster, "crm_enrolled_roster_scan",
+                        lambda *a, **k: _scan(["U100", "U200"]))
     r = roster.enrolled_roster()
     assert r == ["U100", "U200"]
     assert ACCT_A not in r and ACCT_B not in r            # config fallback NOT mixed in
@@ -104,14 +114,14 @@ def test_enrolled_roster_degrades_to_config_when_crm_unreachable(monkeypatch):
     def _boom(*a, **k):
         raise roster.crm_roster.CrmRosterUnavailable("simulated outage")
 
-    monkeypatch.setattr(roster, "crm_enrolled_roster", _boom)
+    monkeypatch.setattr(roster, "crm_enrolled_roster_scan", _boom)
     assert roster.enrolled_roster() == sorted(set(config.ENROLLMENT))
 
 
 def test_enrolled_roster_degrades_to_config_when_crm_returns_empty(monkeypatch):
     """CRM wired and reachable but empty -> the account wall must never be left empty."""
     monkeypatch.setattr(roster.crm_roster, "is_configured", lambda: True)
-    monkeypatch.setattr(roster, "crm_enrolled_roster", lambda *a, **k: [])
+    monkeypatch.setattr(roster, "crm_enrolled_roster_scan", lambda *a, **k: _scan([]))
     assert roster.enrolled_roster() == sorted(set(config.ENROLLMENT))
 
 
