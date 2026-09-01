@@ -333,7 +333,8 @@ def fa_block_whatif_preflight(*_args, **_kwargs):
 # PURE request assembly + per-account margin pre-flight line (#57) — unit-testable offline.
 # ========================================================================================
 def build_batch_requests(plans: list, *, targets, quotes, prices, roster_accounts,
-                         summaries=None, armed=False, kill=False, run_id=None) -> list:
+                         summaries=None, armed=False, kill=False, run_id=None,
+                         contracts=None) -> list:
     """PURE: turn the per-account sized plans into per-account ExecutionRequests by REUSING
     crm_execute.requests_from_crm_plan (no re-implementation).
 
@@ -348,7 +349,14 @@ def build_batch_requests(plans: list, *, targets, quotes, prices, roster_account
     when None), and every orderRef it puts on the wire ends in `:{run_id}` — so the single
     ledger record this batch writes joins back to each IBKR order, and forward to the exact
     model / published allocation version that produced it. crm_execute stays untouched (it
-    builds requests with run_id=None for every caller); the stamp is applied here."""
+    builds requests with run_id=None for every caller); the stamp is applied here.
+
+    `contracts` maps symbol -> the BROKER'S OWN already-qualified contract (from ib.positions())
+    and is stamped onto every request the same way, for the same reason: crm_execute is shared
+    with other callers and stays untouched. safe_execute places a leg for a symbol in this map
+    against the broker's contract instead of rebuilding Stock(symbol, "SMART", "USD") — the
+    half that makes a SELL of a MUTUAL FUND a real order rather than one against a US-stock
+    contract IBKR does not have. Absent/empty leaves every leg on the historic path."""
     crm_result = {"plans": list(plans), "blocks": [], "routes": []}
     requests = crm_execute.requests_from_crm_plan(
         crm_result, targets=targets, quotes=quotes, prices=prices,
@@ -356,6 +364,9 @@ def build_batch_requests(plans: list, *, targets, quotes, prices, roster_account
     if run_id:
         for req in requests:
             req.run_id = run_id
+    if contracts:
+        for req in requests:
+            req.contracts = dict(contracts)
     return requests
 
 
@@ -792,6 +803,10 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     # Union of every version's target symbols + every held symbol across the roster, for one
     # batched live-quote fetch.
     held_symbols: set[str] = set()
+    # Book-wide {symbol: broker contract}. A contract is a property of the INSTRUMENT, not of
+    # the account, so one map serves the whole batch: an account BUYING a fund another account
+    # already holds gets the right contract too.
+    held_contracts: dict = {}
     per_account_state: dict[str, dict] = {}
     for account in roster_accounts:
         summary = s0_live.filter_account_summary(all_summary, account=account)
@@ -807,10 +822,21 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
         # traded (fail closed).
         sec_types = {p.contract.symbol: getattr(p.contract, "secType", None)
                      for p in positions_raw if p.position != 0}
+        # THE BROKER'S OWN QUALIFIED CONTRACT per held symbol, off the SAME loop. ib.positions()
+        # already hands us a fully-resolved contract — real conId, real secType, real exchange —
+        # for a mutual fund exactly as much as for an ETF. Keeping it is the whole fix: every
+        # rail below used to THROW IT AWAY and rebuild Stock(symbol, "SMART", "USD") from the
+        # ticker string, which is simply not what a mutual fund is. IBKR then answered "Unknown
+        # contract", the conId was never populated, and reqMktData RAISED while hashing it —
+        # one unqualifiable holding in ONE account killed the whole batch (measured 2026-09-01:
+        # AFMBX/HIGFX et al. in U27295881 / U27305011 crashed the preview for all 16 accounts).
+        contracts = {p.contract.symbol: p.contract
+                     for p in positions_raw if p.position != 0}
         held_symbols |= set(positions)
+        held_contracts.update(contracts)
         per_account_state[account] = {
             "summary": summary, "net_liq": net_liq, "positions": positions,
-            "sec_types": sec_types}
+            "sec_types": sec_types, "contracts": contracts}
 
     target_symbols: set[str] = set()
     for t in targets.values():
@@ -819,7 +845,12 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
 
     print(f"\n[5] Fetching live quotes for {len(universe)} symbol(s) on port "
           f"{LIVE_TRADE_PORT}...")
-    quotes = live_quotes.fetch(ib, universe)
+    # Hand fetch the BROKER'S OWN contract for every HELD symbol (fetch accepts the universe
+    # as a mapping symbol -> contract; None means "not held, rebuild it"). A model target
+    # nobody holds yet still takes the Stock(symbol, "SMART", "USD") path, qualified before
+    # use. A symbol IBKR will not resolve is DROPPED and NAMED — it does not trade, and it no
+    # longer takes the whole run down with it.
+    quotes = live_quotes.fetch(ib, {s: held_contracts.get(s) for s in universe})
     # LIVE QUOTE ONLY (owner decision, v0.42.0). This loop used to fall back to any version's
     # stored daily CLOSE, and then silently drop the key with no tally when even that was
     # missing — a dropped key sized as target 0 shares, i.e. a FULL LIQUIDATION. IBKR is the
@@ -922,7 +953,7 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     requests = build_batch_requests(
         plans, targets=targets, quotes=quotes, prices=prices,
         roster_accounts=roster_accounts, summaries=summaries, armed=armed, kill=kill,
-        run_id=run_id)
+        run_id=run_id, contracts=held_contracts)
     out_of_spec_accounts = [r.account for r in requests]
     # An account with no legs is NOT automatically "in spec". It is in spec only if there
     # was also nothing we failed to price and nothing withheld: an account missing a sleeve

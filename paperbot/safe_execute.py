@@ -41,8 +41,9 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from types import SimpleNamespace
 
-from ib_async import Stock
-
+# NOTE: `Stock` is deliberately NOT imported here any more. This module no longer
+# reconstructs a contract from a ticker string — the broker's own qualified contract is used
+# for a held symbol, and the fallback construction lives in ONE place (live_quotes).
 from connections import gateway_probe
 
 import config
@@ -197,6 +198,15 @@ class ExecutionRequest:
     # conform: it trims to target and leaves non-target holdings (reported in aliens_left).
     # LAST field with a default so every existing positional/keyword construction is unchanged.
     purpose: str = PURPOSE_DEPLOY
+    # {symbol: the BROKER'S OWN already-qualified contract}, from ib.positions(). Threaded
+    # exactly like `quotes`/`prices` — the caller measured it, the engine uses it. A leg for a
+    # symbol in here is placed against the broker's contract (its real conId and real secType,
+    # which is how IBKR identifies the instrument), which is what makes a SELL of a MUTUAL FUND
+    # an order that exists rather than an order against a US-stock contract that does not have
+    # a conId at all. Anything absent falls back to
+    # the historic Stock(symbol, "SMART", "USD"), qualified before use. Defaulted and LAST so
+    # every existing construction (crm_execute's included) is unchanged.
+    contracts: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -631,7 +641,26 @@ def _cum_filled(active: dict) -> float:
     return float(active.get("filled_prior", 0.0)) + live
 
 
-def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, prices):
+def _leg_contract(ib, symbol, contracts=None):
+    """THE contract one leg is placed against, or None when IBKR will not resolve the symbol.
+
+    Prefers the BROKER'S OWN qualified contract when the account holds the symbol (ib.positions()
+    carries it — real conId, real secType, real exchange). That is the half that makes a SELL of
+    a MUTUAL FUND a real order: rebuilding it as Stock(symbol, "SMART", "USD") produces a
+    contract IBKR does not know, so the order is wrong (or unplaceable) at transmit time even
+    though the quote path succeeded. Anything NOT held falls back to that same historic Stock
+    construction, qualified before use.
+
+    Both cases go through the ONE shared chooser, live_quotes.qualified_contracts — no second
+    rule, no lookup table, no exchange hardcoded here. None means: DO NOT PLACE THIS LEG."""
+    picked, unqualified = live_quotes.qualified_contracts(ib, [symbol], known=contracts)
+    if unqualified:
+        return None
+    return picked.get(symbol)
+
+
+def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, prices,
+                    contracts=None):
     """Transmit ONE phase's legs (all sells, or all buys), then WAIT for terminal state with
     bounded straggler re-pricing. Returns a list of per-leg result dicts:
       {symbol, side, requested, filled, status, reprices, skipped, reason}
@@ -666,14 +695,23 @@ def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, pr
                             "filled": 0.0, "status": "SKIPPED_WORKING", "reprices": 0,
                             "skipped": True, "reason": "identical working order open"})
             continue
+        # THE CONTRACT, BEFORE THE ORDER. Fail closed: a symbol IBKR will not resolve has
+        # nothing to place an order against, so the leg is NOT placed and IS reported —
+        # exactly the posture an unpriceable leg already gets. One unrecognisable holding in
+        # one account must never take the run down or send a wrong-contract order.
+        contract = _leg_contract(ib, l.symbol, contracts)
+        if contract is None:
+            print(f"    [{phase_label}] NOT PLACED {l.side} {l.symbol} x{l.qty}: IBKR would "
+                  f"not resolve a contract for this symbol, so there is nothing to place an "
+                  f"order against. Reported, not traded.")
+            results.append({"symbol": l.symbol, "side": l.side, "requested": l.qty,
+                            "filled": 0.0, "status": "SKIPPED_UNQUALIFIED", "reprices": 0,
+                            "skipped": True,
+                            "reason": "IBKR would not resolve a contract for this symbol"})
+            continue
         ref = _deploy_ref(account, as_of, l.side, l.symbol, run_id)
         order = order_router.build_marketable_limit(
             l.symbol, l.side, l.qty, l.limit, account=account, order_ref=ref)
-        contract = Stock(l.symbol, "SMART", "USD")
-        try:
-            ib.qualifyContracts(contract)   # read-only validation nicety
-        except Exception:
-            pass
         order.transmit = True
         trade = ib.placeOrder(contract, order)
         print(f"    [{phase_label}] SENT {l.side} {l.symbol} x{l.qty} LIMIT {l.limit:,.2f} "
@@ -837,6 +875,11 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     target = req.target
     quotes = req.quotes
     prices = req.prices
+    # The BROKER'S OWN contracts for this account's held symbols, measured by the caller and
+    # carried on the request beside quotes/prices. getattr-with-default so a request built by
+    # an older caller (crm_execute, the pilot rails) is unchanged: an empty map means every
+    # leg takes the historic Stock(symbol, "SMART", "USD") path, qualified before use.
+    contracts = getattr(req, "contracts", None) or {}
     net_liq = req.net_liq
     summary = req.summary
     caps = req.caps
@@ -1035,7 +1078,7 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
               f"terminal state (fill/cancel) before sizing any buy.")
         sell_results = _transmit_phase(ib, sell_legs, account=account, as_of=target.as_of,
                                        run_id=run_id, phase_label="SELL", quotes=quotes,
-                                       prices=prices)
+                                       prices=prices, contracts=contracts)
 
         # BETWEEN PHASES — RE-READ realized cash. NEVER trust the plan's expected proceeds; a
         # cancelled sell (the 2026-07-28 BUCK failure) means that cash never landed.
@@ -1069,7 +1112,7 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
               f"{placed_buy_notional:,.2f} <= cash budget {budget:,.2f}): transmit.")
         buy_results = _transmit_phase(ib, scaled_buys, account=account, as_of=target.as_of,
                                       run_id=run_id, phase_label="BUY", quotes=quotes,
-                                      prices=prices)
+                                      prices=prices, contracts=contracts)
 
     # Consolidated result — LOUD on anything unfilled/skipped in either phase.
     _report_phase("SELL", sell_results)

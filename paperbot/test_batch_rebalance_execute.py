@@ -1086,3 +1086,119 @@ def test_the_batch_summary_line_is_unchanged(monkeypatch):
     src = inspect.getsource(bre.run_batch_session)
     assert 'BATCH-SUMMARY roster=' in src
     assert 'out_of_spec=' in src and 'in_spec=' in src and 'skipped=' in src
+
+
+# =====================================================================================
+# BROKER-SUPPLIED CONTRACTS (2026-09-01). The rail must USE the contract ib.positions()
+# already handed it, and must never die because one holding cannot be resolved.
+#
+# THE INCIDENT. U27295881 / U27305011 were moved onto custom models while still holding
+# MUTUAL FUNDS from a previous advisor. Every rail here threw the broker's contract away
+# and rebuilt Stock(symbol, "SMART", "USD") from the ticker string. A fund is not a US
+# stock: IBKR answered "Unknown contract", conId was never populated, and reqMktData
+# RAISED while hashing it — killing the preview for ALL 16 accounts, not just those two.
+# =====================================================================================
+FUND_SYM = "DODGX"
+
+
+class _FundContract(_FakeContract):
+    """What ib.positions() really returns for a mutual fund: FUND on FUNDSERV, real conId."""
+
+    def __init__(self, symbol=FUND_SYM, con_id=86797803):
+        super().__init__(symbol, "FUND")
+        self.exchange = "FUNDSERV"
+        self.currency = "USD"
+        self.conId = con_id
+
+
+class _FundPosition:
+    def __init__(self, account, symbol=FUND_SYM, qty=100.0):
+        self.account = account
+        self.contract = _FundContract(symbol)
+        self.position = qty
+
+
+def _contract_universe_seen(monkeypatch, tmp_path, positions):
+    """Drive run_batch_session and capture EXACTLY what was handed to live_quotes.fetch."""
+    monkeypatch.setattr(ledger, "RUNS_JSONL", os.path.join(str(tmp_path), "runs.jsonl"))
+    monkeypatch.setattr(ledger, "LOG_TXT", os.path.join(str(tmp_path), "paperbot.log"))
+    seen: dict = {}
+
+    def _fetch(ib, syms):
+        seen["syms"] = syms
+        return {s: bre.live_quotes.Quote(s, 100.0, 100.0, 100.0, 100.0, 1) for s in syms}
+
+    monkeypatch.setattr(bre.live_quotes, "fetch", _fetch)
+    monkeypatch.setattr(bre.sp, "_strategy_universe", lambda: set(S0_UNIVERSE))
+    monkeypatch.setattr(bre.recon_report, "_portfolio_values",
+                        lambda ib, account: {FUND_SYM: 10_000.0})
+
+    requests: list = []
+    real_build = bre.build_batch_requests
+
+    def _spy_build(*a, **k):
+        out = real_build(*a, **k)
+        requests.extend(out)
+        return out
+
+    monkeypatch.setattr(bre, "build_batch_requests", _spy_build)
+
+    t, meta = _custom_target_and_meta()
+    summary = [_row(CUSTOM_ACCT, "NetLiquidation", "110000"),
+               _row(CUSTOM_ACCT, "BuyingPower", "110000"),
+               _row(CUSTOM_ACCT, "TotalCashValue", "0")]
+    rc = bre.run_batch_session(_FakeIB(summary, positions), [CUSTOM_ACCT],
+                               {CUSTOM_ACCT: CUSTOM_LABEL}, {CUSTOM_LABEL: t},
+                               armed=False, armed_conn=False, kill=False,
+                               metas={CUSTOM_LABEL: meta})
+    assert rc == 0
+    return seen["syms"], requests
+
+
+def test_batch_hands_the_quote_path_the_brokers_own_contracts(monkeypatch, tmp_path):
+    """THE FIX. The quote universe carries the broker's fully-qualified contract for every
+    HELD symbol — the same objects ib.positions() returned — and None for a model target
+    nobody holds yet (which still takes the Stock(symbol, "SMART", "USD") path)."""
+    fund_pos = _FundPosition(CUSTOM_ACCT)
+    positions = [_FakePosition(CUSTOM_ACCT, "SCHB", 600), fund_pos]
+
+    syms, _requests = _contract_universe_seen(monkeypatch, tmp_path, positions)
+
+    assert isinstance(syms, dict)                          # a map, not a bare ticker list
+    assert syms[FUND_SYM] is fund_pos.contract             # the broker's OWN object, verbatim
+    assert (syms[FUND_SYM].secType, syms[FUND_SYM].exchange) == ("FUND", "FUNDSERV")
+    assert syms["SCHB"] is positions[0].contract           # held ETF: also the broker's
+    assert syms["USFR"] is None                            # target nobody holds: rebuild it
+
+
+def test_batch_stamps_the_broker_contracts_onto_every_execution_request(monkeypatch,
+                                                                       tmp_path):
+    """The transmit half. safe_execute places a leg for a held symbol against the BROKER'S
+    contract, so the map has to ride on the request beside quotes/prices — stamped here, so
+    the shared crm_execute request builder stays untouched."""
+    fund_pos = _FundPosition(CUSTOM_ACCT)
+    positions = [_FakePosition(CUSTOM_ACCT, "SCHB", 600), fund_pos]
+
+    _syms, requests = _contract_universe_seen(monkeypatch, tmp_path, positions)
+
+    assert requests, "the account should be out of spec and produce a request"
+    for req in requests:
+        assert req.contracts[FUND_SYM] is fund_pos.contract
+        assert req.contracts["SCHB"] is positions[0].contract
+        # And what safe_execute would actually place the fund's SELL against.
+        assert bre.safe_execute._leg_contract(None, FUND_SYM, req.contracts) is \
+            fund_pos.contract
+
+
+def test_batch_all_etf_account_passes_no_exotic_contracts(monkeypatch, tmp_path):
+    """EXISTING BEHAVIOUR UNCHANGED. An all-ETF account's quote universe holds exactly the
+    same symbols as before, and every request's contract map is just its own holdings."""
+    positions = [_FakePosition(CUSTOM_ACCT, "SCHB", 600),
+                 _FakePosition(CUSTOM_ACCT, "USFR", 400)]
+
+    syms, requests = _contract_universe_seen(monkeypatch, tmp_path, positions)
+
+    assert sorted(syms) == ["SCHB", "USFR"]
+    assert all(getattr(c, "secType", None) == "STK" for c in syms.values())
+    for req in requests:
+        assert sorted(req.contracts) == ["SCHB", "USFR"]

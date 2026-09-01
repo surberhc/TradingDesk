@@ -36,13 +36,94 @@ def _valid(x) -> bool:
     return x is not None and x == x and x > 0   # not None, not NaN, positive
 
 
+def qualified_contracts(ib, symbols, known=None) -> tuple[dict, list]:
+    """{symbol: contract} to quote/trade `symbols` with, PLUS the symbols IBKR will not
+    resolve. THE one place a contract is chosen, so no rail reintroduces a guess of its own.
+
+    `known` maps symbol -> a contract THE BROKER ALREADY HANDED US. `ib.positions()` returns
+    a resolved contract per holding — MEASURED 2026-09-01, a fund comes back as secType FUND
+    with its real conId (DODGX 86797803) and a BLANK exchange, which is IBKR's own identity
+    for the instrument. There is nothing for us to reconstruct, so it is used AS-IS.
+
+    Every OTHER symbol is built as Stock(symbol, "SMART", "USD") — the desk's long-standing
+    assumption — and then QUALIFIED before use. That assumption is wrong for anything that is
+    not a US stock/ETF. A MUTUAL FUND is secType FUND on FUNDSERV: IBKR answers "Unknown
+    contract", the conId is never populated, and reqMktData then RAISES while hashing the
+    unqualified contract ("can't be hashed because no 'conId' value exists"). MEASURED live
+    2026-09-01: two accounts newly moved onto custom models (U27295881, U27305011) held
+    mutual funds from a previous advisor (AFMBX DFISX DODGX HIGFX MFEKX MIEIX TRGXX) and ONE
+    of those holdings killed the ENTIRE 16-account batch preview. IBKR knows all of them —
+    only our contract construction was wrong.
+
+    ib_async.qualifyContracts returns ONE SLOT PER INPUT, IN INPUT ORDER, holding None where
+    IBKR would not resolve the contract. That None is THE BROKER'S OWN ANSWER, and it is
+    exactly the case that leaves conId unset — so it is what we key on. If the broker's reply
+    is unusable (wrong length, or it raised) we fall back to the literal crash condition: no
+    conId. Either way the symbol is DROPPED here and returned NAMED; it can never reach
+    reqMktData or an order."""
+    known = known or {}
+    ordered = list(dict.fromkeys(symbols))          # input order, no duplicate requests
+    rebuilt = {s: Stock(s, "SMART", "USD") for s in ordered if known.get(s) is None}
+
+    resolved = None
+    if rebuilt:
+        try:
+            resolved = ib.qualifyContracts(*rebuilt.values())
+        except Exception:  # noqa: BLE001 — an unreadable reply must DROP, never crash the run
+            resolved = None
+    keys = list(rebuilt)
+    usable_reply = isinstance(resolved, (list, tuple)) and len(resolved) == len(keys)
+    ok_rebuilt: set = set()
+    for i, s in enumerate(keys):
+        ok = (resolved[i] is not None) if usable_reply else bool(getattr(rebuilt[s], "conId", 0))
+        if ok:
+            ok_rebuilt.add(s)
+
+    contracts: dict = {}
+    unqualified: list = []
+    for s in ordered:
+        c = known.get(s)
+        if c is not None:
+            contracts[s] = c                        # the broker's own — never rebuilt
+        elif s in ok_rebuilt:
+            contracts[s] = rebuilt[s]
+        else:
+            unqualified.append(s)
+    return contracts, sorted(unqualified)
+
+
+def report_unqualified(unqualified: list, indent: str = "    ") -> None:
+    """Print the no-contract tally LOUDLY — the same convention as report_unquoted, because
+    the outcome is the same: the symbol DOES NOT TRADE and is named. Before this the run did
+    not report it at all; it raised and took every other account down with it."""
+    if not unqualified:
+        return
+    print(f"{indent}!! IBKR WOULD NOT RESOLVE A CONTRACT for {len(unqualified)} symbol(s): "
+          f"{', '.join(unqualified)}")
+    print(f"{indent}   There is nothing to quote or to place an order against, so these "
+          f"symbols WILL NOT BE TRADED on this run — not bought, not sold. Every other "
+          f"account and symbol on the run is unaffected.")
+
+
 def fetch(ib, symbols, wait: float = 3.0) -> dict:
     """Snapshot quotes for `symbols`. Requests live data (IBKR serves delayed if a
-    symbol lacks a live entitlement). Snapshots auto-cancel — nothing to clean up."""
+    symbol lacks a live entitlement). Snapshots auto-cancel — nothing to clean up.
+
+    `symbols` is the usual sequence of tickers, OR a MAPPING of symbol -> the BROKER'S OWN
+    already-qualified contract (from ib.positions(); a None value means "no contract, rebuild
+    it"). A symbol with a broker contract is quoted against THAT contract — the mutual-fund
+    fix; every other symbol is built and qualified exactly as before. The signature is
+    deliberately UNCHANGED: a mapping already IS an iterable of its symbols, so all thirteen
+    existing callers are byte-identical and no rail had to learn a new argument.
+
+    A symbol IBKR will not resolve is dropped and NAMED here, and is then simply absent from
+    the returned quotes — which execution_prices already reports as unquoted, i.e. this
+    rail's established "this symbol does not trade" behaviour. Nothing unqualified ever
+    reaches reqMktData, which is what used to raise and kill the whole run."""
     ib.reqMarketDataType(1)   # prefer live; IBKR downgrades per-symbol if needed
-    contracts = {s: Stock(s, "SMART", "USD") for s in symbols}
-    if contracts:
-        ib.qualifyContracts(*contracts.values())
+    known = symbols if isinstance(symbols, dict) else None
+    contracts, unqualified = qualified_contracts(ib, symbols, known=known)
+    report_unqualified(unqualified)
     tickers = {s: ib.reqMktData(c, "", snapshot=True) for s, c in contracts.items()}
     ib.sleep(wait)
     quotes = {}
