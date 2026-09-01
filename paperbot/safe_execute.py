@@ -422,7 +422,33 @@ def _more_aggressive_cap(side: str, symbol: str, quotes: dict, base_limit: float
 # ========================================================================================
 # ORDERED LEG CONSTRUCTION (moved verbatim).
 # ========================================================================================
-def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool):
+def leg_sec_type(leg, contracts: dict | None = None) -> str:
+    """The instrument type ONE leg is for, as the BROKER names it. Prefers the type stamped on
+    the leg at build time, falling back to the broker's own contract map. "" when unknown —
+    which every fund-specific branch treats as "not a fund", i.e. the ordinary path. PURE."""
+    st = getattr(leg, "sec_type", None)
+    if not st:
+        c = (contracts or {}).get(getattr(leg, "symbol", None))
+        st = getattr(c, "secType", None)
+    return str(st or "")
+
+
+def is_fund_leg(leg, contracts: dict | None = None) -> bool:
+    """True iff this leg is for a MUTUAL FUND — the ONE predicate every fund-specific branch
+    on this rail keys off (pricing, order type, fractional quantity, settlement). Delegates to
+    live_quotes.is_fund so there is a single definition of "is it a fund" on the desk."""
+    return live_quotes.is_fund(leg_sec_type(leg, contracts))
+
+
+def _qty_text(qty) -> str:
+    """A leg quantity for display. An int renders EXACTLY as it always has (`{qty:<8d}`) so an
+    all-ETF preview is byte-identical; a fractional fund quantity renders with its fraction
+    intact instead of raising on the int-only format."""
+    return f"{qty:<8d}" if isinstance(qty, int) else f"{float(qty):<8,.4f}"
+
+
+def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool,
+                      contracts: dict | None = None):
     """PURE order-list construction from an already-sized AccountPlan. Builds and transmits
     NOTHING — returns the ordered candidate legs plus review metadata.
 
@@ -435,18 +461,41 @@ def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool):
     SELLS ARE SEQUENCED BEFORE BUYS (raise cash before buying): the returned `legs` list is
     plan-sells + alien-liquidations + plan-buys, so every SELL precedes every BUY.
 
-    WHOLE-SHARE ONLY: every quantity is an int (deltas are already integer; an alien's
-    fractional share count is truncated toward 0 — a sub-1-share alien can't be whole-share
-    liquidated and is returned in `aliens_left`).
+    WHOLE-SHARE, WITH EXACTLY ONE EXCEPTION: every quantity is an int (deltas are already
+    integer; an alien's fractional share count is truncated toward 0 — a sub-1-share alien
+    can't be whole-share liquidated and is returned in `aliens_left`). The exception is a
+    MUTUAL FUND being sold OUT COMPLETELY — see below.
+
+    `contracts` maps symbol -> the BROKER'S OWN contract (from ib.positions()), and is used
+    for ONE thing: reading `secType` so a mutual fund can be recognised as one. Absent (the
+    default, and every pre-existing caller) nothing is treated as a fund and every leg is
+    built exactly as before.
+
+    SELLING A MUTUAL FUND OUT — WHY THE QUANTITY IS FRACTIONAL
+    ----------------------------------------------------------
+    Mutual-fund positions are fractional by nature (Stevens holds 123.73 AFMBX, 17.393 MFEKX).
+    The engine works in whole shares, so its delta to exit a 123.73-share position is -123 —
+    which would sell 123 shares and leave a 0.73-share stub behind, and the account would
+    never actually close the holding or be convertible to its model. So when, and ONLY when,
+    a leg is (a) for a FUND, (b) a SELL, and (c) the plan's whole-share delta is exactly the
+    truncation of the ENTIRE holding — i.e. the plan's intent is a complete exit — the
+    quantity is restored to the FULL fractional share count off the plan's own reconciliation.
+    A fund the plan intends to only PARTIALLY sell (which this desk never does; it does not
+    buy funds either) keeps its whole-share quantity, unchanged.
 
     Returns (legs, aliens_left, unpriceable):
-      legs        : ordered list of SimpleNamespace(symbol, side, qty, limit, notional, source)
+      legs        : ordered list of SimpleNamespace(symbol, side, qty, limit, notional,
+                    source, sec_type)
       aliens_left : alien lines NOT liquidated (conform False, or a sub-1-share alien)
       unpriceable : list of (symbol, side, qty) with no usable price -> a blocking reason
     """
     sells: list = []
     buys: list = []
     unpriceable: list = []
+    contracts = contracts or {}
+
+    def _sec_type(sym) -> str:
+        return str(getattr(contracts.get(sym), "secType", None) or "")
 
     for sym in sorted(plan.orders):
         qty = int(plan.orders[sym])          # whole-share; engine deltas are already integer
@@ -454,12 +503,21 @@ def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool):
             continue
         side = "BUY" if qty > 0 else "SELL"
         qty = abs(qty)
+        sec_type = _sec_type(sym)
+        if live_quotes.is_fund(sec_type) and side == "SELL":
+            # SELL THE WHOLE FUND POSITION, FRACTION INCLUDED — but only when the plan's
+            # whole-share delta IS the complete exit. held is the account's real (fractional)
+            # holding off the plan's own reconciliation; int(held) == qty is precisely the
+            # "plan wants this position gone" test.
+            held = _held_shares(plan, sym)
+            if held is not None and held > 0 and int(held) == qty:
+                qty = float(held)
         cap = _leg_cap(side, sym, quotes, prices)
         if cap is None:
             unpriceable.append((sym, side, qty))
             continue
         leg = SimpleNamespace(symbol=sym, side=side, qty=qty, limit=cap,
-                              notional=qty * cap, source="plan")
+                              notional=qty * cap, source="plan", sec_type=sec_type)
         (buys if side == "BUY" else sells).append(leg)
 
     alien_sells: list = []
@@ -470,13 +528,18 @@ def build_deploy_legs(plan, quotes: dict, prices: dict, *, conform: bool):
             if qty < 1:
                 aliens_left.append(ln)       # sub-1-share alien: can't whole-share liquidate
                 continue
+            sec_type = _sec_type(ln.symbol)
+            if live_quotes.is_fund(sec_type):
+                # Same rule as the plan-sell branch above: liquidating a fund means the WHOLE
+                # position, fraction included, or the holding never actually closes.
+                qty = float(ln.actual_shares)
             cap = _leg_cap("SELL", ln.symbol, quotes, prices)
             if cap is None:
                 unpriceable.append((ln.symbol, "SELL", qty))
                 continue
             alien_sells.append(SimpleNamespace(
                 symbol=ln.symbol, side="SELL", qty=qty, limit=cap,
-                notional=qty * cap, source="alien_liquidation"))
+                notional=qty * cap, source="alien_liquidation", sec_type=sec_type))
     else:
         aliens_left = list(plan.alien_lines)
 
@@ -552,6 +615,35 @@ def per_order_rail_reasons(legs, plan, target, *, managed_net_liq: float,
                 f"order SELL {l.symbol} x{l.qty} exceeds the {held:,.4f} share(s) actually "
                 f"held — this desk never shorts; fat-finger rail")
     return reasons
+
+
+def _unsettled_fund_proceeds(sell_results, sell_legs, contracts: dict | None = None) -> float:
+    """PURE. Dollars of MUTUAL-FUND sale proceeds that this run must NOT let anything buy
+    against, measured from what actually filled.
+
+    Mutual-fund proceeds do not settle the same day, so no fund sale — however much of it
+    filled — is spendable on the run that placed it. This returns `filled shares x the last
+    NAV` summed over the fund SELL legs, which is 0 in the ordinary case (a fund order placed
+    during the day has not filled: it fills at tonight's NAV) and a real figure only when a
+    run happens to see a fill. The caller subtracts it from the realized-cash budget.
+
+    Measured, never assumed: a leg the broker did not fill contributes nothing, so an
+    all-ETF run — and a run whose fund orders are simply working — is arithmetically
+    unchanged. Non-fund legs are ignored entirely; ordinary equity settlement is untouched by
+    this and is governed, as before, by the broker's own cash figure."""
+    by_symbol = {l.symbol: l for l in (sell_legs or []) if is_fund_leg(l, contracts)}
+    total = 0.0
+    for r in sell_results or []:
+        leg = by_symbol.get(r.get("symbol"))
+        if leg is None:
+            continue
+        try:
+            filled = float(r.get("filled") or 0.0)
+        except (TypeError, ValueError):
+            filled = 0.0
+        if filled > 0:
+            total += filled * float(leg.limit)
+    return total
 
 
 def _scale_buys_to_cash(buy_legs, available_cash: float, *,
@@ -710,12 +802,53 @@ def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, pr
                             "reason": "IBKR would not resolve a contract for this symbol"})
             continue
         ref = _deploy_ref(account, as_of, l.side, l.symbol, run_id)
-        order = order_router.build_marketable_limit(
-            l.symbol, l.side, l.qty, l.limit, account=account, order_ref=ref)
+        # THE ORDER TYPE IS DECIDED BY WHAT THE INSTRUMENT IS, off the contract IBKR just
+        # resolved — the broker's own identity for it, never a ticker-string guess.
+        # A MUTUAL FUND takes a MARKET order with no limit price (it has no intraday price to
+        # limit; it fills at tonight's NAV, and so does every other order entered today).
+        # Everything else takes the capped marketable LMT it always has.
+        fund = live_quotes.is_fund(getattr(contract, "secType", None))
+        if fund:
+            order = order_router.build_mutual_fund_market(
+                l.symbol, l.side, l.qty, account=account, order_ref=ref)
+        else:
+            order = order_router.build_marketable_limit(
+                l.symbol, l.side, l.qty, l.limit, account=account, order_ref=ref)
         order.transmit = True
         trade = ib.placeOrder(contract, order)
-        print(f"    [{phase_label}] SENT {l.side} {l.symbol} x{l.qty} LIMIT {l.limit:,.2f} "
+        px_text = ("MARKET (fills at tonight's NAV; last NAV "
+                   f"{l.limit:,.2f})" if fund else f"LIMIT {l.limit:,.2f}")
+        print(f"    [{phase_label}] SENT {l.side} {l.symbol} x{_qty_text(l.qty)} {px_text} "
               f"ref={ref}")
+        if fund:
+            # A FUND ORDER MUST BE LEFT WORKING — DO NOT ADD IT TO `active`.
+            # `active` is the set this phase waits on, re-prices, and CANCELS at the
+            # PHASE_TERMINAL_TIMEOUT_SEC deadline. A fund order cannot reach a terminal state
+            # inside that window by construction: it does not fill until the fund strikes its
+            # NAV after the close, hours later. Waiting on it would burn the whole phase
+            # timeout and then CANCEL the very order we came to place — defeating the entire
+            # purpose. Re-pricing is meaningless for the same reason (there is no price to
+            # chase, and every order today fills at the same NAV).
+            # It is reported here, honestly, as WORKING and unfilled: this run raised no cash
+            # from it, which is exactly what the settlement rule downstream relies on.
+            print(f"    [{phase_label}] {l.symbol} is a MUTUAL FUND: the order is now WORKING "
+                  f"and will fill at tonight's NAV. This run does NOT wait for it, does NOT "
+                  f"re-price it, and does NOT cancel it — and counts NONE of its proceeds as "
+                  f"cash available to buy with today.")
+            # ONE immediate, non-blocking status read so the report states what the broker
+            # actually says rather than an assumption. In the ordinary case that is
+            # PreSubmitted/Submitted with 0 filled; if the broker HAS already filled it (a run
+            # after the NAV strike), the real fill is reported — and the settlement rule below
+            # then excludes exactly those proceeds from this run's buying power.
+            _st = getattr(trade, "orderStatus", None)
+            _filled = float(getattr(_st, "filled", 0.0) or 0.0)
+            results.append({"symbol": l.symbol, "side": l.side, "requested": l.qty,
+                            "filled": _filled,
+                            "status": str(getattr(_st, "status", "") or "") or "WORKING",
+                            "reprices": 0, "skipped": False, "sec_type": "FUND",
+                            "reason": ("mutual fund — left working, fills at tonight's NAV; "
+                                       "proceeds do NOT settle today")})
+            continue
         active.append({"leg": l, "trade": trade, "contract": contract, "order": order,
                        "ref": ref, "limit": l.limit, "attempts": 0, "filled_prior": 0.0,
                        "placed_at": time.time()})
@@ -781,6 +914,7 @@ def _report_phase(label: str, results) -> None:
         return
     print(f"\n    {label} phase results:")
     flagged: list[dict] = []
+    working_funds: list[dict] = []
     for r in results:
         line = (f"      {r['side']:4s} {r['symbol']:6s} requested={r['requested']:g} "
                 f"filled={r['filled']:g} status={r['status']} reprices={r['reprices']}")
@@ -788,7 +922,19 @@ def _report_phase(label: str, results) -> None:
             line += f"  SKIPPED ({r.get('reason', '')})"
         print(line)
         if r.get("skipped") or r["filled"] < r["requested"]:
-            flagged.append(r)
+            # A MUTUAL-FUND leg that is unfilled is NOT a problem to review — it is the
+            # instrument working exactly as it must. It is listed separately, in plain
+            # English, so it can never be mistaken for a failed order.
+            (working_funds if (live_quotes.is_fund(r.get("sec_type"))
+                               and not r.get("skipped")) else flagged).append(r)
+    if working_funds:
+        print(f"    {label} MUTUAL-FUND legs still WORKING (this is normal and expected — a "
+              f"mutual fund prices once a day at NAV after the close, so an order placed "
+              f"during the day cannot fill yet):")
+        for r in working_funds:
+            print(f"      -> {r['side']} {r['symbol']}: {r['requested']:g} share(s) working, "
+                  f"will fill at tonight's NAV [{r['status']}]. Its proceeds were NOT counted "
+                  f"as cash available to buy with on this run.")
     if flagged:
         print(f"    !! {label} UNFILLED / SKIPPED legs (LOUD — needs human review):")
         for r in flagged:
@@ -891,7 +1037,8 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
 
     # [7] Build the full ordered DEPLOY order list (sells first, then buys; conform adds the
     # ALIEN liquidations). Whole-share, price-guarded caps.
-    legs, aliens_left, unpriceable = build_deploy_legs(plan, quotes, prices, conform=conform)
+    legs, aliens_left, unpriceable = build_deploy_legs(plan, quotes, prices, conform=conform,
+                                                       contracts=contracts)
     # TWO TOTALS, TWO PRICE BASES — they are not interchangeable. See the comment on the
     # total_buy_le_investable check below for which one each gate must use.
     #   total_buy      — WORST CASE: each leg at its marketable CAP (ask * (1 + ORDER_CAP_K)),
@@ -912,7 +1059,12 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
         else:
             tw = float(target.weights.get(l.symbol, 0.0)) * 100.0
             note = f"-> target ~{tw:.2f}%"
-        print(f"    {l.side:4s} {l.symbol:6s} x{l.qty:<8d} LIMIT ~{l.limit:>10,.2f}  "
+        # A MUTUAL FUND leg carries NO limit price — it is a market order that fills at
+        # tonight's NAV — so saying "LIMIT" for it would be a lie on the operator's screen.
+        # A non-fund leg's line is byte-identical to what it has always printed.
+        px_text = (f"MARKET at tonight's NAV (last NAV ~{l.limit:,.2f})"
+                   if is_fund_leg(l, contracts) else f"LIMIT ~{l.limit:>10,.2f}")
+        print(f"    {l.side:4s} {l.symbol:6s} x{_qty_text(l.qty)} {px_text}  "
               f"notional ~{l.notional:>12,.2f}  [{l.source}]  {note}")
     # BOTH buy totals are shown so an operator reading a preview sees exactly what the
     # investable gate compares (buys at plan prices) and what it does NOT (the worst case).
@@ -922,6 +1074,24 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
           f"investable ~{plan.investable:,.2f}   NetLiq ~{net_liq:,.2f}")
     print("    NOTE: buys will be RE-SIZED to REALIZED cash after the sells fill (two-phase); "
           "the buy figures above are the pre-cash-gate plan.")
+    # THE SETTLEMENT RULE, SAID OUT LOUD BEFORE ANYONE ARMS ANYTHING.
+    fund_sell_legs = [l for l in legs if l.side == "SELL" and is_fund_leg(l, contracts)]
+    expected_fund_proceeds = sum(l.notional for l in fund_sell_legs)
+    if fund_sell_legs:
+        print(f"    MUTUAL FUNDS ON THIS RUN: {len(fund_sell_legs)} fund sale(s) worth about "
+              f"{expected_fund_proceeds:,.2f} at the last NAV. THAT MONEY IS EXCLUDED FROM "
+              f"THIS RUN'S BUYING POWER. A mutual fund prices once a day, at NAV, after the "
+              f"close, and its proceeds do NOT settle the same day — so nothing bought today "
+              f"can be paid for with it. Today's buys are sized ONLY to cash that has "
+              f"actually landed (a fresh reading of the account's real cash balance, which "
+              f"cannot contain money a fund has not paid out yet). Expect roughly "
+              f"{expected_fund_proceeds:,.2f} to arrive over the next day or two; a LATER RUN "
+              f"will deploy it, because every run re-reads the account's real cash. This "
+              f"account will therefore be only PARTLY conformed to its model today, on "
+              f"purpose — the alternative is buying with money that has not arrived.")
+        for l in fund_sell_legs:
+            print(f"      SELL {l.symbol:6s} {_qty_text(l.qty)} share(s) — the FULL position "
+                  f"including the fraction — about {l.notional:,.2f} at the last NAV")
     if aliens_left:
         label = ("non-S0 ALIEN holdings that WOULD REMAIN — pass --conform to liquidate"
                  if not conform else
@@ -1092,6 +1262,35 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
         else:
             print(f"\n    Realized available cash (TotalCashValue, fresh read): "
                   f"{available_cash:,.2f}. Buys sized to THIS — never expected proceeds.")
+
+        # THE SETTLEMENT GATE — MUTUAL-FUND PROCEEDS CAN NEVER FUND A SAME-RUN BUY.
+        # Fund proceeds do not settle the same day. Buying against them is the exact failure
+        # shape of the 2026-07-28 negative-balance incident: money the account has not got yet
+        # counted as money it can spend.
+        # TWO INDEPENDENT WALLS, and neither is an assumption:
+        #   1. TIMING. A fund order placed during the day cannot fill until the fund strikes
+        #      its NAV after the close, so the fresh TotalCashValue read above provably cannot
+        #      contain its proceeds. _transmit_phase leaves fund legs WORKING and reports
+        #      filled=0 (it never waits on them), which is the direct evidence of that.
+        #   2. MEASUREMENT. Whatever a fund leg DID report as filled — normally nothing, but a
+        #      run after the NAV strike could see a real fill — is subtracted here, so its
+        #      proceeds are removed from the budget even if the broker's cash figure has
+        #      already picked them up. Exactly what filled, never an estimate: an unfilled
+        #      fund order subtracts 0 and the account deploys its ETF proceeds in full, which
+        #      is the intended shape (this run sells the funds and the ETFs and deploys the
+        #      ETF cash; a LATER run, after settlement, deploys the fund cash).
+        unsettled_fund_cash = _unsettled_fund_proceeds(sell_results, sell_legs, contracts)
+        if unsettled_fund_cash > 0:
+            available_cash = max(0.0, available_cash - unsettled_fund_cash)
+            print(f"    MUTUAL-FUND PROCEEDS EXCLUDED: {unsettled_fund_cash:,.2f} of fund "
+                  f"sale proceeds is UNSETTLED and cannot be spent today, so it is removed "
+                  f"from this run's buying power. Cash available to buy with: "
+                  f"{available_cash:,.2f}.")
+        working_fund_legs = [l for l in sell_legs if is_fund_leg(l, contracts)]
+        if working_fund_legs and unsettled_fund_cash <= 0:
+            print(f"    MUTUAL-FUND PROCEEDS EXCLUDED: {len(working_fund_legs)} fund sale(s) "
+                  f"are still WORKING and have paid out nothing, so the cash figure above "
+                  f"contains none of their proceeds and no buy today is sized against them.")
 
         # PHASE 2 — size buys to realized cash (whole-share; can NEVER go negative), transmit.
         scaled_buys, adjustments = _scale_buys_to_cash(buy_legs, available_cash)

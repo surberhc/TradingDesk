@@ -856,7 +856,42 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
     # missing — a dropped key sized as target 0 shares, i.e. a FULL LIQUIDATION. IBKR is the
     # price source: no quote, no trade, and the symbols are named out loud.
     prices, unquoted = live_quotes.execution_prices(quotes, universe)
-    print(f"    priced from live IBKR quotes: {len(prices)} of {len(universe)} symbol(s).")
+    n_live_quoted = len(prices)
+
+    # MUTUAL FUNDS — THE ONE INSTRUMENT CLASS THE LIVE-QUOTE-ONLY RULE CANNOT COVER.
+    # A mutual fund has NO intraday price by construction: it prices once a day at NAV after
+    # the close, and every order entered that day fills at that same NAV. reqMktData therefore
+    # returns every field NaN for one (measured live 2026-09-01 for all seven funds the two
+    # Stevens accounts hold), and the loop above correctly reports it UNQUOTED — at which
+    # point the engine sees a HELD holding it cannot value and BLOCKS the whole account.
+    # Which is what happened: U27295881 and U27305011 emitted no orders at all.
+    #
+    # So a held FUND is priced from THE BROKER'S OWN REPORTED MARKET VALUE instead, which for a
+    # fund IS its last transacting price. This is NOT the stale-close fallback v0.42.0 removed
+    # from ten call sites — that was an old stored close standing in for a live quote we failed
+    # to get; this is the broker's current mark for an instrument that HAS no live quote to
+    # fail at. See live_quotes' FUND_SEC_TYPES header for the full distinction, and
+    # live_quotes.fund_prices for why the value comes from reqPnLSingle rather than
+    # ib.portfolio() (which is empty on this FA-master login, and hangs the run if pushed).
+    # Scoped to secType FUND and nothing else: EVERY other instrument on this rail stays
+    # live-quote-only, and an ETF that IBKR will not quote is still not traded.
+    #
+    # Paid ONLY by the holdings that actually ARE funds, and keyed off live_quotes' OWN
+    # predicate so pricing and order-building can never disagree about what a fund is.
+    fund_positions = [(a, c) for a in roster_accounts
+                      for sym, c in per_account_state[a]["contracts"].items()
+                      if live_quotes.is_fund(per_account_state[a]["sec_types"].get(sym))]
+    if fund_positions:
+        fund_px, fund_unpriced = live_quotes.fund_prices(ib, fund_positions)
+        live_quotes.report_fund_prices(fund_px, fund_unpriced)
+        prices.update(fund_px)
+        unquoted = [s for s in unquoted if s not in fund_px]
+
+    print(f"    priced from live IBKR quotes: {n_live_quoted} of {len(universe)} symbol(s)."
+          + (f" Plus {len(prices) - n_live_quoted} mutual fund(s) priced at NAV from the "
+             f"broker's portfolio (no such thing as a live fund quote); "
+             f"{len(prices)} of {len(universe)} priced in total."
+             if len(prices) > n_live_quoted else ""))
     live_quotes.report_unquoted(unquoted)
 
     # [6] Size each roster account with the UNCHANGED engine. Refuse (skip) an account with no

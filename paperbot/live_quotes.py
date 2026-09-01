@@ -15,11 +15,184 @@ never silently becomes a $0 order; callers fall back to the strategy-data close.
 """
 from __future__ import annotations
 
+import copy
+import time
 from dataclasses import dataclass
 
 from ib_async import Stock
 
 import config
+
+
+# =========================================================================================
+# MUTUAL FUNDS — the ONE instrument class that has no live quote BY CONSTRUCTION.
+# =========================================================================================
+# A mutual fund does not trade intraday. It prices ONCE A DAY, at NAV, after the close, and
+# every order entered that day fills at that same NAV. So reqMktData returning nothing for a
+# fund is not a failure, not an entitlement gap and not an after-hours artifact — there is no
+# such thing as a fund's live bid/ask/last. MEASURED LIVE, READ-ONLY, 2026-09-01 on the 4003
+# gateway: every price field came back NaN for all seven funds the two Stevens accounts hold
+# (AFMBX DFISX DODGX HIGFX MFEKX MIEIX TRGXX), while the SAME contracts priced perfectly on
+# the broker's own portfolio feed.
+#
+# THIS IS NOT A REINSTATEMENT OF THE STALE-CLOSE FALLBACK v0.42.0 REMOVED.
+# That removal was about substituting an OLD STORED CLOSE from the strategy data when a LIVE
+# quote for a normally-quoted instrument failed — a price you cannot trade at, standing in for
+# a price we simply failed to get. This is a different thing in every respect:
+#   * it is scoped to ONE instrument class that has no live quote AT ALL, by construction;
+#   * the number comes from THE BROKER'S OWN CURRENT BOOK (ib.portfolio(): marketPrice /
+#     marketValue), not from the desk's stored history; and
+#   * for a fund the broker's mark IS its last transacting price — the NAV every fund order
+#     that day fills at. It is the real execution price, not a stale proxy for one.
+# EVERY OTHER INSTRUMENT STAYS LIVE-QUOTE-ONLY. Do not widen FUND_SEC_TYPES.
+FUND_SEC_TYPES = frozenset({"FUND"})
+
+# IBKR's routing destination for a mutual fund. The contract ib.positions() hands back for a
+# HELD fund carries secType FUND and a real conId but a BLANK exchange (measured 2026-09-01:
+# DODGX conId=86797803, exchange=''). The form VERIFIED to qualify is
+# Contract(secType="FUND", exchange="FUNDSERV", currency="USD"), so a blank exchange is filled
+# in with this — and ONLY when it is blank (see fund_contract).
+FUND_EXCHANGE = "FUNDSERV"
+
+# How long to let the broker's per-position value stream fill in before giving up on it, and
+# how often to look. BOUNDED BY CONSTRUCTION: reqPnLSingle is non-blocking (it returns an
+# object the stream updates), so this is a poll with a deadline, never an unbounded await.
+# A fund still unpriced at the deadline is REPORTED and NOT TRADED — fail closed.
+FUND_VALUE_WAIT_SEC = 12.0
+FUND_VALUE_POLL_SEC = 0.5
+
+
+def is_fund(sec_type) -> bool:
+    """True iff this instrument type is a MUTUAL FUND — the no-intraday-price class. The ONE
+    predicate; every fund-specific behaviour on the desk keys off it so none of them can drift
+    apart. Deliberately strict: nothing else is a fund."""
+    if sec_type is None:
+        return False
+    return str(sec_type).strip().upper() in FUND_SEC_TYPES
+
+
+def fund_contract(contract):
+    """The contract to QUOTE/TRADE a held mutual fund with.
+
+    ib.positions() hands back a fund with its real conId and secType FUND but a BLANK
+    exchange. IBKR resolves the instrument from the conId, but an order needs a destination,
+    and FUNDSERV is the one verified to qualify. So: if (and ONLY if) a FUND contract's
+    exchange is blank, return a COPY carrying FUNDSERV. The broker's object is never mutated
+    (it is shared across every account in the batch) and a contract that already names an
+    exchange — fund or not — is returned UNCHANGED, by identity."""
+    if not is_fund(getattr(contract, "secType", None)):
+        return contract
+    if str(getattr(contract, "exchange", "") or "").strip():
+        return contract                      # broker already named a destination — leave it
+    fixed = copy.copy(contract)
+    fixed.exchange = FUND_EXCHANGE
+    return fixed
+
+
+def fund_price_from_value(quantity, market_value) -> float | None:
+    """PURE. Per-share NAV from the broker's own reported position size and market value —
+    `market_value / quantity`. None when either is missing/zero/NaN, which leaves the symbol
+    UNQUOTED and therefore UNTRADED (fail closed), never priced at 0.
+
+    MEASURED 2026-09-01 against the broker's two independent value feeds, which agree exactly:
+    AFMBX 5056.84 / 123.73 = 40.87, DODGX 18.22, MFEKX 207.58, HIGFX 9.72, DFISX 28.69,
+    MIEIX 44.31, TRGXX 1.00 — identical to the marketPrice each reports."""
+    if not _valid(quantity) or market_value is None:
+        return None
+    try:
+        mv = float(market_value)
+    except (TypeError, ValueError):
+        return None
+    if mv != mv or mv <= 0:          # NaN or non-positive -> no price
+        return None
+    px = mv / float(quantity)
+    return float(px) if _valid(px) else None
+
+
+def fund_prices(ib, fund_positions) -> tuple[dict, list]:
+    """{symbol: NAV} for the HELD MUTUAL FUNDS named in `fund_positions`, read from the
+    broker's own reported market value, plus the holdings it could not price.
+
+    `fund_positions` is an iterable of (account, contract) for FUND holdings ONLY — the caller
+    filters, using is_fund, so this can never be pointed at an ETF.
+
+    WHY THE VALUE COMES FROM reqPnLSingle AND NOT FROM ib.portfolio() — MEASURED, NOT ASSUMED.
+    The obvious source is ib.portfolio(), whose PortfolioItem carries BOTH marketPrice and
+    marketValue, and both ARE populated for a fund. It is unusable here anyway:
+
+      * ib_async fills its portfolio cache ONLY from the reqAccountUpdates subscription.
+        Connecting to a SINGLE-account login auto-subscribes, which is why the single-account
+        deploy rail's use of ib.portfolio() works. This is the FA-MASTER login (12 managed
+        accounts) and connecting subscribes to NOTHING — so ib.portfolio(account) returns an
+        empty list for every account and always has. THAT is why recon_report._portfolio_values
+        came back EMPTY for U27295881 and U27305011.
+      * Subscribing does work — but ONLY ONCE PER CONNECTION. MEASURED 2026-09-01, both
+        orderings, on fresh connections: whichever account is subscribed FIRST returns its full
+        portfolio, and EVERY LATER ACCOUNT RETURNS NOTHING, with or without an explicit
+        unsubscribe in between. Worse, ib_async's reqAccountUpdates awaits accountDownloadEnd
+        under IB.RequestTimeout, WHICH DEFAULTS TO 0 — no timeout at all — so the second
+        account does not fail, it HANGS THE WHOLE RUN FOREVER with no output and no error.
+        That is exactly what it did to the first batch preview of this change.
+
+    reqPnLSingle has neither problem: it is per-POSITION, many subscriptions coexist happily on
+    one connection (10 across both accounts, measured), and it is NON-BLOCKING — it returns an
+    object the stream fills in, so the wait below is a poll against a deadline and can never
+    hang. Its `value` is the same broker-reported market value, to the cent.
+
+    Read-only: a value subscription places no order. Every subscription is cancelled on the way
+    out, including on failure, so the run leaves nothing behind on the connection. A holding
+    still unpriced at the deadline is RETURNED NAMED, which leaves it untraded — fail closed."""
+    subs: list = []
+    unpriced: list = []
+    for account, contract in fund_positions:
+        symbol = getattr(contract, "symbol", None)
+        con_id = getattr(contract, "conId", 0)
+        if not symbol or not con_id:
+            unpriced.append(f"{account}/{symbol or '?'}")
+            continue
+        try:
+            subs.append((account, symbol, con_id, ib.reqPnLSingle(account, "", con_id)))
+        except Exception:  # noqa: BLE001 — one bad holding must never take the run down
+            unpriced.append(f"{account}/{symbol}")
+
+    prices: dict = {}
+    try:
+        deadline = time.monotonic() + FUND_VALUE_WAIT_SEC
+        pending = list(subs)
+        while pending and time.monotonic() < deadline:
+            ib.sleep(FUND_VALUE_POLL_SEC)
+            still: list = []
+            for account, symbol, con_id, s in pending:
+                px = fund_price_from_value(getattr(s, "position", None),
+                                           getattr(s, "value", None))
+                if px is None:
+                    still.append((account, symbol, con_id, s))
+                else:
+                    prices[symbol] = px
+            pending = still
+        unpriced.extend(f"{a}/{sym}" for a, sym, _c, _s in pending)
+    finally:
+        for account, _symbol, con_id, _s in subs:
+            try:
+                ib.cancelPnLSingle(account, "", con_id)
+            except Exception:  # noqa: BLE001 — best effort cleanup; never fatal
+                pass
+    return prices, sorted(set(unpriced))
+
+
+def report_fund_prices(prices: dict, unpriced: list, indent: str = "    ") -> None:
+    """Say out loud where a fund's price came from — it is NOT a live quote, and a human
+    reading a preview must never have to guess which prices are which."""
+    if prices:
+        print(f"{indent}MUTUAL FUNDS priced at NAV from the broker's own reported market "
+              f"value, not from a live quote — a mutual fund has NO intraday price: it prices "
+              f"once a day at NAV after the close and every order that day fills at that same "
+              f"NAV. {len(prices)} fund(s): "
+              + ", ".join(f"{s} {p:,.2f}" for s, p in sorted(prices.items())))
+    if unpriced:
+        print(f"{indent}!! THE BROKER REPORTED NO USABLE VALUE for {len(unpriced)} mutual-fund "
+              f"holding(s): {', '.join(unpriced)}. These have no price and WILL NOT BE TRADED "
+              f"on this run — not bought, not sold.")
 
 
 @dataclass
@@ -84,7 +257,11 @@ def qualified_contracts(ib, symbols, known=None) -> tuple[dict, list]:
     for s in ordered:
         c = known.get(s)
         if c is not None:
-            contracts[s] = c                        # the broker's own — never rebuilt
+            # The broker's own — never rebuilt. The ONE adjustment: a held MUTUAL FUND comes
+            # back with a BLANK exchange, and an order needs a destination, so fund_contract
+            # fills in FUNDSERV (and ONLY then). Every other contract, fund or not, is
+            # returned by identity.
+            contracts[s] = fund_contract(c)
         elif s in ok_rebuilt:
             contracts[s] = rebuilt[s]
         else:

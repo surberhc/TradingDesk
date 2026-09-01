@@ -25,7 +25,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 
-from ib_async import (LimitOrder, Order, PriceCondition, Stock, TagValue,
+from ib_async import (LimitOrder, MarketOrder, Order, PriceCondition, Stock, TagValue,
                       TimeCondition, util)
 
 import config
@@ -275,6 +275,34 @@ def build_marketable_limit(symbol, side, qty, cap, *, account=None, fa_group=Non
     """A capped marketable LMT that crosses the spread now. The cap IS the limit price."""
     px = _check_limit_price(symbol, cap)
     o = LimitOrder(side, qty, px)
+    o.tif = "DAY"
+    return _base_fields(o, account, fa_group, fa_method, order_ref)
+
+
+def build_mutual_fund_market(symbol, side, qty, *, account=None, fa_group=None,
+                             fa_method="", order_ref=None) -> Order:
+    """A plain MARKET order — the ONLY correct order for a MUTUAL FUND, and built ONLY for one.
+
+    WHY THERE IS NO LIMIT PRICE HERE, AND WHY THAT IS NOT A HOLE IN THE PRICE GUARD.
+    Every other builder in this module runs its cap through _check_limit_price, because for a
+    continuously-quoted instrument a missing quote silently becoming a 0.0/NaN limit is a real
+    footgun. A mutual fund is not continuously quoted: it has NO intraday price at all. It
+    prices once a day, at NAV, after the close, and EVERY order entered that day fills at that
+    SAME NAV. There is therefore no price to limit and nothing a limit could protect against —
+    a limit order on a fund is not a safer order, it is a malformed one. The price guard is not
+    bypassed; it is inapplicable, and this builder is scoped so narrowly that it can never be
+    reached by an instrument the guard does protect.
+
+    `qty` is deliberately NOT coerced to an int: fund positions are FRACTIONAL by nature
+    (123.73 shares of AFMBX), and selling out means selling the whole position INCLUDING the
+    fraction or the account never actually closes the holding. This is the one place on the
+    desk where a non-whole quantity is correct.
+
+    UNPROVEN UNTIL AN ARMED TEST (2026-09-01): the port-4003 gateway is ReadOnlyApi=yes and
+    refuses transmission at the API boundary, so IBKR's ACCEPTANCE of this order — market type,
+    fractional quantity, FUND contract — has NOT been demonstrated live. Only the construction
+    below is proven."""
+    o = MarketOrder(side, qty)
     o.tif = "DAY"
     return _base_fields(o, account, fa_group, fa_method, order_ref)
 
