@@ -38,6 +38,13 @@ P&L per spread (x100 x qty):
     spread_close_value = short_ask - long_bid      (net debit to close the spread now)
     pnl = (realized_credit - spread_close_value) * 100 * qty
 
+IBKR encodes "no quote" as -1.0, not as null, so the two legs are normalized before
+that subtraction: a NEGATIVE long_bid is IBKR's "no bid" sentinel and becomes 0.0 (a
+leg with no bid cannot be sold for anything — it is not worth negative one dollar,
+which would inflate the cost to close by exactly 1.00 point / $100 per spread), while
+a NEGATIVE short_ask means there is no offer, so the buy-back cost is genuinely
+unknown and the sample is UNPRICEABLE (spread_close_value returns None).
+
 Closing the spread CHEAPER than the credit received  => positive pnl.
 Getting stopped out (closing RICHER than the credit) => negative pnl.
 
@@ -142,6 +149,42 @@ class MonitorState:
 # Pure evaluation
 # --------------------------------------------------------------------------- #
 
+def _bid_or_zero(px: Optional[float]) -> Optional[float]:
+    """Normalize a BID for close-proceeds math.
+
+    IBKR encodes "no bid" as -1.0, not as null. A leg with no bid cannot be sold for
+    anything, so its contribution to the close proceeds is 0.0 — NOT negative one
+    dollar, and not unknown. Clamping to 0.0 is the correct economic floor.
+
+    Returns None if px is None (genuinely missing), 0.0 for any negative sentinel,
+    else float(px).
+    """
+    if px is None:
+        return None
+    px = float(px)
+    if px < 0:
+        return 0.0
+    return px
+
+
+def _ask_or_none(px: Optional[float]) -> Optional[float]:
+    """Normalize an ASK for cost-to-buy-back math.
+
+    A negative ask means there is no offer, so the cost to buy the short leg back is
+    genuinely UNKNOWN. We must not guess it — and must NOT clamp it to 0.0, which would
+    falsely say the position is free to close. Returning None makes the sample
+    unpriceable, which the existing callers already handle.
+
+    Returns None if px is None or negative, else float(px).
+    """
+    if px is None:
+        return None
+    px = float(px)
+    if px < 0:
+        return None
+    return px
+
+
 def spread_close_value(sample: Sample) -> Optional[float]:
     """Mark-to-market COST TO CLOSE the whole spread now (points).
 
@@ -151,14 +194,20 @@ def spread_close_value(sample: Sample) -> Optional[float]:
     Returns None if EITHER price is missing — the cost to close is genuinely unknown
     then, so we don't guess. This is the SINGLE definition shared by both the P&L and
     the stop trigger so the two can never drift (see module docstring §FROZEN).
+
+    NEGATIVE-PRICE SENTINEL: IBKR reports "no bid"/"no offer" as -1.0, not as null.
+    A negative long_bid is therefore normalized to 0.0 (a leg with no bid sells for
+    nothing — it is not worth negative one dollar), while a negative short_ask makes
+    the sample UNPRICEABLE (None): with no offer, the buy-back cost is unknown and
+    must not be guessed. See ``_bid_or_zero`` / ``_ask_or_none``.
     """
     if sample is None:
         return None
-    short_ask = sample.short_ask
-    long_bid = sample.long_bid
+    short_ask = _ask_or_none(sample.short_ask)
+    long_bid = _bid_or_zero(sample.long_bid)
     if short_ask is None or long_bid is None:
         return None
-    return float(short_ask) - float(long_bid)
+    return short_ask - long_bid
 
 
 def pnl_at(position: MonitorPosition, sample: Sample) -> Optional[float]:
@@ -308,9 +357,12 @@ def build_exit_info(position: MonitorPosition, state: MonitorState) -> Dict[str,
     long_leg_exit: Optional[Dict[str, Any]] = None
 
     if sample is not None:
-        if sample.short_ask is not None and sample.long_bid is not None:
-            spread_value_at_exit = float(sample.short_ask) - float(sample.long_bid)
+        spread_value_at_exit = spread_close_value(sample)
         pnl = pnl_at(position, sample)
+        # NOTE: the leg dicts below record the RAW observed feed values on purpose —
+        # including a raw -1.0 "no bid" sentinel. They are the observation/provenance
+        # layer, and we must stay able to distinguish "no bid" from "bid was exactly
+        # zero". Do NOT clamp them the way spread_close_value clamps its math inputs.
         short_leg_exit = _exit_leg_dict(
             strike=position.short_strike,
             right=position.side,

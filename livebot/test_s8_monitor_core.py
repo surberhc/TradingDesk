@@ -22,6 +22,7 @@ from s8_monitor_core import (
     close_at_session_end,
     pnl_at,
     process_sample,
+    spread_close_value,
 )
 
 # The stored stop_price is the FROZEN one computed at entry by s8_strategy.stop_price.
@@ -380,6 +381,144 @@ def test_none_short_ask_never_false_triggers_even_if_huge_other_prices():
     state = MonitorState()
     process_sample(pos, state, s)
     assert state.triggered is False
+
+
+# --------------------------------------------------------------------------- #
+# IBKR "no bid" = -1.0 sentinel (NOT a real price of negative one dollar)
+#
+# IBKR reports an absent bid/offer as -1.0 rather than null. Treating that -1.0 as a
+# real price inflated the cost to close (short_ask - long_bid) by exactly 1.00 point =
+# $100 per spread whenever the deep-OTM long leg had no bid. Measured over 1,385 stored
+# trades: 539 exits affected, $53,600 of phantom loss, 30 stop-outs on a price that did
+# not exist. A negative BID clamps to 0.0 (a leg with no bid sells for nothing); a
+# negative ASK makes the sample unpriceable (the buy-back cost is genuinely unknown).
+# --------------------------------------------------------------------------- #
+
+def test_negative_long_bid_is_treated_as_zero_in_spread_close_value():
+    # long_bid = -1.0 is "no bid", worth 0.0 -> close = 5.0 - 0.0 = 5.0.
+    # The old (buggy) arithmetic gave 5.0 - (-1.0) = 6.0, a full point too rich.
+    s = Sample(ts=ENTRY_TS + 60, short_ask=5.0, long_bid=-1.0, spot=7400.0)
+    assert spread_close_value(s) == pytest.approx(5.0)
+    # identical to an explicit zero bid
+    s0 = Sample(ts=ENTRY_TS + 60, short_ask=5.0, long_bid=0.0, spot=7400.0)
+    assert spread_close_value(s) == pytest.approx(spread_close_value(s0))
+
+
+def test_pnl_at_negative_long_bid_matches_zero_bid_and_is_100_better_than_bug():
+    pos = make_position()
+    s_neg = Sample(ts=ENTRY_TS + 60, short_ask=5.0, long_bid=-1.0)
+    s_zero = Sample(ts=ENTRY_TS + 60, short_ask=5.0, long_bid=0.0)
+    # close 5.0 -> pnl = (4.05 - 5.0)*100 = -95.0
+    assert pnl_at(pos, s_neg) == pytest.approx(-95.0)
+    assert pnl_at(pos, s_neg) == pytest.approx(pnl_at(pos, s_zero))
+    # the old bug computed close 6.0 -> pnl -195.0; the fix is $100 per contract HIGHER
+    old_buggy_pnl = (CREDIT - (5.0 - (-1.0))) * 100.0
+    assert old_buggy_pnl == pytest.approx(-195.0)
+    assert pnl_at(pos, s_neg) == pytest.approx(old_buggy_pnl + 100.0)
+
+
+def test_pnl_at_negative_long_bid_scales_with_qty():
+    pos = make_position(qty=3)
+    s = Sample(ts=ENTRY_TS + 60, short_ask=5.0, long_bid=-1.0)
+    assert pnl_at(pos, s) == pytest.approx(-95.0 * 3)
+
+
+def test_negative_long_bid_does_not_false_trigger_the_stop():
+    pos = make_position()
+    # true close = 5.0 - 0.0 = 5.0, below the 6.0 stop -> must NOT fire.
+    # The old bug computed 5.0 - (-1.0) = 6.0 == stop_price and DID fire (phantom stop).
+    s_neg = Sample(ts=ENTRY_TS + 60, short_ask=5.0, short_bid=4.8, long_bid=-1.0,
+                   long_ask=0.05, spot=7400.0)
+    state = MonitorState()
+    process_sample(pos, state, s_neg)
+    assert state.triggered is False
+    assert state.exit_reason is None
+    assert state.exit_sample is None
+
+    # a real 0.0 bid at the same short_ask likewise does not trigger — same outcome.
+    s_zero = Sample(ts=ENTRY_TS + 60, short_ask=5.0, short_bid=4.8, long_bid=0.0,
+                    long_ask=0.05, spot=7400.0)
+    state_zero = MonitorState()
+    process_sample(pos, state_zero, s_zero)
+    assert state_zero.triggered is False
+
+
+def test_negative_long_bid_still_triggers_when_genuinely_over_the_stop():
+    pos = make_position()
+    # close = 7.5 - 0.0 = 7.5 >= 6.0 -> a REAL stop still fires with a -1.0 long bid.
+    s = Sample(ts=ENTRY_TS + 60, short_ask=7.5, short_bid=7.3, long_bid=-1.0,
+               long_ask=0.05, spot=7350.0)
+    state = MonitorState()
+    process_sample(pos, state, s)
+    assert state.triggered is True
+    assert state.exit_reason == "stop_hit"
+    assert state.exit_sample is s
+
+
+def test_negative_short_ask_is_unpriceable_and_does_not_false_trigger():
+    pos = make_position()
+    # short_ask = -1.0 is "no offer": the buy-back cost is UNKNOWN, not free.
+    s = Sample(ts=ENTRY_TS + 60, short_ask=-1.0, short_bid=-1.0, long_bid=0.5,
+               long_ask=0.7, spot=7400.0)
+    assert spread_close_value(s) is None
+    assert pnl_at(pos, s) is None
+    state = MonitorState()
+    process_sample(pos, state, s)   # must not raise
+    assert state.triggered is False
+    assert state.exit_reason is None
+    assert state.exit_sample is None
+    assert state.last_pnl is None
+
+
+def test_both_legs_negative_is_unpriceable():
+    pos = make_position()
+    s = Sample(ts=ENTRY_TS + 60, short_ask=-1.0, long_bid=-1.0)
+    assert spread_close_value(s) is None
+    assert pnl_at(pos, s) is None
+
+
+def test_none_prices_still_unpriceable_after_sentinel_fix():
+    # existing None behavior is UNCHANGED: missing is still missing, not zero.
+    pos = make_position()
+    assert spread_close_value(Sample(short_ask=None, long_bid=0.5)) is None
+    assert spread_close_value(Sample(short_ask=2.0, long_bid=None)) is None
+    assert spread_close_value(Sample(short_ask=None, long_bid=None)) is None
+    assert pnl_at(pos, Sample(short_ask=None, long_bid=-1.0)) is None
+    assert pnl_at(pos, Sample(short_ask=-1.0, long_bid=None)) is None
+
+
+def test_build_exit_info_agrees_with_spread_close_value_on_negative_long_bid():
+    pos = make_position()
+    # close = 7.5 - 0.0 = 7.5 >= 6.0 -> fires, giving an exit sample with a -1.0 long bid.
+    s = Sample(ts=ENTRY_TS + 60, short_bid=7.3, short_ask=7.5, short_last=7.4,
+               long_bid=-1.0, long_ask=0.05, long_last=0.02, spot=7350.0)
+    state = MonitorState()
+    process_sample(pos, state, s)
+    info = build_exit_info(pos, state)
+
+    # build_exit_info must go through the SINGLE shared definition, not a private copy.
+    assert info["spread_value_at_exit"] == pytest.approx(spread_close_value(s))
+    assert info["spread_value_at_exit"] == pytest.approx(7.5)
+    # pnl = (4.05 - 7.5)*100 = -345.0 (the old bug reported -445.0)
+    assert info["pnl"] == pytest.approx(-345.0)
+    assert info["pnl"] == pytest.approx(pnl_at(pos, s))
+
+
+def test_build_exit_info_preserves_raw_negative_bid_in_leg_provenance():
+    pos = make_position()
+    s = Sample(ts=ENTRY_TS + 60, short_bid=7.3, short_ask=7.5, short_last=7.4,
+               long_bid=-1.0, long_ask=0.05, long_last=0.02, spot=7350.0)
+    state = MonitorState()
+    process_sample(pos, state, s)
+    info = build_exit_info(pos, state)
+
+    # The leg dicts are the OBSERVATION layer: they must record the RAW feed value so
+    # "no bid" (-1.0) stays distinguishable from "bid was exactly zero" (0.0).
+    assert info["long_leg_exit"]["bid"] == -1.0
+    assert info["long_leg_exit"]["ask"] == 0.05
+    assert info["short_leg_exit"]["ask"] == 7.5
+    # ...while the P&L math used the clamped 0.0.
+    assert info["spread_value_at_exit"] == pytest.approx(7.5)
 
 
 # --------------------------------------------------------------------------- #
