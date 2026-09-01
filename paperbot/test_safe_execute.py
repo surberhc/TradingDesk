@@ -30,6 +30,7 @@ import pandas as pd
 import pytest
 
 import config
+import live_quotes
 import order_router
 import safe_execute as se
 import strategy_target
@@ -684,3 +685,149 @@ def test_invalid_purpose_raises():
     req.purpose = "SOMETHING_ELSE"
     with pytest.raises(ValueError):
         se.execute_plan(req, mode=se.MODE_PREVIEW, ib=_NoTxIB())
+
+
+# --- 12. THE TWO PRICE BASES — plan basis vs worst-case-at-the-cap (v0.44.0) ---------
+# The investable gate used to compare a CAP-priced buy total (qty x ask*(1+ORDER_CAP_K))
+# against a plan.investable computed on the REFERENCE-price basis the engine sized on. Two
+# different bases; on 2026-09-01 the mismatch refused three of eight custom-model accounts
+# — $1,194,383 of $1,471,610, 81% of the deployment, including the largest account — for an
+# overspend that cannot happen (the account pays the market, never the cap).
+def _quote(symbol, bid, ask):
+    return live_quotes.Quote(symbol=symbol, bid=bid, ask=ask, last=ask, close=ask, md_type=1)
+
+
+# U25274773 as measured live on the 4003 gateway, 2026-09-01 (after-hours, ~51bps spread):
+#   investable        818,504.60
+#   buys at the caps  822,722.51   <- what HEAD compared, and blocked on
+#   buys at plan px   818,478.28   <- what the plan actually intends to spend (fits, by 26.32)
+_U25274773_INVESTABLE = 818_504.60
+_U25274773_NET_LIQ = 826_772.32
+_U25274773_CAP_TOTAL = 822_722.51
+_U25274773_PLAN_TOTAL = 818_478.28
+
+
+def _u25274773_request(armed=False, summary=None):
+    """The real account's shape: every BUY leg quoted with an ask ~51bps above the reference
+    price the engine sized on, so cap notional > plan notional on every leg."""
+    tgt = _target(weights={"SCHB": 0.755, "USFR": 0.244, "VTI": 0.001},
+                  prices={"SCHB": 61.79, "USFR": 49.94, "VTI": 272.76})
+    plan = _plan(orders={"SCHB": 10_000, "USFR": 4_000, "VTI": 3}, alien_lines=[],
+                 investable=_U25274773_INVESTABLE, net_liq=_U25274773_NET_LIQ)
+    req = _request(plan=plan, target=tgt, armed=armed, net_liq=_U25274773_NET_LIQ,
+                   summary=summary)
+    req.quotes = {"SCHB": _quote("SCHB", 61.90, 61.92),
+                  "USFR": _quote("USFR", 50.03, 50.05),
+                  "VTI": _quote("VTI", 273.30, 273.35)}
+    return req
+
+
+def _overdeploy_reasons(result):
+    return [r for r in result.reasons if "over-deploy" in r]
+
+
+def test_u25274773_two_bases_fixture_is_the_measured_arithmetic():
+    """Pin the fixture itself: the cap-priced total is the blocked figure measured live, the
+    plan-priced total fits inside investable. If this drifts, the tests below prove nothing."""
+    req = _u25274773_request()
+    legs, _aliens, unpriceable = se.build_deploy_legs(req.plan, req.quotes, req.prices,
+                                                      conform=True)
+    assert unpriceable == []
+    cap_total = sum(l.notional for l in legs if l.side == "BUY")
+    plan_total = sum(se._leg_plan_notional(l, req.prices) for l in legs if l.side == "BUY")
+    assert round(cap_total, 2) == _U25274773_CAP_TOTAL
+    assert round(plan_total, 2) == _U25274773_PLAN_TOTAL
+    assert cap_total > _U25274773_INVESTABLE      # HEAD's comparison -> block
+    assert plan_total < _U25274773_INVESTABLE     # the plan actually fits
+
+
+def test_u25274773_blocks_under_heads_comparison_and_clears_under_the_fix(monkeypatch):
+    """FAIL-BEFORE / PASS-AFTER on the SAME fixture.
+
+    HEAD's comparison is restored by making the plan-basis notional return the leg's own
+    cap-priced notional — which collapses total_buy_plan back to total_buy, byte-identical to
+    the pre-fix predicate. It blocks. Undo it and the real account is no longer refused."""
+    # --- HEAD's comparison restored -> the account is refused -----------------------
+    monkeypatch.setattr(se, "_leg_plan_notional", lambda l, prices: float(l.notional))
+    res_head = se.execute_plan(_u25274773_request(), mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    blocked = _overdeploy_reasons(res_head)
+    assert len(blocked) == 1, res_head.reasons
+    assert f"{_U25274773_CAP_TOTAL:,.2f}" in blocked[0]
+
+    # --- the fix -> no over-deploy reason; 'not armed' is the ONLY thing left --------
+    monkeypatch.undo()
+    res_fix = se.execute_plan(_u25274773_request(), mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    assert _overdeploy_reasons(res_fix) == [], res_fix.reasons
+    assert _per_order_rail_reasons(res_fix) == [], res_fix.reasons
+    assert [r for r in res_fix.reasons if "not armed" not in r] == [], res_fix.reasons
+
+
+def test_genuinely_over_deployed_plan_still_blocks_and_reports_both_figures():
+    """The gate is loosened to the right basis, NOT removed: a plan whose PLAN-BASIS spend
+    exceeds investable is still refused, and the reason carries BOTH numbers."""
+    tgt = _target(weights={"SCHB": 1.0}, prices={"SCHB": 61.79})
+    # 14,000 x 61.79 = 865,060.00 at plan prices — well over the 818,504.60 investable.
+    plan = _plan(orders={"SCHB": 14_000}, alien_lines=[],
+                 investable=_U25274773_INVESTABLE, net_liq=_U25274773_NET_LIQ)
+    req = _request(plan=plan, target=tgt, armed=False, net_liq=_U25274773_NET_LIQ)
+    req.quotes = {"SCHB": _quote("SCHB", 61.90, 61.92)}       # cap 62.11 -> 869,540.00
+    res = se.execute_plan(req, mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    blocked = _overdeploy_reasons(res)
+    assert len(blocked) == 1, res.reasons
+    assert "total BUY 865,060.00 at plan prices > investable 818,504.60" in blocked[0]
+    assert "worst case at the marketable caps: 869,540.00" in blocked[0]
+
+
+def test_buy_leg_missing_from_prices_falls_back_to_the_cap_priced_notional():
+    """FAIL CLOSED per leg. A BUY whose symbol has no usable price in `prices` is counted at
+    its own cap-priced notional — strictly the larger figure — so an unreadable price makes
+    the gate STRICTER, never looser. Constructed so the fallback FLIPS the verdict: with it
+    the plan basis is 100,020.00 (blocked); with that leg priced for real it is 99,900.00.
+
+    The leg is still fully PRICEABLE (its cap comes from the live quote), so this is the
+    price-basis fallback firing on its own, not the unpriceable rail."""
+    # XYZ is in the model's weights but absent from `prices` (which _request takes from
+    # target.prices) — it is priced only by its quote.
+    tgt = _target(weights={"SCHB": 0.6, "XYZ": 0.4}, prices={"SCHB": 60.00})
+    plan = _plan(orders={"SCHB": 1_000, "XYZ": 1_000}, alien_lines=[],
+                 investable=100_000.0, net_liq=101_010.0)
+    req = _request(plan=plan, target=tgt, armed=False, net_liq=101_010.0)
+    req.quotes = {"SCHB": _quote("SCHB", 59.98, 60.00),       # cap 60.18
+                  "XYZ": _quote("XYZ", 39.88, 39.90)}         # cap 40.02
+    assert "XYZ" not in req.prices                            # the precondition under test
+
+    res = se.execute_plan(req, mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    assert [r for r in res.reasons if "no usable price" in r] == [], res.reasons
+    blocked = _overdeploy_reasons(res)
+    assert len(blocked) == 1, res.reasons
+    # SCHB at its plan price (60,000.00) + XYZ fallen back to its CAP notional (40,020.00).
+    assert "total BUY 100,020.00 at plan prices > investable 100,000.00" in blocked[0]
+
+    # Prove the fallback is what tipped it: give XYZ a real price and the account clears.
+    req2 = _request(plan=plan, target=_target(weights={"SCHB": 0.6, "XYZ": 0.4},
+                                              prices={"SCHB": 60.00, "XYZ": 39.90}),
+                    armed=False, net_liq=101_010.0)
+    req2.quotes = dict(req.quotes)
+    res2 = se.execute_plan(req2, mode=se.MODE_PREVIEW, ib=_NoTxIB())
+    assert _overdeploy_reasons(res2) == [], res2.reasons     # 60,000 + 39,900 = 99,900
+
+
+def test_buying_power_still_refuses_against_the_worst_case_total(monkeypatch):
+    """The investable gate moved to the plan basis; the BUYING-POWER gate did NOT. Whether the
+    broker will PERMIT the order is genuinely a worst-case question, so it stays on the
+    cap-priced total. BuyingPower is set BETWEEN the two totals: it must still refuse."""
+    monkeypatch.setattr(se, "_probe_gateway_readonly", lambda ib, **k: False)
+    bp = 820_000.0                                    # 818,478.28 < bp < 822,722.51
+    summary = [_row(ACCT, "NetLiquidation", str(_U25274773_NET_LIQ)),
+               _row(ACCT, "BuyingPower", str(bp)),
+               _row(ACCT, "TotalCashValue", str(_U25274773_NET_LIQ))]
+    req = _u25274773_request(armed=True, summary=summary)
+    ib = _TxFakeIB(summary)
+    res = se.execute_plan(req, mode=se.MODE_ARMED, ib=ib)
+
+    assert res.status == se.STATUS_BLOCKED
+    assert ib.placed == []
+    assert _overdeploy_reasons(res) == [], res.reasons          # the investable gate CLEARED
+    bp_reasons = [r for r in res.reasons if "buying power" in r]
+    assert len(bp_reasons) == 1, res.reasons
+    assert f"total BUY notional {_U25274773_CAP_TOTAL:,.2f}" in bp_reasons[0]

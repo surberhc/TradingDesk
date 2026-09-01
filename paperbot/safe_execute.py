@@ -46,6 +46,7 @@ from ib_async import Stock
 from connections import gateway_probe
 
 import config
+import investable as _investable   # the SHARED price-validity helper (usable_price)
 import live_quotes
 import order_router
 import pdt_guard
@@ -154,9 +155,12 @@ class ExecutionCaps:
     exceed this multiple of the model's own target dollars for that symbol (weight x managed
     NetLiq) — the fat-finger rail, measured against the plan rather than against a flat slice
     of NetLiq (see MAX_ORDER_MODEL_MULTIPLE for why the old %NLV cap was removed, owner
-    decision D3 2026-08-19). `total_buy_le_investable`: total BUY notional must not exceed the
-    plan's investable. `max_total_notional`: an optional absolute ceiling on total notional
-    (None = not enforced; the investable cap already bounds deployment).
+    decision D3 2026-08-19). `total_buy_le_investable`: total BUY notional AT THE PLAN'S OWN
+    PRICE BASIS (qty x the reference price the engine sized on) must not exceed the plan's
+    investable — NOT the worst-case-at-the-marketable-cap total, which is a different basis and
+    refused whole accounts for an overspend that cannot happen (see the check in execute_plan).
+    `max_total_notional`: an optional absolute ceiling on total notional (None = not enforced;
+    the investable cap already bounds deployment).
 
     SELL legs are rails-checked against the shares actually held, which needs no knob."""
     per_order_model_multiple: float = MAX_ORDER_MODEL_MULTIPLE
@@ -359,6 +363,27 @@ def _leg_cap(side: str, symbol: str, quotes: dict, prices: dict) -> float | None
     if not (cap and cap == cap and cap > 0):
         return None
     return cap
+
+
+def _leg_plan_notional(leg, prices: dict) -> float:
+    """One leg's notional at the PLAN's OWN price basis — `qty * prices[symbol]`, the same
+    REFERENCE price rebalance_engine sized the position on (target_shares = int(weight *
+    investable / reference_price)).
+
+    This is deliberately NOT the leg's `notional`, which is `qty * cap` where cap is the
+    WORST-CASE marketable crossing price (ask * (1 + ORDER_CAP_K)) — a price the order is
+    permitted to pay but, in the ordinary case, does not. Comparing a cap-priced total to an
+    investable figure computed on the reference basis compares two different bases; see the
+    total_buy_le_investable check in execute_plan for the incident that produced this.
+
+    FAILS CLOSED PER LEG: when the symbol carries no USABLE price (None / NaN / non-positive
+    — judged by the ONE shared rule, investable.usable_price, never a fresh one written here),
+    this falls back to the leg's own cap-priced `notional`, which is strictly the LARGER of the
+    two. An unreadable price therefore makes the gate STRICTER, never looser. PURE."""
+    px = _investable.usable_price(prices.get(leg.symbol))
+    if px is None:
+        return float(leg.notional)
+    return float(leg.qty) * px
 
 
 def _more_aggressive_cap(side: str, symbol: str, quotes: dict, base_limit: float,
@@ -824,7 +849,14 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     # [7] Build the full ordered DEPLOY order list (sells first, then buys; conform adds the
     # ALIEN liquidations). Whole-share, price-guarded caps.
     legs, aliens_left, unpriceable = build_deploy_legs(plan, quotes, prices, conform=conform)
+    # TWO TOTALS, TWO PRICE BASES — they are not interchangeable. See the comment on the
+    # total_buy_le_investable check below for which one each gate must use.
+    #   total_buy      — WORST CASE: each leg at its marketable CAP (ask * (1 + ORDER_CAP_K)),
+    #                    the price the order is willing to cross at but will not normally pay.
+    #   total_buy_plan — PLAN BASIS: each leg at the same REFERENCE price the engine sized it
+    #                    on (`prices`), i.e. what the plan actually intends to spend.
     total_buy = sum(l.notional for l in legs if l.side == "BUY")
+    total_buy_plan = sum(_leg_plan_notional(l, prices) for l in legs if l.side == "BUY")
     total_sell = sum(l.notional for l in legs if l.side == "SELL")
 
     print(f"\n[7] DEPLOY order list ({len(legs)} leg(s); sells first, then buys) — "
@@ -839,7 +871,11 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
             note = f"-> target ~{tw:.2f}%"
         print(f"    {l.side:4s} {l.symbol:6s} x{l.qty:<8d} LIMIT ~{l.limit:>10,.2f}  "
               f"notional ~{l.notional:>12,.2f}  [{l.source}]  {note}")
-    print(f"    TOTALS   sells ~{total_sell:,.2f}   buys ~{total_buy:,.2f}   "
+    # BOTH buy totals are shown so an operator reading a preview sees exactly what the
+    # investable gate compares (buys at plan prices) and what it does NOT (the worst case).
+    print(f"    TOTALS   sells ~{total_sell:,.2f}   "
+          f"buys at plan prices ~{total_buy_plan:,.2f}   "
+          f"buys worst case at the marketable caps ~{total_buy:,.2f}   "
           f"investable ~{plan.investable:,.2f}   NetLiq ~{net_liq:,.2f}")
     print("    NOTE: buys will be RE-SIZED to REALIZED cash after the sells fill (two-phase); "
           "the buy figures above are the pre-cash-gate plan.")
@@ -875,11 +911,34 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     reasons.extend(per_order_rail_reasons(legs, plan, target,
                                           managed_net_liq=managed_net_liq,
                                           model_multiple=model_multiple))
-    # Total-notional sanity cap: total BUY notional must not exceed investable. (The two-phase
-    # cash gate re-sizes buys to realized cash at transmit time; this is the plan-level cap.)
-    if caps.total_buy_le_investable and total_buy > plan.investable:
-        reasons.append(f"total BUY notional {total_buy:,.2f} > investable "
-                       f"{plan.investable:,.2f} — would over-deploy / use margin")
+    # Total-notional sanity cap: total BUY must not exceed investable. (The two-phase cash gate
+    # re-sizes buys to realized cash at transmit time; this is the plan-level cap.)
+    #
+    # THE TWO BASES — DO NOT "FIX" THIS BACK TO `total_buy` (v0.44.0, 2026-09-01).
+    # `plan.investable` is computed on the REFERENCE-price basis: rebalance_engine sizes every
+    # position as target_shares = int(weight * investable / reference_price), and whole-share
+    # rounding is DOWN, so the plan's intended spend is STRICTLY BELOW investable by
+    # construction. `total_buy` is a DIFFERENT basis: qty * the marketable CAP
+    # (ask * (1 + ORDER_CAP_K), ORDER_CAP_K = 0.003) — the deliberately-above-market price the
+    # order may cross at so it actually fills. Comparing the cap basis to a reference-basis
+    # investable compares two different numbers; the gap is (ask - reference)/reference plus
+    # 30bps, which on a larger account exceeds the whole-share rounding slack and refuses the
+    # ENTIRE account. MEASURED 2026-09-01 on U25274773: investable 818,504.60, buys at the caps
+    # 822,722.51 (blocked) vs buys at plan prices 818,504.60-minus-rounding (fine) — a ~51bps
+    # after-hours spread. Three of eight custom-model accounts, $1,194,383 of $1,471,610 (81%
+    # of the deployment, including the largest account), were refused for an overspend that
+    # cannot happen: the account never pays the cap, it pays the market.
+    # The protection that ACTUALLY prevents over-deployment is elsewhere and untouched — the
+    # two-phase transmit re-reads TotalCashValue from the BROKER after the sells and floors the
+    # buys to it via _scale_buys_to_cash (1% safety buffer, hard assert).
+    # So: this arithmetic-consistency gate uses the PLAN basis, and only it. The worst case is
+    # reported alongside so nothing is hidden — and it is still the figure the BUYING-POWER and
+    # margin gates below use, because "will the broker permit this order" genuinely is a
+    # worst-case question.
+    if caps.total_buy_le_investable and total_buy_plan > plan.investable:
+        reasons.append(f"total BUY {total_buy_plan:,.2f} at plan prices > investable "
+                       f"{plan.investable:,.2f} — would over-deploy / use margin "
+                       f"(worst case at the marketable caps: {total_buy:,.2f})")
     # Optional absolute total-notional ceiling (None by default — investable already bounds it).
     if caps.max_total_notional is not None and (total_buy + total_sell) > caps.max_total_notional:
         reasons.append(f"total notional {total_buy + total_sell:,.2f} > max_total_notional "
