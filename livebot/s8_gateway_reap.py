@@ -50,6 +50,15 @@ SAFETY — THE LOAD-BEARING CHECKS (mirrors s8_reap's discipline)
    the 08:45 watchdog alert). True orphans — a gateway unbound while ANOTHER already owns
    4003 — are still reaped on the short boot grace, and a genuinely hung unbound gateway is
    still cleaned once past the login window, or the instant a real session binds 4003.
+6. DEAD AUTH ends the login grace. The long grace in item 5 exists to protect a PENDING
+   2FA. When the gateway's own ``launcher.log`` proves THIS instance's authorization has
+   already FAILED (``Authorization failed``, with no later ``Authentication complete``, in
+   the window between the process's start and now), no 2FA remains to protect: that process
+   can never bind 4003, so it drops back to the short BOOT grace and is reaped promptly.
+   Without this, 2026-09-02's dead-auth gateway squatted from 08:14 until the 08:40 sweep —
+   straight through the market open. Detection is POSITIVE-ONLY: an unreadable log,
+   unparsable stamps, or no decisive event all preserve the full login grace, so item 5's
+   protection is never weakened by uncertainty.
 
 NEVER RAISES, NEVER BLOCKS. Every failure is caught and reported in the returned dict;
 ``main`` always exits 0. This module has NO order path, NO ``ib_async`` import, and NO
@@ -84,6 +93,18 @@ BOOT_GRACE_SECS = 180
 LOGIN_GRACE_SECS = 1800
 REAP_LOG_NAME = "s8_gateway_reap.log"
 
+# The gateway's OWN launcher log. IBKR writes the decisive auth outcome here; it is the
+# only place that distinguishes "2FA still pending" from "2FA already failed".
+LAUNCHER_LOG_PATH = os.path.join(INSTALL_MARKER, "GatewaySettings", "launcher.log")
+AUTH_FAIL_MARKER = "Authorization failed"
+AUTH_OK_MARKER = "Authentication complete"  # also matches IBKR's "Authentication completed."
+_LOG_TS_LEN = 23  # "YYYY-MM-DD HH:MM:SS.mmm"
+_LOG_TS_FMT = "%Y-%m-%d %H:%M:%S.%f"
+# Slack between a process's CreationDate and the log stamps of its own login, absorbing
+# small clock skew. Must stay FAR smaller than the gap between a failed login and the next
+# relaunch, so one instance's failure can never be pinned on its successor.
+AUTH_START_SKEW_SECS = 60
+
 # Tri-state sentinel returned by the port-owner probe when it could not be performed at
 # all. Distinct from an int owner pid and from None ("determinate: no listener").
 UNKNOWN = "UNKNOWN"
@@ -95,6 +116,78 @@ def _cmdline_is_live_trade(cmdline: Optional[str]) -> bool:
     if not cmdline:
         return False
     return INSTALL_MARKER.lower() in str(cmdline).lower()
+
+
+def _parse_log_ts(line: str):
+    """The leading ``YYYY-MM-DD HH:MM:SS.mmm`` of a launcher-log line, or None."""
+    import datetime  # noqa: PLC0415
+
+    try:
+        return datetime.datetime.strptime(str(line)[:_LOG_TS_LEN], _LOG_TS_FMT)
+    except (ValueError, TypeError):
+        return None
+
+
+def auth_outcome_after(log_text: Optional[str], start_dt, end_dt=None) -> Optional[str]:
+    """The LAST decisive auth event at/after ``start_dt``: ``"FAILED"``, ``"OK"``, or None.
+
+    Reading the *last* event (not merely "a failure exists") is what makes this safe for a
+    gateway that fails once and then succeeds on a retry inside the SAME process — that
+    gateway is healthy and must never be reaped. Undated or pre-``start_dt`` lines belong to
+    an earlier instance and are ignored entirely.
+
+    ``end_dt`` bounds the scan at the moment the decision is being made, so the verdict
+    rests only on evidence that existed by then. Live, the log simply has no later lines;
+    the bound matters when replaying history against a log that SUCCEEDING instances have
+    since appended to (all instances share one ``launcher.log``)."""
+    if not log_text or start_dt is None:
+        return None
+    outcome: Optional[str] = None
+    for line in str(log_text).splitlines():
+        is_fail = AUTH_FAIL_MARKER in line
+        is_ok = AUTH_OK_MARKER in line
+        if not (is_fail or is_ok):
+            continue
+        ts = _parse_log_ts(line)
+        if ts is None or ts < start_dt:
+            continue
+        if end_dt is not None and ts > end_dt:
+            continue
+        outcome = "FAILED" if is_fail else "OK"
+    return outcome
+
+
+def _read_launcher_log(path: str) -> Optional[str]:
+    """Best-effort read of the launcher log. None on ANY problem — never raises."""
+    try:
+        with open(path, "r", encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except Exception:  # noqa: BLE001 — unreadable log is simply "no evidence"
+        return None
+
+
+def gateway_auth_failed(
+    pid: int,
+    age_secs: float,
+    *,
+    log_path: Optional[str] = None,
+    now=None,
+    read: Callable[[str], Optional[str]] = _read_launcher_log,
+    skew_secs: float = AUTH_START_SKEW_SECS,
+) -> bool:
+    """True ONLY when the launcher log POSITIVELY proves this instance's login already
+    failed. Every uncertainty — unreadable log, unparsable stamps, no decisive event —
+    returns False, which preserves the full login/2FA grace. Absence of evidence must
+    never license a kill."""
+    import datetime  # noqa: PLC0415
+
+    try:
+        ref = now or datetime.datetime.now()
+        start = ref - datetime.timedelta(seconds=float(age_secs) + float(skew_secs))
+        text = read(log_path or LAUNCHER_LOG_PATH)
+        return auth_outcome_after(text, start, ref) == "FAILED"
+    except Exception:  # noqa: BLE001 — never raise, never license a kill
+        return False
 
 
 # --------------------------------------------------------------------------- #
@@ -209,6 +302,7 @@ def reap_orphans(
     is_alive: Callable[[int], bool] = s8_lock.pid_alive,
     get_cmdline: Callable[[int], Optional[str]] = s8_lock.cmdline_of,
     kill: Callable[[int], bool] = s8_lock.kill_pid,
+    auth_failed: Callable[[int, float], bool] = gateway_auth_failed,
     my_pid: Optional[int] = None,
     log: Callable[[str], Any] = print,
 ) -> Dict[str, Any]:
@@ -269,7 +363,23 @@ def reap_orphans(
             # reaper-vs-2FA thrash. Give it the much longer LOGIN grace so a human has time to
             # answer 2FA. A truly hung gateway is still reaped once past that window, or the
             # moment a real session binds 4003.
-            effective_grace = grace_secs if owner is not None else max(grace_secs, login_grace_secs)
+            # The login grace protects an IN-PROGRESS 2FA. Once the gateway's own launcher
+            # log proves THIS instance's authorization already FAILED, there is no pending
+            # 2FA left to protect: the process can never bind 4003, so holding it for the
+            # full 30-minute window only squats the port lane (2026-09-02: a dead-auth
+            # gateway sat from 08:14 until the 08:40 sweep, straight through the open).
+            # Such a gateway drops back to the short BOOT grace. Detection is positive-only
+            # — any doubt keeps the full login grace.
+            dead_auth = False
+            if owner is None:
+                try:
+                    dead_auth = bool(auth_failed(pid, age))
+                except Exception:  # noqa: BLE001 — probe failure is never a licence to kill
+                    dead_auth = False
+            if owner is not None or dead_auth:
+                effective_grace = grace_secs
+            else:
+                effective_grace = max(grace_secs, login_grace_secs)
             if age < effective_grace:
                 result["spared"].append(pid)
                 if owner is None:
@@ -299,8 +409,10 @@ def reap_orphans(
                 result["error"] = f"{type(exc).__name__}: {exc}"
                 log(f"s8_gateway_reap: error killing pid={pid} ({result['error']})")
                 continue
+            why = ("login already FAILED in the launcher log — no 2FA left to protect"
+                   if dead_auth else "not bound to 4003")
             log(f"s8_gateway_reap: reaped ORPHAN gateway pid={pid} "
-                f"(age={age:.0f}s, not bound to 4003) -> {'ok' if ok else 'FAILED'}")
+                f"(age={age:.0f}s, {why}) -> {'ok' if ok else 'FAILED'}")
             (result["killed"] if ok else result["refused"]).append(pid)
 
         return result
