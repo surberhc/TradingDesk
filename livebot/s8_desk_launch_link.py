@@ -206,7 +206,7 @@ tap this later. The desk stays down until you do.</p>
  text-decoration:none;padding:17px;border-radius:11px;font-size:18px;font-weight:600">
 Bring the desk up</a>
 <p style="font-size:13px;color:#6e6e73;margin:18px 0 0;line-height:1.5">
-The link opens a page with a confirm button; it does nothing until you press it. You will
+One tap is all it takes &mdash; the page just confirms it started. You will
 get a &ldquo;gateway back up&rdquo; email once it is serving.</p>
 </div></body></html>"""
 
