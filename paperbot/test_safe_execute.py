@@ -831,3 +831,82 @@ def test_buying_power_still_refuses_against_the_worst_case_total(monkeypatch):
     bp_reasons = [r for r in res.reasons if "buying power" in r]
     assert len(bp_reasons) == 1, res.reasons
     assert f"total BUY notional {_U25274773_CAP_TOTAL:,.2f}" in bp_reasons[0]
+
+
+# ========================================================================================
+# BROKER-REFUSAL REPORTING (2026-09-02). A leg IBKR refuses outright must never be reported
+# as one the desk chased and gave up on. Live incident: JAAA came back Inactive with
+# reprices=0 in two accounts (insufficient settled cash) and the run recorded
+# "UNFILLED remainder (chased to cap, gave up)" — sending the reader after a market that had
+# moved away, when in fact the order never reached the book.
+# ========================================================================================
+def _log_entry(status="", message="", errorCode=None):
+    return SimpleNamespace(time=None, status=status, message=message, errorCode=errorCode)
+
+
+def _trade_with_log(entries):
+    return SimpleNamespace(log=list(entries), orderStatus=SimpleNamespace(status="Inactive"))
+
+
+def test_broker_message_returns_latest_message_and_code():
+    t = _trade_with_log([
+        _log_entry(status="PendingSubmit"),
+        _log_entry(status="Inactive", message="Available settled cash is insufficient",
+                   errorCode=202),
+    ])
+    assert se._broker_message(t) == (
+        "Available settled cash is insufficient", "202")
+
+
+def test_broker_message_is_empty_when_log_has_nothing_useful():
+    assert se._broker_message(_trade_with_log([])) == ("", "")
+    assert se._broker_message(
+        _trade_with_log([_log_entry(status="Submitted")])) == ("", "")
+
+
+def test_broker_message_never_raises_on_a_junk_trade():
+    assert se._broker_message(object()) == ("", "")
+    assert se._broker_message(SimpleNamespace(log=None)) == ("", "")
+
+
+def test_refused_order_is_not_described_as_a_failed_chase():
+    """THE REGRESSION. Inactive + zero re-prices must say the broker refused it, quote the
+    broker, and must NOT claim it was chased."""
+    t = _trade_with_log([_log_entry(status="Inactive",
+                                    message="Order rejected - insufficient settled cash",
+                                    errorCode=202)])
+    reason = se._unfilled_reason(t, "Inactive", attempts=0, cancelled_by_us=False)
+    assert "BROKER REFUSED THE ORDER" in reason
+    assert "IBKR error 202" in reason
+    assert "insufficient settled cash" in reason
+    assert "chased" not in reason.lower()
+    assert "gave up" not in reason.lower()
+
+
+def test_our_own_timeout_cancel_still_reports_the_true_reprice_count():
+    t = _trade_with_log([_log_entry(status="Submitted")])
+    reason = se._unfilled_reason(t, "Submitted", attempts=3, cancelled_by_us=True)
+    assert "we cancelled it at the phase timeout" in reason
+    assert "after 3 re-price(s)" in reason
+    assert "BROKER REFUSED" not in reason
+
+
+def test_timeout_cancel_with_no_reprices_does_not_claim_re_pricing():
+    t = _trade_with_log([_log_entry(status="Submitted")])
+    reason = se._unfilled_reason(t, "Submitted", attempts=0, cancelled_by_us=True)
+    assert "without re-pricing" in reason
+    assert "after 0 re-price(s)" not in reason
+
+
+def test_every_broker_refused_status_is_classified_as_a_refusal():
+    for status in ("Inactive", "Rejected", "ValidationError"):
+        reason = se._unfilled_reason(
+            _trade_with_log([]), status, attempts=0, cancelled_by_us=False)
+        assert "BROKER REFUSED THE ORDER" in reason, status
+    assert se._BROKER_REFUSED_STATUSES <= se._TERMINAL_STATUSES
+
+
+def test_a_cancelled_status_is_not_treated_as_a_broker_refusal():
+    """Cancelled/ApiCancelled are OUR cancels at the phase timeout, not IBKR refusing."""
+    assert "Cancelled" not in se._BROKER_REFUSED_STATUSES
+    assert "ApiCancelled" not in se._BROKER_REFUSED_STATUSES

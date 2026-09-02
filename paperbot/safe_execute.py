@@ -133,6 +133,14 @@ _TERMINAL_STATUSES = frozenset({
     "Filled", "Cancelled", "ApiCancelled", "Inactive", "Rejected", "ValidationError",
 })
 
+# The subset of terminal statuses that mean THE BROKER REFUSED THE ORDER, as opposed to the
+# order having worked and then been cancelled by us at the phase timeout. The distinction is
+# load-bearing for the operator: a refusal never sat on the book, so it was never chased, and
+# reporting it as "chased to cap, gave up" sends the reader looking for a market that moved
+# away when in fact IBKR declined the order outright. Found live 2026-09-02: JAAA came back
+# Inactive with reprices=0 in two accounts and was reported as a failed chase.
+_BROKER_REFUSED_STATUSES = frozenset({"Inactive", "Rejected", "ValidationError"})
+
 # DEPLOY ORDER-REF NAMESPACE. The tiny-test (s0_live_exec) builds its orderRef with the SAME
 # order_router._order_ref(account, as_of, side, symbol) format, so a one-off tiny-test BUY of
 # a symbol the deploy also buys (e.g. USFR) shares an identical ref. The :deploy tag gives the
@@ -725,6 +733,63 @@ def _trade_done(trade) -> bool:
         return getattr(st, "status", "") in _TERMINAL_STATUSES
 
 
+def _broker_message(trade) -> tuple[str, str]:
+    """(message, errorCode) IBKR attached to this order, or ("", "").
+
+    ib_async appends every status change AND every error the gateway sends for an order to
+    ``Trade.log`` as TradeLogEntry(time, status, message, errorCode). That text is the ONLY
+    record of WHY the broker refused an order, and the desk used to discard it. Reads the log
+    backwards and returns the most recent entry carrying either a message or an error code.
+    PURE and defensive: any missing/renamed attribute yields ("", "") rather than raising —
+    this runs on the reporting path of a real-money transmit and must never be the thing that
+    breaks a run."""
+    try:
+        entries = list(getattr(trade, "log", None) or ())
+    except Exception:  # noqa: BLE001
+        return ("", "")
+    for entry in reversed(entries):
+        msg = str(getattr(entry, "message", "") or "").strip()
+        code = getattr(entry, "errorCode", None)
+        code = "" if code in (None, 0, "0") else str(code)
+        if msg or code:
+            return (msg, code)
+    return ("", "")
+
+
+def _unfilled_reason(trade, status: str, attempts: int, cancelled_by_us: bool) -> str:
+    """Plain-English reason ONE leg did not fully fill, naming what actually happened.
+
+    Replaces a hardcoded "UNFILLED remainder (chased to cap, gave up)" that was emitted for
+    every unfilled leg regardless of cause — including orders the broker refused outright and
+    which were therefore never chased at all. Three distinct outcomes, each said differently:
+
+      * the BROKER REFUSED it  -> say so, and carry IBKR's own error code and text verbatim
+      * WE cancelled it at the phase timeout -> say so, with the true re-price count
+      * anything else          -> report the raw status rather than inventing a story
+
+    PURE."""
+    msg, code = _broker_message(trade)
+    if status in _BROKER_REFUSED_STATUSES:
+        out = f"BROKER REFUSED THE ORDER (status {status}; it never worked, so it was never re-priced)"
+        if code:
+            out += f" — IBKR error {code}"
+        if msg:
+            out += f": {msg}"
+        return out
+    if cancelled_by_us:
+        tail = ("after " + str(attempts) + " re-price(s)") if attempts else "without re-pricing"
+        out = f"UNFILLED remainder — we cancelled it at the phase timeout {tail}"
+        if code or msg:
+            out += f" (last broker message{' ' + code if code else ''}: {msg})" if msg else                    f" (last broker code: {code})"
+        return out
+    out = f"UNFILLED remainder — ended {status or 'UNKNOWN'} after {attempts} re-price(s)"
+    if code:
+        out += f" — IBKR error {code}"
+    if msg:
+        out += f": {msg}"
+    return out
+
+
 def _cum_filled(active: dict) -> float:
     """Cumulative filled shares for a leg across any cancel/replace re-prices (fills on a
     cancelled order are carried in filled_prior; the live trade's own fill is added on top)."""
@@ -892,7 +957,8 @@ def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, pr
 
     for a in active:
         l = a["leg"]
-        if not _trade_done(a["trade"]):
+        cancelled_by_us = not _trade_done(a["trade"])
+        if cancelled_by_us:
             try:
                 ib.cancelOrder(a["order"])    # give up: cancel the straggler, report loudly
             except Exception:
@@ -900,10 +966,17 @@ def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, pr
         st = getattr(a["trade"], "orderStatus", None)
         filled = _cum_filled(a)
         status = str(getattr(st, "status", "") or "")
-        reason = "" if filled >= l.qty else "UNFILLED remainder (chased to cap, gave up)"
+        # WHY it did not fill, from the broker's own words where there are any — never a
+        # hardcoded story. `cancelled_by_us` is captured BEFORE the cancel above, so a leg the
+        # broker refused is never described as one we gave up chasing.
+        broker_msg, broker_code = _broker_message(a["trade"])
+        reason = ("" if filled >= l.qty
+                  else _unfilled_reason(a["trade"], status, a["attempts"], cancelled_by_us))
         results.append({"symbol": l.symbol, "side": l.side, "requested": l.qty,
                         "filled": filled, "status": status, "reprices": a["attempts"],
-                        "skipped": False, "reason": reason})
+                        "skipped": False, "reason": reason,
+                        "broker_message": broker_msg, "broker_error_code": broker_code,
+                        "broker_refused": status in _BROKER_REFUSED_STATUSES})
     return results
 
 
@@ -940,6 +1013,18 @@ def _report_phase(label: str, results) -> None:
         for r in flagged:
             print(f"      -> {r['side']} {r['symbol']}: requested {r['requested']:g}, filled "
                   f"{r['filled']:g} [{r['status']}] {r.get('reason', '')}")
+        # A BROKER REFUSAL is a different animal from a leg that worked and did not fill, and
+        # it gets its own banner so it cannot be read past. The desk asked, IBKR said no, and
+        # IBKR's own words are the only thing that explains why.
+        refused = [r for r in flagged if r.get("broker_refused")]
+        if refused:
+            print(f"    !! {label} — THE BROKER REFUSED {len(refused)} ORDER(S). These never "
+                  f"reached the book and were never re-priced. IBKR's own words:")
+            for r in refused:
+                code = r.get("broker_error_code") or "(no code)"
+                msg = r.get("broker_message") or "(no message returned)"
+                print(f"      -> {r['side']} {r['symbol']} x{r['requested']:g} "
+                      f"[{r['status']}] IBKR {code}: {msg}")
 
 
 # ========================================================================================
