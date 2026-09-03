@@ -220,7 +220,7 @@ ALL_TICKERS = (EQUITY_CORE + SECTORS + DEFENSIVE_ASSETS + REAL_ASSETS + SMALL_TI
 # DOWNLOAD universe by backtester/src/download_data.py and nowhere else — no engine, no
 # strategy, no overlay reads it. Adding or removing a ticker here changes only which parquet
 # files exist on disk.
-CUSTOM_ALLOCATION_TICKERS = ["JAAA", "BUCK", "SGDM", "GDXJ", "SILJ", "GDX", "SIVR"]
+CUSTOM_ALLOCATION_TICKERS = ["JAAA", "BUCK", "SGDM", "GDXJ", "SILJ", "GDX", "SIVR", "FLOT"]
 
 # Benchmarks for the report (SPEC §2, §14, §15)
 BENCHMARK_SPY = "SPY"
