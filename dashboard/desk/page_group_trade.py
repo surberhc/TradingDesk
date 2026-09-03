@@ -72,6 +72,7 @@ def _prepare(models: list) -> dict:
         run["outside"] = ge.accounts_outside_the_wall(run["group_plans"], built["roster"])
         run["stamp"] = stamp
         run["models"] = list(models)
+        run["_built"] = built
         return run
     finally:
         ib.disconnect()
@@ -183,6 +184,58 @@ def render_group_trade() -> None:
                           key="gt_confirm", placeholder=CONFIRM_PHRASE)
     ready = typed.strip().upper() == CONFIRM_PHRASE
     if st.button("Send group trade", type="primary", disabled=not ready):
-        st.warning("Order placement is not wired yet - nothing was sent. The groups, the "
-                   "share splits and every check above are real; the last step is the "
-                   "block executor.")
+        with st.spinner("Creating the groups and sending the orders..."):
+            try:
+                result = _send(run)
+            except Exception as exc:
+                st.error("The run was refused and NOTHING was sent: {}".format(exc))
+                return
+        _render_result(result)
+
+
+def _send(run: dict) -> dict:
+    """Connect on the transmit lane, create the groups, place the blocks.
+
+    The gateway's own Read-Only toggle is the physical wall: connecting with readonly=False
+    only succeeds if a human has turned it off, and the executor probes it again before
+    writing anything. Nothing here can arm the gateway.
+    """
+    from ib_async import IB
+    import group_execute as ge
+
+    built = run["_built"]
+    target = ge.live_gateway(built["versions"])
+    ib = IB()
+    ib.connect(target.host, target.port, clientId=116, readonly=False, timeout=30,
+               account=target.pin_account)
+    try:
+        return ge.execute_group_run(
+            ib, target, run, built,
+            allowed_accounts=built["roster"], armed=True, backup_path=None)
+    finally:
+        ib.disconnect()
+
+
+def _render_result(result: dict) -> None:
+    """What actually happened, in plain sentences. Positions are the truth, not order status."""
+    created = result.get("created") or {}
+    st.markdown("**Groups created:** {}".format(created.get("created", 0)))
+    if result.get("note"):
+        st.warning(result["note"])
+        return
+    ex = result.get("executed") or {}
+    if ex.get("refused"):
+        st.error("The run was refused: {}".format(ex.get("refused_reason") or "no reason given"))
+        return
+    fills = ex.get("placed_fills") or []
+    st.success("{} block(s) sent - {} sell, {} buy.".format(
+        ex.get("n_blocks", 0), ex.get("n_sell_blocks", 0), ex.get("n_buy_blocks", 0)))
+    if fills:
+        st.dataframe(pd.DataFrame(fills), hide_index=True, use_container_width=True)
+    for label, key in (("Dropped for pattern-day-trader limits", "pdt_dropped"),
+                       ("Buy blocks dropped for cash", "dropped_buy_blocks"),
+                       ("Proceeds left uninvested", "uninvested")):
+        rows = ex.get(key) or []
+        if rows:
+            st.warning("{}: {}".format(label, len(rows)))
+            st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
