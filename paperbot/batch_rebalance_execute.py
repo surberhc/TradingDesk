@@ -823,44 +823,20 @@ def build_per_account_state(ib, roster_accounts):
     return per_account_state, held_symbols, held_contracts
 
 
-def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
-                      targets: dict, *, armed: bool, armed_conn: bool, kill: bool,
-                      metas: dict | None = None) -> int:
-    """Read each blessed account off the ONE 4003 login, size it with the frozen engine, and
-    drive safe_execute.execute_plan per OUT-OF-SPEC account (PREVIEW or ARMED). Reads the
-    broker; every transmit decision lives inside the shared engine's gate.
+def build_execution_prices(ib, roster_accounts, targets, per_account_state,
+                           held_symbols, held_contracts):
+    """Fetch live quotes for the run universe and return ``(prices, quotes, universe)``.
 
-    `metas` maps a CUSTOM model label -> its custom_target.AllocationMeta (absent for an S0
-    label). It is the SOURCE-based "is this account on a hand-authored book?" test for the two
-    things this function then does differently: the per-account tradeable universe, and the
-    allocation version stamped into the audit record."""
-    metas = metas or {}
-    # ONE run identifier for the whole batch. Stamped onto every ExecutionRequest, so every
-    # orderRef on the wire ends in it, and written into the single ledger record below — the
-    # join key between an IBKR order and the book that produced it.
-    run_id = safe_execute._run_id()
-    # CORP-ACTION GUARD, FAIL CLOSED (v0.41.0). sp._strategy_universe() swallows every
-    # exception and returns None — justified in ITS docstring because the s0 pilot preview is
-    # zero-transmit. This rail is not that rail: it sizes and can transmit for the whole
-    # roster, and with universe=None reconcile collapses every unrecognised holding into
-    # UNTRACKED, which ALWAYS breaches the band and sizes as delta = 0 - held (a FULL
-    # LIQUIDATION of a spinoff / rename / client holding / sweep). One failed import must not
-    # silently disarm that here, in PREVIEW either — a preview whose classification is wrong
-    # is what a human then arms. Refuse before the broker is even read.
-    strat_universe = sp._strategy_universe()
-    if not strat_universe:
-        print("\n    REFUSING: the strategy's tradeable universe could not be resolved, so a "
-              "spinoff, a rename, a client's own holding or a money-market sweep cannot be "
-              "told apart from a symbol the model dropped — every one of them would size as "
-              "a FULL LIQUIDATION. Nothing read, nothing sized, nothing transmitted.")
-        return 2
+    EXTRACTED VERBATIM from run_batch_session on 2026-09-03 so the GROUP rail can price a run
+    the same way instead of duplicating it. The logic is unchanged; only its location.
 
-    # [4] Read the whole login's account summary + positions ONCE, then filter per account.
-    print(f"\n[4] Reading account summary + positions for {len(roster_accounts)} roster "
-          f"account(s) off the one FA-master login...")
-    per_account_state, held_symbols, held_contracts = build_per_account_state(
-        ib, roster_accounts)
-
+    This block is subtle enough that a second copy would be a real hazard. It carries the
+    LIVE-QUOTE-ONLY rule (owner decision v0.42.0: no stored close is ever substituted for a
+    quote IBKR would not give, because a dropped key sized as target 0 shares - a FULL
+    LIQUIDATION), the broker-own-contract handling that stopped one unqualifiable holding
+    taking a whole batch down, and the MUTUAL-FUND exception where a held fund is priced from
+    the broker reported mark because a fund has no intraday quote by construction.
+    """
     target_symbols: set[str] = set()
     for t in targets.values():
         target_symbols |= set(t.weights.index)
@@ -916,6 +892,50 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
              f"{len(prices)} of {len(universe)} priced in total."
              if len(prices) > n_live_quoted else ""))
     live_quotes.report_unquoted(unquoted)
+
+    return prices, quotes, universe
+
+
+def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
+                      targets: dict, *, armed: bool, armed_conn: bool, kill: bool,
+                      metas: dict | None = None) -> int:
+    """Read each blessed account off the ONE 4003 login, size it with the frozen engine, and
+    drive safe_execute.execute_plan per OUT-OF-SPEC account (PREVIEW or ARMED). Reads the
+    broker; every transmit decision lives inside the shared engine's gate.
+
+    `metas` maps a CUSTOM model label -> its custom_target.AllocationMeta (absent for an S0
+    label). It is the SOURCE-based "is this account on a hand-authored book?" test for the two
+    things this function then does differently: the per-account tradeable universe, and the
+    allocation version stamped into the audit record."""
+    metas = metas or {}
+    # ONE run identifier for the whole batch. Stamped onto every ExecutionRequest, so every
+    # orderRef on the wire ends in it, and written into the single ledger record below — the
+    # join key between an IBKR order and the book that produced it.
+    run_id = safe_execute._run_id()
+    # CORP-ACTION GUARD, FAIL CLOSED (v0.41.0). sp._strategy_universe() swallows every
+    # exception and returns None — justified in ITS docstring because the s0 pilot preview is
+    # zero-transmit. This rail is not that rail: it sizes and can transmit for the whole
+    # roster, and with universe=None reconcile collapses every unrecognised holding into
+    # UNTRACKED, which ALWAYS breaches the band and sizes as delta = 0 - held (a FULL
+    # LIQUIDATION of a spinoff / rename / client holding / sweep). One failed import must not
+    # silently disarm that here, in PREVIEW either — a preview whose classification is wrong
+    # is what a human then arms. Refuse before the broker is even read.
+    strat_universe = sp._strategy_universe()
+    if not strat_universe:
+        print("\n    REFUSING: the strategy's tradeable universe could not be resolved, so a "
+              "spinoff, a rename, a client's own holding or a money-market sweep cannot be "
+              "told apart from a symbol the model dropped — every one of them would size as "
+              "a FULL LIQUIDATION. Nothing read, nothing sized, nothing transmitted.")
+        return 2
+
+    # [4] Read the whole login's account summary + positions ONCE, then filter per account.
+    print(f"\n[4] Reading account summary + positions for {len(roster_accounts)} roster "
+          f"account(s) off the one FA-master login...")
+    per_account_state, held_symbols, held_contracts = build_per_account_state(
+        ib, roster_accounts)
+
+    prices, quotes, universe = build_execution_prices(
+        ib, roster_accounts, targets, per_account_state, held_symbols, held_contracts)
 
     # [6] Size each roster account with the UNCHANGED engine. Refuse (skip) an account with no
     # readable positive NetLiq — an unfunded/invisible account cannot be acted on.
