@@ -15,10 +15,26 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.47.0"
+VERSION = "0.48.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.48.0", "2026-09-03", "TWO GATES WERE REFUSING ACCOUNTS THE BROKER HAD NOT "
+                             "REFUSED. (1) The buying-power pre-flight compared the buy total "
+                             "against buying power BEFORE the run sold anything, which is a "
+                             "question the two-phase execution path never asks - it sells, "
+                             "re-reads realized cash, then sizes the buys to it. Four real "
+                             "accounts were refused on 2026-09-03 whose own sells covered the "
+                             "gap, including U21789948 (bp 147,856 vs buys 201,255, sells "
+                             "54,487). The pre-flight now credits the run own sell proceeds; "
+                             "the hard cash gate inside the armed block is unchanged and is "
+                             "still the binding constraint. (2) PDT now WARNS instead of "
+                             "BLOCKING (owner decision, Andrew Surber): a rebalance produces "
+                             "one net leg per ticker so it contains no round trip and does "
+                             "not engage the day-trade rule; the desk must not refuse on its "
+                             "own reading when IBKR can refuse and say why. The verdict is "
+                             "still computed, printed loudly and carried on "
+                             "ExecutionResult.warnings."),
     ("0.47.0", "2026-09-03", "POSITIONS ARE NOW THE SOURCE OF TRUTH FOR WHAT A RUN "
                              "ACTUALLY DID. The first armed run of the custom book reported "
                              "36 legs as Cancelled with zero fills while every one of them "

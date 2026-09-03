@@ -1021,3 +1021,44 @@ def test_benign_codes_are_not_in_the_refused_set():
     assert 10311 in se._BENIGN_BROKER_WARNING_CODES
     assert 10349 in se._BENIGN_BROKER_WARNING_CODES
     assert "Cancelled" not in se._BROKER_REFUSED_STATUSES
+
+
+# ========================================================================================
+# BUYING-POWER PRE-FLIGHT MUST CREDIT THE RUN OWN SELLS (2026-09-03).
+# execute_plan is two-phase: sells transmit, realized cash is re-read, THEN buys are sized to
+# it. Comparing the buy total against pre-sell buying power asks a question the execution path
+# never asks. It refused four real accounts whose own sells covered the gap.
+# ========================================================================================
+def _bp_rows(bp):
+    return [SimpleNamespace(tag="BuyingPower", value=str(bp), currency="USD")]
+
+
+def test_buying_power_refuses_when_even_the_sells_cannot_cover_it():
+    ok, why = se._buying_power_ok(_bp_rows(7869.73), 12007.06, sell_proceeds=1000.0)
+    assert ok is False
+    assert "7,869.73" in why and "12,007.06" in why
+
+
+def test_buying_power_allows_when_the_runs_own_sells_cover_the_gap():
+    """THE REGRESSION - U7333194 on 2026-09-03: bp 7,869.73, buys 12,007.06, sells 4,252."""
+    ok, why = se._buying_power_ok(_bp_rows(7869.73), 12007.06, sell_proceeds=4252.0)
+    assert ok is True, why
+
+
+def test_the_large_account_that_was_refused_now_passes():
+    """U21789948: bp 147,856.46, buys 201,255.50, sells 54,487."""
+    ok, _ = se._buying_power_ok(_bp_rows(147856.46), 201255.50, sell_proceeds=54487.0)
+    assert ok is True
+
+
+def test_a_pure_buy_run_is_unchanged_by_the_credit():
+    assert se._buying_power_ok(_bp_rows(1000.0), 900.0)[0] is True
+    assert se._buying_power_ok(_bp_rows(1000.0), 1100.0)[0] is False
+
+
+def test_negative_sell_proceeds_can_never_inflate_spendable_cash():
+    assert se._buying_power_ok(_bp_rows(1000.0), 1100.0, sell_proceeds=-5000.0)[0] is False
+
+
+def test_unreadable_buying_power_still_allows_the_investable_cap_to_bound_it():
+    assert se._buying_power_ok([], 999999.0, sell_proceeds=0.0)[0] is True

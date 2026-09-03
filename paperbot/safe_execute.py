@@ -276,6 +276,9 @@ class ExecutionResult:
     unpriceable: list = field(default_factory=list)
     realized_cash: float | None = None
     reconcile_residual: object = None
+    # Non-blocking verdicts the operator still has to see - currently the PDT pre-flight,
+    # which warns instead of refusing (owner decision 2026-09-03).
+    warnings: list = field(default_factory=list)
     run_id: str | None = None
     rc: int = 0
 
@@ -361,14 +364,35 @@ def _total_cash_value(summary) -> float | None:
     return None
 
 
-def _buying_power_ok(summary, notional: float) -> tuple[bool, str]:
+def _buying_power_ok(summary, notional: float, sell_proceeds: float = 0.0) -> tuple[bool, str]:
     """Fail-closed buying-power sanity check for the total BUY notional. If BuyingPower is
-    readable and below the total buy notional, refuse; if it can't be read, allow (the
-    investable cap already bounds deployment). Mirrors s0_live_exec._buying_power_ok."""
+    readable and below what the run can actually spend, refuse; if it cannot be read, allow
+    (the investable cap already bounds deployment).
+
+    CREDITS THIS RUN OWN SELL PROCEEDS (2026-09-03). execute_plan is a TWO-PHASE deploy: it
+    transmits every SELL, waits for terminal state, RE-READS realized cash, and only then
+    sizes the buys against that realized figure. Comparing the buy total against buying power
+    as it stands BEFORE the sells asks a question the execution path never asks, and it
+    refused four real accounts on 2026-09-03 whose own sells would have covered the gap:
+    U7333194 (bp 7,869.73 vs buys 12,007.06, sells 4,252), U14212395, U14237837 and
+    U21789948 (bp 147,856 vs buys 201,255, sells 54,487) - all four affordable once the
+    account had sold what the model says it should not hold.
+
+    THIS DOES NOT WEAKEN THE PROTECTION. The binding constraint is the hard cash gate inside
+    the armed block, which sizes the buys to REALIZED cash after the sells actually settle and
+    carries an assert that the buy notional cannot exceed that budget. A sell that fails to
+    fill therefore shrinks the buys automatically. This pre-flight is the coarse early check;
+    the cash gate is the real one."""
     bp = _buying_power(summary)
-    if bp is not None and bp < notional:
-        return False, (f"buying power {bp:,.2f} < total BUY notional {notional:,.2f} — "
-                       f"refusing.")
+    if bp is None:
+        return True, ""
+    spendable = bp + max(float(sell_proceeds or 0.0), 0.0)
+    if spendable < notional:
+        detail = (f"buying power {bp:,.2f}"
+                  + (f" + {sell_proceeds:,.2f} of sells this run = {spendable:,.2f}"
+                     if sell_proceeds else "")
+                  + f" < total BUY notional {notional:,.2f} - refusing.")
+        return False, detail
     return True, ""
 
 
@@ -1401,12 +1425,15 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
 
     # Connection-dependent gates — only meaningful on the armed (4003 transmit) connection,
     # and only worth probing once the code-level gates above are clean.
+    # PDT verdicts that no longer block (owner decision 2026-09-03) but must still be reported.
+    pdt_warnings: list[str] = []
+
     if armed and purpose_ok and armed_conn and not reasons:
         if _probe_gateway_readonly(ib):
             reasons.append("Gateway is still READ-ONLY on 4003 (arming.probe idiom) — not "
                            "physically armed; a human must turn the Read-Only API toggle off")
     if armed and purpose_ok and armed_conn and not reasons:
-        bp_ok, bp_reason = _buying_power_ok(summary, total_buy)
+        bp_ok, bp_reason = _buying_power_ok(summary, total_buy, sell_proceeds=total_sell)
         if not bp_ok:
             reasons.append(bp_reason)
     # Self-computed per-account MARGIN pre-flight (#57): refuse a genuinely levered request on
@@ -1437,15 +1464,34 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     # trade-off in full; read it before changing this.
     if armed and purpose_ok and armed_conn and not reasons:
         pdt = pdt_guard.pdt_verdict(account, summary)
-        # NEVER SILENT — the verdict is printed on a clearance as well as on a refusal, so an
+        # NEVER SILENT - the verdict is printed on a clearance as well as on a refusal, so an
         # armed run always shows which basis each account was let through on.
         print(f"    PDT pre-flight [{pdt.code}]: {pdt.reason}")
         if not pdt.ok:
-            reasons.append(pdt.reason)
+            # OWNER DECISION, Andrew Surber 2026-09-03: WARN, DO NOT BLOCK. Let IBKR be the
+            # one that refuses a day-trade-restricted account.
+            #
+            # WHY. A day trade is buying AND selling the SAME security on the SAME day. This
+            # desk rebalances: it produces ONE net leg per ticker, so a run contains no round
+            # trip in anything (verified across every account in the 2026-09-03 book - no
+            # symbol appears on both sides). The gate was therefore refusing accounts over a
+            # rule our orders do not engage. It held six accounts, two of them solely on this,
+            # out of every run since they became visible - and the desk had never sent them a
+            # single order, so it cannot have caused their state either.
+            #
+            # THE RISK, STATED. The gate existed because of one measurement (2026-07-28,
+            # U5721712): a flagged account bounced a plain BUY of 1 USFR with no offsetting
+            # sell. If that generalises, these orders bounce AT THE BROKER instead of here.
+            # That is the accepted cost: a refusal we can read beats a refusal we guessed at,
+            # and the reason now gets captured (broker_message / broker_advanced_reject).
+            print("    !! PDT WARNING - NOT BLOCKING (owner decision 2026-09-03). IBKR may "
+                  "refuse this account. Proceeding so the BROKER gives the reason.")
+            pdt_warnings.append(pdt.reason)
 
     permit = (armed and purpose_ok and armed_conn and not kill and not reasons)
 
     result = ExecutionResult(status=STATUS_PREVIEW_ONLY, legs=legs, reasons=reasons,
+                             warnings=pdt_warnings,
                              aliens_left=aliens_left, unpriceable=unpriceable, rc=0)
 
     # [9] Report + (only if permitted) transmit the two-phase cash-gated deploy.
