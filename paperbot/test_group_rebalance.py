@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 
 import group_rebalance as gr
+import rebalance_engine as eng
 import recon_report
 
 
@@ -113,3 +114,56 @@ def test_summarize_reads_in_plain_english_and_never_raises_on_empty():
     assert "2 block order(s) across 2 account(s)" in text
     assert "ONE average price" in text
     assert "XLE BUY 20260904-0931" in text
+
+
+# ========================================================================================
+# routes_from_group_plans - EVERY group is an fa_block route, including a one-account group.
+# rebalance_engine.route_blocks sends a lone account down a "direct" route; under the
+# 2026-09-03 owner decision the group IS the audit record, and the staged rollout STARTS with
+# the single-account model, so that run must be recorded like every other.
+# ========================================================================================
+def test_every_route_is_an_fa_block_even_with_one_account():
+    """Conservative (Custom) has exactly 1 account and is deliberately run FIRST."""
+    groups = gr.plan_ticker_groups(
+        [_plan("U101", "Conservative (Custom)", {"USFR": 40, "JAAA": -30})],
+        run_stamp=STAMP)
+    routes = gr.routes_from_group_plans(groups)
+    assert len(routes) == 2
+    assert all(r.route == "fa_block" for r in routes),         "a one-account group must NOT fall back to a direct order - it would be the one run "         "with no audit record, and it is the first run we make"
+    assert all(r.account is None for r in routes), "a block order sets no single account"
+    assert all(len(r.per_account_split) == 1 for r in routes)
+
+
+def test_the_engine_would_have_routed_that_same_block_direct():
+    """Pins the deliberate difference so nobody 'fixes' it back."""
+    plans = [_plan("U101", "Conservative (Custom)", {"USFR": 40})]
+    engine_routes = eng.route_blocks(eng.aggregate_blocks_by_ticker(plans))
+    assert engine_routes[0].route == "direct"
+    ours = gr.routes_from_group_plans(gr.plan_ticker_groups(plans, run_stamp=STAMP))
+    assert ours[0].route == "fa_block"
+
+
+def test_route_carries_the_run_group_name_and_empty_fa_method():
+    routes = gr.routes_from_group_plans(
+        gr.plan_ticker_groups([_plan("U1", "G", {"XLE": 10}), _plan("U2", "B", {"XLE": 4})],
+                              run_stamp=STAMP))
+    r = routes[0]
+    assert r.fa_group == "XLE BUY 20260904-0931"
+    assert r.fa_method == "", "an order-level faMethod is rejected by IBKR (Error 10226)"
+    assert r.per_account_split == {"U1": 10, "U2": 4}
+    assert r.total_qty == 14
+    assert r.version == eng.CROSS_MODEL_VERSION
+
+
+def test_split_still_sums_to_total_on_every_route():
+    plans = [_plan(f"U{i}", "G", {"XLB": i, "XLE": -i}) for i in range(1, 6)]
+    for r in gr.routes_from_group_plans(gr.plan_ticker_groups(plans, run_stamp=STAMP)):
+        assert sum(r.per_account_split.values()) == r.total_qty
+
+
+def test_sides_are_preserved_so_the_executor_can_phase_them():
+    """The executor runs ALL sells, re-reads realized cash, then buys. It phases on side."""
+    plans = [_plan("U1", "G", {"JAAA": -100, "FLOT": 99})]
+    sides = {(r.symbol, r.side) for r in
+             gr.routes_from_group_plans(gr.plan_ticker_groups(plans, run_stamp=STAMP))}
+    assert sides == {("JAAA", "SELL"), ("FLOT", "BUY")}

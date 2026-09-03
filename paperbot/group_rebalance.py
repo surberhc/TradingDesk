@@ -48,6 +48,7 @@ from dataclasses import dataclass, field
 
 import fa_group_sync
 import rebalance_engine
+from recon_report import BlockOrder  # noqa: F401  (shape reference)
 
 
 @dataclass(frozen=True)
@@ -122,6 +123,54 @@ def plan_ticker_groups(plans, *, run_stamp: str, prices=None) -> list[TickerGrou
             per_account=split,
             est_notional=(float(p) * total) if p else None))
     return out
+
+
+def routes_from_group_plans(group_plans) -> list:
+    """Turn TickerGroupPlans into RoutePlans the block executor can drive.
+
+    EVERY route is ``route="fa_block"``, INCLUDING a group with a single account.
+
+    WHY THAT DIFFERS FROM rebalance_engine.route_blocks. That function sends a one-account
+    block down a ``"direct"`` route, reasoning that "the group machinery buys nothing for a
+    lone account; a plain single-account order is simpler and equally auditable". That was
+    true when FA groups were standing furniture. It is NOT true under the 2026-09-03 owner
+    decision, where the group IS the audit record: it is created fresh for the run, carries
+    the membership read from the CRM at that moment, and is left behind as the permanent
+    record of exactly who was in that trade. A one-account run that quietly became a direct
+    order would be the one run with no such record - and it is precisely the run we most want
+    recorded, because the staged rollout STARTS with the single-account model (Conservative
+    (Custom), 1 account) before anything larger is trusted.
+
+    ``fa_method`` is "" on every route: the group's explicit ContractsOrShares allocation
+    governs the split, and an order-level faMethod is rejected by IBKR (Error 10226).
+
+    UNPROVEN AT IBKR: whether a block order against a group with a SINGLE member is accepted.
+    Nothing in IBKR's documentation says either way and it cannot be tested against a
+    read-only gateway. Owner decision 2026-09-03: build it this way and let the first staged
+    run - one account, the smallest exposure in the book - be the live test. If IBKR refuses
+    it, that is learned on the safest possible trade rather than discovered later.
+
+    PURE: builds no order and touches no broker.
+    """
+    from rebalance_engine import RoutePlan
+    routes = []
+    for g in group_plans:
+        if not g.per_account:
+            raise ValueError(
+                f"routes_from_group_plans: group {g.group_name!r} has no accounts. A block "
+                f"with nobody in it is never what the caller meant. FAILING LOUD.")
+        routes.append(RoutePlan(
+            route="fa_block",
+            version=rebalance_engine.CROSS_MODEL_VERSION,
+            symbol=g.symbol,
+            side=g.side,
+            total_qty=int(g.total_qty),
+            fa_group=g.group_name,
+            fa_method="",
+            account=None,
+            per_account_split=dict(g.per_account),
+            reason="REBALANCE_TO_MODEL"))
+    return routes
 
 
 def summarize(group_plans) -> str:
