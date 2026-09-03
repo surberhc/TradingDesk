@@ -595,3 +595,111 @@ def test_two_runs_on_the_same_day_get_different_group_names():
     a = fgs.run_group_name("XLE BUY", "20260904-0931")
     b = fgs.run_group_name("XLE BUY", "20260904-1416")
     assert a != b, "the run stamp is what makes a group an audit record of ONE run"
+
+
+# ========================================================================================
+# create_run_group - the ARMED creation chain. Same safe order as sync_group_membership:
+# read -> plan -> MANDATORY backup -> arm-gated replaceFA -> read-back. The read-back is
+# stricter than the membership chain because replaceFA overwrites the WHOLE document and the
+# live master carries eight groups this desk does not own.
+# ========================================================================================
+def test_create_run_group_unarmed_is_a_preview_that_writes_nothing(tmp_path):
+    ib = FakeIB(_xml())
+    res = fgs.create_run_group(ib, "XLE BUY 20260904-0931", ["DU100003"],
+                               armed=False, backup_path=str(tmp_path))
+    assert res["wrote"] is False
+    assert res["created"] is False
+    assert res["backup"] == ""
+    assert res["refused_reason"]
+    assert ib.replaced == [], "an unarmed preview must never call replaceFA"
+    assert res["diff"].strip(), "the operator still gets a reviewable diff"
+
+
+def test_create_run_group_armed_writes_and_verifies(tmp_path, armed_config):
+    ib = FakeIB(_xml())
+    res = fgs.create_run_group(ib, "XLE BUY 20260904-0931", ["DU100003", "DU100004"],
+                               armed=True, backup_path=str(tmp_path))
+    assert res["wrote"] is True
+    assert res["verified"] is True
+    assert res["backup"], "a backup is mandatory before any write"
+    assert len(ib.replaced) == 1
+    after = fa_membership.parse_group_membership(ib.replaced[0][1])
+    assert after["XLE BUY 20260904-0931"] == {"DU100003", "DU100004"}
+    assert res["groups_before"] == 3
+
+
+def test_create_run_group_leaves_the_groups_it_does_not_own_alone(tmp_path, armed_config):
+    before = fa_membership.parse_group_membership(_xml())
+    ib = FakeIB(_xml())
+    fgs.create_run_group(ib, "XLE BUY 1", ["DU100003"], armed=True, backup_path=str(tmp_path))
+    after = fa_membership.parse_group_membership(ib.replaced[0][1])
+    for name, members in before.items():
+        assert after[name] == members, f"{name} must be untouched by a creation"
+    assert len(after) == len(before) + 1
+
+
+def test_create_run_group_preserves_existing_amounts(tmp_path, armed_config):
+    """TIER_A carries distinct ContractsOrShares amounts; creation must not disturb them."""
+    ib = FakeIB(_xml())
+    fgs.create_run_group(ib, "XLE BUY 1", ["DU100003"], armed=True, backup_path=str(tmp_path))
+    assert _amounts(ib.replaced[0][1], "TIER_A") == _amounts(_xml(), "TIER_A")
+
+
+def test_create_run_group_refuses_a_name_that_already_exists_before_any_write(tmp_path,
+                                                                             armed_config):
+    ib = FakeIB(_xml())
+    with pytest.raises(fgs.FaGroupSyncRefused) as e:
+        fgs.create_run_group(ib, "TIER_A", ["DU100003"], armed=True, backup_path=str(tmp_path))
+    assert "ALREADY EXISTS" in str(e.value)
+    assert ib.replaced == [], "the refusal must land before replaceFA, not after"
+
+
+def test_create_run_group_refuses_an_empty_membership_before_any_write(tmp_path, armed_config):
+    ib = FakeIB(_xml())
+    with pytest.raises(fgs.FaGroupSyncRefused):
+        fgs.create_run_group(ib, "XLE BUY 1", [], armed=True, backup_path=str(tmp_path))
+    assert ib.replaced == []
+
+
+def test_create_run_group_raises_when_the_read_back_membership_is_wrong(tmp_path,
+                                                                       armed_config):
+    """The write happened; the master is UNVERIFIED and the caller is told to restore."""
+    ib = FakeIB(_xml(), echo_writes=False)   # read-back returns the ORIGINAL, no new group
+    with pytest.raises(fgs.FaGroupSyncVerifyFailed) as e:
+        fgs.create_run_group(ib, "XLE BUY 1", ["DU100003"], armed=True,
+                             backup_path=str(tmp_path))
+    assert "UNVERIFIED" in str(e.value)
+    assert ib.replaced, "the write DID happen - that is why this is a verify failure"
+
+
+def test_create_run_group_catches_a_read_back_that_lost_another_group(tmp_path, armed_config):
+    """Creation must disturb nothing else - and prove it after the write, not just before."""
+    stripped = (
+        "<ListOfGroups>"
+        "  <Group><name>TIER_A</name><defaultMethod>ContractsOrShares</defaultMethod>"
+        "    <ListOfAccts>"
+        "      <Account><acct>DU100001</acct><amount>7</amount></Account>"
+        "      <Account><acct>DU100002</acct><amount>13</amount></Account>"
+        "    </ListOfAccts></Group>"
+        "  <Group><name>XLE BUY 1</name><defaultMethod>NetLiq</defaultMethod>"
+        "    <ListOfAccts>"
+        "      <Account><acct>DU100003</acct><amount>0</amount></Account>"
+        "    </ListOfAccts></Group>"
+        "</ListOfGroups>")
+    ib = FakeIB(_xml(), stripped, echo_writes=False)
+    with pytest.raises(fgs.FaGroupSyncVerifyFailed) as e:
+        fgs.create_run_group(ib, "XLE BUY 1", ["DU100003"], armed=True,
+                             backup_path=str(tmp_path))
+    msg = str(e.value)
+    assert "UNVERIFIED" in msg
+    assert "restore the backup" in msg
+
+
+def test_create_run_group_refuses_the_write_on_committed_readonly_defaults(tmp_path):
+    """No monkeypatch: the on-disk defaults alone stop a write even with armed=True."""
+    assert config.READONLY is True and config.DRY_RUN is True
+    ib = FakeIB(_xml())
+    res = fgs.create_run_group(ib, "XLE BUY 1", ["DU100003"], armed=True,
+                               backup_path=str(tmp_path))
+    assert res["wrote"] is False
+    assert ib.replaced == []

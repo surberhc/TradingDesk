@@ -606,6 +606,102 @@ def apply_membership_change(ib, new_xml: str, *, armed: bool, backup_path: str) 
 # ============================================================================================
 # 5. THE GLUE — read -> plan -> (no-op? stop) -> backup -> write -> verify.
 # ============================================================================================
+def create_run_group(
+    ib,
+    fa_group: str,
+    desired_accounts: Sequence[str],
+    *,
+    armed: bool = False,
+    backup_path: str | None = None,
+    default_method: str = "NetLiq",
+    new_member_amount: int = 0,
+    verify: bool = True,
+) -> dict:
+    """The full CREATION chain for ONE run group, in the same safe order as
+    :func:`sync_group_membership`.
+
+        requestFA(1) -> plan (pure) -> MANDATORY backup -> arm-gated replaceFA -> read-back
+
+    UNARMED (the default) this is a PREVIEW: it reads, plans, and returns the diff and summary
+    having taken no backup, written no file and called no replaceFA.
+
+    THERE IS NO NO-OP SHORT-CIRCUIT, unlike the membership chain. Creating a group is always a
+    change by definition; a name that already exists is a REFUSAL from plan_group_creation, not
+    a quiet no-op. That distinction is deliberate - a run group whose name already exists means
+    the run stamp is not unique, and silently reusing another run's group would destroy the
+    audit record this whole design exists to produce.
+
+    THE READ-BACK IS STRICTER THAN THE MEMBERSHIP CHAIN'S. Editing membership only has to
+    prove one group landed correctly. Creation must ALSO prove it did not disturb anything
+    else, because replaceFA overwrites the whole document and the master carries groups this
+    desk does not own (on 2026-09-03: Main, Ted, MainSmall, Rebalance, No Trade, Dougs Group,
+    Income, Rob). So the read-back checks the new group's membership AND that every
+    pre-existing group is unchanged AND that the group count rose by exactly one.
+
+    Returns the same result dict shape as sync_group_membership, with ``created`` in place of
+    ``changed``. Raises FaGroupSyncRefused if the read or plan cannot be trusted (nothing
+    written), and FaGroupSyncVerifyFailed if the read-back does not match (the write DID
+    happen - restore ``result["backup"]``).
+    """
+    current_xml = read_live_groups(ib)
+    before = fa_membership.parse_group_membership(current_xml)
+    new_xml, diff_text, summary = plan_group_creation(
+        current_xml, fa_group, desired_accounts,
+        default_method=default_method, new_member_amount=new_member_amount)
+
+    result: dict = {
+        "fa_group": summary.fa_group,
+        "created": True,
+        "wrote": False,
+        "armed": bool(armed),
+        "summary": summary,
+        "summary_text": summary.text(),
+        "diff": diff_text,
+        "current_xml": current_xml,
+        "new_xml": new_xml,
+        "backup": "",
+        "verified": None,
+        "refused_reason": "",
+        "groups_before": len(before),
+    }
+
+    permit, why = order_router.transmit_guard(bool(armed))
+    if not permit:
+        result["created"] = False
+        result["refused_reason"] = (
+            f"not written ({why}) - preview only, no backup, no replaceFA")
+        return result
+
+    result["backup"] = backup_groups(current_xml, backup_path)
+    apply_membership_change(ib, new_xml, armed=armed, backup_path=result["backup"])
+    result["wrote"] = True
+
+    if verify:
+        result["verified"] = False
+        after = fa_membership.parse_group_membership(read_live_groups(ib))
+        want = {str(a).strip() for a in (desired_accounts or []) if str(a).strip()}
+        if after.get(summary.fa_group) != want:
+            raise FaGroupSyncVerifyFailed(
+                f"create_run_group: replaceFA WAS WRITTEN but the read-back of new FA group "
+                f"{summary.fa_group!r} is {sorted(after.get(summary.fa_group, set()))}, not "
+                f"the approved {sorted(want)}. The master is in an UNVERIFIED state - restore "
+                f"the backup at {result['backup']}", result)
+        if len(after) != len(before) + 1:
+            raise FaGroupSyncVerifyFailed(
+                f"create_run_group: replaceFA WAS WRITTEN but the master now has {len(after)} "
+                f"groups, not the expected {len(before) + 1}. The master is in an UNVERIFIED "
+                f"state - restore the backup at {result['backup']}", result)
+        for name, members in before.items():
+            if after.get(name) != members:
+                raise FaGroupSyncVerifyFailed(
+                    f"create_run_group: replaceFA WAS WRITTEN but pre-existing group {name!r} "
+                    f"CHANGED. Creating a group must disturb nothing else. The master is in an "
+                    f"UNVERIFIED state - restore the backup at {result['backup']}", result)
+        result["verified"] = True
+
+    return result
+
+
 def sync_group_membership(
     ib,
     fa_group: str,
