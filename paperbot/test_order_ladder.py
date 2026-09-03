@@ -661,3 +661,70 @@ def test_all_terminal_nonfill_statuses_escalate(status):
         armed=True, rung_seconds=1, poll=0)
     assert res["rungs_used"] >= 2
     assert res["filled"] == 100
+
+
+# ========================================================================================
+# ADAPTIVE ON FA BLOCK ORDERS (owner decision 2026-09-03). A plain marketable limit CROSSES
+# the spread; Adaptive works the order between bid and ask instead. The limit price stays the
+# ceiling, so it is a better fill or the same fill, never worse.
+# ========================================================================================
+def test_block_without_adaptive_is_what_it_always_was():
+    b = orm.build_fa_block("XLE", "BUY", 500, 65.0, "XLE BUY 1", "", "2026-09-04")
+    assert not getattr(b.order, "algoStrategy", None)
+    assert not getattr(b.order, "algoParams", None)
+    assert b.order.faGroup == "XLE BUY 1"
+    assert b.order.tif == "DAY"
+
+
+def test_adaptive_is_attached_with_the_priority_asked_for():
+    b = orm.build_fa_block("XLE", "BUY", 500, 65.0, "XLE BUY 1", "", "2026-09-04",
+                           adaptive_priority="Patient")
+    assert b.order.algoStrategy == "Adaptive"
+    assert [(t.tag, t.value) for t in b.order.algoParams] == [("adaptivePriority", "Patient")]
+
+
+def test_the_limit_price_is_still_the_ceiling_under_adaptive():
+    """Adaptive works INSIDE the cap - it can never pay more than the plain limit would."""
+    plain = orm.build_fa_block("XLE", "BUY", 500, 65.0, "G", "", "2026-09-04")
+    algo = orm.build_fa_block("XLE", "BUY", 500, 65.0, "G", "", "2026-09-04",
+                              adaptive_priority="Patient")
+    assert algo.order.lmtPrice == plain.order.lmtPrice == 65.0
+    assert algo.order.totalQuantity == plain.order.totalQuantity
+
+
+def test_the_group_and_the_ref_are_untouched_by_the_algo():
+    plain = orm.build_fa_block("XLE", "SELL", 10, 65.0, "XLE SELL 1", "", "2026-09-04",
+                               run_id="R1")
+    algo = orm.build_fa_block("XLE", "SELL", 10, 65.0, "XLE SELL 1", "", "2026-09-04",
+                              run_id="R1", adaptive_priority="Urgent")
+    assert algo.order.faGroup == plain.order.faGroup
+    assert algo.order.orderRef == plain.order.orderRef
+    assert algo.order.faMethod == plain.order.faMethod == ""
+
+
+def test_tif_stays_day_because_gtc_is_impossible_with_an_algo():
+    b = orm.build_fa_block("XLE", "BUY", 500, 65.0, "G", "", "2026-09-04",
+                           adaptive_priority="Patient")
+    assert b.order.tif == "DAY", "IBKR does not support GTC with any IB algo"
+
+
+def test_a_priority_ibkr_would_not_recognise_fails_loud():
+    for bad in ("Aggressive", "patient!", "URGENTLY", "fast"):
+        with pytest.raises(ValueError):
+            orm.build_fa_block("XLE", "BUY", 500, 65.0, "G", "", "2026-09-04",
+                               adaptive_priority=bad)
+
+
+def test_priority_is_case_insensitive():
+    for good in ("patient", "PATIENT", "Patient"):
+        b = orm.build_fa_block("XLE", "BUY", 500, 65.0, "G", "", "2026-09-04",
+                               adaptive_priority=good)
+        assert b.order.algoParams[0].value == "Patient"
+
+
+def test_the_price_guard_still_runs_before_the_algo_is_attached():
+    """A missing quote must never become a $0/NaN block, algo or not."""
+    for bad in (0, -1, None, float("nan")):
+        with pytest.raises(Exception):
+            orm.build_fa_block("XLE", "BUY", 500, bad, "G", "", "2026-09-04",
+                               adaptive_priority="Patient")

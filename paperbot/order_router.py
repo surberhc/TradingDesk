@@ -412,7 +412,7 @@ def build(approved, account: str, as_of, ib=None, run_id=None) -> list[BuiltOrde
 
 def build_fa_block(symbol: str, side: str, quantity: int, limit_price: float,
                    fa_group: str, fa_method: str, as_of, ib=None,
-                   run_id=None) -> BuiltOrder:
+                   run_id=None, adaptive_priority: str | None = None) -> BuiltOrder:
     """Construct ONE FA group (block) order: the master executes it as a single block
     at one average price and allocates across the group's accounts by fa_method. No
     single `account` is set — that is what makes it a group order rather than a direct
@@ -424,13 +424,50 @@ def build_fa_block(symbol: str, side: str, quantity: int, limit_price: float,
 
     HARD PRICE GUARD: the block's limit price is validated (NaN/None/<=0 rejected)
     BEFORE the order object is built — a missing quote can never become a $0/NaN block
-    order that the master would then split across a whole tier."""
+    order that the master would then split across a whole tier.
+
+    ``adaptive_priority`` (Patient | Normal | Urgent) wraps the capped limit in IBKR's
+    ADAPTIVE algo. Owner decision 2026-09-03: use it on block orders.
+
+    WHY. A plain marketable limit CROSSES the spread - it takes the offer and pays the
+    half-spread. Adaptive is "designed to ensure that both market and aggressive limit orders
+    trade between the bid and ask prices" (IBKR, Order Types and Algos), so it works the order
+    toward the midpoint instead of lifting it. On the sector SPDRs this book trades, State
+    Street publishes a 30-day median spread of 0.02% (2 bps), so the half-spread being avoided
+    is ~1 bp - small per order, real across a book this size, and it also makes a large block
+    less visible. IBKR additionally names an algo as its OWN remedy when an order is too large
+    for a plain limit (error 201: "convert your order to an algorithmic Order (IBALGO)").
+
+    THE LIMIT PRICE IS STILL THE CEILING. Adaptive works inside it; it never pays more. So
+    this is strictly a better fill or the same fill, never a worse one.
+
+    GTC IS IMPOSSIBLE WITH AN ALGO - IBKR does not support it - so the TIF stays DAY, which is
+    what a block order already used. A caller wanting a resting remainder must use a plain
+    limit for that rung; the two cannot be combined.
+
+    UNPROVEN AT IBKR, stated plainly: no IBKR document confirms OR denies that an FA group
+    order accepts an algoStrategy. The evidence is favourable (faGroup and algoStrategy are
+    independent fields; IBKR's advisor training says reallocated group orders can use "all the
+    algorithms and order types Interactive Brokers offers"; Accumulate/Distribute is
+    documented to allocate across accounts) but no compatibility matrix exists. Owner decision:
+    ship it and let the first staged run - one account, the smallest exposure in the book - be
+    the test. If IBKR refuses the combination, call this with adaptive_priority=None and the
+    order is exactly what it was before."""
     _check_limit_price(symbol, limit_price)
     contract = Stock(symbol, "SMART", "USD")
     order = LimitOrder(side, quantity, limit_price)
     order.faGroup = fa_group        # the allocation group defined on the gateway
     order.faMethod = fa_method      # e.g. "NetLiq" (proportional to each acct's net liq)
-    order.tif = "DAY"
+    order.tif = "DAY"               # Adaptive forbids GTC; a block was DAY already
+    if adaptive_priority:
+        priority = str(adaptive_priority).strip().capitalize()
+        if priority not in ("Patient", "Normal", "Urgent"):
+            raise ValueError(
+                f"build_fa_block: adaptive_priority must be Patient, Normal or Urgent, "
+                f"not {adaptive_priority!r}. FAILING LOUD rather than sending an order with "
+                f"an algo parameter IBKR will not recognise.")
+        order.algoStrategy = "Adaptive"
+        order.algoParams = [TagValue("adaptivePriority", priority)]
     order.orderRef = _fa_block_ref(fa_group, as_of, side, symbol, run_id)
     order.transmit = False
     if ib is not None:
