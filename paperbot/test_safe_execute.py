@@ -910,3 +910,114 @@ def test_a_cancelled_status_is_not_treated_as_a_broker_refusal():
     """Cancelled/ApiCancelled are OUR cancels at the phase timeout, not IBKR refusing."""
     assert "Cancelled" not in se._BROKER_REFUSED_STATUSES
     assert "ApiCancelled" not in se._BROKER_REFUSED_STATUSES
+
+
+# ========================================================================================
+# POSITIONS AS THE SOURCE OF TRUTH + BENIGN BROKER WARNINGS (2026-09-03).
+# An armed run reported 36 legs as "Cancelled, filled 0" while every one of them had filled
+# at IBKR. ib_async marks a LIVE order Cancelled when it sees a code outside its own warning
+# set, and 10311 (direct-routing notice) is outside it. Order status is a claim; positions
+# are the fact.
+# ========================================================================================
+def _trade_cancelled_with(code, filled=0.0, status="Cancelled"):
+    return SimpleNamespace(
+        orderStatus=SimpleNamespace(status=status, filled=filled),
+        log=[SimpleNamespace(status="Submitted", message="", errorCode=None),
+             SimpleNamespace(status=status, message="routed to ARCA", errorCode=code)])
+
+
+def test_10311_marks_a_live_order_cancelled_and_we_do_not_believe_it():
+    t = _trade_cancelled_with(10311)
+    assert se._spuriously_cancelled(t) is True
+    assert se._trade_done(t) is False, "a live order must keep being watched and re-priced"
+
+
+def test_10349_is_treated_the_same_way():
+    assert se._spuriously_cancelled(_trade_cancelled_with(10349)) is True
+
+
+def test_a_real_cancellation_is_still_terminal():
+    t = _trade_cancelled_with(202)
+    assert se._spuriously_cancelled(t) is False
+
+
+def test_a_benign_code_on_a_partially_filled_order_is_left_alone():
+    t = _trade_cancelled_with(10311, filled=5.0)
+    assert se._spuriously_cancelled(t) is False
+
+
+def test_spurious_check_never_raises_on_junk():
+    assert se._spuriously_cancelled(object()) is False
+    assert se._spuriously_cancelled(SimpleNamespace()) is False
+
+
+def test_reconcile_catches_the_phantom_cancellation():
+    """THE REGRESSION: status says nothing filled, the position says it all filled."""
+    buys = [{"symbol": "XLE", "side": "BUY", "requested": 68, "filled": 0.0,
+             "status": "Cancelled"}]
+    rec = se._reconcile_by_position({}, {"XLE": 68.0}, [], buys)
+    assert rec["available"] is True
+    assert buys[0]["filled_by_position"] == 68.0
+    assert buys[0]["position_disagrees"] is True
+    assert len(rec["disagreements"]) == 1
+    assert se._effective_filled(buys[0]) == 68.0
+
+
+def test_reconcile_is_clean_when_status_and_positions_agree():
+    buys = [{"symbol": "XLE", "side": "BUY", "requested": 68, "filled": 68.0,
+             "status": "Filled"}]
+    rec = se._reconcile_by_position({}, {"XLE": 68.0}, [], buys)
+    assert rec["disagreements"] == []
+    assert buys[0]["position_disagrees"] is False
+
+
+def test_reconcile_catches_a_fill_that_never_happened():
+    """The other direction: the client claimed a fill the position does not show."""
+    buys = [{"symbol": "JAAA", "side": "BUY", "requested": 29, "filled": 29.0,
+             "status": "Filled"}]
+    # The position file IS readable (the account holds XLE); JAAA simply never moved.
+    rec = se._reconcile_by_position({"XLE": 10.0}, {"XLE": 10.0}, [], buys)
+    assert buys[0]["filled_by_position"] == 0.0
+    assert len(rec["disagreements"]) == 1
+    assert se._effective_filled(buys[0]) == 0.0
+
+
+def test_reconcile_handles_sells_by_the_signed_delta():
+    sells = [{"symbol": "BUCK", "side": "SELL", "requested": 33, "filled": 0.0,
+              "status": "Cancelled"}]
+    rec = se._reconcile_by_position({"BUCK": 33.0}, {}, sells, [])
+    assert sells[0]["filled_by_position"] == 33.0
+    assert len(rec["disagreements"]) == 1
+
+
+def test_a_symbol_traded_on_both_sides_is_reported_unverifiable_not_guessed():
+    sells = [{"symbol": "XLE", "side": "SELL", "requested": 10, "filled": 10.0, "status": "Filled"}]
+    buys = [{"symbol": "XLE", "side": "BUY", "requested": 4, "filled": 4.0, "status": "Filled"}]
+    rec = se._reconcile_by_position({"XLE": 10.0}, {"XLE": 4.0}, sells, buys)
+    assert "XLE" in rec["unverifiable"]
+    assert sells[0]["filled_by_position"] is None
+    assert rec["disagreements"] == []
+    # falls back to the order status rather than inventing a number
+    assert se._effective_filled(sells[0]) == 10.0
+
+
+def test_an_unreadable_position_file_reports_unavailable_not_zero():
+    buys = [{"symbol": "XLE", "side": "BUY", "requested": 68, "filled": 68.0, "status": "Filled"}]
+    rec = se._reconcile_by_position({}, {}, [], buys)
+    # before AND after empty -> cannot verify anything; must not claim everything failed
+    assert rec["available"] is False
+    assert rec["disagreements"] == []
+    assert "filled_by_position" not in buys[0]
+
+
+def test_effective_filled_prefers_the_position_over_the_status():
+    assert se._effective_filled({"filled": 0.0, "filled_by_position": 68.0}) == 68.0
+    assert se._effective_filled({"filled": 68.0, "filled_by_position": 0.0}) == 0.0
+    assert se._effective_filled({"filled": 12.0}) == 12.0
+
+
+def test_benign_codes_are_not_in_the_refused_set():
+    """A routing notice is not a refusal and must never be reported as one."""
+    assert 10311 in se._BENIGN_BROKER_WARNING_CODES
+    assert 10349 in se._BENIGN_BROKER_WARNING_CODES
+    assert "Cancelled" not in se._BROKER_REFUSED_STATUSES

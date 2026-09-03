@@ -125,6 +125,7 @@ REPRICE_AFTER_SEC = 18.0             # unfilled longer than this -> cancel + re-
 REPRICE_MAX_ATTEMPTS = 3             # cap on cancel-replace re-prices per leg
 POLL_SEC = 1.0                       # phase poll cadence
 CASH_SETTLE_SEC = 3.0                # let streaming account values update after the sells fill
+POSITION_SETTLE_SEC = 3.0            # let the position stream catch up before reconciling
 # Keep a small slice of realized cash UNSPENT so rounding / a late fill can never tip negative.
 CASH_SAFETY_BUFFER_PCT = 0.01
 # Terminal order statuses (filled OR done-without-fill). Mirrors ib_async DoneStates + the
@@ -140,6 +141,48 @@ _TERMINAL_STATUSES = frozenset({
 # away when in fact IBKR declined the order outright. Found live 2026-09-02: JAAA came back
 # Inactive with reprices=0 in two accounts and was reported as a failed chase.
 _BROKER_REFUSED_STATUSES = frozenset({"Inactive", "Rejected", "ValidationError"})
+
+# CODES IBKR SENDS AS "ERRORS" THAT ARE PURELY INFORMATIONAL — THE ORDER IS STILL LIVE.
+# ib_async's wrapper.error() keeps its own `warningCodes` set and treats anything OUTSIDE it as
+# a real failure, which sets `trade.orderStatus.status = Cancelled` on a LIVE order (site-
+# packages/ib_async/wrapper.py, the `elif trade:` branch). Neither of these is in that set:
+#   10311 "This order will be directly routed to <EXCH>. Direct routed orders may result in
+#          higher trade fees. Restriction is specified in Precautionary Settings..."
+#   10349 "Order TIF was set to DAY based on order preset."
+# MEASURED 2026-09-03: all 36 legs of an armed run came back locally "Cancelled / filled 0"
+# on 10311 while every one of them was live at IBKR and filled — positions moved, the desk
+# reported nothing had happened, and the re-price ladder never engaged because a "cancelled"
+# order is terminal. Known upstream (ib-api-reloaded/ib_async discussion #190, worse on TWS
+# 10.45+; this gateway is build 1045).
+_BENIGN_BROKER_WARNING_CODES = frozenset({10311, 10349})
+
+
+def _spuriously_cancelled(trade) -> bool:
+    """True when the ONLY thing that marked this trade terminal was one of the benign
+    informational codes above — i.e. the order is still live at the broker and our local copy
+    is wrong. Reads the trade log backwards to the entry that set the terminal status.
+
+    Conservative by construction: returns False unless the status is one ib_async writes for
+    this failure (Cancelled / ValidationError), the trade reports nothing filled, and the most
+    recent log entry carrying a code carries a BENIGN one. Any real cancel, rejection or fill
+    lands a different status or a different code, and is left alone. PURE and defensive."""
+    try:
+        status = str(getattr(getattr(trade, "orderStatus", None), "status", "") or "")
+        if status not in ("Cancelled", "ValidationError"):
+            return False
+        if float(getattr(getattr(trade, "orderStatus", None), "filled", 0.0) or 0.0) > 0:
+            return False
+        for entry in reversed(list(getattr(trade, "log", None) or ())):
+            code = getattr(entry, "errorCode", None)
+            if code in (None, 0, "0"):
+                continue
+            try:
+                return int(code) in _BENIGN_BROKER_WARNING_CODES
+            except (TypeError, ValueError):
+                return False
+    except Exception:  # noqa: BLE001 — never break a transmit on a reporting helper
+        return False
+    return False
 
 # DEPLOY ORDER-REF NAMESPACE. The tiny-test (s0_live_exec) builds its orderRef with the SAME
 # order_router._order_ref(account, as_of, side, symbol) format, so a one-off tiny-test BUY of
@@ -725,7 +768,15 @@ def _working_order_present(ib, symbol: str, side: str) -> bool:
 
 def _trade_done(trade) -> bool:
     """Terminal-state test for one placed order. Prefers ib_async Trade.isDone(); falls back to
-    the orderStatus.status against the terminal set."""
+    the orderStatus.status against the terminal set.
+
+    EXCEPTION: a trade our client marked terminal ONLY because of a benign informational code
+    (:func:`_spuriously_cancelled`) is NOT done — the order is still working at IBKR. Treating
+    it as done is what stopped the re-price ladder and made an armed run report 36 phantom
+    cancellations on 2026-09-03. Keep watching it; a genuine fill or cancel will land a real
+    status, and if nothing does, the phase timeout cancels it like any other straggler."""
+    if _spuriously_cancelled(trade):
+        return False
     try:
         return bool(trade.isDone())
     except Exception:
@@ -970,14 +1021,120 @@ def _transmit_phase(ib, legs, *, account, as_of, run_id, phase_label, quotes, pr
         # hardcoded story. `cancelled_by_us` is captured BEFORE the cancel above, so a leg the
         # broker refused is never described as one we gave up chasing.
         broker_msg, broker_code = _broker_message(a["trade"])
+        # IBKR's STRUCTURED rejection payload (advancedOrderRejectJson). ib_async parks it on
+        # the trade as `advancedError`; it is the only place the broker explains a refusal in
+        # machine-readable detail, and the desk used to discard it.
+        advanced = str(getattr(a["trade"], "advancedError", "") or "")
         reason = ("" if filled >= l.qty
                   else _unfilled_reason(a["trade"], status, a["attempts"], cancelled_by_us))
         results.append({"symbol": l.symbol, "side": l.side, "requested": l.qty,
                         "filled": filled, "status": status, "reprices": a["attempts"],
                         "skipped": False, "reason": reason,
                         "broker_message": broker_msg, "broker_error_code": broker_code,
-                        "broker_refused": status in _BROKER_REFUSED_STATUSES})
+                        "broker_refused": status in _BROKER_REFUSED_STATUSES,
+                        "broker_advanced_reject": advanced})
     return results
+
+
+def _positions_for(ib, account: str) -> dict:
+    """{symbol: shares} the BROKER says this account holds, right now. Never raises: a
+    reconcile that cannot read positions must degrade to UNKNOWN, never take a run down."""
+    out: dict = {}
+    try:
+        ib.reqPositions()
+        ib.sleep(POSITION_SETTLE_SEC)
+        for pos in ib.positions():
+            if getattr(pos, "account", None) != account:
+                continue
+            qty = float(getattr(pos, "position", 0.0) or 0.0)
+            if qty:
+                out[str(pos.contract.symbol)] = qty
+    except Exception as exc:  # noqa: BLE001
+        print(f"    !! could not read positions for {account} ({type(exc).__name__}: {exc}) - "
+              f"the position reconcile is UNAVAILABLE for this run.")
+        return {}
+    return out
+
+
+def _reconcile_by_position(before: dict, after: dict, sell_results, buy_results) -> dict:
+    """POSITIONS ARE THE SOURCE OF TRUTH. Compare what the account actually holds now against
+    what it held before the phases, and set each leg filled_by_position from that delta rather
+    than from the order status this client happens to be holding.
+
+    WHY THIS EXISTS. On 2026-09-03 an armed run reported 36 legs as Cancelled with filled 0
+    while every one of them had filled at IBKR - the client had marked live orders cancelled
+    off a benign informational code (see _BENIGN_BROKER_WARNING_CODES). An order status is a
+    CLAIM; the position file is the FACT. Every leg is annotated, disagreements are collected,
+    and the caller reports the run outcome from the position side.
+
+    Returns {"available", "legs", "disagreements", "unverifiable"}. PURE apart from mutating
+    the result dicts it is handed. Empty before/after means the position read failed, and the
+    whole reconcile reports available=False rather than guessing zero."""
+    out = {"available": bool(after) or bool(before), "legs": [], "disagreements": [],
+           "unverifiable": []}
+    if not out["available"]:
+        return out
+    buy_syms = {x["symbol"] for x in (buy_results or [])}
+    sell_syms = {x["symbol"] for x in (sell_results or [])}
+    both = buy_syms & sell_syms
+    for res, sign in ((sell_results or [], -1.0), (buy_results or [], 1.0)):
+        for r in res:
+            sym = r["symbol"]
+            if sym in both:
+                # Traded on BOTH sides in one run: a net delta cannot attribute either leg.
+                r["filled_by_position"] = None
+                out["unverifiable"].append(sym)
+                continue
+            delta = float(after.get(sym, 0.0)) - float(before.get(sym, 0.0))
+            by_pos = abs(delta) if (delta * sign) > 0 else 0.0
+            r["filled_by_position"] = by_pos
+            reported = float(r.get("filled", 0.0) or 0.0)
+            r["position_disagrees"] = abs(by_pos - reported) > 1e-6
+            row = {"symbol": sym, "side": r["side"], "requested": r["requested"],
+                   "reported_filled": reported, "position_filled": by_pos,
+                   "status": r.get("status", "")}
+            out["legs"].append(row)
+            if r["position_disagrees"]:
+                out["disagreements"].append(row)
+    return out
+
+
+def _effective_filled(r: dict) -> float:
+    """How many shares a leg ACTUALLY moved. The position-derived figure when the reconcile
+    established one, otherwise the order status. Positions first, always."""
+    by_pos = r.get("filled_by_position")
+    return float(r.get("filled", 0.0) or 0.0) if by_pos is None else float(by_pos)
+
+
+def _report_reconcile(rec: dict) -> None:
+    """Print the position reconcile, LOUDLY when the broker positions disagree with what the
+    order statuses claimed. A silent disagreement is the failure this exists to catch."""
+    if not rec.get("available"):
+        print("")
+        print("    !! POSITION RECONCILE UNAVAILABLE - positions could not be read, so the "
+              "fills for this run are UNVERIFIED. Treat the per-leg statuses below as a claim, "
+              "not a fact, and check the account before trading it again.")
+        return
+    if rec.get("unverifiable"):
+        print("")
+        print("    Position reconcile: {} traded on BOTH sides this run, so a net position "
+              "delta cannot attribute them. Not a fault, just not verifiable this way.".format(
+                  ", ".join(sorted(set(rec["unverifiable"])))))
+    dis = rec.get("disagreements") or []
+    if not dis:
+        print("")
+        print("    POSITION RECONCILE: CLEAN - every leg fill matches the change in the "
+              "holdings the account actually reports.")
+        return
+    print("")
+    print("    !!!! POSITION RECONCILE MISMATCH on {} leg(s). THE POSITIONS ARE THE TRUTH; "
+          "the order status is only what this client believed. Where they differ the order "
+          "status is wrong - this is the 2026-09-03 failure mode.".format(len(dis)))
+    for d in dis:
+        print("      -> {} {}: order status said filled {:g} [{}], but the position moved by "
+              "{:g} of {:g} requested.".format(d["side"], d["symbol"], d["reported_filled"],
+                                               d["status"], d["position_filled"],
+                                               d["requested"]))
 
 
 def _report_phase(label: str, results) -> None:
@@ -1326,6 +1483,10 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     # UNREACHABLE unless `permit` is True (above the `if not permit: return` guard). Deploy passes
     # gateway_lock_on_busy=None: its branch decision (permit) is computed from explicit inputs
     # ABOVE, and it is serialized by the physical 4003 gateway arming, not the 4002 mutex.
+    # POSITIONS BEFORE - the baseline for the post-run reconcile. Read OUTSIDE the armed
+    # session so a position-read problem can never delay or disturb a transmit.
+    positions_before = _positions_for(ib, account)
+
     with armed_session(purpose="safe_execute_deploy", client_id=None,
                        gateway_lock_on_busy=None):
         # PHASE 1 — SELLS (raise cash), wait for terminal, re-price stragglers.
@@ -1398,6 +1559,13 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
                                       run_id=run_id, phase_label="BUY", quotes=quotes,
                                       prices=prices, contracts=contracts)
 
+    # POSITIONS AFTER, and the reconcile. This runs BEFORE the phase reports so the operator
+    # reads the truth first and the claims second.
+    positions_after = _positions_for(ib, account)
+    reconcile = _reconcile_by_position(positions_before, positions_after,
+                                       sell_results, buy_results)
+    _report_reconcile(reconcile)
+
     # Consolidated result — LOUD on anything unfilled/skipped in either phase.
     _report_phase("SELL", sell_results)
     _report_phase("BUY", buy_results)
@@ -1407,10 +1575,19 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
     result.sell_results = sell_results
     result.buy_results = buy_results
     result.realized_cash = available_cash
+    result.reconcile_residual = reconcile
     # Terminal status: PARTIAL_LOUD if any leg was unfilled/skipped, else COMPLETE.
-    any_short = any(r.get("skipped") or r["filled"] < r["requested"]
+    # THE FILL FIGURE COMES FROM THE POSITIONS wherever the reconcile could establish one; the
+    # order status is the fallback, not the authority. A leg this client called cancelled that
+    # actually moved the position counts as filled, and a leg it called filled that did NOT
+    # move the position counts as short. Both were wrong the other way round before this.
+    any_short = any(r.get("skipped") or _effective_filled(r) < r["requested"]
                     for r in (sell_results + buy_results))
-    result.status = STATUS_PARTIAL_LOUD if any_short else STATUS_COMPLETE
+    if reconcile.get("disagreements"):
+        # A disagreement is never quietly COMPLETE: the operator has to look at it.
+        result.status = STATUS_PARTIAL_LOUD
+    else:
+        result.status = STATUS_PARTIAL_LOUD if any_short else STATUS_COMPLETE
     result.rc = 0
     return result
 

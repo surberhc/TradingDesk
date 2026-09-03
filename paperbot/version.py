@@ -15,10 +15,25 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.46.0"
+VERSION = "0.47.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.47.0", "2026-09-03", "POSITIONS ARE NOW THE SOURCE OF TRUTH FOR WHAT A RUN "
+                             "ACTUALLY DID. The first armed run of the custom book reported "
+                             "36 legs as Cancelled with zero fills while every one of them "
+                             "had filled at IBKR: ib_async marks a LIVE order Cancelled when "
+                             "it sees an IBKR code outside its own warning set, and 10311 "
+                             "(the direct-routing notice) is outside it. Three changes. (1) "
+                             "execute_plan snapshots positions before and after the phases "
+                             "and derives each leg fill from the position delta; the run "
+                             "status is computed from that, and any disagreement with the "
+                             "order status is PARTIAL_LOUD and printed under its own banner. "
+                             "(2) 10311 and 10349 are recognised as benign, so a live order "
+                             "is no longer treated as terminal and the re-price ladder keeps "
+                             "working it. (3) IBKR advancedOrderRejectJson is captured off "
+                             "the trade instead of discarded. An unreadable position file "
+                             "reports UNVERIFIED rather than guessing zero."),
     ("0.46.0", "2026-09-01", "THE DESK COULD NOT SELL A CLIENT'S TRANSFERRED-IN MUTUAL FUNDS, "
                              "SO AN ACCOUNT HOLDING THEM COULD NOT BE CONVERTED TO ITS MODEL "
                              "AT ALL. Order-affecting: it decides whether such an account "
