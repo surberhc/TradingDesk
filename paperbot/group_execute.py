@@ -37,6 +37,8 @@ that.
 """
 from __future__ import annotations
 
+import fa_group_sync
+import group_rebalance
 from connections import clientids
 from live_fa_block_execute import TargetGateway
 
@@ -92,3 +94,126 @@ def live_gateway(enrollment: dict, *, pin_account: str | None = None) -> TargetG
         enrollment=book,
         group_names=None,                        # per-run groups; the name is on the route
     )
+
+
+# ========================================================================================
+# THE PURE PLANNING CORE. Takes AccountPlans somebody else already built and returns the
+# whole run as reviewable data. No broker, no XML, no order.
+#
+# WHY IT TAKES PLANS RATHER THAN BUILDING THEM. rebalance_engine.plan_account is the frozen
+# engine and batch_rebalance_execute already drives it correctly - roster scope, per-account
+# universe, per-model cash reserve, held-aside carve-out, strict live prices. Rebuilding that
+# here would be a SECOND place for it to drift, and the two rails would silently size the same
+# account differently. So the caller hands plans in and this module never sizes anything.
+# ========================================================================================
+def plan_group_run(plans, *, run_stamp: str, prices=None) -> dict:
+    """PURE: AccountPlans -> ticker groups -> block routes, plus a reviewable summary.
+
+    Returns ``{"group_plans", "routes", "summary_text", "n_groups", "n_accounts",
+    "n_buy", "n_sell", "accounts", "symbols"}``.
+
+    ``run_stamp`` identifies the run and becomes part of every group name, which is what makes
+    each group the audit record of ONE run. Two runs on the same day MUST pass different
+    stamps; a collision is refused downstream at creation rather than silently reusing another
+    run's group.
+
+    Builds nothing and transmits nothing. Every refusal in the pure layer (a split that does
+    not sum, an empty group, duplicate group names, an account on both sides of a symbol)
+    raises here, BEFORE anything is created at the broker.
+    """
+    group_plans = group_rebalance.plan_ticker_groups(
+        plans, run_stamp=run_stamp, prices=prices)
+    routes = group_rebalance.routes_from_group_plans(group_plans)
+    accounts = sorted({a for g in group_plans for a in g.per_account})
+    return {
+        "group_plans": group_plans,
+        "routes": routes,
+        "summary_text": group_rebalance.summarize(group_plans),
+        "n_groups": len(group_plans),
+        "n_accounts": len(accounts),
+        "n_buy": sum(1 for g in group_plans if g.side == "BUY"),
+        "n_sell": sum(1 for g in group_plans if g.side == "SELL"),
+        "accounts": accounts,
+        "symbols": sorted({g.symbol for g in group_plans}),
+    }
+
+
+def accounts_outside_the_wall(group_plans, allowed_accounts) -> list:
+    """Every account in the run that is NOT on the human-blessed roster, sorted.
+
+    A SECOND, INDEPENDENT check of the account wall, run over the GROUP SPLITS before any
+    group is created. The block executor applies its own wall per route, but a group is
+    created BEFORE its route is executed - so without this an account outside the roster could
+    be written into a live FA group at the master, and only refused later at the order. The
+    group would still be sitting there naming a client this run had no business touching.
+
+    This matters far more than it used to. The 4003 login now carries 354 accounts, including
+    Ted's 98 and Doug's 17; until 2026-09-03 it carried 18 and could not reach them at all.
+    Software is now the only thing scoping a run.
+
+    Returns [] when everything is in scope. PURE.
+    """
+    allowed = {str(a).strip() for a in (allowed_accounts or []) if str(a).strip()}
+    in_run = {a for g in group_plans for a in g.per_account}
+    return sorted(in_run - allowed)
+
+
+class GroupRunRefused(RuntimeError):
+    """The run was refused before ANY group was created and before any order. Nothing at the
+    broker was touched."""
+
+
+def create_run_groups(ib, group_plans, *, allowed_accounts, armed: bool = False,
+                      backup_path: str | None = None) -> dict:
+    """Create EVERY group this run needs, up front, before a single order is placed.
+
+    ORDER OF OPERATIONS, AND WHY.
+
+    1. THE ACCOUNT WALL, OVER THE WHOLE RUN, FIRST. If any account in any group is off the
+       human-blessed roster the WHOLE run is refused and nothing is created. This is checked
+       here rather than only per-route because a group is created BEFORE its route executes:
+       without it, an off-roster account could be written into a live FA group at the master
+       and only refused later at the order, leaving a group standing that names a client this
+       run had no business touching. The 4003 login now carries 354 accounts including two
+       other advisors' books, so this is the wall that matters.
+
+    2. THEN CREATE ALL GROUPS, before any order. A creation that fails half way leaves some
+       groups created and ZERO orders placed - recoverable, and no money has moved. Creating
+       them lazily, one before each block, would mean a failure at group 9 of 17 had already
+       traded the first eight tickers.
+
+    Each creation is its own read -> plan -> backup -> arm-gated replaceFA -> strict read-back
+    (fa_group_sync.create_run_group), so N creations compose correctly: each one reads the
+    document the previous one wrote.
+
+    UNARMED this is a PREVIEW: every creation is planned and its diff returned, nothing is
+    written. Returns ``{"refused", "refused_reason", "results", "created", "previewed"}``.
+    """
+    plans = list(group_plans or [])
+    if not plans:
+        return {"refused": False, "refused_reason": "", "results": [],
+                "created": 0, "previewed": 0}
+
+    outside = accounts_outside_the_wall(plans, allowed_accounts)
+    if outside:
+        raise GroupRunRefused(
+            f"create_run_groups: {len(outside)} account(s) in this run are NOT on the "
+            f"human-blessed roster: {', '.join(outside)}. The whole run is refused. NOTHING "
+            f"was created and no order was placed. The login carries every account under the "
+            f"advisor master, so the roster is the only thing scoping a run.")
+
+    results = []
+    created = previewed = 0
+    for g in plans:
+        res = fa_group_sync.create_run_group(
+            ib, g.group_name, g.accounts, armed=armed, backup_path=backup_path)
+        res["symbol"] = g.symbol
+        res["side"] = g.side
+        res["total_qty"] = g.total_qty
+        results.append(res)
+        if res.get("wrote"):
+            created += 1
+        else:
+            previewed += 1
+    return {"refused": False, "refused_reason": "", "results": results,
+            "created": created, "previewed": previewed}
