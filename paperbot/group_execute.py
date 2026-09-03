@@ -223,7 +223,9 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
     """Scope by MODEL, read state, price the universe, and size every account. Read-only.
 
     Returns ``{"plans", "prices", "versions", "targets", "metas", "roster", "scan",
-    "skipped"}``.
+    "skipped", "account_inputs", "summaries"}``. The last two are the block executor's
+    inputs, built from the SAME state the plans were sized on so its margin and PDT
+    pre-flights can never disagree with the plan about an account.
 
     EVERY SUBSTANTIVE STEP IS THE BATCH RAIL'S OWN FUNCTION, called not copied:
       * roster.enrolled_roster_scan(models=...)   - the model scope and the account wall
@@ -278,6 +280,10 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
             "FULL LIQUIDATION. Nothing sized, nothing created, nothing transmitted.")
 
     plans, skipped = [], []
+    # The block executor's own margin and PDT pre-flights re-derive each account's plan from
+    # these, so they are built HERE from the same state the plans were sized on. Building them
+    # a second time somewhere else is how the two would disagree about one account.
+    account_inputs, summaries = [], {}
     for account in accounts:
         st = state[account]
         v = versions[account]
@@ -288,11 +294,17 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
             skipped.append(account)
             continue
         target = targets[v]
+        acct_universe = bre.account_universe(target, metas.get(v), st["positions"],
+                                             base=strat_universe)
+        account_inputs.append({
+            "account": account, "version": target.version, "net_liq": net_liq,
+            "positions": st["positions"], "prices": prices, "sec_types": st["sec_types"],
+            "strict_prices": True})
+        summaries[account] = st["summary"]
         plans.append(rebalance_engine.plan_account(
             account, target.version, net_liq, st["positions"], target,
             prices=prices,
-            universe=bre.account_universe(target, metas.get(v), st["positions"],
-                                          base=strat_universe),
+            universe=acct_universe,
             sec_types=st["sec_types"],
             cash_reserve_pct=bre.account_reserve_pct(metas.get(v)),
             band_pct=band_pct,
@@ -300,4 +312,54 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
             # stored close is never substituted for a quote we could not get.
             strict_prices=True))
     return {"plans": plans, "prices": prices, "versions": versions, "targets": targets,
-            "metas": metas, "roster": accounts, "scan": scan, "skipped": skipped}
+            "metas": metas, "roster": accounts, "scan": scan, "skipped": skipped,
+            "account_inputs": account_inputs, "summaries": summaries}
+
+
+ADAPTIVE_PRIORITY = "Patient"
+
+
+def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool = False,
+                      backup_path: str | None = None,
+                      adaptive_priority: str | None = ADAPTIVE_PRIORITY) -> dict:
+    """Create this run's groups, then hand its routes to the proven block executor.
+
+    ORDER OF OPERATIONS. Groups are created FIRST, all of them, before any order - a creation
+    that fails half way leaves groups made and ZERO orders placed, which is recoverable and
+    costs nothing. Only then does live_fa_block_execute.execute_fa_block_routes run, which
+    owns everything from there: the two-phase SELL-then-BUY gate, the realized-cash re-read
+    between phases, the per-account margin and PDT pre-flights over the split, writing each
+    group's ContractsOrShares in lockstep with placing that group's block, and the
+    uninvested-proceeds report. None of that is reimplemented here.
+
+    UNARMED IS A PREVIEW END TO END: no group is created, no FA config is written, no order is
+    placed. ``permit`` is passed straight through, so the executor's own gate decides.
+
+    ``adaptive_priority`` defaults to Patient - IBKR's Adaptive algo works the block between
+    the bid and ask instead of crossing the spread. Pass None to fall back to the plain capped
+    marketable limit, which is the one-argument retreat if IBKR refuses an algo on a group
+    order (undocumented either way; the first staged run is the test).
+    """
+    import live_fa_block_execute as fab
+    import order_router
+
+    created = create_run_groups(ib, run.get("group_plans") or [],
+                                allowed_accounts=allowed_accounts,
+                                armed=armed, backup_path=backup_path)
+
+    routes = run.get("routes") or []
+    if not routes:
+        return {"created": created, "executed": None,
+                "note": "Nothing in this scope needs to trade."}
+
+    permit, why = order_router.transmit_guard(bool(armed))
+    if not permit:
+        return {"created": created, "executed": None,
+                "note": f"Preview only ({why}). No group was created, no FA config was "
+                        f"written and no order was placed."}
+
+    executed = fab.execute_fa_block_routes(
+        ib, routes, built["account_inputs"], built["targets"], target,
+        permit=permit, summaries=built.get("summaries"), run_id=run.get("stamp"),
+        adaptive_priority=adaptive_priority)
+    return {"created": created, "executed": executed, "note": ""}

@@ -764,7 +764,8 @@ def _cancel_working_block(ib, order_ref: str) -> int:
 
 def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
                        permit: bool, summaries: dict | None, phase_label: str,
-                       run_id: str | None = None) -> dict:
+                       run_id: str | None = None,
+                       adaptive_priority: str | None = None) -> dict:
     """Run ONE fa_block route: account wall over the split, margin pre-flight over the split,
     the PDT pre-flight over the split (blocked accounts DROPPED, block refused only if the split
     empties — both BEFORE the group diff, so a refused account never causes a replaceFA write),
@@ -860,7 +861,7 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
         try:
             bo = order_router.build_fa_block(
                 r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib,
-                run_id=run_id)
+                run_id=run_id, adaptive_priority=adaptive_priority)
         except ValueError as exc:
             print(f"      PRICE GUARD skipped this block: {exc}")
             return _skip("SKIPPED_PRICE_GUARD", str(exc))
@@ -877,7 +878,7 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
     try:
         bo = order_router.build_fa_block(
             r.symbol, r.side, r.total_qty, limit, r.fa_group, r.fa_method, as_of, ib=ib,
-            run_id=run_id)
+            run_id=run_id, adaptive_priority=adaptive_priority)
     except ValueError as exc:
         print(f"      PRICE GUARD skipped this block AFTER the group write: {exc}")
         return _skip("SKIPPED_PRICE_GUARD_AFTER_WRITE", str(exc))
@@ -936,7 +937,8 @@ def _notional_by_account(routes_with_limits, results) -> dict:
 
 def _run_block_phase(ib, phase_label, routes_with_limits, account_inputs, targets, allowed,
                      as_of, *, permit: bool, summaries: dict | None,
-                     run_id: str | None = None) -> list[dict]:
+                     run_id: str | None = None,
+                     adaptive_priority: str | None = None) -> list[dict]:
     """Run ONE phase's blocks (all sells, or all buys) and return their result dicts.
 
     Blocks are run ONE AT A TIME: an FA block's allocation IS its group's live
@@ -950,13 +952,15 @@ def _run_block_phase(ib, phase_label, routes_with_limits, account_inputs, target
         return []
     return [_execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit,
                                permit=permit, summaries=summaries, phase_label=phase_label,
-                               run_id=run_id)
+                               run_id=run_id,
+                              adaptive_priority=adaptive_priority)
             for r, limit in routes_with_limits]
 
 
 def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetGateway,
                             *, permit: bool, summaries: dict | None = None,
-                            run_id: str | None = None) -> dict:
+                            run_id: str | None = None,
+                            adaptive_priority: str | None = None) -> dict:
     """Drive the fa_block routes under the SAME two-phase cash gate the per-account lane uses
     (see the module docstring): SELL blocks first, then a fresh REALIZED-cash read per
     sub-account, then BUY blocks RE-SIZED to that cash, then the uninvested-proceeds exception
@@ -1061,7 +1065,7 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     # sized; stragglers are cancelled and reported LOUDLY inside _execute_one_route.
     sell_results = _run_block_phase(ib, "SELL", sell_with_limits, account_inputs, targets,
                                    allowed, as_of, permit=permit, summaries=summaries,
-                                   run_id=run_id)
+                                   run_id=run_id, adaptive_priority=adaptive_priority)
     for res in sell_results:
         placed_fills.extend(res.get("fills", []))
 
@@ -1108,7 +1112,7 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     # [5] PHASE 2 — BUYS (re-sized).
     buy_results = _run_block_phase(ib, "BUY", buy_with_limits, account_inputs, targets,
                                   allowed, as_of, permit=permit, summaries=summaries,
-                                  run_id=run_id)
+                                  run_id=run_id, adaptive_priority=adaptive_priority)
     for res in buy_results:
         placed_fills.extend(res.get("fills", []))
 

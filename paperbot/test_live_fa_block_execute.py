@@ -911,3 +911,67 @@ def test_block_lane_refuses_when_the_universe_cannot_be_resolved(monkeypatch):
     rc = lx._run_session(_e2e_target(), _session_targets(), armed=False)
     assert rc == 2
     assert called["n"] == 0                       # nothing was sized at all
+
+
+def _route(group="XLE BUY 1"):
+    return SimpleNamespace(symbol="XLE", side="BUY", total_qty=10, fa_group=group,
+                           fa_method="", per_account_split={"U1": 10}, route="fa_block")
+
+
+def _spy_builder(seen):
+    def _spy(symbol, side, qty, limit, fa_group, fa_method, as_of, ib=None, run_id=None,
+             adaptive_priority=None):
+        seen["adaptive_priority"] = adaptive_priority
+        seen["fa_group"] = fa_group
+        raise ValueError("stop here - we only wanted the arguments")
+    return _spy
+
+
+_GROUPS_XML = (
+    "<ListOfGroups>"
+    "<Group><name>XLE BUY 1</name><defaultMethod>ContractsOrShares</defaultMethod>"
+    "<ListOfAccts><Account><acct>U1</acct><amount>0</amount></Account></ListOfAccts>"
+    "</Group>"
+    "<Group><name>G</name><defaultMethod>ContractsOrShares</defaultMethod>"
+    "<ListOfAccts><Account><acct>U1</acct><amount>0</amount></Account></ListOfAccts>"
+    "</Group>"
+    "</ListOfGroups>")
+
+
+class _GroupsIB:
+    """Answers requestFA with a groups document containing the route's group, so the preview
+    path can compute its would-write diff. Records nothing else and places nothing."""
+
+    def requestFA(self, kind):
+        return _GROUPS_XML
+
+
+def _open_the_gates(monkeypatch, fab, seen):
+    """Let the route reach the order builder. The wall and the margin pre-flight have their
+    own tests; this one is only about whether the algo parameter arrives."""
+    monkeypatch.setattr(fab, "account_wall_over_split", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(fab, "margin_preflight_over_split", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(fab, "pdt_preflight_over_split", lambda *a, **k: (True, ""))
+    monkeypatch.setattr(fab, "pdt_drop_blocked_from_split", lambda r, s=None: (r, []))
+    monkeypatch.setattr(fab.order_router, "build_fa_block", _spy_builder(seen))
+
+
+def test_adaptive_priority_reaches_the_order_builder(monkeypatch):
+    """The parameter must actually ARRIVE at build_fa_block, not just exist in a signature."""
+    import live_fa_block_execute as fab
+    seen = {}
+    _open_the_gates(monkeypatch, fab, seen)
+    fab._execute_one_route(_GroupsIB(), _route(), [], {}, ["U1"], "2026-09-04", 65.0,
+                           permit=False, summaries=None, phase_label="BUY",
+                           run_id="R1", adaptive_priority="Patient")
+    assert seen["adaptive_priority"] == "Patient"
+    assert seen["fa_group"] == "XLE BUY 1"
+
+
+def test_the_default_is_none_so_existing_behaviour_is_unchanged(monkeypatch):
+    import live_fa_block_execute as fab
+    seen = {}
+    _open_the_gates(monkeypatch, fab, seen)
+    fab._execute_one_route(_GroupsIB(), _route("G"), [], {}, ["U1"], "2026-09-04", 65.0,
+                           permit=False, summaries=None, phase_label="BUY")
+    assert seen["adaptive_priority"] is None
