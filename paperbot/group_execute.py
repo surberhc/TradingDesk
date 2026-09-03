@@ -217,3 +217,87 @@ def create_run_groups(ib, group_plans, *, allowed_accounts, armed: bool = False,
             previewed += 1
     return {"refused": False, "refused_reason": "", "results": results,
             "created": created, "previewed": previewed}
+
+
+def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
+    """Scope by MODEL, read state, price the universe, and size every account. Read-only.
+
+    Returns ``{"plans", "prices", "versions", "targets", "metas", "roster", "scan",
+    "skipped"}``.
+
+    EVERY SUBSTANTIVE STEP IS THE BATCH RAIL'S OWN FUNCTION, called not copied:
+      * roster.enrolled_roster_scan(models=...)   - the model scope and the account wall
+      * resolve_roster_versions                   - account -> model label
+      * build_targets                             - SOURCE-based dispatch; a custom label is
+                                                    built from the published CRM allocation
+                                                    and never falls through to the S0 engine
+      * build_per_account_state                   - positions, secTypes, contracts, NAV
+      * build_execution_prices                    - live-quote-only + the mutual-fund mark
+      * account_universe / account_reserve_pct    - per-account universe and cash reserve
+      * rebalance_engine.plan_account             - the frozen engine, untouched
+
+    So this function decides nothing on its own. It is the loop that hands those decisions to
+    the engine, which is why the group rail and the per-account rail cannot size the same
+    account differently.
+
+    THE MODEL SCOPE IS THE RUN. Pass models=["Conservative (Custom)"] and the run is that
+    model's accounts - one account today. That is what makes the staged rollout possible.
+    """
+    import batch_rebalance_execute as bre
+    import rebalance_engine
+    import roster as roster_mod
+
+    scan = roster_mod.enrolled_roster_scan(models=models)
+    accounts = scan["accounts"]
+    if not accounts:
+        return {"plans": [], "prices": {}, "versions": {}, "targets": {}, "metas": {},
+                "roster": [], "scan": scan, "skipped": []}
+
+    versions = bre.resolve_roster_versions(accounts)
+    targets, metas = bre.build_targets(sorted(set(versions.values())))
+    state, held_symbols, held_contracts = bre.build_per_account_state(ib, accounts)
+    prices, _quotes, _universe = bre.build_execution_prices(
+        ib, accounts, targets, state, held_symbols, held_contracts)
+
+    # THE S0 BASE UNIVERSE, resolved exactly as the batch rail resolves it. It is only used
+    # for an S0 model - a custom allocation derives its own universe from the published
+    # allocation plus the account's held symbols - but a run whose scope included an S0 label
+    # would size against the wrong universe if this were guessed, so it is not guessed.
+    #
+    # REFUSE, do not degrade, when it cannot be resolved: without it reconcile cannot tell a
+    # spinoff, a rename, a client's own holding or a money-market sweep apart from a symbol
+    # the model dropped, and every one of them would size as a FULL LIQUIDATION. Same refusal
+    # the batch rail makes, for the same reason.
+    import s0_live_pilot_run as sp
+    strat_universe = sp._strategy_universe()
+    if not strat_universe:
+        raise GroupRunRefused(
+            "build_plans_for_scope: the strategy's tradeable universe could not be resolved, "
+            "so a spinoff, a rename, a client's own holding or a money-market sweep cannot be "
+            "told apart from a symbol the model dropped - every one of them would size as a "
+            "FULL LIQUIDATION. Nothing sized, nothing created, nothing transmitted.")
+
+    plans, skipped = [], []
+    for account in accounts:
+        st = state[account]
+        v = versions[account]
+        net_liq = st["net_liq"]
+        if not net_liq or net_liq <= 0:
+            # An account with no readable positive NetLiq cannot be acted on. Named, skipped,
+            # never silently sized to zero (which would read as a full liquidation).
+            skipped.append(account)
+            continue
+        target = targets[v]
+        plans.append(rebalance_engine.plan_account(
+            account, target.version, net_liq, st["positions"], target,
+            prices=prices,
+            universe=bre.account_universe(target, metas.get(v), st["positions"],
+                                          base=strat_universe),
+            sec_types=st["sec_types"],
+            cash_reserve_pct=bre.account_reserve_pct(metas.get(v)),
+            band_pct=band_pct,
+            # EXECUTION RAIL: the live IBKR quotes above are the ONLY price source. A model's
+            # stored close is never substituted for a quote we could not get.
+            strict_prices=True))
+    return {"plans": plans, "prices": prices, "versions": versions, "targets": targets,
+            "metas": metas, "roster": accounts, "scan": scan, "skipped": skipped}
