@@ -271,39 +271,40 @@ class _TxFakeIB:
     def cancelOrder(self, *a, **k): return None
 
 
-def test_execute_plan_armed_WARNS_on_a_pdt_flagged_account_but_still_transmits(monkeypatch,
-                                                                              capsys):
-    """OWNER DECISION 2026-09-03: warn, do not block. A rebalance produces one net leg per
-    ticker, so it contains no round trip and does not engage the day-trade rule at all. The
-    desk must not refuse the account on its own reading - IBKR gets to be the one that says
-    no, so the reason comes from the broker instead of from a guess."""
+def test_execute_plan_armed_SUPPRESSES_THE_WHOLE_ACCOUNT_including_sells(monkeypatch,
+                                                                        capsys):
+    """MEASURED 2026-09-03. IBKR restricts a flagged PDT account to LIQUIDATING TRADES ONLY:
+    across five such accounts every one of 60 BUY legs came back Inactive and every SELL
+    filled. So the sells are withheld too - selling an account that cannot buy strips holdings
+    and parks the cash, leaving it further from its model than doing nothing. Half a rebalance
+    is worse than none."""
     monkeypatch.setattr(se, "_probe_gateway_readonly", lambda ib, **k: False)
     rows = _rows(0)
     ib = _TxFakeIB(rows)
     res = se.execute_plan(_request(rows), mode=se.MODE_ARMED, ib=ib)
-    assert res.status != se.STATUS_BLOCKED, "PDT must no longer block the run"
-    assert ib.placed, "the account must reach the transmit path"
-    assert not [r for r in res.reasons if pg.PDT_TAG in r],         f"PDT must not appear as a BLOCKING reason: {res.reasons}"
-    hit = [w for w in res.warnings if pg.PDT_TAG in w]
-    assert hit, f"the PDT verdict must still be recorded as a warning: {res.warnings}"
-    assert ACCT in hit[0] and "DayTradesRemaining=" in hit[0]
-    # And it is printed loudly, not just returned.
+    assert res.status == se.STATUS_BLOCKED
+    assert ib.placed == [], "NOTHING may transmit - not the buys and not the sells"
+    hit = [r for r in res.reasons if pg.PDT_TAG in r]
+    assert hit, f"no PDT reason in {res.reasons}"
+    assert ACCT in hit[0] and "DayTradesRemaining='0'" in hit[0]
+    assert "LIQUIDATING TRADES ONLY" in hit[0]
+    assert "SELLS are withheld" in hit[0]
+    # surfaced as a condition to fix as well as a refusal
+    assert any(pg.PDT_TAG in w for w in res.warnings)
     out = capsys.readouterr().out
     assert "PDT pre-flight" in out
-    assert "PDT WARNING - NOT BLOCKING" in out
+    assert "PDT BLOCK - transmitting NOTHING" in out
 
 
-def test_execute_plan_armed_WARNS_on_an_unreadable_summary(monkeypatch):
-    """An account whose summary carries no witness tag is still called out - but as a warning,
-    not a refusal. pdt_guard keeps failing closed in its VERDICT; what changed is what the
-    caller does with it."""
+def test_execute_plan_armed_BLOCKS_on_an_unreadable_summary(monkeypatch):
+    """An account whose summary carries no witness tag at all fails closed at the gate."""
     monkeypatch.setattr(se, "_probe_gateway_readonly", lambda ib, **k: False)
     rows = [_row("Cushion", "1.0")]
     ib = _TxFakeIB(rows)
     res = se.execute_plan(_request(rows), mode=se.MODE_ARMED, ib=ib)
-    assert res.status != se.STATUS_BLOCKED
-    assert any(pg.PDT_TAG in w for w in res.warnings)
-    assert not any(pg.PDT_TAG in r for r in res.reasons)
+    assert res.status == se.STATUS_BLOCKED
+    assert ib.placed == []
+    assert any(pg.PDT_TAG in r for r in res.reasons)
 
 
 def test_execute_plan_armed_CLEARS_an_absent_tag_account_and_transmits(monkeypatch, capsys):

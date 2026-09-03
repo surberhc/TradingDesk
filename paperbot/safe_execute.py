@@ -1468,24 +1468,35 @@ def execute_plan(request: ExecutionRequest, *, mode: str = MODE_PREVIEW,
         # armed run always shows which basis each account was let through on.
         print(f"    PDT pre-flight [{pdt.code}]: {pdt.reason}")
         if not pdt.ok:
-            # OWNER DECISION, Andrew Surber 2026-09-03: WARN, DO NOT BLOCK. Let IBKR be the
-            # one that refuses a day-trade-restricted account.
+            # SUPPRESS THE WHOLE ACCOUNT - no buys AND no sells. MEASURED 2026-09-03.
             #
-            # WHY. A day trade is buying AND selling the SAME security on the SAME day. This
-            # desk rebalances: it produces ONE net leg per ticker, so a run contains no round
-            # trip in anything (verified across every account in the 2026-09-03 book - no
-            # symbol appears on both sides). The gate was therefore refusing accounts over a
-            # rule our orders do not engage. It held six accounts, two of them solely on this,
-            # out of every run since they became visible - and the desk had never sent them a
-            # single order, so it cannot have caused their state either.
+            # A flagged pattern-day-trader account under 25,000 USD is restricted by IBKR to
+            # LIQUIDATING TRADES ONLY: it may close a position, it may not open one. That is
+            # not a guess. In one armed run across five such accounts (DayTradesRemaining=0)
+            # every one of 60 BUY legs came back Inactive and every SELL leg filled, while the
+            # two accounts reading -1 or no tag filled everything. All five had ample funds
+            # (e.g. U11293593: 5,235.79 available against 4,678 of buys), so money was never
+            # the constraint.
             #
-            # THE RISK, STATED. The gate existed because of one measurement (2026-07-28,
-            # U5721712): a flagged account bounced a plain BUY of 1 USFR with no offsetting
-            # sell. If that generalises, these orders bounce AT THE BROKER instead of here.
-            # That is the accepted cost: a refusal we can read beats a refusal we guessed at,
-            # and the reason now gets captured (broker_message / broker_advanced_reject).
-            print("    !! PDT WARNING - NOT BLOCKING (owner decision 2026-09-03). IBKR may "
-                  "refuse this account. Proceeding so the BROKER gives the reason.")
+            # WHY SUPPRESS THE SELLS TOO. A rebalance is ONE transaction. Letting the sells
+            # through on an account that cannot buy does not get it closer to its model, it
+            # strips holdings and parks the proceeds in cash - strictly worse than doing
+            # nothing. That is exactly what happened on 2026-09-03 when this gate was briefly
+            # relaxed to warn-only: five accounts sold BUCK and XLP, bought nothing, and ended
+            # further from target than they started. Half a rebalance is worse than none.
+            #
+            # The account is refused as a whole, loudly, and the verdict is carried in BOTH
+            # reasons (so nothing transmits) and warnings (so it surfaces as a condition to
+            # fix, not just a refusal). Resolution is broker-side: fund the account to 25,000
+            # NLV, wait out the 90 days, or ask IBKR for their one-time PDT reset.
+            blocked_reason = (
+                f"{pdt.reason} IBKR restricts such an account to LIQUIDATING TRADES ONLY, so "
+                f"its BUYS cannot fill. The SELLS are withheld as well: a rebalance is one "
+                f"transaction, and selling an account that cannot buy leaves it further from "
+                f"its model than doing nothing. Nothing is transmitted for this account.")
+            print(f"    !! PDT BLOCK - transmitting NOTHING for {account}, sells included. "
+                  f"{blocked_reason}")
+            reasons.append(blocked_reason)
             pdt_warnings.append(pdt.reason)
 
     permit = (armed and purpose_ok and armed_conn and not kill and not reasons)

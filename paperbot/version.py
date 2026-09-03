@@ -15,10 +15,24 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.48.0"
+VERSION = "0.49.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.49.0", "2026-09-03", "PDT NOW SUPPRESSES THE WHOLE ACCOUNT, SELLS INCLUDED. The "
+                             "0.48.0 warn-only change was WRONG and was measured wrong within "
+                             "the hour: IBKR restricts a flagged account to LIQUIDATING "
+                             "TRADES ONLY, so across five such accounts every one of 60 BUY "
+                             "legs came back Inactive while every SELL filled. Five real "
+                             "accounts sold BUCK and XLP, bought nothing, and ended further "
+                             "from target than they started. Money was never the constraint - "
+                             "all five had ample available funds. The gate is restored, but "
+                             "as whole-account suppression rather than a bare refusal: if an "
+                             "account cannot buy it must not sell either, because half a "
+                             "rebalance is worse than none. Verdict carried in BOTH reasons "
+                             "and warnings. Buying-power sell-credit from 0.48.0 is "
+                             "UNCHANGED and was correct - it unblocked U21789948, which "
+                             "filled 17 of 18 legs."),
     ("0.48.0", "2026-09-03", "TWO GATES WERE REFUSING ACCOUNTS THE BROKER HAD NOT "
                              "REFUSED. (1) The buying-power pre-flight compared the buy total "
                              "against buying power BEFORE the run sold anything, which is a "
