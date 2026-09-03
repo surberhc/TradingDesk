@@ -25,6 +25,7 @@ import pytest
 
 import config
 import holding_class
+import recon_report
 import rebalance_engine as eng
 import strategy_target
 
@@ -501,3 +502,92 @@ def test_held_aside_position_never_reaches_a_block_or_route():
                     | set(out["plans"][0].orders))
     assert BOND_SYM not in every_symbol
     assert every_symbol == {"SPY"}
+
+
+# ========================================================================================
+# CROSS-MODEL PER-TICKER BLOCKS (owner decision 2026-09-03).
+# The model decides how many shares each account needs; it has no business reaching the order
+# layer. An API order is one contract and IBKR has no rebalance verb, so a rebalance is N
+# block orders either way - and slicing per TICKER rather than per MODEL means ONE XLE order
+# at ONE average price for every account in the book, instead of six.
+# ========================================================================================
+def _plan(account, version, orders):
+    return recon_report.AccountPlan(
+        account=account, version=version, net_liq=100000.0, reserve=1500.0,
+        investable=98500.0, lines=[], needs_rebalance=bool(orders), orders=dict(orders))
+
+
+def test_one_ticker_from_many_models_becomes_a_single_block():
+    plans = [
+        _plan("U1", "Growth (Custom)", {"XLE": 10}),
+        _plan("U2", "Balanced (Custom)", {"XLE": 4}),
+        _plan("U3", "Growth (Small, Custom)", {"XLE": 1}),
+    ]
+    blocks = eng.aggregate_blocks_by_ticker(plans)
+    assert len(blocks) == 1
+    b = blocks[0]
+    assert (b.symbol, b.side, b.total_qty) == ("XLE", "BUY", 15)
+    assert b.per_account == {"U1": 10, "U2": 4, "U3": 1}
+    assert sum(b.per_account.values()) == b.total_qty
+    assert b.version == eng.CROSS_MODEL_VERSION
+
+
+def test_the_same_book_produces_far_fewer_blocks_than_per_model():
+    """The whole point: per-model gives one order per model per ticker."""
+    plans = [
+        _plan("U1", "Growth (Custom)", {"XLE": 10, "XLF": 5}),
+        _plan("U2", "Balanced (Custom)", {"XLE": 4, "XLF": 2}),
+        _plan("U3", "Conservative (Custom)", {"XLE": 1, "XLF": 1}),
+    ]
+    per_model = eng.aggregate_blocks(plans)
+    per_ticker = eng.aggregate_blocks_by_ticker(plans)
+    assert len(per_model) == 6      # 3 models x 2 tickers
+    assert len(per_ticker) == 2     # 2 tickers, everyone at one price
+    assert {b.symbol for b in per_ticker} == {"XLE", "XLF"}
+
+
+def test_buys_and_sells_of_one_symbol_stay_separate_blocks():
+    plans = [
+        _plan("U1", "Growth (Custom)", {"JAAA": -100}),
+        _plan("U2", "Balanced (Custom)", {"JAAA": -50}),
+        _plan("U3", "Growth (Custom)", {"FLOT": 30}),
+    ]
+    blocks = eng.aggregate_blocks_by_ticker(plans)
+    by = {(b.symbol, b.side): b for b in blocks}
+    assert by[("JAAA", "SELL")].total_qty == 150
+    assert by[("JAAA", "SELL")].per_account == {"U1": 100, "U2": 50}
+    assert by[("FLOT", "BUY")].total_qty == 30
+
+
+def test_zero_deltas_never_create_a_block():
+    blocks = eng.aggregate_blocks_by_ticker(
+        [_plan("U1", "Growth (Custom)", {"XLE": 0, "XLF": 3})])
+    assert [b.symbol for b in blocks] == ["XLF"]
+
+
+def test_an_account_on_both_sides_of_one_symbol_is_refused():
+    """Impossible from plan_account - one net delta per symbol - so it means plans from two
+    runs were mixed, which would double-trade the account."""
+    plans = [
+        _plan("U1", "Growth (Custom)", {"XLE": 10}),
+        _plan("U1", "Growth (Custom)", {"XLE": -3}),
+    ]
+    with pytest.raises(ValueError) as e:
+        eng.aggregate_blocks_by_ticker(plans)
+    assert "BOTH sides" in str(e.value)
+
+
+def test_output_is_deterministic_and_sorted_by_symbol_then_side():
+    plans = [_plan("U1", "G", {"XLV": 1, "XLB": 2}), _plan("U2", "B", {"XLB": -1})]
+    blocks = eng.aggregate_blocks_by_ticker(plans)
+    assert [(b.symbol, b.side) for b in blocks] == [
+        ("XLB", "BUY"), ("XLB", "SELL"), ("XLV", "BUY")]
+
+
+def test_the_existing_per_model_aggregator_is_unchanged():
+    """aggregate_blocks must keep keying on version - nothing else may shift under it."""
+    plans = [_plan("U1", "Growth (Custom)", {"XLE": 10}),
+             _plan("U2", "Balanced (Custom)", {"XLE": 4})]
+    blocks = eng.aggregate_blocks(plans)
+    assert len(blocks) == 2
+    assert {b.version for b in blocks} == {"Growth (Custom)", "Balanced (Custom)"}

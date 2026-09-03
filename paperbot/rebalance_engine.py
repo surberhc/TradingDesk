@@ -375,6 +375,65 @@ def aggregate_blocks(plans: list[AccountPlan]) -> list[BlockOrder]:
     return sorted(blocks.values(), key=lambda b: (b.version, b.symbol, b.side))
 
 
+CROSS_MODEL_VERSION = "ALL MODELS"
+
+
+def aggregate_blocks_by_ticker(plans: list[AccountPlan]) -> list[BlockOrder]:
+    """Aggregate same-symbol, same-DIRECTION deltas across EVERY model into one block each.
+
+    The cross-model counterpart to :func:`aggregate_blocks`, which keys on
+    ``(version, symbol, side)`` and therefore produces one block per model per ticker.
+
+    WHY THIS EXISTS (owner decision 2026-09-03). The model decides HOW MANY SHARES each
+    account needs; it has no business reaching the order layer. An IBKR API order is always
+    for ONE CONTRACT, and IBKR exposes no verb that rebalances a group to target percentages
+    (verified against docs/MODEL_PORTFOLIO_RESEARCH.md and the TWS API FA page: the allocation
+    methods are EqualQuantity / NetLiq / AvailableEquity / PctChange / ContractsOrShares, and
+    there is no rebalance call). So a rebalance IS N block orders whichever way it is sliced -
+    and slicing per MODEL would mean six separate XLE orders at six different average prices
+    for the same ETF on the same day. Slicing per TICKER means ONE XLE order, and every
+    account across every model fills at the SAME average price. On the 2026-09-03 book that is
+    the difference between roughly 96 orders and roughly 17.
+
+    A block is one side at one price, so BUY and SELL of the same symbol stay separate blocks.
+    ``per_account`` records the EXACT share split, fixed at build time and never reallocated
+    after fills (allocation fairness and recordkeeping), and by construction
+    ``sum(per_account.values()) == total_qty``.
+
+    ``version`` on the returned blocks is :data:`CROSS_MODEL_VERSION`, not any real model
+    name: these blocks deliberately span models, and putting a real version there would invite
+    a caller to look up a per-model group or a per-model cash reserve from a block that has
+    neither.
+
+    RAISES ValueError if one account ends up on BOTH sides of the same symbol. That cannot
+    happen from plan_account (one net delta per symbol per account) so it means the caller
+    mixed plans from two different runs of the same account - which would double-trade it.
+    """
+    blocks: dict[tuple, BlockOrder] = {}
+    sides_seen: dict[tuple, str] = {}
+    for p in plans:
+        for sym, delta in p.orders.items():
+            if not delta:
+                continue
+            side = "BUY" if delta > 0 else "SELL"
+            prior = sides_seen.get((p.account, sym))
+            if prior is not None and prior != side:
+                raise ValueError(
+                    f"aggregate_blocks_by_ticker: account {p.account} appears on BOTH sides of "
+                    f"{sym} ({prior} and {side}). One account has one net delta per symbol, so "
+                    f"this means plans from two different runs were mixed - refusing to build a "
+                    f"split that would double-trade it.")
+            sides_seen[(p.account, sym)] = side
+            key = (sym, side)
+            blk = blocks.get(key)
+            if blk is None:
+                blk = blocks[key] = BlockOrder(CROSS_MODEL_VERSION, sym, side, 0)
+            qty = abs(delta)
+            blk.total_qty += qty
+            blk.per_account[p.account] = blk.per_account.get(p.account, 0) + qty
+    return sorted(blocks.values(), key=lambda b: (b.symbol, b.side))
+
+
 # --- 4. order-router inputs (group block vs single-account direct) -------------
 @dataclass
 class RoutePlan:
