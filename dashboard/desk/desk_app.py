@@ -53,6 +53,7 @@ T.inject_theme()
 import emergency
 import page_action_center
 import page_control_plane
+import page_group_trade
 import page_custom_alloc
 import page_feeds
 import page_history
@@ -98,6 +99,8 @@ pages = [
             title="Strategy Models — all models", icon="🗂️"),
     st.Page(page_custom_alloc.render_custom_alloc,
             title="Custom allocation — models Andrew writes himself", icon="✍️"),
+    st.Page(page_group_trade.render_group_trade,
+            title="Group trade — pick, prepare, send", icon="📦"),
     st.Page(page_control_plane.render_control_plane,
             title="Control Plane — S0 rebalance", icon="🎛️"),
     st.Page(page_s8.render_s8_full,
