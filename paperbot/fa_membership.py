@@ -41,6 +41,7 @@ side of the pair that touches a broker.
 from __future__ import annotations
 
 import difflib
+import copy
 import xml.etree.ElementTree as ET
 from typing import Dict, List, Mapping, Set
 
@@ -163,6 +164,109 @@ def membership_diff(
         if add or remove:
             out[group] = {"add": add, "remove": remove}
     return out
+
+
+def create_group(
+    groups_xml: str,
+    name: str,
+    accounts,
+    *,
+    default_method: str = "NetLiq",
+    new_member_amount: int = 0,
+) -> str:
+    """Return NEW GROUPS XML with ONE additional <Group> named ``name`` holding exactly
+    ``accounts``. Every pre-existing group is left byte-for-byte untouched.
+
+    WHY THIS EXISTS. ``apply_membership`` deliberately refuses to invent a group, because
+    editing a STANDING group is a different act from bringing one into existence. Owner
+    decision 2026-09-03 makes group creation a first-class, per-run step: every armed run
+    creates its OWN fresh group, named for the model and stamped with the run, uploads the
+    membership read from the CRM at that moment, and trades it. The group IS the audit record
+    of who was in that trade. Nothing standing, nothing that can drift between runs.
+
+    THE SHAPE IS CLONED, NOT CONSTRUCTED. The new <Group> is a deep copy of an existing group
+    element with its name, method and account list rewritten, and each <Account> is cloned
+    from a real one. That is deliberate: IBKR sent us this document, so copying its own
+    element layout, namespace prefixes and child ordering is the only way to be certain the
+    payload is one it will accept. Building the element from scratch would be guessing at a
+    schema we have never been given.
+
+    FAILS LOUD (ValueError) on: a blank name, an empty account set, XML that will not parse,
+    a name that ALREADY exists (use apply_membership to edit membership), or a document with
+    no existing group to use as a template.
+    """
+    group_name = str(name or "").strip()
+    if not group_name:
+        raise ValueError("create_group: no group name given. FAILING LOUD.")
+
+    want = sorted({str(a).strip() for a in (accounts or []) if str(a).strip()})
+    if not want:
+        raise ValueError(
+            f"create_group: the membership for new group {group_name!r} is EMPTY. Creating an "
+            f"empty group is never what the caller meant. FAILING LOUD.")
+
+    if not groups_xml or not groups_xml.strip():
+        raise ValueError(
+            "create_group: empty GROUPS XML - the live state is UNKNOWN, so no replaceFA "
+            "payload may be computed. FAILING LOUD.")
+
+    root = ET.fromstring(groups_xml)
+    existing = {}
+    for grp in _iter_groups(root):
+        nm = _group_name(grp)
+        if nm:
+            existing[nm] = grp
+    if group_name in existing:
+        raise ValueError(
+            f"create_group: FA group {group_name!r} ALREADY EXISTS. Creation is for a NEW "
+            f"group; editing membership is apply_membership. FAILING LOUD.")
+    if not existing:
+        raise ValueError(
+            "create_group: the GROUPS XML contains no existing <Group> to clone the element "
+            "shape from, and this function will not invent a schema IBKR has never sent us. "
+            "FAILING LOUD.")
+
+    template = existing[sorted(existing)[0]]
+    new_grp = copy.deepcopy(template)
+
+    for child in new_grp.iter():
+        if _local(child.tag) == "name":
+            child.text = group_name
+            break
+    method_el = _find_child(new_grp, "defaultmethod")
+    if method_el is not None:
+        method_el.text = str(default_method)
+
+    loa = _find_child(new_grp, "listofaccts")
+    if loa is None:
+        raise ValueError(
+            f"create_group: the template group {sorted(existing)[0]!r} has no ListOfAccts "
+            f"element - refusing to guess the member layout. FAILING LOUD.")
+
+    acct_template = None
+    for child in list(loa):
+        if _local(child.tag) == "account":
+            acct_template = child
+            break
+    if acct_template is None:
+        raise ValueError(
+            "create_group: the template group has no <Account> child to clone - refusing to "
+            "guess the member layout. FAILING LOUD.")
+
+    for child in list(loa):
+        loa.remove(child)
+    for acct in want:
+        node = copy.deepcopy(acct_template)
+        for c in node.iter():
+            lt = _local(c.tag)
+            if lt == "acct":
+                c.text = acct
+            elif lt == "amount":
+                c.text = str(new_member_amount)
+        loa.append(node)
+
+    root.append(new_grp)
+    return ET.tostring(root, encoding="unicode")
 
 
 def apply_membership(

@@ -27,6 +27,7 @@ import xml.etree.ElementTree as ET
 import pytest
 
 import config
+import fa_membership
 import fa_group_sync as fgs
 from fa_group_sync import (
     FaGroupSyncRefused,
@@ -489,3 +490,108 @@ def test_sync_verification_failure_is_loud_and_names_the_backup(
     assert exc.value.result["backup"] in str(exc.value)
     assert exc.value.result["wrote"] is True
     assert exc.value.result["verified"] is False
+
+
+# ========================================================================================
+# GROUP CREATION (owner decision 2026-09-03). Groups are not standing furniture: every armed
+# run creates its OWN group per TICKER AND SIDE, uploads the membership computed from the CRM
+# at that moment, trades it, and leaves it behind as the audit record of who was in that
+# trade. A per-ticker group is what lets every account across EVERY model fill that ticker at
+# ONE average price. Fixtures below are shaped like the REAL master F6795549 XML, which was
+# read live on 2026-09-03 and round-trips through parse_group_membership as a no-op.
+# ========================================================================================
+REAL_SHAPE = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    "<ListOfGroups>"
+    "<Group><name>Main</name><defaultMethod>NetLiq</defaultMethod>"
+    '<ListOfAccts varName="list">'
+    "<Account><acct>U1111111</acct></Account>"
+    "<Account><acct>U2222222</acct></Account>"
+    "</ListOfAccts></Group>"
+    "<Group><name>Ted</name><defaultMethod>NetLiq</defaultMethod>"
+    '<ListOfAccts varName="list">'
+    "<Account><acct>U3333333</acct></Account>"
+    "</ListOfAccts></Group>"
+    "</ListOfGroups>"
+)
+
+
+def _members(xml):
+    return fa_membership.parse_group_membership(xml)
+
+
+def test_create_a_new_group_leaves_every_existing_group_untouched():
+    before = _members(REAL_SHAPE)
+    new_xml, diff, summary = fgs.plan_group_creation(
+        REAL_SHAPE, "XLE BUY 20260904-0931", ["U4444444", "U5555555"])
+    after = _members(new_xml)
+    assert len(after) == len(before) + 1
+    assert set(after["XLE BUY 20260904-0931"]) == {"U4444444", "U5555555"}
+    for name, mem in before.items():
+        assert after[name] == mem, f"pre-existing group {name} was modified"
+    assert summary.added == ("U4444444", "U5555555")
+    assert summary.removed == ()
+    assert summary.changed
+    assert diff.strip()
+
+
+def test_creation_refuses_a_name_that_already_exists():
+    with pytest.raises(fgs.FaGroupSyncRefused) as e:
+        fgs.plan_group_creation(REAL_SHAPE, "Main", ["U4444444"])
+    assert "ALREADY EXISTS" in str(e.value)
+
+
+def test_creation_refuses_an_empty_membership_with_no_escape_hatch():
+    """plan_membership_change has allow_empty; creation deliberately does NOT - a run group
+    with nobody in it is never what the caller meant."""
+    with pytest.raises(fgs.FaGroupSyncRefused) as e:
+        fgs.plan_group_creation(REAL_SHAPE, "XLE BUY 1", [])
+    assert "EMPTY" in str(e.value)
+
+
+def test_creation_refuses_blank_name_blank_and_unparseable_xml():
+    for args in ((REAL_SHAPE, "   ", ["U4444444"]),
+                 ("", "XLE BUY 1", ["U4444444"]),
+                 ("<not xml", "XLE BUY 1", ["U4444444"])):
+        with pytest.raises(fgs.FaGroupSyncRefused):
+            fgs.plan_group_creation(*args)
+
+
+def test_creation_is_pure_and_does_not_mutate_the_input_xml():
+    snapshot = REAL_SHAPE
+    fgs.plan_group_creation(REAL_SHAPE, "XLE BUY 1", ["U4444444"])
+    assert REAL_SHAPE == snapshot
+
+
+def test_created_group_clones_the_real_element_shape():
+    """The new Group is a deep copy of a real one, so layout, namespace and the ListOfAccts
+    varName attribute all match what IBKR itself sent."""
+    new_xml, _, _ = fgs.plan_group_creation(REAL_SHAPE, "XLE BUY 1", ["U4444444"])
+    root = ET.fromstring(new_xml)
+    grp = [g for g in root.iter()
+           if fa_membership._local(g.tag) == "group"
+           and fa_membership._group_name(g) == "XLE BUY 1"][0]
+    loa = fa_membership._find_child(grp, "listofaccts")
+    assert loa is not None
+    assert loa.attrib.get("varName") == "list"
+    assert fa_membership._find_child(grp, "defaultmethod").text == "NetLiq"
+
+
+def test_run_group_name_strips_characters_the_live_master_has_never_shown_us():
+    """Parens and commas appear in every custom model name and are NOT proven at IBKR; a name
+    it silently mangles becomes a group the block rail cannot find."""
+    assert fgs.run_group_name("Growth (Small, Custom)", "20260904-0931") ==         "Growth Small Custom 20260904-0931"
+    assert fgs.run_group_name("XLE BUY", "20260904-0931") == "XLE BUY 20260904-0931"
+
+
+def test_run_group_name_requires_both_a_label_and_a_stamp():
+    with pytest.raises(fgs.FaGroupSyncRefused):
+        fgs.run_group_name("XLE BUY", "")
+    with pytest.raises(fgs.FaGroupSyncRefused):
+        fgs.run_group_name("(),", "20260904")
+
+
+def test_two_runs_on_the_same_day_get_different_group_names():
+    a = fgs.run_group_name("XLE BUY", "20260904-0931")
+    b = fgs.run_group_name("XLE BUY", "20260904-1416")
+    assert a != b, "the run stamp is what makes a group an audit record of ONE run"

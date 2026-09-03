@@ -277,6 +277,153 @@ def backup_is_usable(path: str | None) -> tuple[bool, str]:
 # ============================================================================================
 # 3. PLAN — PURE. The reviewable change: new XML + unified diff + who is added/removed.
 # ============================================================================================
+RUN_GROUP_SAFE = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789 -"
+
+
+def run_group_name(label: str, run_stamp: str) -> str:
+    """The name of the throwaway FA group ONE armed run creates for ONE tradeable unit.
+
+    ``label`` is what the group trades - owner decision 2026-09-03 makes that ONE TICKER AND
+    SIDE ("XLE BUY"), not one model. An API order is always for a single contract, and IBKR
+    exposes no call that rebalances a group to target percentages (verified against our own
+    docs/MODEL_PORTFOLIO_RESEARCH.md and the TWS API FA page: the allocation methods are
+    EqualQuantity / NetLiq / AvailableEquity / PctChange / ContractsOrShares, and there is no
+    rebalance verb). So a rebalance is N block orders, one per ticker, and a per-ticker group
+    lets every account across EVERY model fill that ticker at ONE average price - which is the
+    whole point of trading blocks rather than per account.
+
+    OWNER DECISION 2026-09-03. Groups are not standing furniture: every armed run creates its
+    own group, uploads the membership read from the CRM at that moment, trades it, and leaves
+    it behind as the audit record of exactly who was in that trade. So the name has to carry
+    BOTH the model and the run.
+
+    CHARACTER SET IS DELIBERATELY NARROW. The live master (F6795549) carries names like
+    "Dougs Group" and "MainSmall", so letters, digits and spaces are PROVEN to work.
+    Parentheses and commas - which every custom model name contains - are NOT proven, and a
+    name IBKR silently mangles would produce a group the block rail then cannot find.
+    Everything outside :data:`RUN_GROUP_SAFE` is dropped and runs of spaces collapsed, so
+    ``Growth (Small, Custom)`` becomes ``Growth Small Custom``. The full label is recorded in
+    the ledger, so nothing is lost by narrowing the name here.
+    """
+    m = "".join(ch for ch in str(label or "") if ch in RUN_GROUP_SAFE)
+    m = " ".join(m.split())
+    stamp = "".join(ch for ch in str(run_stamp or "") if ch in RUN_GROUP_SAFE).strip()
+    if not m:
+        raise FaGroupSyncRefused(
+            f"run_group_name: label {label!r} reduces to an empty group name once unproven "
+            f"characters are dropped. FAILING CLOSED.")
+    if not stamp:
+        raise FaGroupSyncRefused(
+            "run_group_name: no run stamp given - a run group MUST be identifiable to its "
+            "run or it is not an audit record. FAILING CLOSED.")
+    return f"{m} {stamp}"
+
+
+def plan_group_creation(
+    current_xml: str,
+    fa_group: str,
+    desired_accounts: Iterable[str],
+    *,
+    default_method: str = "NetLiq",
+    new_member_amount: int = 0,
+) -> tuple[str, str, MembershipSummary]:
+    """PURE (no broker, no disk): plan CREATING ``fa_group`` holding exactly
+    ``desired_accounts``, against ``current_xml``.
+
+    The creation counterpart to :func:`plan_membership_change`, and deliberately a SEPARATE
+    function rather than a flag on it: editing a group that exists and bringing a new one into
+    existence are different acts with different failure modes, and the refusal that protects
+    each is the inverse of the other. plan_membership_change refuses a name that is ABSENT;
+    this refuses a name that is PRESENT.
+
+    Returns ``(new_xml, diff_text, summary)`` with the same shape as plan_membership_change;
+    ``summary.added`` is the full membership, ``summary.removed`` is empty.
+
+    FAILS CLOSED (FaGroupSyncRefused) on: a blank name, an empty desired set (an empty group
+    is never what the caller meant, and there is no allow_empty escape here), blank or
+    unparseable ``current_xml``, a name that already exists, or a computed payload that
+    changed ANY pre-existing group or did not land on exactly the desired membership.
+    """
+    group = str(fa_group or "").strip()
+    if not group:
+        raise FaGroupSyncRefused("plan_group_creation: no FA group name given. FAILING CLOSED.")
+
+    desired = {str(a).strip() for a in (desired_accounts or []) if str(a).strip()}
+    if not desired:
+        raise FaGroupSyncRefused(
+            f"plan_group_creation: the membership for new group {group!r} is EMPTY. A run "
+            f"group with nobody in it is never what the caller meant, and an empty roster read "
+            f"must never produce one. FAILING CLOSED.")
+
+    current = str(current_xml or "").strip()
+    if not current:
+        raise FaGroupSyncRefused(
+            "plan_group_creation: empty current groups XML - the live state is UNKNOWN, so no "
+            "replaceFA payload may be computed. FAILING CLOSED.")
+
+    try:
+        before = fa_membership.parse_group_membership(current)
+    except ET.ParseError as exc:
+        raise FaGroupSyncRefused(
+            f"plan_group_creation: current groups XML is unparseable ({exc}). "
+            f"FAILING CLOSED.") from exc
+
+    if group in before:
+        raise FaGroupSyncRefused(
+            f"plan_group_creation: FA group {group!r} ALREADY EXISTS. This function creates a "
+            f"NEW group; changing an existing membership is plan_membership_change. A run "
+            f"group name that collides means the run stamp is not unique - fix that rather "
+            f"than reusing the group. FAILING CLOSED.")
+
+    try:
+        new_xml = fa_membership.create_group(
+            current, group, sorted(desired),
+            default_method=default_method, new_member_amount=new_member_amount)
+    except ValueError as exc:
+        raise FaGroupSyncRefused(f"plan_group_creation: {exc}") from exc
+
+    _assert_only_new_group_added(current, new_xml, group, desired, before)
+
+    diff_text = fa_membership.membership_diff_text(current, new_xml, label=group)
+    summary = MembershipSummary(
+        fa_group=group, added=tuple(sorted(desired)), removed=(), kept=())
+    return new_xml, diff_text, summary
+
+
+def _assert_only_new_group_added(current_xml, new_xml, group, desired, before) -> None:
+    """Load-bearing invariant on the COMPUTED creation payload, before any human sees the diff.
+
+    replaceFA overwrites the WHOLE document, so a creation payload has to be proven to (a)
+    parse, (b) contain exactly one more group than before, (c) land the new group on exactly
+    the desired membership, and (d) leave every pre-existing group byte-identical. Any failure
+    raises rather than returning a payload the caller might write.
+    """
+    try:
+        after = fa_membership.parse_group_membership(new_xml)
+    except ET.ParseError as exc:
+        raise FaGroupSyncRefused(
+            f"plan_group_creation: the COMPUTED payload does not parse ({exc}). Refusing to "
+            f"hand back an unwritable payload. FAILING CLOSED.") from exc
+
+    if group not in after:
+        raise FaGroupSyncRefused(
+            f"plan_group_creation: the computed payload does not contain the new group "
+            f"{group!r}. FAILING CLOSED.")
+    if set(after[group]) != set(desired):
+        raise FaGroupSyncRefused(
+            f"plan_group_creation: the computed payload does not land {group!r} on the desired "
+            f"membership (wanted {len(desired)}, got {len(after[group])}). FAILING CLOSED.")
+    if len(after) != len(before) + 1:
+        raise FaGroupSyncRefused(
+            f"plan_group_creation: the computed payload changed the GROUP COUNT by "
+            f"{len(after) - len(before)}, expected exactly +1. FAILING CLOSED.")
+    for name, members in before.items():
+        if set(after.get(name, ())) != set(members):
+            raise FaGroupSyncRefused(
+                f"plan_group_creation: the computed payload MODIFIED pre-existing group "
+                f"{name!r}. A creation must touch nothing else. FAILING CLOSED.")
+
+
 def plan_membership_change(
     current_xml: str,
     fa_group: str,

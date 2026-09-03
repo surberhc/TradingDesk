@@ -15,10 +15,27 @@ from __future__ import annotations
 
 # 0.MAJOR.MINOR while pre-trading. Bump on ANY change that can affect a generated order
 # (strategy wiring, sizing, reserve/band logic, allocation, routing).
-VERSION = "0.49.0"
+VERSION = "0.50.0"
 
 # Newest first. Keep terse; for an examiner the "why" matters as much as the "what".
 CHANGELOG = [
+    ("0.50.0", "2026-09-03", "FA GROUP CREATION, the missing half of the group rail. The "
+                             "live master F6795549 was read for the first time on 2026-09-03: "
+                             "354 client accounts and 8 existing groups, and every one of "
+                             "those 8 round-trips through fa_membership as a NO-OP, which "
+                             "closes the standing MASTER_PLAN A.2 caveat that the parser had "
+                             "only ever seen test fixtures. fa_membership.create_group and "
+                             "fa_group_sync.plan_group_creation add ONE group and prove the "
+                             "payload leaves every pre-existing group byte-identical. The new "
+                             "Group element is DEEP-COPIED from a real one rather than built "
+                             "from scratch, so layout, namespace and the ListOfAccts varName "
+                             "match what IBKR itself sent. run_group_name stamps a group with "
+                             "its run and strips characters the live master has never shown "
+                             "us. Owner decision: groups are per-run and per-TICKER, never "
+                             "standing - an API order is always one contract and IBKR exposes "
+                             "no rebalance verb, so a rebalance is N block orders and a "
+                             "per-ticker group fills every account across every model at ONE "
+                             "average price."),
     ("0.49.0", "2026-09-03", "PDT NOW SUPPRESSES THE WHOLE ACCOUNT, SELLS INCLUDED. The "
                              "0.48.0 warn-only change was WRONG and was measured wrong within "
                              "the hour: IBKR restricts a flagged account to LIQUIDATING "
