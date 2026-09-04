@@ -166,13 +166,41 @@ def membership_diff(
     return out
 
 
+
+_XML_DECL = '<?xml version="1.0" encoding="UTF-8"?>'
+
+
+def serialize_groups(root) -> str:
+    """Serialize the groups document THE WAY IBKR SENT IT - with the XML declaration.
+
+    ``ET.tostring(root, encoding="unicode")`` omits ``<?xml version="1.0" encoding="UTF-8"?>``.
+    IBKR's own document always carries it. On 2026-09-04 a maintenance write rewrote the whole
+    document without it; from that moment IBKR accepted DELETIONS from the document but
+    rejected every ADDITION to it -- [10229] FA data saving error: Invalid Group <name> -- and
+    creation had worked for 190 groups earlier the same day. Always emit the declaration.
+    """
+    body = ET.tostring(root, encoding="unicode").lstrip()
+    if body.startswith("<?xml"):
+        return body
+    return _XML_DECL + chr(10) + body
+
+
 def create_group(
     groups_xml: str,
     name: str,
     accounts,
     *,
-    default_method: str = "NetLiq",
-    new_member_amount: int = 0,
+    # ContractsOrShares, NOT NetLiq. IBKR refuses NetLiq on a newly created group:
+    #   [10260] Group <name> has unsupported method (NetLiq)
+    # (captured live 2026-09-04 once replaceFA errors were finally being read). It is
+    # also what we actually use -- every block writes an explicit ContractsOrShares
+    # split before it places, so NetLiq was only ever a vestigial default.
+    default_method: str = "ContractsOrShares",
+    # 1, NOT 0. A ContractsOrShares group whose every account is allocated ZERO shares
+    # is rejected outright: [10229] FA data saving error: Invalid Group <name>
+    # (captured live 2026-09-04). This is only a placeholder -- the real per-account
+    # split is written by set_group_contracts_or_shares immediately before the order.
+    new_member_amount: int = 1,
 ) -> str:
     """Return NEW GROUPS XML with ONE additional <Group> named ``name`` holding exactly
     ``accounts``. Every pre-existing group is left byte-for-byte untouched.
@@ -266,7 +294,7 @@ def create_group(
         loa.append(node)
 
     root.append(new_grp)
-    return ET.tostring(root, encoding="unicode")
+    return serialize_groups(root)
 
 
 def apply_membership(
@@ -353,4 +381,4 @@ def apply_membership(
             amt = ET.SubElement(ael, f"{tag_prefix}amount")
             amt.text = str(int(new_member_amount))
 
-    return ET.tostring(root, encoding="unicode")
+    return serialize_groups(root)

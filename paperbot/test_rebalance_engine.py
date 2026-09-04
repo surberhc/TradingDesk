@@ -631,17 +631,19 @@ def test_a_fractional_stub_is_now_cleared_instead_of_stranded_forever():
     assert plan.orders["BND"] == 3925            # the genuine drift is unaffected
 
 
-def test_a_lone_fractional_stub_now_breaches_the_band_and_is_cleared():
-    """A stub of a DROPPED holding is a reason to trade on its own (v0.50.0). The account is
-    otherwise perfectly in spec -- SPY is exactly on target -- yet the leftover 0.8499 TLT is
-    a position the model no longer wants, so the account breaches and sells the stub in full.
-    Nothing else moves: the breach exists only to carry the exit order."""
+def test_a_lone_fractional_stub_does_NOT_breach_the_band(monkeypatch):
+    """v0.57.0, reversing v0.50.0 on measured evidence. A stub SHOULD go -- but IBKR refuses
+    every fractional order via the API (10243), so it is not actionable. Making it
+    always-breach created a permanent loop: the stub forces a breach, the account trades, it
+    still cannot clear the stub, it breaches again. Measured after a clean two-model run: 41
+    of 43 accounts would have re-traded, ALL driven by a stub alone, ZERO on trade size.
+    The stub is REPORTED by verify_in_sync; it never drags an in-spec account into a run."""
     target = make_target({"SPY": 1.0}, {"SPY": 100.0, "TLT": 90.0})
     plan = eng.plan_account("DU0803", "Balanced", 1_000_000, {"SPY": 9850, "TLT": 0.8499},
                             target, band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
     assert next(l.status for l in plan.lines if l.symbol == "TLT") == reconcile.FRACTIONAL
-    assert plan.needs_rebalance is True
-    assert plan.orders == {"TLT": pytest.approx(-0.8499)}
+    assert plan.needs_rebalance is False
+    assert plan.orders == {}
 
 
 def test_a_fractional_share_of_a_HELD_model_ticker_is_not_a_stub_and_never_forces_a_trade():

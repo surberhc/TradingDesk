@@ -90,6 +90,25 @@ def _checks(run: dict) -> list:
                    "Every account is on the approved roster." if not outside
                    else "{} account(s) are NOT on the approved roster: {}. This run cannot "
                         "be sent.".format(len(outside), ", ".join(outside))))
+    # THE GATEWAY'S OWN ORDER LIMITS. An oversized block is rejected at the gateway, which
+    # mid-run means a failed sell, a halted buy phase and a wasted window. Caught here, before
+    # anything is sent. Found on the 2026-09-04 Growth (Custom) plan: SELL BUCK 347,419 shares
+    # / $8,098,337 against limits of 100,000 and $5,000,000.
+    import group_rebalance as _gr
+    oversize = _gr.blocks_over_gateway_limits(groups)
+    if oversize:
+        detail = "; ".join(
+            "{} {} = {:,.0f} shares / ${:,.0f}{}{}".format(
+                r["side"], r["symbol"], r["shares"], r["value"],
+                " (over the {:,} share limit)".format(r["size_limit"]) if r["over_size"] else "",
+                " (over the ${:,.0f} value limit)".format(r["value_limit"]) if r["over_value"] else "")
+            for r in oversize)
+        checks.append((False,
+                       "{} block(s) exceed the gateway's order limits and would be REJECTED: "
+                       "{}. This run cannot be sent as planned.".format(len(oversize), detail)))
+    else:
+        checks.append((True, "Every block is inside the gateway's order size and value limits."))
+
     skipped = run.get("skipped") or []
     checks.append((not skipped,
                    "Every account in scope has a readable account value." if not skipped
@@ -113,6 +132,24 @@ def render_group_trade() -> None:
     st.markdown("## Group trade")
     st.caption("One order per holding, shared across every account that needs it, so "
                "everyone gets the same price.")
+
+    # Housekeeping and Reset live ABOVE step 1 on purpose: both are needed most when a trade
+    # is NOT prepared -- after a run, or when the page is holding stale state. They used to
+    # sit below the "nothing prepared yet" early return, which made them invisible exactly
+    # when they were wanted.
+    top_left, mid, right = st.columns([2, 1, 1])
+    with mid:
+        if st.button("Reset this page", key="reset_group_trade",
+                     use_container_width=True):
+            # A RESET CLEARS EVERYTHING, not just the prepared trade. The strategy tickboxes
+            # are Streamlit widget state under "gt_<model>" keys and survive a rerun on their
+            # own, so dropping only _STATE left the boxes ticked and the page half-reset.
+            st.session_state.pop(_STATE, None)
+            for k in [k for k in st.session_state if str(k).startswith("gt_")]:
+                st.session_state.pop(k, None)
+            st.rerun()
+    with right:
+        _purge_button()
 
     st.markdown("#### 1. Pick the strategies")
     try:
@@ -214,6 +251,53 @@ def _send(run: dict) -> dict:
             allowed_accounts=built["roster"], armed=True, backup_path=None)
     finally:
         ib.disconnect()
+
+
+def _purge_button() -> None:
+    """Clear spent throwaway groups from the master. TOP RIGHT, always visible, no expander
+    and no prepared trade required: this is needed most when a trade CANNOT be prepared,
+    which is exactly the situation it fixes. Every run leaves one group per block behind at
+    IBKR; four runs took that document from 8 groups to 198 on 2026-09-04 and the gateway
+    stopped committing writes (error 10230), which blocked trading outright."""
+    from ib_async import IB
+    import group_execute as ge
+
+    if not st.button("Purge old groups", key="purge_groups", use_container_width=True,
+                     help="Deletes spent run groups at IBKR. Permanent groups are never "
+                          "touched. Backs up first and verifies before writing."):
+        return
+    ib = IB()
+    try:
+        ib.connect("127.0.0.1", 4003, clientId=118, readonly=False, timeout=30,
+                   account=ge.LIVE_MASTER_ACCOUNT)
+    except Exception as exc:
+        st.error("Could not reach the gateway: {}".format(exc))
+        return
+    try:
+        res = ge.purge_run_groups(ib, armed=True)
+    except Exception as exc:
+        st.error("Purge refused, nothing was changed: {}".format(exc))
+        return
+    finally:
+        ib.disconnect()
+    if res.get("refused"):
+        st.warning(res["refused"])
+    elif res.get("written"):
+        # Counted from the LIVE document after settling, never from what we asked for -- an
+        # earlier version reported deleting 82 groups while deleting none, because the read
+        # straight after a write is served stale.
+        msg = ("Deleted {} group(s) over {} pass(es). {} group(s) remain: {} permanent, "
+               "{} still to clear.").format(res["deleted"], res["passes"], res["remaining"],
+                                            res["permanent"], res["remaining_dated"])
+        if res["remaining_dated"]:
+            st.warning(msg + "  Press again to continue.")
+        else:
+            st.success(msg)
+        for n in res.get("notes", []):
+            st.caption(n)
+        st.caption("Backup: {}".format(res["backup"]))
+    else:
+        st.info("Nothing was written.")
 
 
 def _render_result(result: dict) -> None:

@@ -497,3 +497,115 @@ def _record_run(target, run, routes, created, executed, *, adaptive_priority=Non
         print(f"    !! COULD NOT WRITE THE AUDIT RECORD ({type(exc).__name__}: {exc}). The run "
               f"itself is unaffected, but THIS RUN IS UNRECORDED - capture the screen before "
               f"moving on.")
+
+def purge_run_groups(ib, *, armed: bool = False, keep_stamps=(),
+                     client_id: int = 118, max_passes: int = 8,
+                     batch: int = 40, settle_sec: float = 4.0) -> dict:
+    """Delete SPENT throwaway run-groups from the master, IN PASSES.
+
+    WHY PASSES (measured 2026-09-04). Every group run leaves one throwaway group per block
+    behind as its audit record; four runs took the master's document from 8 groups to 198,
+    and the gateway then stopped committing FA writes at all -- IBKR error 10230, "You have
+    unsaved FA changes" -- which blocked trading outright.
+
+    The first attempt to delete all 190 in ONE replaceFA removed 108 and then stopped: the
+    gateway accepts a write and refuses further ones until it settles. A second identical
+    call deleted NOTHING while reporting success, because the verify read straight after a
+    write is served STALE. So: delete a BATCH, wait, RE-READ on its own terms, and repeat
+    until either nothing dated is left or a pass makes no progress. Truthful either way --
+    `deleted` is measured from the live document, never from what we intended.
+
+    Only groups whose name carries a dated run stamp (``YYYYMMDD-HHMM``) are touched;
+    anything without one is PERMANENT and is never removed. ``keep_stamps`` spares named
+    stamps, e.g. a run still in flight.
+    """
+    import re
+    import time
+    import xml.etree.ElementTree as ET
+    import rebalance_execute as rx
+    import fa_group_sync as fgs
+    import safe_execute
+    from fa_membership import serialize_groups as fa_membership_serialize
+
+    stamp_re = re.compile(r"\d{8}-\d{4}")
+    spare = set(keep_stamps)
+
+    def _name(g):
+        e = g.find("name")
+        return (e.text or "").strip() if e is not None else ""
+
+    def _dated(names):
+        out = []
+        for n in names:
+            m = stamp_re.search(n)
+            if m and m.group(0) not in spare:
+                out.append(n)
+        return out
+
+    backup = rx.backup_fa_groups(ib)
+    first_names = [_name(g) for g in ET.fromstring(fgs.read_live_groups(ib)).findall(".//Group")]
+    started_with = len(first_names)
+    result = {"backup": backup, "started_with": started_with, "deleted": 0, "passes": 0,
+              "remaining": started_with, "remaining_dated": len(_dated(first_names)),
+              "permanent": started_with - len(_dated(first_names)),
+              "written": False, "refused": "", "notes": []}
+
+    if not _dated(first_names):
+        result["refused"] = "Nothing to clean up - no dated run groups found."
+        return result
+    if not armed:
+        result["refused"] = "Preview only - not armed, nothing written."
+        return result
+
+    for attempt in range(1, max_passes + 1):
+        xml = fgs.read_live_groups(ib)
+        root = ET.fromstring(xml)
+        groups = list(root.findall(".//Group"))
+        before = len(groups)
+        doomed, keep = [], []
+        for g in groups:
+            n = _name(g)
+            m = stamp_re.search(n)
+            (doomed if (m and m.group(0) not in spare) else keep).append(g)
+        if not doomed:
+            result["notes"].append(f"pass {attempt}: nothing dated left")
+            break
+        if not keep:
+            result["refused"] = ("REFUSING: every group carries a run stamp; this would empty "
+                                 "the master's configuration.")
+            break
+
+        chunk = doomed[:max(1, int(batch))]
+        parent = root.find(".//ListOfGroups")
+        if parent is None:
+            parent = root
+        for g in chunk:
+            parent.remove(g)
+        new_xml = fa_membership_serialize(root)
+        expect = before - len(chunk)
+        if len(ET.fromstring(new_xml).findall(".//Group")) != expect:
+            result["refused"] = f"REFUSING on pass {attempt}: post-edit count mismatch."
+            break
+
+        with safe_execute.armed_session(purpose="fa_group_purge", client_id=client_id,
+                                        gateway_lock_on_busy="refuse"):
+            fgs.apply_membership_change(ib, new_xml, armed=True, backup_path=backup)
+        result["written"] = True
+
+        # SETTLE, then re-read on its OWN terms. A read straight after a write is stale, which
+        # is how the second attempt reported deleting 82 groups while deleting none.
+        time.sleep(float(settle_sec))
+        now = len(ET.fromstring(fgs.read_live_groups(ib)).findall(".//Group"))
+        moved = before - now
+        result["passes"] = attempt
+        result["notes"].append(f"pass {attempt}: asked to drop {len(chunk)}, actually dropped {moved}")
+        if moved <= 0:
+            result["notes"].append("gateway stopped accepting writes - stopping here")
+            break
+
+    final = [_name(g) for g in ET.fromstring(fgs.read_live_groups(ib)).findall(".//Group")]
+    result["remaining"] = len(final)
+    result["remaining_dated"] = len(_dated(final))
+    result["permanent"] = len(final) - len(_dated(final))
+    result["deleted"] = started_with - len(final)
+    return result

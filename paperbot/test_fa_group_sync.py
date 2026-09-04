@@ -296,7 +296,10 @@ def test_kept_members_keep_their_amounts_and_new_member_gets_placeholder():
     amounts = _amounts(new_xml, "TIER_A")
     assert amounts["DU100001"] == "7"     # unchanged ContractsOrShares
     assert amounts["DU100002"] == "13"    # unchanged ContractsOrShares
-    assert amounts["DU100003"] == "0"     # placeholder for the new member
+    # 1, not 0: IBKR rejects a ContractsOrShares group whose members are all allocated zero
+    # -- [10229] FA data saving error: Invalid Group <name>, captured live 2026-09-04. The
+    # placeholder is overwritten by the real split before any order is placed.
+    assert amounts["DU100003"] == "1"     # placeholder for the new member
     assert summary.added == ("DU100003",)
 
 
@@ -447,7 +450,9 @@ def test_sync_armed_add_backs_up_writes_once_and_verifies(tmp_path, armed_config
         assert fh.read() == _xml()
 
     written = ib.replaced[0][1]
-    assert _amounts(written, "TIER_A") == {"DU100001": "7", "DU100002": "13", "DU100003": "0"}
+    # new member placeholder is 1, not 0 -- see the note above; IBKR rejects an all-zero
+    # ContractsOrShares group with [10229] Invalid Group.
+    assert _amounts(written, "TIER_A") == {"DU100001": "7", "DU100002": "13", "DU100003": "1"}
     assert _group_blob(written, "TIER_B") == _group_blob(_xml(), "TIER_B")
 
 
@@ -574,7 +579,10 @@ def test_created_group_clones_the_real_element_shape():
     loa = fa_membership._find_child(grp, "listofaccts")
     assert loa is not None
     assert loa.attrib.get("varName") == "list"
-    assert fa_membership._find_child(grp, "defaultmethod").text == "NetLiq"
+    # ContractsOrShares, not NetLiq: IBKR refuses a newly created group with NetLiq --
+    #   [10260] Group <name> has unsupported method (NetLiq)
+    # captured live 2026-09-04. It is also the method every block actually writes.
+    assert fa_membership._find_child(grp, "defaultmethod").text == "ContractsOrShares"
 
 
 def test_run_group_name_strips_characters_the_live_master_has_never_shown_us():

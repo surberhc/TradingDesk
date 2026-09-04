@@ -349,8 +349,17 @@ def plan_group_creation(
     fa_group: str,
     desired_accounts: Iterable[str],
     *,
-    default_method: str = "NetLiq",
-    new_member_amount: int = 0,
+    # ContractsOrShares, NOT NetLiq. IBKR refuses NetLiq on a newly created group:
+    #   [10260] Group <name> has unsupported method (NetLiq)
+    # (captured live 2026-09-04 once replaceFA errors were finally being read). It is
+    # also what we actually use -- every block writes an explicit ContractsOrShares
+    # split before it places, so NetLiq was only ever a vestigial default.
+    default_method: str = "ContractsOrShares",
+    # 1, NOT 0. A ContractsOrShares group whose every account is allocated ZERO shares
+    # is rejected outright: [10229] FA data saving error: Invalid Group <name>
+    # (captured live 2026-09-04). This is only a placeholder -- the real per-account
+    # split is written by set_group_contracts_or_shares immediately before the order.
+    new_member_amount: int = 1,
 ) -> tuple[str, str, MembershipSummary]:
     """PURE (no broker, no disk): plan CREATING ``fa_group`` holding exactly
     ``desired_accounts``, against ``current_xml``.
@@ -454,7 +463,11 @@ def plan_membership_change(
     fa_group: str,
     desired_accounts: Iterable[str],
     *,
-    new_member_amount: int = 0,
+    # 1, NOT 0. A ContractsOrShares group whose every account is allocated ZERO shares
+    # is rejected outright: [10229] FA data saving error: Invalid Group <name>
+    # (captured live 2026-09-04). This is only a placeholder -- the real per-account
+    # split is written by set_group_contracts_or_shares immediately before the order.
+    new_member_amount: int = 1,
     allow_empty: bool = False,
 ) -> tuple[str, str, MembershipSummary]:
     """PURE (no broker, no disk): plan setting ``fa_group``'s membership to EXACTLY
@@ -624,7 +637,41 @@ def apply_membership_change(ib, new_xml: str, *, armed: bool, backup_path: str) 
             "apply_membership_change: REFUSED — no gateway connection with replaceFA. "
             "FAILING CLOSED.")
 
-    ib.replaceFA(FA_GROUPS, payload)   # serialized config write — overwrites the WHOLE XML
+    # LISTEN TO THE BROKER WHILE WE WRITE (2026-09-04). Nothing in this system captured what
+    # IBKR says in response to replaceFA -- we only ever inspected the read-back afterwards.
+    # That left a whole afternoon of "replaceFA WAS WRITTEN but the group is not there" with
+    # no stated reason, and three wrong theories chased in its place. Any error the gateway
+    # sends during the write is now collected and RAISED with the broker's own words.
+    captured = []
+
+    def _catch(reqId, errorCode, errorString, contract=None):   # ib_async errorEvent signature
+        captured.append((reqId, errorCode, str(errorString or "")))
+
+    listening = False
+    try:
+        ib.errorEvent += _catch
+        listening = True
+    except Exception:  # noqa: BLE001 - never let instrumentation break the write path
+        pass
+    try:
+        ib.replaceFA(FA_GROUPS, payload)   # serialized config write — overwrites the WHOLE XML
+        try:
+            ib.sleep(2.0)                  # let the gateway's response land before we stop listening
+        except Exception:  # noqa: BLE001
+            pass
+    finally:
+        if listening:
+            try:
+                ib.errorEvent -= _catch
+            except Exception:  # noqa: BLE001
+                pass
+
+    real = [c for c in captured if c[1] not in (2104, 2106, 2158, 2107, 2119, 10275)]
+    if real:
+        detail = "; ".join(f"[{code}] {msg}" for _rid, code, msg in real)
+        print(f"      BROKER SAID during replaceFA: {detail}", flush=True)
+        raise FaGroupSyncRefused(
+            f"apply_membership_change: IBKR REPORTED AN ERROR during replaceFA: {detail}")
     return payload
 
 
@@ -638,8 +685,17 @@ def create_run_group(
     *,
     armed: bool = False,
     backup_path: str | None = None,
-    default_method: str = "NetLiq",
-    new_member_amount: int = 0,
+    # ContractsOrShares, NOT NetLiq. IBKR refuses NetLiq on a newly created group:
+    #   [10260] Group <name> has unsupported method (NetLiq)
+    # (captured live 2026-09-04 once replaceFA errors were finally being read). It is
+    # also what we actually use -- every block writes an explicit ContractsOrShares
+    # split before it places, so NetLiq was only ever a vestigial default.
+    default_method: str = "ContractsOrShares",
+    # 1, NOT 0. A ContractsOrShares group whose every account is allocated ZERO shares
+    # is rejected outright: [10229] FA data saving error: Invalid Group <name>
+    # (captured live 2026-09-04). This is only a placeholder -- the real per-account
+    # split is written by set_group_contracts_or_shares immediately before the order.
+    new_member_amount: int = 1,
     verify: bool = True,
 ) -> dict:
     """The full CREATION chain for ONE run group, in the same safe order as
@@ -734,7 +790,11 @@ def sync_group_membership(
     *,
     armed: bool = False,
     backup_path: str | None = None,
-    new_member_amount: int = 0,
+    # 1, NOT 0. A ContractsOrShares group whose every account is allocated ZERO shares
+    # is rejected outright: [10229] FA data saving error: Invalid Group <name>
+    # (captured live 2026-09-04). This is only a placeholder -- the real per-account
+    # split is written by set_group_contracts_or_shares immediately before the order.
+    new_member_amount: int = 1,
     allow_empty: bool = False,
     verify: bool = True,
 ) -> dict:

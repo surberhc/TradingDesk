@@ -119,11 +119,16 @@ _NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP", reconcile.UN
 # Statuses that ALWAYS breach regardless of trade size — a KNOWN held symbol the model
 # dropped to 0% must be cleared. UNTRACKED is the legacy (universe=None) equivalent;
 # ROTATE_OUT is its refined form when a universe is supplied. Both mean "sell it".
-# FRACTIONAL joins them (v0.50.0): a stub is only ever a symbol the model weights at
-# 0%, i.e. a holding we no longer want, so leaving it un-cleared is the same defect as
-# leaving a whole-share ROTATE_OUT -- it just costs less. A fractional share of a
-# ticker the model still HOLDS is not FRACTIONAL and is untouched by this.
-_ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT", reconcile.FRACTIONAL})
+# FRACTIONAL was added here in v0.50.0 and REMOVED in v0.57.0. The intent was right -- a
+# stub of a dropped holding should go -- but IBKR will not accept ANY fractional order via
+# the API (error 10243, see config.BLOCK_ORDERS_WHOLE_SHARES_ONLY). So a stub is not
+# actionable, and making it always-breach created a permanent loop: the stub forces the
+# account to breach, the account is pulled into the run, it cannot clear the stub, and it
+# breaches again on the next run, forever. Measured 2026-09-04 after a clean run of two
+# models: 41 of 43 accounts would have re-traded, ALL 41 driven by a stub alone, ZERO
+# breaching on trade size. A stub is REPORTED by verify_in_sync and never traded on;
+# clearing it needs the desktop platform.
+_ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT"})
 
 
 def band_breached(lines, net_liq: float, target: strategy_target.Target,

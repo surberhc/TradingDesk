@@ -276,6 +276,18 @@ LARGE_BLOCK_ADAPTIVE_PRIORITY = "Urgent"
 # the remaining stub, so nothing is hidden -- but per IBKR's own message the API cannot
 # clear it at all. Clearing a sub-share stub requires the desktop platform, by hand.
 BLOCK_ORDERS_WHOLE_SHARES_ONLY = True
+
+# THE GATEWAY'S OWN PRECAUTIONARY LIMITS, mirrored here so the desk refuses an oversized
+# block BEFORE sending it rather than learning from a broker rejection mid-run. Owner set
+# these in TWS/Gateway on 2026-09-04: Order Size Limit 100,000 shares, Order Value Limit
+# $5,000,000. KEEP THESE IN STEP WITH THE GATEWAY -- if they drift apart the desk either
+# refuses orders IBKR would accept, or sends orders IBKR will bounce.
+#
+# Found on the 2026-09-04 Growth (Custom) plan: SELL BUCK 347,419 shares / $8,098,337 broke
+# both. It was also 105% of BUCK's entire daily volume against 4,200 shares at the bid, so
+# the limits were the least of its problems -- but nothing should reach the wire unchecked.
+GATEWAY_ORDER_SIZE_LIMIT = 100_000
+GATEWAY_ORDER_VALUE_LIMIT = 5_000_000.0
 # HALT_BUYS_ON_UNFILLED_SELL — the sell phase's gate is "every block reached a TERMINAL state",
 # and Cancelled is terminal. That let the run proceed to buys the failed sell was funding. When
 # any sell block ends short, STOP: report it and place no buys. The buys are re-sized to
