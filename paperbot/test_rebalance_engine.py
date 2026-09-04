@@ -631,13 +631,28 @@ def test_a_fractional_stub_is_now_cleared_instead_of_stranded_forever():
     assert plan.orders["BND"] == 3925            # the genuine drift is unaffected
 
 
-def test_a_lone_fractional_stub_still_does_not_breach_the_band_by_itself():
-    """BOUNDARY the fix does NOT move: a stub is not a reason to trade an otherwise in-spec
-    account. FRACTIONAL is excluded from the band test, so an account holding nothing but a
-    stub emits no orders at all and the stub is cleared on the next cycle that trades."""
+def test_a_lone_fractional_stub_now_breaches_the_band_and_is_cleared():
+    """A stub of a DROPPED holding is a reason to trade on its own (v0.50.0). The account is
+    otherwise perfectly in spec -- SPY is exactly on target -- yet the leftover 0.8499 TLT is
+    a position the model no longer wants, so the account breaches and sells the stub in full.
+    Nothing else moves: the breach exists only to carry the exit order."""
     target = make_target({"SPY": 1.0}, {"SPY": 100.0, "TLT": 90.0})
     plan = eng.plan_account("DU0803", "Balanced", 1_000_000, {"SPY": 9850, "TLT": 0.8499},
                             target, band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert next(l.status for l in plan.lines if l.symbol == "TLT") == reconcile.FRACTIONAL
+    assert plan.needs_rebalance is True
+    assert plan.orders == {"TLT": pytest.approx(-0.8499)}
+
+
+def test_a_fractional_share_of_a_HELD_model_ticker_is_not_a_stub_and_never_forces_a_trade():
+    """THE distinction that makes the rule safe. 9850.77 SPY is a fractional QUANTITY of a
+    ticker the model still wants at 100%. It is not FRACTIONAL (that status requires model
+    weight 0), it is an ordinary on-target line, so the .77 is simply carried and the account
+    does not trade. Only a stub of a holding we have DROPPED forces a run."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0})
+    plan = eng.plan_account("DU0806", "Balanced", 1_000_000, {"SPY": 9850.77},
+                            target, band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert next(l.status for l in plan.lines if l.symbol == "SPY") != reconcile.FRACTIONAL
     assert plan.needs_rebalance is False
     assert plan.orders == {}
 

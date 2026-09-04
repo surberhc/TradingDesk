@@ -25,7 +25,7 @@ NEVER auto-liquidating an alien / corporate-action holding:
   ALIEN      — held, weight 0, symbol ∉ universe, ∉ whitelist, ≠ cash symbol, int(shares)>=1
                (spinoff / rename / manual position -> REVIEW; the bot never auto-trades it)
   FRACTIONAL — held, weight 0, int(shares) == 0 but shares != 0
-               (DRIP sub-share stub -> record, do not action; suppressed from the band)
+               (sub-share stub of a DROPPED ticker -> breaches the band, sold in full)
   SWEEP      — held, weight 0, symbol is the cash symbol or in config.SWEEP_WHITELIST
                (a money-market sweep held by design -> not ALIEN, no order, no page)
 When `universe is None` (backtester / paper callers that don't pass it) the classification

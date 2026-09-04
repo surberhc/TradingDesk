@@ -149,9 +149,11 @@ def test_ticker_rename_old_is_alien_new_is_missing_no_churn():
     assert [ln.symbol for ln in plan.alien_lines] == ["OLDCO"]
 
 
-def test_fractional_drip_stub_is_suppressed():
-    # A DRIP leaves 0.6 fractional shares of a dropped holding -> FRACTIONAL: no breach,
-    # no delta, no perpetual nightly false page.
+def test_fractional_drip_stub_is_cleared_not_suppressed():
+    # v0.50.0 REVERSAL of the old suppress rule. A DRIP leaves 0.6 shares of a holding the
+    # model has DROPPED. That is a position we no longer want, so it breaches the band on
+    # its own and is sold in full -- rather than sitting until the account happens to trade
+    # for some other reason. Sub-1-share, so the exit is the whole 0.6, not int(0.6) == 0.
     target = make_target({"SPY": 1.0}, {"SPY": 100.0, "BND": 80.0})
     lines = reconcile.reconcile(target, 1_000_000, {"SPY": 9850, "BND": 0.6},
                                 tolerance_w=0.03, investable=985_000, universe=UNIVERSE)
@@ -159,9 +161,25 @@ def test_fractional_drip_stub_is_suppressed():
 
     plan = eng.plan_account("DU0004", "Balanced", 1_000_000, {"SPY": 9850, "BND": 0.6},
                             target, band_pct=0.03, universe=UNIVERSE)
-    assert "BND" not in plan.orders
-    assert plan.needs_rebalance is False             # fractional stub never breaches
+    assert plan.needs_rebalance is True              # the stub IS a reason to trade
+    assert plan.orders == {"BND": pytest.approx(-0.6)}
     assert plan.alien_lines == []
+
+
+def test_a_sub_share_of_an_UNKNOWN_symbol_is_swept_too_documented_consequence():
+    # DOCUMENTED CONSEQUENCE of routing every stub through FRACTIONAL. classify_untracked
+    # checks the truncation seam BEFORE universe membership, so a sub-1-share spinoff of a
+    # symbol we do not recognise lands in FRACTIONAL, not ALIEN -- and is therefore sold on
+    # sight like any other stub. A whole-share alien is still protected for human review
+    # (see test_an_alien_holding_is_still_never_auto_traded_fraction_or_not); only the
+    # sub-share case is swept. If that is ever wrong, the fix is to split FRACTIONAL by
+    # universe membership, NOT to re-suppress every stub.
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0, "WEIRD": 30.0})
+    plan = eng.plan_account("DU0007", "Balanced", 1_000_000, {"SPY": 9850, "WEIRD": 0.4},
+                            target, band_pct=0.03, universe=UNIVERSE)
+    assert _status(plan.lines, "WEIRD") == "FRACTIONAL"
+    assert plan.needs_rebalance is True
+    assert plan.orders == {"WEIRD": pytest.approx(-0.4)}
 
 
 def test_fractional_alien_stub_is_fractional_not_alien():

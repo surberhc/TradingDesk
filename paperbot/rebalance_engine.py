@@ -119,7 +119,11 @@ _NO_AUTOTRADE_STATUSES = frozenset({"ALIEN", "FRACTIONAL", "SWEEP", reconcile.UN
 # Statuses that ALWAYS breach regardless of trade size — a KNOWN held symbol the model
 # dropped to 0% must be cleared. UNTRACKED is the legacy (universe=None) equivalent;
 # ROTATE_OUT is its refined form when a universe is supplied. Both mean "sell it".
-_ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT"})
+# FRACTIONAL joins them (v0.50.0): a stub is only ever a symbol the model weights at
+# 0%, i.e. a holding we no longer want, so leaving it un-cleared is the same defect as
+# leaving a whole-share ROTATE_OUT -- it just costs less. A fractional share of a
+# ticker the model still HOLDS is not FRACTIONAL and is untouched by this.
+_ALWAYS_BREACH_STATUSES = frozenset({"UNTRACKED", "ROTATE_OUT", reconcile.FRACTIONAL})
 
 
 def band_breached(lines, net_liq: float, target: strategy_target.Target,
@@ -128,14 +132,15 @@ def band_breached(lines, net_liq: float, target: strategy_target.Target,
     """ACCOUNT-LEVEL, all-or-nothing no-trade band test (the single source of truth).
 
     Returns True iff the account needs work: some holding's required TRADE SIZE exceeds
-    band_pct of NetLiq, OR a stray UNTRACKED/ROTATE_OUT position is held (a known dropped
-    ticker, always cleared regardless of size). The breach test keys on trade size, NOT
+    band_pct of NetLiq, OR a stray UNTRACKED/ROTATE_OUT/FRACTIONAL position is held (a
+    dropped ticker, always cleared regardless of size -- a stub included). The breach test keys on trade size, NOT
     raw weight-vs-model drift, so the cash-reserve gap (a fully-invested account sits
     ~reserve% under raw model weight by construction) can never falsely trip it.
 
-    An ALIEN / FRACTIONAL / SWEEP line NEVER breaches by itself — an alien holding is
-    reviewed by a human, not auto-swept, and a fractional stub / whitelisted sweep is not
-    a trade. So an alien-only cycle is 'needs review', not a false 'band breach' page.
+    An ALIEN / SWEEP line NEVER breaches by itself — an alien holding is reviewed by a
+    human, not auto-swept, and a whitelisted sweep is held by design. So an alien-only
+    cycle is 'needs review', not a false 'band breach' page. A FRACTIONAL stub DOES
+    breach (v0.50.0): it is a holding the model dropped, and it is cleared on sight.
     Pure — reads `lines` only (statuses are set by reconcile with the universe)."""
     if band_pct is None:
         band_pct = config.REBALANCE_BAND_PCT
