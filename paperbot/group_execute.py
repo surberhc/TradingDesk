@@ -342,24 +342,43 @@ def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool =
     """
     import live_fa_block_execute as fab
     import order_router
+    import safe_execute
+    from connections import clientids
 
-    created = create_run_groups(ib, run.get("group_plans") or [],
-                                allowed_accounts=allowed_accounts,
-                                armed=armed, backup_path=backup_path)
-
+    plans = run.get("group_plans") or []
     routes = run.get("routes") or []
-    if not routes:
+
+    if not armed:
+        # PREVIEW. Every group is planned and its diff returned; nothing is written.
+        created = create_run_groups(ib, plans, allowed_accounts=allowed_accounts,
+                                    armed=False, backup_path=backup_path)
         return {"created": created, "executed": None,
+                "note": "Preview only - no group was created, no FA config was written and "
+                        "no order was placed."}
+
+    if not routes:
+        return {"created": {"created": 0, "previewed": 0, "results": []}, "executed": None,
                 "note": "Nothing in this scope needs to trade."}
 
-    permit, why = order_router.transmit_guard(bool(armed))
-    if not permit:
-        return {"created": created, "executed": None,
-                "note": f"Preview only ({why}). No group was created, no FA config was "
-                        f"written and no order was placed."}
-
-    executed = fab.execute_fa_block_routes(
-        ib, routes, built["account_inputs"], built["targets"], target,
-        permit=permit, summaries=built.get("summaries"), run_id=run.get("stamp"),
-        adaptive_priority=adaptive_priority)
+    # THE ARM GATE. config.READONLY / config.DRY_RUN are committed True on disk on purpose, so
+    # nothing transmits from a fresh process no matter what a caller passes. armed_session is
+    # the ONE place they are flipped, in-process, restored in a finally, and it holds the
+    # gateway lock for the whole armed body so no other desk task can use the connection
+    # underneath us. BOTH halves must be inside it: replaceFA (creating each group) is gated by
+    # the same flags as placing an order, so creating the groups outside the session would
+    # silently produce a preview and then "send" nothing.
+    with safe_execute.armed_session(
+            purpose="group_trade",
+            client_id=clientids.get(target.clientid_consumer),
+            gateway_lock_on_busy="refuse"):
+        created = create_run_groups(ib, plans, allowed_accounts=allowed_accounts,
+                                    armed=True, backup_path=backup_path)
+        permit, why = order_router.transmit_guard(True)
+        if not permit:
+            return {"created": created, "executed": None,
+                    "note": f"Refused inside the arm gate ({why}). Nothing was placed."}
+        executed = fab.execute_fa_block_routes(
+            ib, routes, built["account_inputs"], built["targets"], target,
+            permit=permit, summaries=built.get("summaries"), run_id=run.get("stamp"),
+            adaptive_priority=adaptive_priority)
     return {"created": created, "executed": executed, "note": ""}
