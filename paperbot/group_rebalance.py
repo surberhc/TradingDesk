@@ -61,7 +61,7 @@ class TickerGroupPlan:
     """
     symbol: str
     side: str                       # BUY | SELL
-    total_qty: int
+    total_qty: float          # int for a BUY; may be fractional for a full-exit SELL
     group_name: str
     per_account: dict = field(default_factory=dict)   # account -> shares
     est_notional: float | None = None                 # None when no price was supplied
@@ -73,6 +73,27 @@ class TickerGroupPlan:
     @property
     def n_accounts(self) -> int:
         return len(self.per_account)
+
+
+def block_order_qty(side: str, qty) -> float:
+    """The quantity ONE account contributes to a block, and the only place the whole-share
+    rule is decided.
+
+    BUY is whole shares only -- the TWS API refuses a fractional buy (error 10243), which is
+    why every buy in this system has always been an int.
+
+    SELL carries the EXACT share count, fraction included. A "full exit" that sells 13 of
+    13.8499 has not exited: it leaves a 0.8499 stub of a holding the model has already
+    dropped, and that stub can then never be cleared, because int() truncates it to zero on
+    every subsequent cycle too. Owner rule 2026-09-04: if we no longer own it, it goes.
+
+    A quantity that is already whole comes back as an int, so every block that was whole
+    before this existed is byte-identical to what it was.
+    """
+    f = float(qty)
+    if side == "SELL" and f != int(f):
+        return f
+    return int(f)
 
 
 def plan_ticker_groups(plans, *, run_stamp: str, prices=None) -> list[TickerGroupPlan]:
@@ -102,11 +123,16 @@ def plan_ticker_groups(plans, *, run_stamp: str, prices=None) -> list[TickerGrou
     seen_names: dict[str, str] = {}
 
     for b in blocks:
-        split = {a: int(q) for a, q in b.per_account.items() if int(q)}
+        split = {}
+        for a, q in b.per_account.items():
+            v = block_order_qty(b.side, q)
+            if v:
+                split[a] = v
         if not split:
             continue
         total = sum(split.values())
-        if total != int(b.total_qty):
+        expected = block_order_qty(b.side, b.total_qty)
+        if abs(total - expected) > 1e-6:
             raise ValueError(
                 f"plan_ticker_groups: {b.side} {b.symbol} split sums to {total} but the block "
                 f"total is {b.total_qty}. Refusing to hand back a split that does not add up.")
@@ -119,7 +145,7 @@ def plan_ticker_groups(plans, *, run_stamp: str, prices=None) -> list[TickerGrou
         seen_names[name] = f"{b.symbol} {b.side}"
         p = px.get(b.symbol)
         out.append(TickerGroupPlan(
-            symbol=b.symbol, side=b.side, total_qty=int(b.total_qty), group_name=name,
+            symbol=b.symbol, side=b.side, total_qty=total, group_name=name,
             per_account=split,
             est_notional=(float(p) * total) if p else None))
     return out
@@ -164,7 +190,7 @@ def routes_from_group_plans(group_plans) -> list:
             version=rebalance_engine.CROSS_MODEL_VERSION,
             symbol=g.symbol,
             side=g.side,
-            total_qty=int(g.total_qty),
+            total_qty=g.total_qty,
             fa_group=g.group_name,
             fa_method="",
             account=None,

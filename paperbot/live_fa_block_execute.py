@@ -428,7 +428,7 @@ def pdt_blocked_in_split(route, summaries: dict | None = None) -> list[dict]:
         if ok:
             continue
         blocked.append({"account": acct,
-                        "shares": int(route.per_account_split.get(acct, 0)),
+                        "shares": route.per_account_split.get(acct, 0),
                         "day_trades_remaining": day_trades_remaining(rows),
                         "reason": reason})
     return blocked
@@ -471,10 +471,13 @@ def pdt_drop_blocked_from_split(route, summaries: dict | None = None) -> tuple:
     if not dropped:
         return route, []
     blocked_accts = {d["account"] for d in dropped}
-    split = {a: int(q) for a, q in route.per_account_split.items()
+    # The quantities are carried through UNCHANGED (v0.51.0). They were already decided by
+    # group_rebalance.block_order_qty -- whole shares for a BUY, the exact count for a SELL --
+    # and re-int()ing them here would silently truncate a full-exit sell back into a stub.
+    split = {a: q for a, q in route.per_account_split.items()
              if a not in blocked_accts}
     return (dc_replace(route, per_account_split=dict(sorted(split.items())),
-                       total_qty=int(sum(split.values()))),
+                       total_qty=sum(split.values())),
             dropped)
 
 
