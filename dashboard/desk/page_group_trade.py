@@ -228,9 +228,32 @@ def _render_result(result: dict) -> None:
         st.error("The run was refused: {}".format(ex.get("refused_reason") or "no reason given"))
         return
     fills = ex.get("placed_fills") or []
-    st.success("{} block(s) sent - {} sell, {} buy.".format(
-        ex.get("n_blocks", 0), ex.get("n_sell_blocks", 0), ex.get("n_buy_blocks", 0)))
+    outcomes = ex.get("outcomes") or {}
+    counts = outcomes.get("counts") or {}
+    n_filled, n_partial = counts.get("FILLED", 0), counts.get("PARTIAL", 0)
+    n_nofill, n_skipped = counts.get("NO_FILL", 0), counts.get("SKIPPED", 0)
+
+    # "Sent" is not an outcome. A block that was placed, sat and cancelled having traded
+    # nothing used to count toward a green success box -- that is how a run in which 12 of 25
+    # blocks did nothing reported as a success. Green ONLY when every block filled in full.
+    if outcomes.get("complete"):
+        st.success("Every block filled in full - {} of {}.".format(n_filled, n_filled))
+    else:
+        st.error(
+            "This run did NOT complete. {} block(s) filled, {} filled only partly, "
+            "{} were placed and traded NOTHING, {} never went out.".format(
+                n_filled, n_partial, n_nofill, n_skipped))
+
+    if ex.get("halted"):
+        st.error("STOPPED AFTER THE SELLS: {}".format(ex.get("halted_reason") or ""))
+
+    shortfalls = outcomes.get("shortfalls") or []
+    if shortfalls:
+        st.markdown("**What did not trade, and why:**")
+        st.dataframe(pd.DataFrame(shortfalls), hide_index=True, use_container_width=True)
+
     if fills:
+        st.markdown("**What actually filled:**")
         st.dataframe(pd.DataFrame(fills), hide_index=True, use_container_width=True)
     for label, key in (("Dropped for pattern-day-trader limits", "pdt_dropped"),
                        ("Buy blocks dropped for cash", "dropped_buy_blocks"),
@@ -239,3 +262,22 @@ def _render_result(result: dict) -> None:
         if rows:
             st.warning("{}: {}".format(label, len(rows)))
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+
+    # THE ANSWER TO "IS ANYTHING LEFT BEHIND": the book re-read after the run, per account and
+    # per line. Order counts describe what we asked for; this describes what the accounts are.
+    sync = result.get("sync") or {}
+    if not sync:
+        return
+    if not sync.get("ok"):
+        st.warning("Could not verify the accounts afterwards: {}".format(sync.get("error", "")))
+        return
+    n_ok, n_off = sync.get("in_sync", 0), sync.get("out_of_sync", 0)
+    if n_off == 0:
+        st.success("All {} account(s) are on target. Nothing left behind.".format(n_ok))
+        return
+    st.error("{} account(s) on target, {} still OFF target.".format(n_ok, n_off))
+    off_rows = [ln for acct in sync.get("accounts", []) if not acct.get("in_sync")
+                for ln in acct.get("lines_off", [])]
+    if off_rows:
+        st.markdown("**Still off target - account by account, line by line:**")
+        st.dataframe(pd.DataFrame(off_rows), hide_index=True, use_container_width=True)

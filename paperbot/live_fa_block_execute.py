@@ -869,6 +869,31 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
     res["limit"] = limit
     print(f"      block limit = {limit} (marketable={config.FA_BLOCK_MARKETABLE})")
 
+    # HOW BIG IS THIS BLOCK, and therefore how should it be handled? Decided BEFORE the order
+    # is built, because size changes the order TYPE as well as the fill window.
+    #
+    # Small block  -> plain marketable limit. It crosses and it is done.
+    # Large block  -> IBKR Adaptive on URGENT, worked for LARGE_BLOCK_TIMEOUT_SEC.
+    #
+    # Urgent, not Patient. Patient works toward the midpoint and will NOT cross, which is what
+    # left every buy block unfilled on 2026-09-04. Urgent crosses, but works the order INTO the
+    # book rather than sweeping it in one print -- which is what a block large relative to the
+    # visible size needs. Measured 2026-09-04: BUCK showed 5,100 shares at the bid against an
+    # 18,573-share sale, 7% of that day's entire volume. The capped limit is still the hard
+    # ceiling either way, so the algo can only ever improve the fill, never worsen it.
+    notional = abs(float(r.total_qty or 0.0)) * float(limit or 0.0)
+    is_large = notional >= float(config.LARGE_BLOCK_NOTIONAL)
+    window = float(config.LARGE_BLOCK_TIMEOUT_SEC) if is_large else PHASE_TERMINAL_TIMEOUT_SEC
+    if is_large:
+        adaptive_priority = config.LARGE_BLOCK_ADAPTIVE_PRIORITY
+        print(f"      LARGE BLOCK ~${notional:,.0f} (>= ${config.LARGE_BLOCK_NOTIONAL:,.0f}) "
+              f"- Adaptive/{adaptive_priority}, worked up to {window:.0f}s instead of "
+              f"{PHASE_TERMINAL_TIMEOUT_SEC:.0f}s.")
+    res["notional"] = notional
+    res["worked_as_large_block"] = is_large
+    res["fill_window_sec"] = window
+    res["adaptive_priority"] = adaptive_priority
+
     if not permit:
         # PREVIEW: build the block object (build-only) and log; write NO FA config.
         try:
@@ -899,20 +924,6 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
     # NEVER what-if a block (it hangs). Place directly, watch fills. Dedup lives in place().
     # The fill watch is BOUNDED by safe_execute.PHASE_TERMINAL_TIMEOUT_SEC — the SAME bound the
     # per-account phase discipline uses, so a phase always terminates and never blocks the wire.
-    # A LARGE block is WORKED, not raced. A block that is big relative to the book fills in
-    # pieces over minutes; giving it the standard 90s only guarantees a cancel. Measured
-    # 2026-09-04: SELL BUCK 15,196 shares (~$354,000) filled ZERO and was cancelled at the
-    # phase timeout, and the run then tried to spend proceeds that never arrived.
-    notional = abs(float(r.total_qty or 0.0)) * float(limit or 0.0)
-    is_large = notional >= float(config.LARGE_BLOCK_NOTIONAL)
-    window = float(config.LARGE_BLOCK_TIMEOUT_SEC) if is_large else PHASE_TERMINAL_TIMEOUT_SEC
-    res["notional"] = notional
-    res["worked_as_large_block"] = is_large
-    res["fill_window_sec"] = window
-    if is_large:
-        print(f"      LARGE BLOCK ~${notional:,.0f} (>= ${config.LARGE_BLOCK_NOTIONAL:,.0f}) "
-              f"— working it for up to {window:.0f}s instead of "
-              f"{PHASE_TERMINAL_TIMEOUT_SEC:.0f}s.")
     placed = order_router.place(ib, [bo], armed=True, fill_timeout=int(window))
     fills = list(placed.get("fills", []) or [])
     res["fills"] = fills

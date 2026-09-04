@@ -253,6 +253,12 @@ FA_BLOCK_MARKETABLE = True
 # relative to the book fills in pieces over minutes and 90 seconds only guarantees a cancel.
 LARGE_BLOCK_NOTIONAL = 50_000.0
 LARGE_BLOCK_TIMEOUT_SEC = 600.0
+# Large blocks get IBKR's Adaptive algo on URGENT. Urgent CROSSES the spread (Patient
+# does not, which is what left every buy unfilled on 2026-09-04) but works the order into
+# the book instead of sweeping it in one print. The capped marketable limit remains the
+# hard ceiling, so the algo can only improve the fill, never worsen it. Small blocks stay
+# on a plain marketable limit -- they cross and they are done.
+LARGE_BLOCK_ADAPTIVE_PRIORITY = "Urgent"
 # HALT_BUYS_ON_UNFILLED_SELL — the sell phase's gate is "every block reached a TERMINAL state",
 # and Cancelled is terminal. That let the run proceed to buys the failed sell was funding. When
 # any sell block ends short, STOP: report it and place no buys. The buys are re-sized to
