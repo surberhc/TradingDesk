@@ -169,77 +169,72 @@ def test_sides_are_preserved_so_the_executor_can_phase_them():
     assert sides == {("JAAA", "SELL"), ("FLOT", "BUY")}
 
 
-# --- fractional full-exit sells survive the group layer (v0.51.0) -------------------
-# The engine's full-exit rule produces an EXACT sell (-13.8499). Before this, the group
-# planner int()-truncated every split, so the block sent 13 and left a 0.8499 stub of a
-# holding the model had already dropped -- silently, on the only path the desk actually
-# trades through. These pin the whole-share rule to the SIDE, not to the layer.
+# --- IBKR REFUSES FRACTIONAL ORDERS VIA THE API (measured live 2026-09-04) ------------
+# The engine computes an exact full exit (-13.8499) and the group layer used to carry that
+# fraction all the way to the order. IBKR rejects it outright:
+#
+#   Error 10243: Fractional-sized order cannot be placed via API.
+#                Please use desktop version to place this order.
+#
+# Five fractional sell blocks were refused with that code in a single run while SILJ -- the
+# only whole-share sell, same run, same algo -- filled 130 @ 31.74. So a block order is whole
+# shares, and the leftover fraction is a stub only the desktop platform can clear.
 
-def test_a_full_exit_sell_reaches_the_block_with_its_fraction_intact():
+def test_a_full_exit_sell_is_truncated_to_whole_shares_because_ibkr_refuses_a_fraction():
     plans = [_plan("U7586137", "Balanced (Small, Custom)", {"BIL": -13.8499})]
-    groups = gr.plan_ticker_groups(plans, run_stamp=STAMP)
-    assert len(groups) == 1
-    g = groups[0]
+    g = gr.plan_ticker_groups(plans, run_stamp=STAMP)[0]
     assert g.side == "SELL"
-    assert g.total_qty == pytest.approx(13.8499)
-    assert g.per_account == {"U7586137": pytest.approx(13.8499)}
+    assert g.total_qty == 13 and isinstance(g.total_qty, int)
+    assert g.per_account == {"U7586137": 13}
 
 
-def test_the_route_handed_to_the_executor_keeps_the_fraction_too():
+def test_the_route_handed_to_the_executor_is_whole_shares_too():
     plans = [_plan("U7586137", "Balanced (Small, Custom)", {"BIL": -13.8499})]
     routes = gr.routes_from_group_plans(gr.plan_ticker_groups(plans, run_stamp=STAMP))
-    assert len(routes) == 1
-    assert routes[0].total_qty == pytest.approx(13.8499)
-    assert routes[0].per_account_split == {"U7586137": pytest.approx(13.8499)}
+    assert routes[0].total_qty == 13
+    assert routes[0].per_account_split == {"U7586137": 13}
 
 
-def test_a_sub_one_share_stub_is_no_longer_dropped_from_the_split():
-    """THE regression that made the stub un-clearable: `if int(q)` evaluated 0.6 as falsey,
-    so the account vanished from the split entirely and the stub could never be sold."""
+def test_a_sub_one_share_stub_cannot_be_traded_at_all_and_is_dropped():
+    """A 0.6-share stub truncates to zero, so there is no order IBKR would accept. It is
+    dropped from the split rather than sent and refused. verify_in_sync still reports the
+    holding as off target, so it is surfaced, not hidden -- clearing it needs the desktop."""
     plans = [_plan("U1", "Growth (Custom)", {"BND": -0.6})]
+    assert gr.plan_ticker_groups(plans, run_stamp=STAMP) == []
+
+
+def test_per_account_truncation_does_not_blow_up_the_sum_invariant():
+    """THE run-killer this must never become. Accounts selling 0.6 and 5.4 truncate to 0 and
+    5 against an engine total of 6.0. The invariant tolerates a shortfall of strictly less
+    than one share per account -- exactly truncation -- and refuses anything outside it, so
+    one stub can never abort an entire run again."""
+    plans = [_plan("U1", "Growth (Custom)", {"BND": -0.6}),
+             _plan("U2", "Growth (Custom)", {"BND": -5.4})]
     groups = gr.plan_ticker_groups(plans, run_stamp=STAMP)
     assert len(groups) == 1
-    assert groups[0].per_account == {"U1": pytest.approx(0.6)}
+    assert groups[0].per_account == {"U2": 5}
+    assert groups[0].total_qty == 5
 
 
 def test_a_buy_is_still_whole_shares_only():
-    """IBKR refuses a fractional BUY through the TWS API (10243). The rule is side-specific."""
     assert gr.block_order_qty("BUY", 10.9) == 10
     assert isinstance(gr.block_order_qty("BUY", 10.9), int)
 
 
-def test_a_whole_sell_is_still_an_int_so_existing_blocks_are_unchanged():
-    """Byte-identical behaviour for every block that was already whole -- the change must
-    only ever reach a genuinely fractional sell."""
+def test_a_whole_sell_is_unchanged():
     assert gr.block_order_qty("SELL", 13.0) == 13
-    assert isinstance(gr.block_order_qty("SELL", 13.0), int)
     plans = [_plan("U1", "Growth (Custom)", {"XLE": -10})]
     g = gr.plan_ticker_groups(plans, run_stamp=STAMP)[0]
     assert g.total_qty == 10 and isinstance(g.total_qty, int)
 
 
-def test_a_mixed_run_no_longer_blows_up_on_the_sum_invariant():
-    """The run-killer this exposed: one account selling 0.6 and another 5.4 used to produce a
-    split of {B: 5} against a block total of int(6.0) == 6, and plan_ticker_groups raised
-    ValueError -- refusing the ENTIRE run, every ticker, over one stub."""
-    plans = [_plan("U1", "Growth (Custom)", {"BND": -0.6}),
-             _plan("U2", "Growth (Custom)", {"BND": -5.4})]
-    groups = gr.plan_ticker_groups(plans, run_stamp=STAMP)
-    assert len(groups) == 1
-    assert groups[0].total_qty == pytest.approx(6.0)
-    assert groups[0].per_account == {"U1": pytest.approx(0.6), "U2": pytest.approx(5.4)}
-
-
-def test_a_pdt_drop_does_not_truncate_the_survivors_fraction():
-    """The other truncation site: dropping a PDT-blocked account re-built the split with
-    int(), quietly turning a surviving full-exit sell back into a stub."""
+def test_a_pdt_drop_leaves_the_survivor_whole():
     import live_fa_block_execute as lfbe
     plans = [_plan("U1", "Growth (Custom)", {"BIL": -13.8499}),
              _plan("U2", "Growth (Custom)", {"BIL": -4.0})]
     route = gr.routes_from_group_plans(gr.plan_ticker_groups(plans, run_stamp=STAMP))[0]
-    summaries = {"U1": {lfbe.PDT_TAG: "-1"},      # unlimited -> trades
-                 "U2": {lfbe.PDT_TAG: "0"}}        # restricted -> dropped
+    summaries = {"U1": {lfbe.PDT_TAG: "-1"}, "U2": {lfbe.PDT_TAG: "0"}}
     resized, dropped = lfbe.pdt_drop_blocked_from_split(route, summaries)
     assert [d["account"] for d in dropped] == ["U2"]
-    assert resized.per_account_split == {"U1": pytest.approx(13.8499)}
-    assert resized.total_qty == pytest.approx(13.8499)
+    assert resized.per_account_split == {"U1": 13}
+    assert resized.total_qty == 13

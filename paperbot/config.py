@@ -259,6 +259,23 @@ LARGE_BLOCK_TIMEOUT_SEC = 600.0
 # hard ceiling, so the algo can only improve the fill, never worsen it. Small blocks stay
 # on a plain marketable limit -- they cross and they are done.
 LARGE_BLOCK_ADAPTIVE_PRIORITY = "Urgent"
+
+# BLOCK ORDERS ARE WHOLE SHARES. NOT a policy choice -- IBKR refuses anything else.
+# Measured on the live master 2026-09-04, quoting the broker verbatim:
+#
+#   Error 10243: Fractional-sized order cannot be placed via API.
+#                Please use desktop version to place this order.
+#
+# Five sell blocks carrying fractional quantities (BIL 865.3444, BUCK 6060.1915,
+# GDXJ 64.5439, SIL 83.9454, XLP 102.1601) were ALL rejected with that code in one run,
+# while SILJ -- the only whole-share sell in the same run, same algo, same window --
+# filled 130 @ 31.74. The JAAA block rejected an hour earlier was the same thing.
+#
+# CONSEQUENCE, stated plainly: a full exit computed as 865.3444 places 865 and leaves
+# 0.3444 behind. The engine still computes the exact exit and verify_in_sync still reports
+# the remaining stub, so nothing is hidden -- but per IBKR's own message the API cannot
+# clear it at all. Clearing a sub-share stub requires the desktop platform, by hand.
+BLOCK_ORDERS_WHOLE_SHARES_ONLY = True
 # HALT_BUYS_ON_UNFILLED_SELL — the sell phase's gate is "every block reached a TERMINAL state",
 # and Cancelled is terminal. That let the run proceed to buys the failed sell was funding. When
 # any sell block ends short, STOP: report it and place no buys. The buys are re-sized to

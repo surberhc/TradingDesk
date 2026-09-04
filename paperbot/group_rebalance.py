@@ -47,6 +47,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 import fa_group_sync
+import config
 import rebalance_engine
 from recon_report import BlockOrder  # noqa: F401  (shape reference)
 
@@ -91,6 +92,8 @@ def block_order_qty(side: str, qty) -> float:
     before this existed is byte-identical to what it was.
     """
     f = float(qty)
+    if config.BLOCK_ORDERS_WHOLE_SHARES_ONLY:
+        return int(f)      # IBKR error 10243 refuses any fraction via the API -- see config
     if side == "SELL" and f != int(f):
         return f
     return int(f)
@@ -131,11 +134,17 @@ def plan_ticker_groups(plans, *, run_stamp: str, prices=None) -> list[TickerGrou
         if not split:
             continue
         total = sum(split.values())
-        expected = block_order_qty(b.side, b.total_qty)
-        if abs(total - expected) > 1e-6:
+        # The split must account for the block. Under whole-share mode each account is
+        # truncated independently, so the sum can legitimately fall BELOW the engine's exact
+        # total -- by strictly less than one share per account and never by more, and never
+        # above it. Anything outside that band means the split and the block disagree about
+        # what is being traded, which is a silent mis-trade, so refuse the plan.
+        shortfall = float(b.total_qty) - total
+        if shortfall < -1e-6 or shortfall >= len(b.per_account) + 1e-6:
             raise ValueError(
                 f"plan_ticker_groups: {b.side} {b.symbol} split sums to {total} but the block "
-                f"total is {b.total_qty}. Refusing to hand back a split that does not add up.")
+                f"total is {b.total_qty} ({len(b.per_account)} account(s)). That is outside "
+                f"per-account truncation. Refusing to hand back a split that does not add up.")
         name = fa_group_sync.run_group_name(f"{b.symbol} {b.side}", stamp)
         if name in seen_names:
             raise ValueError(
