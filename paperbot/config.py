@@ -243,3 +243,19 @@ LADDER_FA_BLOCKS = False
 # still rejects NaN/<=0). This is NOT an algo on the block — it is a plain marketable LMT.
 FA_BLOCK_MARKETABLE = True
 
+# --- block outcome discipline (v0.53.0, after the 2026-09-04 Balanced run) ---------------
+# A $354,000 BUCK sell was given the standard 90-second window, did not fill, was cancelled,
+# and the run carried on into the buy phase it was supposed to fund. Twelve of twenty-five
+# blocks ended up doing nothing and the desk reported "25 blocks sent" in a green box.
+#
+# LARGE_BLOCK_NOTIONAL — above this, a block is WORKED rather than raced: it gets
+# LARGE_BLOCK_TIMEOUT_SEC instead of the standard phase window, because a block that is large
+# relative to the book fills in pieces over minutes and 90 seconds only guarantees a cancel.
+LARGE_BLOCK_NOTIONAL = 50_000.0
+LARGE_BLOCK_TIMEOUT_SEC = 600.0
+# HALT_BUYS_ON_UNFILLED_SELL — the sell phase's gate is "every block reached a TERMINAL state",
+# and Cancelled is terminal. That let the run proceed to buys the failed sell was funding. When
+# any sell block ends short, STOP: report it and place no buys. The buys are re-sized to
+# realized cash anyway, so this costs nothing except a run that would have churned.
+HALT_BUYS_ON_UNFILLED_SELL = True
+

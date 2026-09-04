@@ -325,6 +325,45 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
 ADAPTIVE_PRIORITY = None
 
 
+def verify_in_sync(ib, models) -> dict:
+    """RE-READ the book after a run and answer ONE question per account: is it on target?
+
+    THE POINT OF AUTOMATING THIS. The run result says what the ORDERS did. That is not the
+    same question as whether the ACCOUNTS are right, and on 2026-09-04 the difference was the
+    whole story: 25 blocks were "sent", 12 traded nothing, and five accounts were left part
+    way through a rebalance with no surface anywhere saying so.
+
+    This re-prices and re-plans the same scope, read-only, straight after the run. An account
+    is IN SYNC when the engine would place no further orders for it. Anything else is named,
+    with the exact symbol, what is held, what the model wants, and the remaining delta -- per
+    account, per line. Never a count of blocks, never "sent".
+
+    NEVER raises into a finished run: a verification failure is reported as ok=False, because
+    losing the check is bad but losing it AND crashing after the money moved is worse.
+    """
+    try:
+        after = build_plans_for_scope(ib, models=list(models or []))
+    except Exception as exc:
+        return {"ok": False, "error": f"{type(exc).__name__}: {exc}", "accounts": [],
+                "in_sync": 0, "out_of_sync": 0}
+    rows = []
+    for pl in after.get("plans") or []:
+        off = []
+        for ln in pl.lines:
+            delta = (pl.orders or {}).get(ln.symbol)
+            if delta:
+                off.append({"account": pl.account, "symbol": ln.symbol,
+                            "held": float(ln.actual_shares or 0.0),
+                            "model_wants": float(ln.target_shares or 0.0),
+                            "still_needs": float(delta),
+                            "status": ln.status})
+        rows.append({"account": pl.account, "model": pl.version,
+                     "in_sync": not pl.needs_rebalance, "lines_off": off})
+    return {"ok": True, "error": "", "accounts": rows,
+            "in_sync": sum(1 for r in rows if r["in_sync"]),
+            "out_of_sync": sum(1 for r in rows if not r["in_sync"])}
+
+
 def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool = False,
                       backup_path: str | None = None,
                       adaptive_priority: str | None = ADAPTIVE_PRIORITY) -> dict:
@@ -389,7 +428,17 @@ def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool =
             adaptive_priority=adaptive_priority)
         _record_run(target, run, routes, created, executed,
                     adaptive_priority=adaptive_priority)
-    return {"created": created, "executed": executed, "note": ""}
+
+    # OUTSIDE the arm gate: the book is re-read read-only, so the arming flags are already
+    # restored and the gateway lock is released before this slower scan runs.
+    sync = verify_in_sync(ib, run.get("models"))
+    try:
+        import ledger
+        ledger.record_run({"mode": "GROUP_TRADE_SYNC_CHECK", "run_id": run.get("stamp"),
+                           "models": list(run.get("models") or []), "sync": sync})
+    except Exception as exc:
+        print(f"    !! sync check not written to the ledger ({type(exc).__name__}: {exc})")
+    return {"created": created, "executed": executed, "sync": sync, "note": ""}
 
 
 def _record_run(target, run, routes, created, executed, *, adaptive_priority=None) -> None:

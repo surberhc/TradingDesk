@@ -899,8 +899,21 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
     # NEVER what-if a block (it hangs). Place directly, watch fills. Dedup lives in place().
     # The fill watch is BOUNDED by safe_execute.PHASE_TERMINAL_TIMEOUT_SEC — the SAME bound the
     # per-account phase discipline uses, so a phase always terminates and never blocks the wire.
-    placed = order_router.place(ib, [bo], armed=True,
-                                fill_timeout=int(PHASE_TERMINAL_TIMEOUT_SEC))
+    # A LARGE block is WORKED, not raced. A block that is big relative to the book fills in
+    # pieces over minutes; giving it the standard 90s only guarantees a cancel. Measured
+    # 2026-09-04: SELL BUCK 15,196 shares (~$354,000) filled ZERO and was cancelled at the
+    # phase timeout, and the run then tried to spend proceeds that never arrived.
+    notional = abs(float(r.total_qty or 0.0)) * float(limit or 0.0)
+    is_large = notional >= float(config.LARGE_BLOCK_NOTIONAL)
+    window = float(config.LARGE_BLOCK_TIMEOUT_SEC) if is_large else PHASE_TERMINAL_TIMEOUT_SEC
+    res["notional"] = notional
+    res["worked_as_large_block"] = is_large
+    res["fill_window_sec"] = window
+    if is_large:
+        print(f"      LARGE BLOCK ~${notional:,.0f} (>= ${config.LARGE_BLOCK_NOTIONAL:,.0f}) "
+              f"— working it for up to {window:.0f}s instead of "
+              f"{PHASE_TERMINAL_TIMEOUT_SEC:.0f}s.")
+    placed = order_router.place(ib, [bo], armed=True, fill_timeout=int(window))
     fills = list(placed.get("fills", []) or [])
     res["fills"] = fills
     res["filled"] = sum(float(f.get("filled", 0.0) or 0.0) for f in fills)
@@ -918,7 +931,7 @@ def _execute_one_route(ib, r, account_inputs, targets, allowed, as_of, limit, *,
         # STRAGGLER give-up, mirroring _transmit_phase: cancel and report LOUDLY. Never leave a
         # working block alive across the cash re-read.
         _cancel_working_block(ib, res["order_ref"])
-        res["reason"] = (f"NOT TERMINAL after {PHASE_TERMINAL_TIMEOUT_SEC:.0f}s "
+        res["reason"] = (f"NOT TERMINAL after {window:.0f}s "
                          f"(status={res['status']}) — cancelled at the phase timeout")
     elif res["filled"] < res["requested"]:
         res["reason"] = "UNFILLED remainder (block reached terminal state short)"
@@ -946,6 +959,63 @@ def _notional_by_account(routes_with_limits, results) -> dict:
         for acct, q in split.items():
             out[acct] = out.get(acct, 0.0) + float(q) * lim * frac
     return out
+
+
+# --- what a block ACTUALLY did (v0.53.0) -------------------------------------------
+FILLED, PARTIAL, NO_FILL, SKIPPED = "FILLED", "PARTIAL", "NO_FILL", "SKIPPED"
+
+
+def classify_block_outcome(res: dict) -> str:
+    """PURE: what ONE block actually achieved, by SHARES -- never by "was it sent".
+
+    The desk used to report `n block(s) sent` in a success box. On 2026-09-04 that printed
+    green for a run in which 12 of 25 blocks were placed, sat, and cancelled having traded
+    NOTHING. "Sent" is not an outcome; filled shares are.
+
+      FILLED  - the whole requested quantity traded
+      PARTIAL - some traded, some did not
+      NO_FILL - the block went to IBKR and traded nothing (the silent killer: it has always
+                been invisible, because the only warnings the page knew about were blocks
+                DROPPED before placement)
+      SKIPPED - never placed at all (price guard, group-write failure, already working)
+    """
+    if res.get("skipped") or str(res.get("status", "")).startswith("SKIPPED"):
+        return SKIPPED
+    requested = float(res.get("requested", 0.0) or 0.0)
+    filled = float(res.get("filled", 0.0) or 0.0)
+    if requested > 0 and filled >= requested - 1e-9:
+        return FILLED
+    if filled > 0:
+        return PARTIAL
+    return NO_FILL
+
+
+def summarize_block_outcomes(results) -> dict:
+    """PURE: {counts, complete, shortfalls} over a list of block result dicts.
+
+    `complete` is True ONLY when every block filled in full -- the single condition under
+    which a run may be reported as a success. `shortfalls` is every block that did not, with
+    the numbers, so the operator sees WHAT did not trade rather than a count of what was sent.
+    """
+    counts = {FILLED: 0, PARTIAL: 0, NO_FILL: 0, SKIPPED: 0}
+    shortfalls = []
+    for res in results or []:
+        outcome = classify_block_outcome(res)
+        counts[outcome] += 1
+        if outcome != FILLED:
+            shortfalls.append({
+                "outcome": outcome,
+                "side": res.get("side", ""),
+                "symbol": res.get("symbol", ""),
+                "requested": float(res.get("requested", 0.0) or 0.0),
+                "filled": float(res.get("filled", 0.0) or 0.0),
+                "status": res.get("status", ""),
+                "reason": res.get("reason", ""),
+                "group": res.get("group", ""),
+            })
+    return {"counts": counts,
+            "complete": bool(results) and counts[FILLED] == len(results),
+            "shortfalls": shortfalls}
 
 
 def _run_block_phase(ib, phase_label, routes_with_limits, account_inputs, targets, allowed,
@@ -1054,7 +1124,11 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
                 "refused": False, "refused_reason": "", "n_sell_blocks": 0, "n_buy_blocks": 0,
                 "sell_results": [], "buy_results": [], "realized_cash": {}, "buy_resize": {},
                 "dropped_buy_blocks": [], "uninvested": [], "pdt_dropped": [],
-                "pdt_refused_blocks": [], "run_id": run_id}
+                "pdt_refused_blocks": [], "run_id": run_id,
+                # v0.53.0 -- what the blocks ACHIEVED, so no caller can report "sent" as
+                # success again. `complete` is the ONLY green light.
+                "outcomes": {"counts": {}, "complete": False, "shortfalls": []},
+                "halted": False, "halted_reason": ""}
         base.update(extra)
         return base
 
@@ -1117,6 +1191,32 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     for res in sell_results:
         placed_fills.extend(res.get("fills", []))
 
+    # [2b] THE SELL PHASE MUST ACTUALLY HAVE SOLD. The phase gate is "every block reached a
+    # TERMINAL state", and Cancelled is terminal — so on 2026-09-04 a $354,000 BUCK sell that
+    # filled ZERO counted as "sells done" and the run walked straight into the buy phase that
+    # sale was funding. Buys are re-sized to realized cash so no money was overspent, but the
+    # run churned through 16 buy blocks it could never fund and reported success. If a sell
+    # came up short, STOP HERE and say so.
+    sell_summary = summarize_block_outcomes(sell_results)
+    halted_reason = ""
+    # Halt on a sell that traded NOTHING, not merely one that came up short. A PARTIAL fill
+    # still delivers cash, and the buy phase is already sized to cash actually read back, so
+    # a partial funds a proportionally smaller buy correctly. A ZERO fill is different: that
+    # money never arrived at all, and the buys it was paying for cannot happen.
+    dead_sells = [sf for sf in sell_summary["shortfalls"] if sf["outcome"] == NO_FILL]
+    if permit and config.HALT_BUYS_ON_UNFILLED_SELL and dead_sells:
+        short = dead_sells
+        halted_reason = (
+            f"{len(short)} of {len(sell_results)} SELL block(s) traded NOTHING. The buy "
+            f"phase is funded by those sales, so NO BUYS WERE PLACED.")
+        print("")
+        print("    !! HALTED AFTER THE SELL PHASE: " + halted_reason)
+        for sf in short:
+            print(f"      -> {sf['outcome']:<8} {sf['side']} {sf['symbol']}: "
+                  f"filled {sf['filled']:g} of {sf['requested']:g}  "
+                  f"status={sf['status']} :: {sf['reason']}")
+        print("      Re-run once the sells complete; nothing here is left resting.")
+
     # [3] BETWEEN PHASES — RE-READ realized cash. NEVER trust the plan's expected proceeds; a
     # cancelled/short sell block means that cash never landed. PREVIEW does NO broker read.
     realized_cash: dict = {}
@@ -1162,10 +1262,13 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
             print(f"      !! DROPPED buy block {r.symbol} group={r.fa_group}: every account "
                   f"scaled to zero shares against realized cash.")
 
-    # [5] PHASE 2 — BUYS (re-sized).
-    buy_results = _run_block_phase(ib, "BUY", buy_with_limits, account_inputs, targets,
-                                  allowed, as_of, permit=permit, summaries=summaries,
-                                  run_id=run_id, adaptive_priority=adaptive_priority)
+    # [5] PHASE 2 — BUYS (re-sized). Skipped entirely when the sell phase came up short.
+    if halted_reason:
+        buy_results = []
+    else:
+        buy_results = _run_block_phase(ib, "BUY", buy_with_limits, account_inputs, targets,
+                                       allowed, as_of, permit=permit, summaries=summaries,
+                                       run_id=run_id, adaptive_priority=adaptive_priority)
     for res in buy_results:
         placed_fills.extend(res.get("fills", []))
 
@@ -1239,7 +1342,9 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
                     realized_cash=realized_cash, buy_resize=buy_resize,
                     dropped_buy_blocks=[r.symbol for r, _l in dropped],
                     uninvested=uninvested,
-                    pdt_dropped=pdt_dropped, pdt_refused_blocks=pdt_refused_blocks)
+                    pdt_dropped=pdt_dropped, pdt_refused_blocks=pdt_refused_blocks,
+                    outcomes=summarize_block_outcomes(sell_results + buy_results),
+                    halted=bool(halted_reason), halted_reason=halted_reason)
 
 
 # Module-level quote cache the route loop reads for marketable-cap block pricing (reuses
