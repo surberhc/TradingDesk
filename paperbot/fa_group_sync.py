@@ -136,6 +136,12 @@ class MembershipSummary:
 # ============================================================================================
 # 1. READ — requestFA(1), fail closed on anything we cannot trust.
 # ============================================================================================
+# An empty requestFA response is a TIMED-OUT read, not an empty master, so it is retried a
+# bounded number of times before the refusal below stands. See the note inside read_live_groups.
+FA_READ_ATTEMPTS = 3
+FA_READ_RETRY_SECS = 2.0
+
+
 def read_live_groups(ib) -> str:
     """Read the FULL live GROUPS XML with ``requestFA(1)`` and return it as a string.
 
@@ -157,12 +163,31 @@ def read_live_groups(ib) -> str:
         raise FaGroupSyncRefused(
             "read_live_groups: no gateway connection with requestFA — cannot read the live "
             "FA groups. FAILING CLOSED (nothing read, nothing written).")
-    try:
-        raw = ib.requestFA(FA_GROUPS)
-    except Exception as exc:  # noqa: BLE001 — any read failure is a refusal, never a guess
-        raise FaGroupSyncRefused(
-            f"read_live_groups: requestFA({FA_GROUPS}) failed ({exc!r}). FAILING CLOSED — the "
-            f"current groups XML is UNKNOWN, so nothing may be written.") from exc
+    # BOUNDED RETRY ON AN EMPTY READ. ib_async's requestFA can TIME OUT and hand back None or
+    # "" rather than raising - observed live on 2026-09-03 ("requestFAAsync: Timeout") and
+    # again on 2026-09-04, when a Group trade run was refused mid-flight on an empty read while
+    # the very same call from a fresh connection returned 17,697 characters seconds later.
+    # A timed-out read is not information; retrying it is not a weakening of the gate, because
+    # an empty result after every attempt STILL refuses below exactly as before. What must
+    # never be retried away is a genuine answer - so a requestFA that RAISES is still an
+    # immediate refusal, and a parseable-but-group-less document is still refused.
+    raw = None
+    last_exc = None
+    for attempt in range(FA_READ_ATTEMPTS):
+        try:
+            raw = ib.requestFA(FA_GROUPS)
+        except Exception as exc:  # noqa: BLE001 — a raising read is a refusal, never a guess
+            raise FaGroupSyncRefused(
+                f"read_live_groups: requestFA({FA_GROUPS}) failed ({exc!r}). FAILING CLOSED — "
+                f"the current groups XML is UNKNOWN, so nothing may be written.") from exc
+        if str(raw or "").strip():
+            break
+        last_exc = f"attempt {attempt + 1} of {FA_READ_ATTEMPTS} returned an empty response"
+        if attempt + 1 < FA_READ_ATTEMPTS:
+            try:
+                ib.sleep(FA_READ_RETRY_SECS)
+            except Exception:  # noqa: BLE001 — a fake//offline ib in tests has no sleep
+                pass
 
     xml = str(raw or "").strip()
     if not xml:
@@ -170,7 +195,7 @@ def read_live_groups(ib) -> str:
             f"read_live_groups: requestFA({FA_GROUPS}) returned an EMPTY response. This is "
             f"NOT 'the master has no groups' — it is 'the current state is unknown'. FAILING "
             f"CLOSED (replaceFA overwrites the WHOLE groups XML; writing off an empty read "
-            f"would clobber every group).")
+            f"would clobber every group). Retried {FA_READ_ATTEMPTS} time(s); {last_exc}.")
 
     try:
         root = ET.fromstring(xml)

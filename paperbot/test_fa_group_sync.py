@@ -703,3 +703,75 @@ def test_create_run_group_refuses_the_write_on_committed_readonly_defaults(tmp_p
                                backup_path=str(tmp_path))
     assert res["wrote"] is False
     assert ib.replaced == []
+
+
+# ========================================================================================
+# BOUNDED RETRY ON AN EMPTY GROUPS READ (2026-09-04). requestFA can TIME OUT and hand back
+# None/"" rather than raising. A timed-out read is not information - but it must still refuse
+# if every attempt comes back empty, because replaceFA overwrites the whole document.
+# ========================================================================================
+class _FlakyIB:
+    """Returns empty `empties` times, then the real XML."""
+
+    def __init__(self, empties, xml):
+        self.empties = empties
+        self.xml = xml
+        self.calls = 0
+
+    def requestFA(self, kind):
+        self.calls += 1
+        if self.calls <= self.empties:
+            return ""
+        return self.xml
+
+    def sleep(self, secs):
+        pass
+
+
+def test_a_single_timed_out_read_is_retried_and_succeeds():
+    ib = _FlakyIB(1, _xml())
+    got = fgs.read_live_groups(ib)
+    assert "TIER_A" in got
+    assert ib.calls == 2, "it must actually retry, not succeed by accident"
+
+
+def test_it_retries_up_to_the_bound_then_still_refuses():
+    ib = _FlakyIB(99, _xml())
+    with pytest.raises(fgs.FaGroupSyncRefused) as e:
+        fgs.read_live_groups(ib)
+    assert ib.calls == fgs.FA_READ_ATTEMPTS
+    assert "EMPTY response" in str(e.value)
+    assert "clobber every group" in str(e.value)
+
+
+def test_a_read_that_RAISES_is_never_retried_away():
+    """A raising read is a real answer. Only an empty one is treated as a timed-out read."""
+    class _Raiser:
+        calls = 0
+        def requestFA(self, kind):
+            _Raiser.calls += 1
+            raise RuntimeError("connection reset")
+    with pytest.raises(fgs.FaGroupSyncRefused):
+        fgs.read_live_groups(_Raiser())
+    assert _Raiser.calls == 1
+
+
+def test_a_group_less_document_is_still_refused_and_not_retried():
+    class _Empty:
+        calls = 0
+        def requestFA(self, kind):
+            _Empty.calls += 1
+            return "<ListOfGroups></ListOfGroups>"
+    with pytest.raises(fgs.FaGroupSyncRefused) as e:
+        fgs.read_live_groups(_Empty())
+    assert "NO <Group> elements" in str(e.value)
+    assert _Empty.calls == 1, "a parseable answer is an answer - do not retry it"
+
+
+def test_an_ib_without_sleep_does_not_break_the_retry():
+    class _NoSleep:
+        calls = 0
+        def requestFA(self, kind):
+            _NoSleep.calls += 1
+            return "" if _NoSleep.calls == 1 else _xml()
+    assert "TIER_A" in fgs.read_live_groups(_NoSleep())
