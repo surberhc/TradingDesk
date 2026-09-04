@@ -79,7 +79,7 @@ def test_small_drift_stays_hold():
 
 # --- 3. ALERT: an upcoming distribution that available cash does not cover -----
 def test_alert_withdrawal_due_unreserved():
-    # SYNTHETIC schedule: $20,000/mo distribution; RESERVE_MONTHS(=1) -> reserve $20,000.
+    # SYNTHETIC schedule: $20,000/mo distribution; RESERVE_MONTHS(=2) -> reserve $40,000.
     # Account cash is only $5,000 -> cannot cover the upcoming distribution -> ALERT.
     sched = [cashflows.Flow("distribution", amount=20_000.0, pct_nav=0.0, day=1,
                             note="SYNTHETIC test flow")]
@@ -87,14 +87,17 @@ def test_alert_withdrawal_due_unreserved():
     v = mon.decide(state)
     assert v.action == "ALERT"
     assert v.reason == mon.REASON_WITHDRAWAL_DUE_UNRESERVED
-    assert v.detail["shortfall"] == pytest.approx(15_000.0)
+    assert v.detail["shortfall"] == pytest.approx(35_000.0)
 
 
 def test_withdrawal_covered_is_not_alerted():
-    # Same $20k reserve, but cash $25,000 covers it -> no withdrawal ALERT (HOLD here).
+    # Same $20k/mo reserve now doubled to $40k reserve, cash $45,000 covers it -> no
+    # withdrawal ALERT. Positions must match the reserve-adjusted target (not the
+    # zero-reserve ON_TARGET) so drift alone doesn't force a REBALANCE instead of HOLD:
+    # investable = (1,000,000 - 40,000)*(1-0.015) = 945,600 -> floor(945,600/100) = 9456 sh.
     sched = [cashflows.Flow("distribution", amount=20_000.0, pct_nav=0.0, day=1,
                             note="SYNTHETIC test flow")]
-    state = make_state({"SPY": ON_TARGET}, cash=25_000.0, schedule=sched)
+    state = make_state({"SPY": 9456}, cash=45_000.0, schedule=sched)
     assert mon.decide(state).action == "HOLD"
 
 

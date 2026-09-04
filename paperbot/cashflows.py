@@ -18,10 +18,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-# How many months of an upcoming distribution to hold liquid at all times. Monthly,
-# regular distributions -> 1 month is the simple, never-caught-short default. Raise it
-# for a thicker buffer; a future "ramp" could reserve only as the date approaches.
-RESERVE_MONTHS = 1
+# How many months of an upcoming distribution to hold liquid at all times. 1 month is
+# the never-caught-short minimum for regular monthly distributions; 2 months is now the
+# deliberate default (Andrew's call, 2026-09-04) to hold a thicker buffer so fewer
+# rebalance trades are forced to fund a distribution and less gets paid in fees, at the
+# cost of some idle cash. A future "ramp" (reserve grows only as the date approaches)
+# remains a possible later refinement.
+RESERVE_MONTHS = 2
 
 
 @dataclass(frozen=True)
