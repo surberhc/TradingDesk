@@ -132,6 +132,13 @@ REBALANCE_MASTER = False   # the DF...141 master is the advisor account; not tra
 # from ALIEN in addition to this set; this set EXTENDS that single anchor.
 SWEEP_WHITELIST: set[str] = set()
 
+# FULL EXIT SELLS THE WHOLE POSITION, FRACTION INCLUDED (owner decision, Andrew Surber,
+# 2026-09-04). When the model wants NONE of a symbol the order is the entire holding rather
+# than int() of it. Truncating manufactured a permanent stub: 13 of 13.8499 sold, 0.8499 left,
+# and on the next run int(0.8499) == 0 classifies the line FRACTIONAL, which is never
+# auto-traded. Set False to restore whole-share-only exits if IBKR refuses a fractional sell.
+SELL_WHOLE_POSITION_ON_EXIT = True
+
 # Drift band (no-trade band): an account is LEFT ALONE until some holding drifts beyond
 # this fraction of NAV from its model weight. Once any holding breaches it, the account
 # is rebalanced fully back to target. Applied identically to every account so there is

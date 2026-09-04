@@ -381,4 +381,64 @@ def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool =
             ib, routes, built["account_inputs"], built["targets"], target,
             permit=permit, summaries=built.get("summaries"), run_id=run.get("stamp"),
             adaptive_priority=adaptive_priority)
+        _record_run(target, run, routes, created, executed,
+                    adaptive_priority=adaptive_priority)
     return {"created": created, "executed": executed, "note": ""}
+
+
+def _record_run(target, run, routes, created, executed, *, adaptive_priority=None) -> None:
+    """Write ONE durable audit record for a group run. NEVER raises into the run.
+
+    WHY THIS EXISTS. On 2026-09-04 a group run created 17 FA groups and sent 17 block orders
+    and left NO record anywhere: execute_fa_block_routes does not write the ledger - the block
+    rail's own main() does - and this path calls the executor directly, so it skipped it. The
+    result dict went to the screen and nowhere else, and once the page moved on the detail was
+    gone. IBKR does not retain rejected orders past the session, so WHY those blocks produced
+    nothing is now unrecoverable. That must never be possible again.
+
+    Records the run scope, the groups it created, every route with its per-account split, the
+    fills, and the run_id - so an IBKR orderRef, which ends in that run_id, joins back to this
+    record and vice versa.
+
+    Wrapped so a ledger failure can never take down a run that has already traded: losing the
+    record is bad, but losing it AND crashing mid-flight is worse.
+    """
+    try:
+        import ledger
+        ex = executed or {}
+        ledger.record_run({
+            "mode": "GROUP_TRADE_ARMED",
+            "account": f"<group run, {len(run.get('accounts') or [])} account(s)>",
+            "master": target.master_account,
+            "models": run.get("models") or [],
+            "accounts": run.get("accounts") or [],
+            "nav": 0.0, "daily_pnl": 0.0,
+            "target_as_of": run.get("stamp", ""), "target_weights": {},
+            "adaptive_priority": adaptive_priority,
+            "groups_created": [r.get("fa_group") for r in (created.get("results") or [])],
+            "n_groups_created": created.get("created", 0),
+            "group_backups": [r.get("backup") for r in (created.get("results") or [])
+                              if r.get("backup")],
+            "intents": [{"route": r.route, "side": r.side, "symbol": r.symbol,
+                         "qty": r.total_qty, "group": r.fa_group,
+                         "split": r.per_account_split} for r in routes],
+            "n_intents": len(routes), "n_approved": len(routes),
+            "n_transmitted": len(ex.get("placed_fills") or []),
+            "fills": ex.get("placed_fills") or [],
+            "sell_results": ex.get("sell_results") or [],
+            "buy_results": ex.get("buy_results") or [],
+            "realized_cash": ex.get("realized_cash") or {},
+            "buy_resize": ex.get("buy_resize") or {},
+            "dropped_buy_blocks": ex.get("dropped_buy_blocks") or [],
+            "pdt_dropped": ex.get("pdt_dropped") or [],
+            "uninvested": ex.get("uninvested") or [],
+            "refused": ex.get("refused", False),
+            "refused_reason": ex.get("refused_reason", ""),
+            "replace_fa_writes": ex.get("replace_fa_writes", 0),
+            "run_id": ex.get("run_id") or run.get("stamp", ""),
+            "halted": False, "halt_reason": "",
+        })
+    except Exception as exc:  # noqa: BLE001
+        print(f"    !! COULD NOT WRITE THE AUDIT RECORD ({type(exc).__name__}: {exc}). The run "
+              f"itself is unaffected, but THIS RUN IS UNRECORDED - capture the screen before "
+              f"moving on.")

@@ -26,6 +26,7 @@ import pytest
 import config
 import holding_class
 import recon_report
+import reconcile
 import rebalance_engine as eng
 import strategy_target
 
@@ -591,3 +592,104 @@ def test_the_existing_per_model_aggregator_is_unchanged():
     blocks = eng.aggregate_blocks(plans)
     assert len(blocks) == 2
     assert {b.version for b in blocks} == {"Growth (Custom)", "Balanced (Custom)"}
+
+
+# ========================================================================================
+# FULL EXIT SELLS THE WHOLE POSITION, FRACTION INCLUDED (owner decision 2026-09-04).
+# When the model wants NONE of a symbol the order is the entire holding, not int() of it.
+# Truncating sold 13 of a 13.8499 holding and stranded 0.8499 forever: on the next run
+# int(0.8499) is 0, the line classifies FRACTIONAL, FRACTIONAL is never auto-traded, and no
+# order is ever produced for it again. These pin the new rule AND its boundaries - it must
+# reach ROTATE_OUT and FRACTIONAL only, never ALIEN, never SWEEP, never ordinary drift.
+# ========================================================================================
+FULL_EXIT_UNIVERSE = {"SPY", "BND", "TLT"}
+
+
+def test_a_full_exit_sells_the_whole_position_including_the_fraction():
+    # TLT is a KNOWN ticker (in universe) the model dropped to 0% -> ROTATE_OUT, which
+    # always breaches. The order is the ENTIRE 13.8499 holding, not the truncated -13 that
+    # used to leave a 0.8499 stub behind forever.
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0, "TLT": 90.0})
+    plan = eng.plan_account("DU0801", "Balanced", 1_000_000, {"SPY": 9850, "TLT": 13.8499},
+                            target, band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert next(l.status for l in plan.lines if l.symbol == "TLT") == reconcile.ROTATE_OUT
+    assert plan.orders["TLT"] == pytest.approx(-13.8499)
+    assert plan.orders["TLT"] != -13             # the old truncated exit
+
+
+def test_a_fractional_stub_is_now_cleared_instead_of_stranded_forever():
+    # The stub a truncated exit used to manufacture: 0.8499 shares of a dropped holding,
+    # int() == 0, so it classifies FRACTIONAL and USED to produce no order at all. It is
+    # now sold in full whenever the account trades. BND supplies the breach.
+    target = make_target({"SPY": 0.5, "BND": 0.5},
+                         {"SPY": 100.0, "BND": 100.0, "TLT": 90.0})
+    positions = {"SPY": 4925, "BND": 1000, "TLT": 0.8499}
+    plan = eng.plan_account("DU0802", "Balanced", 1_000_000, positions, target,
+                            band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert next(l.status for l in plan.lines if l.symbol == "TLT") == reconcile.FRACTIONAL
+    assert plan.orders["TLT"] == pytest.approx(-0.8499)
+    assert plan.orders["BND"] == 3925            # the genuine drift is unaffected
+
+
+def test_a_lone_fractional_stub_still_does_not_breach_the_band_by_itself():
+    """BOUNDARY the fix does NOT move: a stub is not a reason to trade an otherwise in-spec
+    account. FRACTIONAL is excluded from the band test, so an account holding nothing but a
+    stub emits no orders at all and the stub is cleared on the next cycle that trades."""
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0, "TLT": 90.0})
+    plan = eng.plan_account("DU0803", "Balanced", 1_000_000, {"SPY": 9850, "TLT": 0.8499},
+                            target, band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert plan.needs_rebalance is False
+    assert plan.orders == {}
+
+
+def test_an_alien_holding_is_still_never_auto_traded_fraction_or_not():
+    # THE negative test. An unrecognised holding (spinoff, rename, a client's own position)
+    # is surfaced for human review, never swept up by the full-exit rule -- even though its
+    # model weight is 0 and the account IS trading. ALIEN is deliberately absent from
+    # _FULL_EXIT_STATUSES.
+    target = make_target({"SPY": 0.5, "BND": 0.5},
+                         {"SPY": 100.0, "BND": 100.0, "SPNOFF": 30.0})
+    positions = {"SPY": 4925, "BND": 1000, "SPNOFF": 13.8499}
+    plan = eng.plan_account("DU0804", "Balanced", 1_000_000, positions, target,
+                            band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert next(l.status for l in plan.lines if l.symbol == "SPNOFF") == reconcile.ALIEN
+    assert "SPNOFF" not in plan.orders           # NEVER auto-traded
+    assert plan.orders["BND"] == 3925            # while the account rebalances around it
+    assert [ln.symbol for ln in plan.alien_lines] == ["SPNOFF"]
+
+
+def test_a_sweep_holding_is_still_never_auto_traded(monkeypatch):
+    # A whitelisted money-market sweep is held BY DESIGN. Model weight 0 and a trading
+    # account must not turn it into a liquidation.
+    monkeypatch.setattr(config, "SWEEP_WHITELIST", {"MMFXX"})
+    target = make_target({"SPY": 0.5, "BND": 0.5},
+                         {"SPY": 100.0, "BND": 100.0, "MMFXX": 1.0})
+    positions = {"SPY": 4925, "BND": 1000, "MMFXX": 5000.75}
+    plan = eng.plan_account("DU0805", "Balanced", 1_000_000, positions, target,
+                            band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert next(l.status for l in plan.lines if l.symbol == "MMFXX") == reconcile.SWEEP
+    assert "MMFXX" not in plan.orders
+    assert plan.orders["BND"] == 3925
+
+
+def test_ordinary_drift_still_moves_whole_shares_only():
+    # THE OTHER BOUNDARY: a holding the model still WANTS is not a full exit, so the old
+    # whole-share delta is untouched. investable = 100,000 * (1 - 0.015) = 98,500;
+    # 98,500 / 4,925 = 20 target shares against a fractional 10.6 held.
+    target = make_target({"SPY": 1.0}, {"SPY": 4925.0})
+    plan = eng.plan_account("DU0806", "Balanced", 100_000.0, {"SPY": 10.6}, target,
+                            band_pct=0.03, universe={"SPY"})
+    line = next(l for l in plan.lines if l.symbol == "SPY")
+    assert line.target_shares == 20
+    assert plan.orders["SPY"] == 10              # 20 - int(10.6), NOT 20 - 10.6
+    assert plan.orders["SPY"] != pytest.approx(9.4)
+
+
+def test_the_flag_off_restores_the_old_truncated_exit(monkeypatch):
+    # The escape hatch, for the day IBKR refuses a fractional sell: SELL_WHOLE_POSITION_ON_
+    # EXIT=False reverts the 13.8499 ROTATE_OUT to the old -13 (and the 0.8499 stub with it).
+    monkeypatch.setattr(config, "SELL_WHOLE_POSITION_ON_EXIT", False)
+    target = make_target({"SPY": 1.0}, {"SPY": 100.0, "TLT": 90.0})
+    plan = eng.plan_account("DU0807", "Balanced", 1_000_000, {"SPY": 9850, "TLT": 13.8499},
+                            target, band_pct=0.03, universe=FULL_EXIT_UNIVERSE)
+    assert plan.orders["TLT"] == -13

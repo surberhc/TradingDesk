@@ -145,6 +145,13 @@ def band_breached(lines, net_liq: float, target: strategy_target.Target,
 
 
 # --- 2. per-account target shares, deltas, band suppression --------------------
+# The statuses a FULL EXIT may clear outright, fraction included. ROTATE_OUT is a KNOWN
+# ticker the model dropped; FRACTIONAL is the sub-1-share stub a previous truncated exit left
+# behind. ALIEN is deliberately ABSENT - an unrecognised holding (a spinoff, a rename, a
+# client's own position) is still never auto-traded - and so is a SWEEP held by design.
+_FULL_EXIT_STATUSES = frozenset({reconcile.ROTATE_OUT, reconcile.FRACTIONAL})
+
+
 def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target,
                  prices: dict | None = None,
@@ -268,6 +275,26 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
     orders: dict = {}
     if breached:
         for ln in lines:
+            # FULL EXIT SELLS THE WHOLE POSITION, FRACTION INCLUDED (owner decision
+            # 2026-09-04). The model wants NONE of this symbol, so the order is the entire
+            # holding, not int() of it.
+            #
+            # WHY. delta = target - int(actual) sold 13 of a 13.8499 holding and stranded
+            # 0.8499 forever: on the next run int(0.8499) is 0, the line classifies
+            # FRACTIONAL, FRACTIONAL is in _NO_AUTOTRADE_STATUSES, and no order is ever
+            # produced for it again. The desk manufactured the stub and then refused to clear
+            # it; account U7586137 was found holding eleven of them. The mutual-fund path
+            # already follows this rule for the same stated reason: selling out means selling
+            # the whole position INCLUDING the fraction, or the account never actually closes
+            # the holding.
+            #
+            # ONLY a full exit. A drift trade still moves whole shares, so ordinary
+            # rebalancing is unchanged, and a fractional holding the model WANTS is left be.
+            full_exit = (ln.target_shares == 0 and ln.actual_shares
+                         and ln.status in _FULL_EXIT_STATUSES)
+            if full_exit and config.SELL_WHOLE_POSITION_ON_EXIT:
+                orders[ln.symbol] = -float(ln.actual_shares)
+                continue
             if ln.status in _NO_AUTOTRADE_STATUSES:
                 continue
             delta = ln.target_shares - int(ln.actual_shares)
