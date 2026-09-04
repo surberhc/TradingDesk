@@ -316,7 +316,13 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
             "account_inputs": account_inputs, "summaries": summaries}
 
 
-ADAPTIVE_PRIORITY = "Patient"
+# NO ALGO ON A REBALANCE BLOCK (owner decision 2026-09-04: "this is trading not scalping").
+# Adaptive/Patient works an order toward the midpoint and refuses to cross, which turns a
+# rebalance into a fill-or-time-out lottery: on 2026-09-04 every buy block sat unfilled for
+# its full 90s window and cancelled. A rebalance needs to GET DONE at a fair price, not to
+# save a basis point. None = a plain marketable limit at the cap, which crosses and fills.
+# Set to "Urgent"/"Normal"/"Patient" only for a deliberate experiment.
+ADAPTIVE_PRIORITY = None
 
 
 def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool = False,

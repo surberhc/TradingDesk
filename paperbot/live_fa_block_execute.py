@@ -403,9 +403,19 @@ def pdt_account_ok(summary_rows) -> tuple[bool, str]:
     account we cannot clear is an account we do not trade)."""
     n = day_trades_remaining(summary_rows)
     if n is None:
-        return False, (f"{PDT_TAG} is absent/unparseable in this account's accountSummary — "
-                       f"cannot confirm the account is not pattern-day-trader restricted. "
-                       f"FAILING CLOSED.")
+        # ABSENT IS NOT UNKNOWN (v0.52.0). Pattern day trading is a Reg T MARGIN rule, and
+        # IBKR reports DayTradesRemaining only as part of the margin tag block. Measured on
+        # the live master 2026-09-04: a margin TRUST returns 30 tags including
+        # DayTradesRemaining, DayTradesRemainingT+1..T+4, RegTEquity, RegTMargin and SMA; a
+        # cash IRA returns 22 tags with NONE of those and SettledCash instead. The tag is
+        # missing BY DESIGN on a cash account, not because we failed to read it.
+        #
+        # This gate used to fail closed here, which silently excluded 38 of 185 enrolled
+        # accounts -- every one of them a cash account that can never be PDT-restricted --
+        # across four models. An account quietly left out of a rebalance is the exact failure
+        # this system exists to prevent, so the ONLY refusal left is the one we have actually
+        # measured: IBKR answering 0. Anything else goes to IBKR, and IBKR decides.
+        return True, ""
     if n == -1:
         return True, ""
     if n > 0:
@@ -960,6 +970,39 @@ def _run_block_phase(ib, phase_label, routes_with_limits, account_inputs, target
             for r, limit in routes_with_limits]
 
 
+def _phase_quotes(ib, routes, permit: bool) -> dict:
+    """Re-quote the symbols in ONE phase, IMMEDIATELY before that phase is priced.
+
+    WHY (measured live 2026-09-04). Limits used to be computed once at the top of the run.
+    The run then spent 20+ minutes creating FA groups and working the sell phase before a
+    single buy was placed. GLDM was priced off an 87.48 ask captured at 11:07, giving a
+    marketable cap of 87.74; by the time the buy block actually went out the market was
+    87.83 / 87.84 and that limit sat BELOW THE BID. A buy limit under the bid cannot fill,
+    so every buy block ran its 90s timeout and cancelled -- the run sold and bought nothing.
+
+    30 bps of marketable cap cannot absorb 20 minutes of drift. Only a fresh quote can.
+
+    Falls back to the run's opening quotes if the re-quote fails or returns nothing, so a
+    quote outage degrades to the old behaviour instead of refusing to trade.
+    """
+    symbols = sorted({r.symbol for r in routes})
+    if not symbols or not permit:
+        return _quotes_cache
+    try:
+        fresh = live_quotes.fetch(ib, symbols)
+    except Exception as exc:
+        print(f"      !! re-quote failed ({type(exc).__name__}: {exc}) - falling back to the "
+              f"run's opening quotes. Limits may be stale.")
+        return _quotes_cache
+    if not fresh:
+        print("      !! re-quote returned nothing - falling back to the run's opening quotes.")
+        return _quotes_cache
+    merged = dict(_quotes_cache)
+    merged.update(fresh)
+    print(f"      re-quoted {len(fresh)} symbol(s) for this phase.")
+    return merged
+
+
 def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetGateway,
                             *, permit: bool, summaries: dict | None = None,
                             run_id: str | None = None,
@@ -1051,12 +1094,14 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
         print(f"      2. BUY  {r.symbol} x{r.total_qty} group={r.fa_group}  "
               f"(quantity + group split WILL be re-sized to realized cash)")
 
-    # Block limits are computed ONCE, up front, so the buy re-sizing prices the SAME cap the
-    # block is actually placed at (a second quote read could drift and break the cash gate).
-    sell_with_limits = [(r, rebalance_execute._fa_block_limit(r, _quotes_cache, account_inputs,
+    # Each phase is priced from a quote taken IMMEDIATELY BEFORE IT RUNS (v0.52.0). The buy
+    # cap is still computed ONCE and the SAME value both sizes and places the block, so the
+    # cash gate keeps its invariant -- it is just no longer read 20 minutes early. See
+    # _phase_quotes for the measured failure this replaces.
+    _sell_quotes = _phase_quotes(ib, sell_routes, permit)
+    sell_with_limits = [(r, rebalance_execute._fa_block_limit(r, _sell_quotes, account_inputs,
                                                               targets)) for r in sell_routes]
-    buy_with_limits = [(r, rebalance_execute._fa_block_limit(r, _quotes_cache, account_inputs,
-                                                             targets)) for r in buy_routes]
+    buy_with_limits: list = []      # priced below, immediately before the buys are sized
 
     # ARMED + permitted: MANDATORY backup of the whole groups XML BEFORE any replaceFA write.
     if permit:
@@ -1075,8 +1120,8 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
     # [3] BETWEEN PHASES — RE-READ realized cash. NEVER trust the plan's expected proceeds; a
     # cancelled/short sell block means that cash never landed. PREVIEW does NO broker read.
     realized_cash: dict = {}
-    cash_accounts = sorted({a for r, _l in buy_with_limits for a in r.per_account_split}
-                           | {a for r, _l in sell_with_limits for a in r.per_account_split})
+    cash_accounts = sorted({a for r in buy_routes for a in r.per_account_split}
+                           | {a for r in sell_routes for a in r.per_account_split})
     if permit:
         ib.sleep(CASH_SETTLE_SEC)      # let streaming account values catch up to the fills
         realized_cash = read_realized_cash(ib, cash_accounts)
@@ -1096,7 +1141,12 @@ def execute_fa_block_routes(ib, routes, account_inputs, targets, target: TargetG
               f"realized cash covers. No broker read performed; buy quantities below are the "
               f"UNRESIZED plan.")
 
-    # [4] RE-SIZE the buy blocks to realized cash (armed only — preview keeps plan quantities so
+    # [4] PRICE THE BUYS NOW - after the sells, not before them - then RE-SIZE to realized cash
+    _buy_quotes = _phase_quotes(ib, buy_routes, permit)
+    buy_with_limits = [(r, rebalance_execute._fa_block_limit(r, _buy_quotes, account_inputs,
+                                                             targets)) for r in buy_routes]
+
+    # RE-SIZE the buy blocks to realized cash (armed only — preview keeps plan quantities so
     # the operator sees the engine's intent; the print above says they would be re-sized).
     buy_resize: dict = {}
     dropped: list = []

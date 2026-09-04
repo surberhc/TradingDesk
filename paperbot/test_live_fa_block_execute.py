@@ -685,11 +685,14 @@ def test_pdt_account_ok_semantics():
     ok, reason = lx.pdt_account_ok(_rows(0))              # 0 = none left -> REFUSE
     assert ok is False and "DayTradesRemaining=0" in reason
 
-    ok, reason = lx.pdt_account_ok([])                    # missing tag -> FAIL CLOSED
-    assert ok is False and "FAILING CLOSED" in reason
-
-    ok, reason = lx.pdt_account_ok(_rows("garbage"))      # unparseable -> FAIL CLOSED
-    assert ok is False and "FAILING CLOSED" in reason
+    # ABSENT IS NOT UNKNOWN (v0.52.0). DayTradesRemaining ships inside IBKR's Reg T MARGIN
+    # tag block; a CASH account never carries it. Measured on the live master 2026-09-04: a
+    # margin trust returns it alongside RegTEquity/RegTMargin/SMA, a cash IRA returns none of
+    # those and SettledCash instead. Failing closed here silently excluded 38 of 185 enrolled
+    # accounts, every one of them a cash account PDT cannot apply to. The only refusal left is
+    # the one we measured: IBKR answering 0.
+    assert lx.pdt_account_ok([])[0] is True               # no tag -> cash account -> trade it
+    assert lx.pdt_account_ok(_rows("garbage"))[0] is True  # unreadable -> let IBKR decide
 
 
 def _split_summaries(mapping):
@@ -719,14 +722,13 @@ def test_pdt_preflight_refuses_the_block_only_when_the_split_empties():
     assert "EVERY account" in reason and "REFUSING" in reason
 
 
-def test_pdt_preflight_fails_closed_on_a_missing_tag():
-    # summaries={} — the tag cannot be read for EITHER account -> the split empties -> refuse.
+def test_pdt_preflight_clears_a_missing_tag_instead_of_refusing_the_block():
+    # REVERSED v0.52.0. summaries={} means neither account reports DayTradesRemaining, which
+    # is what a CASH account looks like. The block clears and nobody is dropped -- the order
+    # goes to IBKR and IBKR decides, rather than us inventing a restriction.
     route = _block("Balanced", "SPY", "tier_balanced", {"DU8922143": 15, "DU8922144": 15})
-    ok, reason = lx.pdt_preflight_over_split(route, {})
-    assert ok is False
-    blocked = lx.pdt_blocked_in_split(route, {})
-    assert {b["account"] for b in blocked} == {"DU8922143", "DU8922144"}
-    assert all(b["day_trades_remaining"] is None for b in blocked)
+    assert lx.pdt_preflight_over_split(route, {}) == (True, "")
+    assert lx.pdt_blocked_in_split(route, {}) == []
 
 
 def test_pdt_drop_removes_only_the_blocked_account_and_recomputes_total_qty():
@@ -814,8 +816,10 @@ def test_armed_lane_fully_pdt_blocked_block_writes_NO_replaceFA(monkeypatch, cap
     assert "BLOCK REFUSED" in capsys.readouterr().out
 
 
-def test_armed_lane_missing_pdt_tag_fails_closed_no_replaceFA(monkeypatch):
-    # Unreadable tag == refused account (fail closed), NOT a pass-through.
+def test_armed_lane_missing_pdt_tag_now_trades_instead_of_being_skipped(monkeypatch):
+    # REVERSED v0.52.0. A cash account reports no DayTradesRemaining at all. This used to
+    # SKIP the whole block; 38 enrolled cash accounts were being left out of every rebalance
+    # that way. It now writes the group and places the order like any other block.
     _armed_lane(monkeypatch)
     ib = _FakeIB()
     routes = [_block("Balanced", "SPY", "tier_balanced", {"DU8922143": 15, "DU8922144": 15})]
@@ -823,9 +827,10 @@ def test_armed_lane_missing_pdt_tag_fails_closed_no_replaceFA(monkeypatch):
         ib, routes, _account_inputs(), _targets(), _e2e_target(),
         permit=True, summaries={})                         # no summary rows at all
 
-    assert ib.replace_fa_calls == 0
-    assert ib.placed == []
-    assert result["buy_results"][0]["status"] == "SKIPPED_PDT"
+    assert ib.replace_fa_calls == 1
+    assert len(ib.placed) == 1
+    assert result["buy_results"][0]["status"] != "SKIPPED_PDT"
+    assert result["pdt_dropped"] == []
 
 
 def test_clean_run_says_so_and_carries_empty_pdt_lists(monkeypatch, capsys):
