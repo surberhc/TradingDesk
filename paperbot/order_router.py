@@ -489,6 +489,29 @@ def transmit_guard(armed: bool) -> tuple[bool, str]:
     return True, "ARMED"
 
 
+def _broker_message(trade) -> tuple:
+    """(message, errorCode) IBKR attached to this order, or ("", "").
+
+    ib_async appends every status change AND every error the gateway sends for an order to
+    ``Trade.log`` as TradeLogEntry(time, status, message, errorCode). That text is the ONLY
+    record of WHY the broker refused an order. Mirrors safe_execute._broker_message, which
+    has read it since v0.47.0 -- this module, which is what actually places every FA block,
+    never did. PURE and defensive: any missing/renamed attribute yields ("", "") rather than
+    raising, because this runs on the reporting path of a real-money transmit.
+    """
+    try:
+        entries = list(getattr(trade, "log", None) or ())
+    except Exception:  # noqa: BLE001
+        return ("", "")
+    for entry in reversed(entries):
+        msg = str(getattr(entry, "message", "") or "").strip()
+        code = getattr(entry, "errorCode", None)
+        code = "" if code in (None, 0, "0") else str(code)
+        if msg or code:
+            return (msg, code)
+    return ("", "")
+
+
 def place(ib, built, armed: bool = False, fill_timeout: int = 60, *,
           day=None, journal_states: dict | None = None, account=None,
           context: str = "") -> dict:
@@ -554,11 +577,29 @@ def place(ib, built, armed: bool = False, fill_timeout: int = 60, *,
     fills = []
     for t in trades:
         st = t.orderStatus
+        # WHY THE BROKER SAID NO (2026-09-04). This used to record status/filled/remaining and
+        # price and NOTHING ELSE, so a rejected order was indistinguishable from one that
+        # simply did not fill -- it looked like it "just disappeared". On the Balanced run the
+        # JAAA block came back Cancelled with filled=0 AND remaining=0, which this module's own
+        # comment identifies as the signature of a REJECTED order, and the reason IBKR gave was
+        # discarded here. ib_async appends every error the gateway sends for an order to
+        # Trade.log; safe_execute has read it since v0.47.0 and the block path never did.
+        msg, code = _broker_message(t)
+        rejected = (float(st.filled) == 0.0 and float(st.remaining) == 0.0
+                    and str(st.status) in _TERMINAL_NONFILL_STATUSES)
         fills.append({"symbol": t.contract.symbol, "status": st.status,
                       "filled": float(st.filled), "remaining": float(st.remaining),
-                      "avgFillPrice": float(st.avgFillPrice or 0.0)})
+                      "avgFillPrice": float(st.avgFillPrice or 0.0),
+                      "broker_message": msg, "broker_error_code": code,
+                      "looks_rejected": rejected})
         print(f"      {t.contract.symbol:6s} {st.status:12s} filled={st.filled:g} "
               f"remaining={st.remaining:g} @ {st.avgFillPrice or 0.0:,.2f}")
+        if msg or code:
+            print(f"        BROKER SAID: [{code or 'no code'}] {msg}")
+        if rejected and not (msg or code):
+            print(f"        !! {t.contract.symbol} reports filled=0 AND remaining=0 with "
+                  f"status={st.status} - the signature of a REJECTED order - but IBKR "
+                  f"attached NO message. Recorded as rejected with no stated reason.")
 
     # Per-RUN margin snapshot AFTER the fill-watch, diffed against `before`, persisted, and
     # returned as result["margin"] (conductor #26). Fully fail-soft — any error here degrades
