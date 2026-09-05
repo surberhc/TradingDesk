@@ -63,7 +63,7 @@ T.inject_theme()
 import emergency
 import page_action_center
 import page_control_plane
-import page_group_trade
+import page_trade_execution
 import page_custom_alloc
 import page_feeds
 import page_history
@@ -110,8 +110,8 @@ pages = [
             title="Strategy Models — all models", icon="🗂️"),
     st.Page(page_custom_alloc.render_custom_alloc,
             title="Custom allocation — models Andrew writes himself", icon="✍️"),
-    st.Page(page_group_trade.render_group_trade,
-            title="Group trade — pick, prepare, send", icon="📦"),
+    st.Page(page_trade_execution.render_trade_execution,
+            title="Trade Execution — pick, prepare, send", icon="📦"),
     st.Page(page_withdrawal_cash_raise.render_withdrawal_cash_raise,
             title="Raise withdrawal cash — reserve-short accounts only", icon="💵"),
     st.Page(page_control_plane.render_control_plane,

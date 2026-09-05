@@ -1,4 +1,4 @@
-"""page_group_trade.py — GROUP TRADE. Pick strategies, prepare, check, send.
+"""page_trade_execution.py — TRADE EXECUTION. Pick strategies, prepare, check, send.
 
 DELIBERATELY SMALL. The Control Plane is 2,359 lines of nested expanders, tables and prose,
 and the owner verdict on it (2026-09-03) was that it is unreadable: list after list and box
@@ -22,7 +22,7 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-# This module lives at dashboard/desk/execution/page_group_trade.py, so the repo root
+# This module lives at dashboard/desk/execution/page_trade_execution.py, so the repo root
 # is parents[3].
 _PAPERBOT = str(Path(__file__).resolve().parents[3] / "paperbot")
 if _PAPERBOT not in sys.path:
@@ -130,8 +130,8 @@ def _checks(run: dict) -> list:
     return checks
 
 
-def render_group_trade() -> None:
-    st.markdown("## Group trade")
+def render_trade_execution() -> None:
+    st.markdown("## Trade Execution")
     st.caption("One order per holding, shared across every account that needs it, so "
                "everyone gets the same price.")
 
