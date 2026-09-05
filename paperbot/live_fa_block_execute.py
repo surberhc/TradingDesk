@@ -99,6 +99,7 @@ Run — ARMED (human-supervised; requires the arm token + a physically-armed gat
 from __future__ import annotations
 
 import difflib
+import os
 import sys
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace as dc_replace
@@ -142,6 +143,29 @@ ARM_TOKEN = "--arm-i-understand"
 # (non-PyPI) AND whatIf on a block HANGS. Ship WITHOUT it; the substitute is the self-computed
 # per-account margin pre-flight over the split (see margin_preflight_over_split) before placing.
 FA_BLOCK_WHATIF_ENABLED = False
+
+# KILL SWITCH — the same AUTOTRADE_DISABLED sentinel every other transmit-capable rail honors
+# (s0_live_deploy.py, batch_rebalance_execute.py, group_execute.py, rebalance_execute.py).
+# Mirrored as a literal, exactly like those callers, so this module pulls in none of their
+# module-level state.
+#
+# WHY IT IS CHECKED AT THIS RAIL'S OWN CHOKEPOINT AND NOT INSIDE safe_execute.armed_session().
+# armed_session() is shared with group_execute.purge_run_groups(), which deletes spent throwaway
+# FA groups and places NO order — housekeeping a halt must not block. So each rail checks at the
+# point where IT can transmit: for this one that is main() below, ahead of the arm context, so a
+# halt refuses before any flag is flipped, any gateway lock is taken, any connection is opened,
+# any FA config is written and any block order is placed.
+#
+# NOTE: execute_fa_block_routes() itself is deliberately NOT gated here. It is the shared route
+# executor group_execute.execute_group_run() calls from INSIDE its own arm gate, and that caller
+# already refuses on this same sentinel before it ever gets there — gating the callee too would
+# double-check the Group Trade path while adding a second place for the two to disagree.
+KILL_SWITCH = r"C:\TradingDesk-Local\AUTOTRADE_DISABLED"
+
+
+def _kill_switch_present() -> bool:
+    """True if the AUTOTRADE_DISABLED sentinel exists -> the armed block executor refuses."""
+    return os.path.exists(KILL_SWITCH)
 
 
 # ========================================================================================
@@ -1431,6 +1455,20 @@ def main(argv: list[str] | None = None, target: TargetGateway = TARGET) -> int:
         return 2
     for v, t in targets.items():
         print(f"    {v:13s} as_of={t.as_of.date()}  ({len(t.weights)} holdings)")
+
+    # KILL SWITCH — checked BEFORE the arm context, so a halted desk refuses with nothing done:
+    # no flag flipped, no gateway lock taken, no connection opened, no replaceFA, no block
+    # placed. Only the ARMED path is gated; an unarmed preview is read-only and stays useful
+    # during a halt (same shape as group_execute.execute_group_run, which returns its preview
+    # before this check). Exit code 2 is this module's existing "refused before doing anything"
+    # code (see the GatewayBusyRefuse branch below), so callers already treat it as a clean
+    # refusal rather than a crash.
+    if armed and _kill_switch_present():
+        print(f"\n[2] REFUSING to start the armed block execute — AUTOTRADE_DISABLED sentinel "
+              f"present ({KILL_SWITCH}); trading is halted. No connection opened, no block "
+              f"built, nothing transmitted, no replaceFA, no FA config written. Delete the "
+              f"sentinel file to resume.")
+        return 2
 
     # ARM-GATE: flip READONLY/DRY_RUN False IN-PROCESS behind the token (restored in a finally)
     # via the shared armed_session; hold the gateway lock across the whole armed body. The dry

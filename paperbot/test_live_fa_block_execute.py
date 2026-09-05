@@ -980,3 +980,66 @@ def test_the_default_is_none_so_existing_behaviour_is_unchanged(monkeypatch):
     fab._execute_one_route(_GroupsIB(), _route("G"), [], {}, ["U1"], "2026-09-04", 65.0,
                            permit=False, summaries=None, phase_label="BUY")
     assert seen["adaptive_priority"] is None
+
+
+# --- THE KILL SWITCH (AUTOTRADE_DISABLED) — the armed block executor must refuse first -------
+# safe_execute.armed_session() does NOT check the sentinel (it is shared with
+# group_execute.purge_run_groups, a no-order housekeeping path that must keep working during a
+# halt), so this rail checks at its own transmit chokepoint in main(). Mirrors
+# test_group_execute.test_kill_switch_refuses_before_any_group_or_order: the CHECK is
+# monkeypatched, never the real sentinel file, so a failed run can never leave the real desk
+# halted.
+def test_kill_switch_refuses_the_armed_block_execute_before_any_order(monkeypatch):
+    """AUTOTRADE_DISABLED must refuse main()'s ARMED path before the arm context is entered:
+    no flag flipped, no gateway lock taken, no session run, no replaceFA, nothing transmitted."""
+    import safe_execute
+
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(lx, "_kill_switch_present", lambda: True)
+    # Targets are computed before the gate and must not need real strategy data.
+    monkeypatch.setattr(lx, "targets_for", lambda *_a, **_k: {})
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("must not be called while AUTOTRADE_DISABLED is present")
+
+    monkeypatch.setattr(lx, "_run_session", _must_not_be_called)
+    monkeypatch.setattr(lx, "gateway_lock", _must_not_be_called)
+    monkeypatch.setattr(lx, "armed_session", _must_not_be_called)
+    monkeypatch.setattr(safe_execute, "armed_session", _must_not_be_called)
+
+    rc = lx.main([lx.ARM_TOKEN], target=_e2e_target())
+
+    assert rc == 2, "a halted desk must refuse with the 'refused before doing anything' code"
+    assert config.READONLY is True
+    assert config.DRY_RUN is True
+
+
+def test_kill_switch_absent_does_not_short_circuit_the_armed_block_execute(monkeypatch):
+    """Converse sanity check: with the sentinel absent, main() does NOT take the kill-switch
+    early return — it proceeds into the arm context and runs the session."""
+    from contextlib import contextmanager
+    import safe_execute
+
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(lx, "_kill_switch_present", lambda: False)
+    monkeypatch.setattr(lx, "targets_for", lambda *_a, **_k: {})
+
+    @contextmanager
+    def _free_ctx(*_a, **_k):
+        yield {"purpose": "test-free-lock"}
+    monkeypatch.setattr(lx, "gateway_lock", _free_ctx)
+    monkeypatch.setattr(lx, "armed_session", _free_ctx)
+    monkeypatch.setattr(safe_execute, "armed_session", _free_ctx)
+
+    reached = {}
+
+    def _fake_session(target, targets, *, armed):
+        reached["armed"] = armed
+        return 0
+    monkeypatch.setattr(lx, "_run_session", _fake_session)
+
+    rc = lx.main([lx.ARM_TOKEN], target=_e2e_target())
+
+    assert rc == 0 and reached.get("armed") is True

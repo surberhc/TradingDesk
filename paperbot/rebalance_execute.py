@@ -102,6 +102,23 @@ PIN_ACCOUNT = sorted(config.ENROLLMENT)[0]   # DU8922142
 # Where FA-config backups land (off Drive, with the rest of paperbot state).
 _BACKUP_DIR = os.path.join(config.STATE_DIR, "fa_backups")
 
+# KILL SWITCH — the same AUTOTRADE_DISABLED sentinel every other transmit-capable rail honors
+# (s0_live_deploy.py, batch_rebalance_execute.py, group_execute.py). Mirrored as a literal,
+# exactly like those callers, so this module pulls in none of their module-level state.
+#
+# WHY IT IS CHECKED HERE AND NOT INSIDE safe_execute.armed_session(). armed_session() is shared
+# with group_execute.purge_run_groups(), which deletes spent throwaway FA groups and places NO
+# order — housekeeping a halt must not block. So the check sits at each rail's own
+# order-transmitting chokepoint instead: for this rail that is execute_armed() below, ahead of
+# the arm context, so a halt refuses before any flag is flipped, any gateway lock is taken, any
+# connection is opened, any FA config is written and any block is placed.
+KILL_SWITCH = r"C:\TradingDesk-Local\AUTOTRADE_DISABLED"
+
+
+def _kill_switch_present() -> bool:
+    """True if the AUTOTRADE_DISABLED sentinel exists -> the armed executor refuses to run."""
+    return os.path.exists(KILL_SWITCH)
+
 
 # --- the gate ------------------------------------------------------------------
 def arm_requested(argv: list[str]) -> bool:
@@ -384,6 +401,20 @@ def execute_armed(armed: bool, only_account: str | None = None,
 
     if token_present is None:
         token_present = armed   # real flow: main() sets armed = token_present (always equal)
+
+    # KILL SWITCH — checked BEFORE the arm context, so a halted desk refuses with nothing done:
+    # no flag flipped, no gateway lock taken, no connection opened, no replaceFA, no block
+    # placed. Only the ARMED path is gated; an unarmed dry review is read-only and stays useful
+    # during a halt (same shape as group_execute.execute_group_run, which returns its preview
+    # before this check). Exit code 2 is this module's existing "refused before doing anything"
+    # code (see the GatewayBusyRefuse branch below), so callers already treat it as a clean
+    # refusal rather than a crash.
+    if armed and _kill_switch_present():
+        print(f"\nREFUSING to start the armed execute — AUTOTRADE_DISABLED sentinel present "
+              f"({KILL_SWITCH}); trading is halted. No connection was opened, NO orders were "
+              f"built, nothing was transmitted, no FA config was written, no replaceFA. "
+              f"Delete the sentinel file to resume.")
+        return 2
 
     arm_ctx = (armed_session(purpose="rebalance_execute",
                              client_id=clientids.get("paperbot_rebalance_exec"),

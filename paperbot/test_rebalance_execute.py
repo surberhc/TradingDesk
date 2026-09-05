@@ -823,3 +823,62 @@ def test_executor_preview_refuses_when_the_universe_cannot_be_resolved(monkeypat
     ai, targets = _alien_case()
     with pytest.raises(recon_report.CorpActionGuardUnavailable):
         rx.guarded_preview(ai, targets, tier_groups={"Conservative": "tier_cons"})
+
+
+# --- THE KILL SWITCH (AUTOTRADE_DISABLED) — the armed executor must refuse BEFORE anything ---
+# safe_execute.armed_session() does NOT check the sentinel (it is shared with
+# group_execute.purge_run_groups, a no-order housekeeping path that must keep working during a
+# halt), so this rail checks at its own transmit chokepoint. Mirrors
+# test_group_execute.test_kill_switch_refuses_before_any_group_or_order: the CHECK is
+# monkeypatched, never the real sentinel file, so a failed run can never leave the real desk
+# halted.
+def test_kill_switch_refuses_the_armed_execute_before_any_order(monkeypatch):
+    """AUTOTRADE_DISABLED must refuse execute_armed before the arm context is even entered:
+    no flag flipped, no gateway lock taken, no armed body run, nothing transmitted."""
+    import safe_execute
+
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(rx, "_kill_switch_present", lambda: True)
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("must not be called while AUTOTRADE_DISABLED is present")
+
+    monkeypatch.setattr(rx, "_run_armed_session", _must_not_be_called)
+    monkeypatch.setattr(rx, "gateway_lock", _must_not_be_called)
+    monkeypatch.setattr(safe_execute, "armed_session", _must_not_be_called)
+
+    rc = rx.execute_armed(armed=True, token_present=True)
+
+    assert rc == 2, "a halted desk must refuse with the 'refused before doing anything' code"
+    # The committed-safe posture was never flipped, because the arm context was never entered.
+    assert config.READONLY is True
+    assert config.DRY_RUN is True
+
+
+def test_kill_switch_absent_does_not_short_circuit_the_armed_execute(monkeypatch):
+    """Converse sanity check: with the sentinel absent, execute_armed does NOT take the
+    kill-switch early return — it proceeds into the arm context and runs the armed body."""
+    import rebalance_run as rr
+    from contextlib import contextmanager
+
+    monkeypatch.setattr(config, "READONLY", True)
+    monkeypatch.setattr(config, "DRY_RUN", True)
+    monkeypatch.setattr(rx, "_kill_switch_present", lambda: False)
+    monkeypatch.setattr(rr, "_targets_by_version", lambda: {})
+
+    @contextmanager
+    def _free_lock(*_a, **_k):
+        yield {"purpose": "test-free-lock"}
+    monkeypatch.setattr(rx, "gateway_lock", _free_lock)
+
+    reached = {}
+
+    def _fake_body(armed, only_account, only_tier, permit, why, targets):
+        reached["yes"] = True
+        return 0
+    monkeypatch.setattr(rx, "_run_armed_session", _fake_body)
+
+    rc = rx.execute_armed(armed=True, token_present=True)
+
+    assert rc == 0 and reached.get("yes") is True
