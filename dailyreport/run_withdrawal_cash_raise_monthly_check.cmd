@@ -1,0 +1,49 @@
+@echo off
+REM ===========================================================================
+REM  run_withdrawal_cash_raise_monthly_check.cmd - monthly consolidated "raise
+REM  withdrawal cash" Action Center notice.
+REM
+REM  Launcher for the WithdrawalCashRaiseMonthly scheduled task (runs once a month,
+REM  around the 20th, in the early-to-mid afternoon CT while the live-trading Gateway
+REM  is still up before its ~3:05pm teardown). Reads live, read-only, via
+REM  paperbot/withdrawal_cash_raise.accounts_needing_cash() (itself a thin reuse of
+REM  withdrawal_reserve_check.py's own shortfall decision) and, if one or more accounts
+REM  are short of their withdrawal reserve, posts ONE consolidated Action Center notice
+REM  naming every flagged account and pointing at the "Raise withdrawal cash" dashboard
+REM  page. Below zero flagged accounts it posts nothing. INFORMATIONAL + READ-ONLY:
+REM  builds no order, calls no order-placement method, transmits nothing
+REM  (readonly=True is the wall, inherited from withdrawal_reserve_check.read_cash).
+REM  Not order-affecting.
+REM ===========================================================================
+
+set "VENV_PY=C:\TradingDesk-Local\venv\Scripts\python.exe"
+set "REPO=%~dp0.."
+
+REM --- Resolve the live CRM DSN from the User-scope registry if it is not already
+REM     present in this process env. Task Scheduler can cache its environment until a
+REM     reboot, so a freshly-set User TRADINGDESK_CRM_DSN may be invisible to the
+REM     inherited env, silently dropping the read-only CRM role back to the built-in
+REM     allow-list. Pull it live here. Only set when empty (never clobber an
+REM     already-correct inherited value); never echo it (it contains a password). ---
+if not defined TRADINGDESK_CRM_DSN (
+    for /f "usebackq delims=" %%V in (`powershell -NoProfile -Command "[Environment]::GetEnvironmentVariable('TRADINGDESK_CRM_DSN','User')"`) do set "TRADINGDESK_CRM_DSN=%%V"
+)
+
+REM --- PYTHONPATH shim so `from connections import ...` resolves; the script also adds
+REM     connections + paperbot + dashboard\desk to sys.path itself (belt-and-suspenders). ---
+for /f "usebackq delims=" %%i in (`%VENV_PY% -c "import sys;print(next((p for p in sys.path if p.endswith('site-packages') and 'venv' in p.lower()), ''))"`) do set "VENV_SITE=%%i"
+set "PYTHONPATH=%VENV_SITE%;%REPO%\connections;%PYTHONPATH%"
+
+cd /d "%~dp0"
+
+REM --- best-effort per-day logging under the local state dir (never fatal). ---
+set "LOGDIR=C:\TradingDesk-Local\state\dailyreport"
+if not exist "%LOGDIR%" mkdir "%LOGDIR%" 2>nul
+for /f %%d in ('%VENV_PY% -c "import datetime;print(datetime.date.today().strftime('%%Y%%m%%d'))"') do set "DAY=%%d"
+set "LOG=%LOGDIR%\withdrawal_cash_raise_monthly_check_%DAY%.log"
+
+echo [%date% %time%] === Monthly withdrawal-cash-raise consolidated check ===>> "%LOG%"
+"%VENV_PY%" withdrawal_cash_raise_monthly_check.py >> "%LOG%" 2>&1
+set "RC=%ERRORLEVEL%"
+echo [%date% %time%] withdrawal_cash_raise_monthly_check exit=%RC%>> "%LOG%"
+exit /b %RC%
