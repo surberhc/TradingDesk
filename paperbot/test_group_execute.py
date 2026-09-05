@@ -234,3 +234,86 @@ def test_nothing_to_do_is_not_an_error(tmp_path):
     res = ge.create_run_groups(_FakeIB(_BASE_XML), [], allowed_accounts=["U1"],
                                armed=True, backup_path=str(tmp_path))
     assert res["created"] == 0 and res["results"] == []
+
+
+# ========================================================================================
+# build_plans_for_accounts — the account-list-driven core factored out 2026-09-05 for the
+# withdrawal-cash-raise trigger (paperbot/withdrawal_cash_raise.py), which sizes exactly a
+# flagged account list instead of a whole model's roster. build_plans_for_scope is a thin
+# wrapper over this same function (see test_batch_rebalance_execute.py / the existing
+# build_plans_for_scope tests for the model-scope path, unaffected by this refactor).
+# ========================================================================================
+import recon_report as _rr
+
+
+def test_build_plans_for_accounts_never_pulls_in_a_third_sibling_account(monkeypatch):
+    """U1 and U3 sit in two DIFFERENT models; U2 is a THIRD account sharing U1's model but is
+    NOT in the requested list. It must never appear anywhere in the result — not in the
+    resolved versions, not in the per-account state read, not in a plan."""
+    import batch_rebalance_execute as bre
+    import rebalance_engine
+    import s0_live_pilot_run as sp
+
+    requested = ["U1", "U3"]
+    model_by_account = {"U1": "Growth (Custom)", "U2": "Growth (Custom)",
+                        "U3": "Balanced (Custom)"}
+
+    seen_resolve_calls = []
+
+    def fake_resolve(accts):
+        seen_resolve_calls.append(list(accts))
+        return {a: model_by_account[a] for a in accts}
+
+    monkeypatch.setattr(bre, "resolve_roster_versions", fake_resolve)
+
+    class _FakeTarget:
+        def __init__(self, version):
+            self.version = version
+
+    monkeypatch.setattr(
+        bre, "build_targets",
+        lambda versions: ({v: _FakeTarget(v) for v in versions}, {}))
+
+    seen_state_calls = []
+
+    def fake_state(ib, accts):
+        seen_state_calls.append(list(accts))
+        state = {a: {"net_liq": 100_000.0, "positions": {}, "sec_types": {}, "summary": {}}
+                 for a in accts}
+        return state, set(), {}
+
+    monkeypatch.setattr(bre, "build_per_account_state", fake_state)
+    monkeypatch.setattr(
+        bre, "build_execution_prices",
+        lambda ib, accts, targets, state, held_syms, held_contracts: ({}, {}, set()))
+    monkeypatch.setattr(bre, "account_universe", lambda target, meta, held, base=None: base)
+    monkeypatch.setattr(bre, "account_reserve_pct", lambda meta: None)
+    monkeypatch.setattr(sp, "_strategy_universe", lambda: {"XLE"})
+
+    seen_plan_accounts = []
+
+    def fake_plan_account(account, version, net_liq, positions, target, **kwargs):
+        seen_plan_accounts.append(account)
+        return _rr.AccountPlan(account=account, version=version, net_liq=net_liq,
+                               reserve=0.0, investable=net_liq, lines=[],
+                               needs_rebalance=False, orders={})
+
+    monkeypatch.setattr(rebalance_engine, "plan_account", fake_plan_account)
+
+    built = ge.build_plans_for_accounts(object(), requested)
+
+    assert seen_resolve_calls == [["U1", "U3"]]
+    assert seen_state_calls == [["U1", "U3"]]
+    assert seen_plan_accounts == ["U1", "U3"]
+    assert {p.account for p in built["plans"]} == {"U1", "U3"}
+    assert {a["account"] for a in built["account_inputs"]} == {"U1", "U3"}
+    assert "U2" not in built["versions"]
+    assert set(built["versions"].values()) == {"Growth (Custom)", "Balanced (Custom)"}
+    assert "roster" not in built and "scan" not in built, (
+        "build_plans_for_accounts has no model-scope concept -- those keys belong only to "
+        "build_plans_for_scope's wrapper result")
+
+
+def test_build_plans_for_accounts_empty_list_is_a_no_op(monkeypatch):
+    built = ge.build_plans_for_accounts(object(), [])
+    assert built["plans"] == [] and built["account_inputs"] == [] and built["versions"] == {}

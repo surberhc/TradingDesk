@@ -62,6 +62,7 @@ import page_research
 import page_s0
 import page_s0_model
 import page_s8
+import page_withdrawal_cash_raise
 import pulse
 
 # --- Persistent emergency bar on EVERY page --------------------------------- #
@@ -101,6 +102,8 @@ pages = [
             title="Custom allocation — models Andrew writes himself", icon="✍️"),
     st.Page(page_group_trade.render_group_trade,
             title="Group trade — pick, prepare, send", icon="📦"),
+    st.Page(page_withdrawal_cash_raise.render_withdrawal_cash_raise,
+            title="Raise withdrawal cash — reserve-short accounts only", icon="💵"),
     st.Page(page_control_plane.render_control_plane,
             title="Control Plane — S0 rebalance", icon="🎛️"),
     st.Page(page_s8.render_s8_full,

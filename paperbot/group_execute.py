@@ -219,16 +219,22 @@ def create_run_groups(ib, group_plans, *, allowed_accounts, armed: bool = False,
             "created": created, "previewed": previewed}
 
 
-def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
-    """Scope by MODEL, read state, price the universe, and size every account. Read-only.
+def build_plans_for_accounts(ib, accounts: list, *, band_pct=None) -> dict:
+    """Read state, price the universe, and size EXACTLY the given accounts. Read-only.
 
-    Returns ``{"plans", "prices", "versions", "targets", "metas", "roster", "scan",
-    "skipped", "account_inputs", "summaries"}``. The last two are the block executor's
-    inputs, built from the SAME state the plans were sized on so its margin and PDT
-    pre-flights can never disagree with the plan about an account.
+    This is the account-list-driven core :func:`build_plans_for_scope` uses once it has
+    resolved a model scope into an account list — factored out (2026-09-05, the
+    withdrawal-cash-raise trigger) so a caller that already knows precisely which accounts
+    it wants (e.g. the ones a shortfall check flagged) can size THOSE accounts and nothing
+    else, without going through a model selection at all. Nothing below reads a model list;
+    ``accounts`` is the whole scope.
+
+    Returns ``{"plans", "prices", "versions", "targets", "metas", "skipped",
+    "account_inputs", "summaries"}``. The last two are the block executor's inputs, built
+    from the SAME state the plans were sized on so its margin and PDT pre-flights can never
+    disagree with the plan about an account.
 
     EVERY SUBSTANTIVE STEP IS THE BATCH RAIL'S OWN FUNCTION, called not copied:
-      * roster.enrolled_roster_scan(models=...)   - the model scope and the account wall
       * resolve_roster_versions                   - account -> model label
       * build_targets                             - SOURCE-based dispatch; a custom label is
                                                     built from the published CRM allocation
@@ -240,20 +246,16 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
 
     So this function decides nothing on its own. It is the loop that hands those decisions to
     the engine, which is why the group rail and the per-account rail cannot size the same
-    account differently.
-
-    THE MODEL SCOPE IS THE RUN. Pass models=["Conservative (Custom)"] and the run is that
-    model's accounts - one account today. That is what makes the staged rollout possible.
+    account differently — and why a caller scoped to 2 accounts spanning 2 different models
+    gets back plans for exactly those 2 accounts, never a 3rd sibling in either model.
     """
     import batch_rebalance_execute as bre
     import rebalance_engine
-    import roster as roster_mod
 
-    scan = roster_mod.enrolled_roster_scan(models=models)
-    accounts = scan["accounts"]
+    accounts = [str(a).strip() for a in (accounts or []) if str(a).strip()]
     if not accounts:
         return {"plans": [], "prices": {}, "versions": {}, "targets": {}, "metas": {},
-                "roster": [], "scan": scan, "skipped": []}
+                "skipped": [], "account_inputs": [], "summaries": {}}
 
     versions = bre.resolve_roster_versions(accounts)
     targets, metas = bre.build_targets(sorted(set(versions.values())))
@@ -274,10 +276,11 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
     strat_universe = sp._strategy_universe()
     if not strat_universe:
         raise GroupRunRefused(
-            "build_plans_for_scope: the strategy's tradeable universe could not be resolved, "
-            "so a spinoff, a rename, a client's own holding or a money-market sweep cannot be "
-            "told apart from a symbol the model dropped - every one of them would size as a "
-            "FULL LIQUIDATION. Nothing sized, nothing created, nothing transmitted.")
+            "build_plans_for_accounts: the strategy's tradeable universe could not be "
+            "resolved, so a spinoff, a rename, a client's own holding or a money-market "
+            "sweep cannot be told apart from a symbol the model dropped - every one of them "
+            "would size as a FULL LIQUIDATION. Nothing sized, nothing created, nothing "
+            "transmitted.")
 
     plans, skipped = [], []
     # The block executor's own margin and PDT pre-flights re-derive each account's plan from
@@ -312,8 +315,38 @@ def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
             # stored close is never substituted for a quote we could not get.
             strict_prices=True))
     return {"plans": plans, "prices": prices, "versions": versions, "targets": targets,
-            "metas": metas, "roster": accounts, "scan": scan, "skipped": skipped,
+            "metas": metas, "skipped": skipped,
             "account_inputs": account_inputs, "summaries": summaries}
+
+
+def build_plans_for_scope(ib, *, models=None, band_pct=None) -> dict:
+    """Scope by MODEL, read state, price the universe, and size every account. Read-only.
+
+    Returns ``{"plans", "prices", "versions", "targets", "metas", "roster", "scan",
+    "skipped", "account_inputs", "summaries"}``. The last two are the block executor's
+    inputs, built from the SAME state the plans were sized on so its margin and PDT
+    pre-flights can never disagree with the plan about an account.
+
+    Thin wrapper (2026-09-05): resolves the model scope into an account list via
+    ``roster.enrolled_roster_scan``, then hands that list to :func:`build_plans_for_accounts`
+    for every substantive step. This function decides nothing beyond the model->account
+    resolution — the sizing loop lives in exactly one place.
+
+    THE MODEL SCOPE IS THE RUN. Pass models=["Conservative (Custom)"] and the run is that
+    model's accounts - one account today. That is what makes the staged rollout possible.
+    """
+    import roster as roster_mod
+
+    scan = roster_mod.enrolled_roster_scan(models=models)
+    accounts = scan["accounts"]
+    if not accounts:
+        return {"plans": [], "prices": {}, "versions": {}, "targets": {}, "metas": {},
+                "roster": [], "scan": scan, "skipped": []}
+
+    built = build_plans_for_accounts(ib, accounts, band_pct=band_pct)
+    built["roster"] = accounts
+    built["scan"] = scan
+    return built
 
 
 # NO ALGO ON A REBALANCE BLOCK (owner decision 2026-09-04: "this is trading not scalping").
