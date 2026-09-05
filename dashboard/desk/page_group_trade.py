@@ -365,3 +365,13 @@ def _render_result(result: dict) -> None:
     if off_rows:
         st.markdown("**Still off target - account by account, line by line:**")
         st.dataframe(pd.DataFrame(off_rows), hide_index=True, use_container_width=True)
+
+    # TRADE DUST THIS RUN LEFT BEHIND (D.5 fix 3): a sub-share stub a full-exit sell could not
+    # clear because IBKR's API refuses any fractional order (error 10243, config.
+    # BLOCK_ORDERS_WHOLE_SHARES_ONLY). Reported here, once, at trade time, rather than only
+    # turning up later when the nightly foreign-holding scan rediscovers it.
+    dust = result.get("dust") or []
+    if dust:
+        st.warning("{} sub-share stub(s) left from this run - clear these in TWS:"
+                   .format(len(dust)))
+        st.dataframe(pd.DataFrame(dust), hide_index=True, use_container_width=True)

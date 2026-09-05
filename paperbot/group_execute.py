@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import fa_group_sync
 import group_rebalance
+import reconcile
 from connections import clientids
 from live_fa_block_execute import TargetGateway
 
@@ -397,6 +398,35 @@ def verify_in_sync(ib, models) -> dict:
             "out_of_sync": sum(1 for r in rows if not r["in_sync"])}
 
 
+def dust_stubs_from_sync(sync: dict, *, scope: set | None = None) -> list[dict]:
+    """Pull the sub-share stubs THIS RUN left behind out of verify_in_sync's own report.
+
+    A FRACTIONAL line (reconcile.FRACTIONAL: "held, weight 0, int(shares) == 0 but shares !=
+    0") IS the remainder a full-exit sell could not clear, because config.BLOCK_ORDERS_
+    WHOLE_SHARES_ONLY truncates the block to whole shares before it ever reaches the wire
+    (IBKR error 10243 — see config.py). verify_in_sync already re-reads the book and reports
+    that exact leftover as a `lines_off` entry; this is a FILTER over data it already
+    computed, not a new calculation.
+
+    `scope`, when given, is the set of (account, symbol) pairs THIS run actually sent a SELL
+    for — verify_in_sync rescans the whole model, which also carries every OLDER stub the
+    nightly foreign-holding scan already knows about (see D.5's cleanup list), and those must
+    not be re-reported here as if this run just made them. Pass the run's own SELL pairs to
+    get only the NEW stubs this run's truncation left; omit it to see every FRACTIONAL line
+    verify_in_sync found (used by callers with no run-scope of their own, and by tests).
+    """
+    out = []
+    for acct in sync.get("accounts", []):
+        for ln in acct.get("lines_off", []):
+            if ln.get("status") != reconcile.FRACTIONAL:
+                continue
+            if scope is not None and (ln["account"], ln["symbol"]) not in scope:
+                continue
+            out.append({"account": ln["account"], "symbol": ln["symbol"],
+                        "quantity": abs(ln["held"])})
+    return out
+
+
 def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool = False,
                       backup_path: str | None = None,
                       adaptive_priority: str | None = ADAPTIVE_PRIORITY) -> dict:
@@ -465,13 +495,27 @@ def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool =
     # OUTSIDE the arm gate: the book is re-read read-only, so the arming flags are already
     # restored and the gateway lock is released before this slower scan runs.
     sync = verify_in_sync(ib, run.get("models"))
+
+    # TRADE-DUST REPORTING (D.5 fix 3, 2026-09-05). This run's own SELL blocks are the only
+    # source of a NEW sub-share stub (config.BLOCK_ORDERS_WHOLE_SHARES_ONLY truncates a
+    # full-exit sell to whole shares before it goes out). Scoping to exactly the (account,
+    # symbol) pairs this run sent a SELL for keeps this list to what THIS run just left
+    # behind, not the whole model's pre-existing dust (that backlog is D.5's one-time cleanup
+    # list, not something every run should re-announce).
+    sell_pairs = {(a, p.symbol) for p in plans if p.side == "SELL" for a in p.per_account}
+    dust = dust_stubs_from_sync(sync, scope=sell_pairs)
+    if dust:
+        print(f"    !! {len(dust)} sub-share stub(s) left from this run - clear these in "
+              f"TWS: {dust}")
+
     try:
         import ledger
         ledger.record_run({"mode": "GROUP_TRADE_SYNC_CHECK", "run_id": run.get("stamp"),
-                           "models": list(run.get("models") or []), "sync": sync})
+                           "models": list(run.get("models") or []), "sync": sync,
+                           "dust": dust})
     except Exception as exc:
         print(f"    !! sync check not written to the ledger ({type(exc).__name__}: {exc})")
-    return {"created": created, "executed": executed, "sync": sync, "note": ""}
+    return {"created": created, "executed": executed, "sync": sync, "dust": dust, "note": ""}
 
 
 def _record_run(target, run, routes, created, executed, *, adaptive_priority=None) -> None:

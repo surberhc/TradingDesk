@@ -317,3 +317,52 @@ def test_build_plans_for_accounts_never_pulls_in_a_third_sibling_account(monkeyp
 def test_build_plans_for_accounts_empty_list_is_a_no_op(monkeypatch):
     built = ge.build_plans_for_accounts(object(), [])
     assert built["plans"] == [] and built["account_inputs"] == [] and built["versions"] == {}
+
+
+# --- dust_stubs_from_sync (D.5 fix 3: trade-dust reporting) -----------------------------
+# Same scenario test_group_rebalance.py already uses for the truncation itself: a full exit
+# of 13.8499 BIL sends 13 (BLOCK_ORDERS_WHOLE_SHARES_ONLY, IBKR error 10243) and leaves a
+# 0.8499 stub. verify_in_sync classifies that stub FRACTIONAL and reports it as a lines_off
+# entry with the exact remainder in `held`; these tests are on the read side of that report.
+
+def _sync_with(*lines_off_by_account):
+    """Build a verify_in_sync-shaped ``sync`` dict from a list of per-account lines_off lists."""
+    accounts = [{"account": f"U{i}", "model": "Balanced (Small, Custom)",
+                "in_sync": not rows, "lines_off": rows}
+                for i, rows in enumerate(lines_off_by_account, start=1)]
+    return {"ok": True, "error": "", "accounts": accounts,
+            "in_sync": sum(1 for a in accounts if a["in_sync"]),
+            "out_of_sync": sum(1 for a in accounts if not a["in_sync"])}
+
+
+def test_a_truncated_full_exit_stub_becomes_a_dust_entry():
+    sync = _sync_with([{"account": "U7586137", "symbol": "BIL", "held": 0.8499,
+                        "model_wants": 0.0, "still_needs": -0.8499, "status": "FRACTIONAL"}])
+    dust = ge.dust_stubs_from_sync(sync)
+    assert dust == [{"account": "U7586137", "symbol": "BIL", "quantity": 0.8499}]
+
+
+def test_an_ordinary_off_target_line_is_not_dust():
+    """A plain drift shortfall (still needs 3 more shares, nothing fractional about it) is a
+    DIFFERENT problem verify_in_sync already surfaces elsewhere -- it must not show up in the
+    dust list just because it is off target."""
+    sync = _sync_with([{"account": "U1", "symbol": "XLE", "held": 7.0, "model_wants": 10.0,
+                        "still_needs": 3.0, "status": "DRIFTED"}])
+    assert ge.dust_stubs_from_sync(sync) == []
+
+
+def test_scope_limits_dust_to_this_runs_own_sell_pairs():
+    """The model can carry OLDER stubs (D.5's pre-existing cleanup list) that this run never
+    touched. Scoped to this run's own SELL pairs, only the NEW one is reported."""
+    sync = _sync_with([
+        {"account": "U1", "symbol": "BIL", "held": 0.84, "model_wants": 0.0,
+         "still_needs": -0.84, "status": "FRACTIONAL"},
+        {"account": "U1", "symbol": "SIL", "held": 0.5, "model_wants": 0.0,
+         "still_needs": -0.5, "status": "FRACTIONAL"},
+    ])
+    dust = ge.dust_stubs_from_sync(sync, scope={("U1", "BIL")})
+    assert dust == [{"account": "U1", "symbol": "BIL", "quantity": 0.84}]
+
+
+def test_no_dust_when_nothing_is_off_target():
+    assert ge.dust_stubs_from_sync(_sync_with([])) == []
