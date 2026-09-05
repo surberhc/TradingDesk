@@ -232,7 +232,19 @@ def resolve_roster_versions(roster_accounts: list[str]) -> dict[str, str]:
     crm_has_prior: dict[str, bool] = {}
     if crm_roster.is_configured():
         try:
-            for r in crm_roster.fetch_roster(advisor_name=crm_roster.DEFAULT_ADVISOR):
+            # advisor_name=None -> the WHOLE book, not just Andrew's (DEFAULT_ADVISOR). A
+            # caller can hand this function an account from ANY advisor's book (e.g.
+            # withdrawal_cash_raise.build_restricted_plans passes an arbitrary account list,
+            # not one filtered through roster.enrolled_roster_scan()) -- Ted's client
+            # U13221397 is a real example. Scoping this fetch to Andrew's book left such an
+            # account absent from crm_models, so the fallback chain
+            # (crm_models.get(a) or config.ENROLLMENT.get(a) or config.STRATEGY_VERSION)
+            # silently landed on the hardcoded "Balanced" default instead of the account's
+            # real model. Safe to widen: the loop below (`for a in roster_accounts`) only
+            # ever looks up crm_models.get(a) for accounts the CALLER already passed in, so
+            # the extra rows this pulls in for other advisors' accounts outside that list are
+            # simply never read by any existing caller.
+            for r in crm_roster.fetch_roster(advisor_name=None):
                 acct = crm_roster.account_identifier(r)
                 crm_models[acct] = (r.get("model") or "")
                 nav = r.get("total_value")

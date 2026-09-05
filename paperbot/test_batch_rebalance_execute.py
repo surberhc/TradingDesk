@@ -103,6 +103,66 @@ def test_resolve_roster_versions_unmapped_defaults_to_strategy_version(monkeypat
 
 
 # =====================================================================================
+# resolve_roster_versions must read the WHOLE CRM book (advisor_name=None), not just
+# Andrew's (DEFAULT_ADVISOR). A caller can hand this function an account belonging to a
+# DIFFERENT advisor's book (e.g. withdrawal_cash_raise.build_restricted_plans passes an
+# arbitrary account list, never filtered through roster.enrolled_roster_scan()) -- Ted's
+# client U13221397 is the real-world example that surfaced this. Before the fix,
+# crm_roster.fetch_roster(advisor_name=DEFAULT_ADVISOR) never returned that account's row,
+# so it fell through crm_models.get/config.ENROLLMENT.get all the way to the hardcoded
+# config.STRATEGY_VERSION default ("Balanced") -- silently wrong.
+# =====================================================================================
+TED_ACCT = "U13221397"    # a real account in a DIFFERENT advisor's book, not Andrew's
+
+
+def _fake_advisor_scoped_roster(monkeypatch, andrew_rows, whole_book_rows):
+    """crm_roster.fetch_roster that returns DIFFERENT results depending on advisor_name,
+    exactly like the real CRM: advisor_name=DEFAULT_ADVISOR -> only Andrew's book;
+    advisor_name=None -> everyone. Pins that resolve_roster_versions actually passes None
+    rather than merely tolerating it."""
+    monkeypatch.setattr(crm_roster, "is_configured", lambda: True)
+
+    def _fetch(advisor_name=crm_roster.DEFAULT_ADVISOR, model=None, conn=None):
+        if advisor_name == crm_roster.DEFAULT_ADVISOR:
+            return list(andrew_rows)
+        if advisor_name is None:
+            return list(whole_book_rows)
+        raise AssertionError(f"unexpected advisor_name={advisor_name!r}")
+
+    monkeypatch.setattr(crm_roster, "fetch_roster", _fetch)
+
+
+def test_resolve_roster_versions_resolves_a_non_andrew_account_to_its_real_model(
+        monkeypatch):
+    # Andrew's own book does NOT carry Ted's client at all -- exactly the shape of the
+    # real bug: a advisor_name=DEFAULT_ADVISOR-only fetch would never see this row.
+    andrew_rows = [{"account_number": ACCT_A, "model": "Conservative", "total_value": 1e6}]
+    whole_book_rows = andrew_rows + [
+        {"account_number": TED_ACCT, "model": "Ted", "total_value": 500_000.0}]
+    _fake_advisor_scoped_roster(monkeypatch, andrew_rows, whole_book_rows)
+
+    versions = bre.resolve_roster_versions([TED_ACCT])
+
+    # MUST resolve to the account's real CRM model, never the hardcoded default.
+    assert versions == {TED_ACCT: "Ted"}
+    assert versions[TED_ACCT] != config.STRATEGY_VERSION
+
+
+def test_resolve_roster_versions_andrew_account_unaffected_by_whole_book_fetch(
+        monkeypatch):
+    # Regression guard: widening the fetch to the whole book must not change what an
+    # existing Andrew-book account resolves to.
+    andrew_rows = [{"account_number": ACCT_A, "model": "Conservative", "total_value": 1e6}]
+    whole_book_rows = andrew_rows + [
+        {"account_number": TED_ACCT, "model": "Ted", "total_value": 500_000.0}]
+    _fake_advisor_scoped_roster(monkeypatch, andrew_rows, whole_book_rows)
+
+    versions = bre.resolve_roster_versions([ACCT_A])
+
+    assert versions == {ACCT_A: "Conservative"}
+
+
+# =====================================================================================
 # build_batch_requests — one request per OUT-OF-SPEC roster account, roster-scoped wall
 # =====================================================================================
 def test_build_batch_requests_out_of_spec_subset_and_fields():
