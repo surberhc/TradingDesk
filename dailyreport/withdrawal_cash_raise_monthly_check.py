@@ -79,18 +79,18 @@ def _log(msg: str) -> None:
 
 
 # --------------------------------------------------------------------------- #
-# Household names — best-effort, same pattern as page_withdrawal_cash_raise._household_names.
-# A CRM miss leaves the name blank and never blocks the notice: the shortfall numbers came
-# straight off the live broker read, not the CRM.
+# Household names — best-effort, via crm_roster.fetch_household_names (the client's real
+# household name, joined accounts -> households; NOT master_name, which is the IBKR
+# advisor/master entity name and identical for every account under one advisor). A CRM miss
+# leaves the name blank and never blocks the notice: the shortfall numbers came straight off
+# the live broker read, not the CRM.
 # --------------------------------------------------------------------------- #
 def _household_names(accounts: list[str]) -> dict[str, str]:
     if not accounts:
         return {}
     try:
         import crm_roster
-        names = {}
-        for r in crm_roster.fetch_roster(advisor_name=None):
-            names[crm_roster.account_identifier(r)] = r.get("master_name") or ""
+        names = crm_roster.fetch_household_names(accounts)
         return {a: names.get(a, "") for a in accounts}
     except Exception:
         return {a: "" for a in accounts}

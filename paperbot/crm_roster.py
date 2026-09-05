@@ -92,6 +92,42 @@ def account_identifier(row: Mapping) -> str:
     return str(row["account_number"])
 
 
+# --- household names -------------------------------------------------------------
+def fetch_household_names(accounts: Iterable[str], conn=None) -> dict[str, str]:
+    """account_number -> the client's actual household name (``households.household_name``),
+    scoped to the given account list. READ-ONLY: a plain SELECT joining ``accounts`` to
+    ``households`` on ``accounts.household_id``.
+
+    This is deliberately NOT ``master_name`` off ``v_tradingdesk_roster``/``fetch_roster()``:
+    ``master_name`` is the IBKR advisor/master entity name (e.g. "APS Ventures, LLC"),
+    identical for every account under one advisor — never the client's household. The roster
+    view also does not carry household_name at all, so this reads ``accounts``/``households``
+    directly rather than through the view. An account with no household match, or whose
+    household has no name, is simply absent from the returned dict — callers must treat a
+    missing key as "unknown", never raise. Raises CrmRosterUnavailable if the CRM is not
+    reachable/configured."""
+    ids = [str(a) for a in accounts]
+    if not ids:
+        return {}
+    own = conn is None
+    conn = conn or _connect()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "select a.account_number, h.household_name "
+                "from accounts a left join households h on h.id = a.household_id "
+                "where a.account_number = any(%s)",
+                (ids,))
+            return {r[0]: r[1] for r in cur.fetchall() if r[1]}
+    except CrmRosterUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise CrmRosterUnavailable(f"CRM household-name query failed: {exc}") from exc
+    finally:
+        if own:
+            conn.close()
+
+
 # --- reads ----------------------------------------------------------------------
 def fetch_roster(advisor_name: Optional[str] = DEFAULT_ADVISOR,
                  model: Optional[str] = None,

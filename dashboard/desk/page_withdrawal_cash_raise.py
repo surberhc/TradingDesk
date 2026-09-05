@@ -57,17 +57,14 @@ def _accounts_needing_cash() -> list:
 
 
 def _household_names(accounts: list) -> dict:
-    """account -> CRM master_name, best-effort. A CRM miss leaves the column blank and never
-    blocks the shortfall table — the shortfall numbers came straight off the live broker read,
-    not the CRM. advisor_name=None reads the whole book so an account under any advisor is
-    still named, matching the fact that accounts_needing_cash() is not advisor-scoped either."""
+    """account -> the client's real household name (crm_roster.fetch_household_names), best-
+    effort. A CRM miss leaves the column blank and never blocks the shortfall table — the
+    shortfall numbers came straight off the live broker read, not the CRM."""
     if not accounts:
         return {}
     try:
         import crm_roster
-        names = {}
-        for r in crm_roster.fetch_roster(advisor_name=None):
-            names[crm_roster.account_identifier(r)] = r.get("master_name") or ""
+        names = crm_roster.fetch_household_names(accounts)
         return {a: names.get(a, "") for a in accounts}
     except Exception:
         return {a: "" for a in accounts}

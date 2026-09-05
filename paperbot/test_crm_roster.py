@@ -110,3 +110,50 @@ def test_funded_account_ids_keeps_only_accounts_with_holdings(monkeypatch):
     monkeypatch.setattr(crm_roster, "fetch_holdings_latest",
                         lambda ids, conn=None: {"a1": [{"symbol": "SPY"}], "a2": []})
     assert crm_roster.funded_account_ids(["a1", "a2", "a3"]) == {"a1"}
+
+
+def test_fetch_household_names_empty_list_no_db():
+    """An empty account list is an explicit no-op -- returns {} without opening a connection
+    (conn=None default would otherwise try to _connect())."""
+    assert crm_roster.fetch_household_names([]) == {}
+
+
+def test_fetch_household_names_joins_accounts_to_households():
+    """The real per-client household name (households.household_name), NOT
+    accounts.master_name (the IBKR advisor/master entity name, identical for every account
+    under one advisor). A missing/blank household name is simply absent from the dict, never
+    a raise -- mirrors the graceful-degradation contract every crm_roster read follows."""
+    seen = {}
+
+    class _Cur:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def execute(self, sql, params=None):
+            seen["sql"] = sql
+            seen["params"] = params
+
+        def fetchall(self):
+            return [("U1", "Hermach, Jon"), ("U2", None)]
+
+    class _Conn:
+        def cursor(self):
+            return _Cur()
+
+        def close(self):
+            pass
+
+    result = crm_roster.fetch_household_names(["U1", "U2"], conn=_Conn())
+    assert result == {"U1": "Hermach, Jon"}
+    assert "households" in seen["sql"]
+    assert "accounts" in seen["sql"]
+    assert seen["params"] == (["U1", "U2"],)
+
+
+def test_fetch_household_names_without_dsn_raises(monkeypatch):
+    monkeypatch.delenv(crm_roster.DSN_ENV, raising=False)
+    with pytest.raises(crm_roster.CrmRosterUnavailable):
+        crm_roster.fetch_household_names(["U1"])
