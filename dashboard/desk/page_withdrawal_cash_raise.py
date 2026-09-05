@@ -9,7 +9,7 @@ is that it is driven by the report, never by hand, and it trades EXACTLY those a
 a whole model's book just because one of its accounts came up short.
 
 REUSE, NOT A PARALLEL PATH. Everything after "which accounts" is the SAME machinery
-page_group_trade.py already drives for a normal model-scoped run:
+page_trade_execution.py already drives for a normal model-scoped run:
 
     paperbot/withdrawal_cash_raise.prepare_run()
         -> group_execute.build_plans_for_accounts   (the account-list-driven core
@@ -20,10 +20,10 @@ page_group_trade.py already drives for a normal model-scoped run:
                                                        confirmed account-list-driven, not
                                                        model-scoped)
 
-This page also borrows page_group_trade.py's own ``_checks()`` and ``_render_result()``
+This page also borrows page_trade_execution.py's own ``_checks()`` and ``_render_result()``
 UNCHANGED, so the pass/fail wording a reviewer sees and the outcome report after sending are
 identical to the page Andrew already knows — only "which accounts" and the two preview/send
-connections (own clientIds, so this page can never collide with Group Trade if both happen to
+connections (own clientIds, so this page can never collide with Trade Execution if both happen to
 be open at once) are new. Sending still goes through group_execute.execute_group_run's own
 preview -> arm -> transmit gate, with allowed_accounts set to EXACTLY the flagged accounts.
 """
@@ -38,11 +38,15 @@ import streamlit as st
 
 _PAPERBOT = str(Path(__file__).resolve().parents[2] / "paperbot")
 _DAILYREPORT = str(Path(__file__).resolve().parents[2] / "dailyreport")
-for _p in (_PAPERBOT, _DAILYREPORT):
+# The Trade Execution page lives in the execution/ sub-folder, and this file does not.
+# That folder has to be on sys.path BEFORE the import just below runs, because this page
+# reuses that page's checks and result renderer.
+_EXECUTION = str(Path(__file__).resolve().parent / "execution")
+for _p in (_PAPERBOT, _DAILYREPORT, _EXECUTION):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
-import page_group_trade as _gt  # reuse _checks()/_render_result() verbatim — no parallel UI
+import page_trade_execution as _gt  # reuse _checks()/_render_result() verbatim — no parallel UI
 
 CONFIRM_PHRASE = "SEND GROUP TRADE"
 _STATE = "wcr_prepared"
@@ -73,7 +77,7 @@ def _household_names(accounts: list) -> dict:
 def _prepare(accounts: list) -> dict:
     """Read-only: the flagged accounts -> sized plans -> ticker groups -> routes.
 
-    Own clientId (119) — distinct from page_group_trade.py's preview connection (115) — so
+    Own clientId (119) — distinct from page_trade_execution.py's preview connection (115) — so
     the two pages can never collide at the gateway if both happen to be open at once.
     """
     from ib_async import IB
@@ -90,13 +94,13 @@ def _prepare(accounts: list) -> dict:
 
 def _send(run: dict) -> dict:
     """Connect on the transmit lane, create the groups, place the blocks — the same gate as
-    page_group_trade.py's own ``_send()``: the gateway's Read-Only API toggle is the physical
+    page_trade_execution.py's own ``_send()``: the gateway's Read-Only API toggle is the physical
     wall; connecting with readonly=False only succeeds if a human has turned it off, and the
     executor probes it again before writing anything. ``allowed_accounts`` is EXACTLY the
     accounts this run was scoped to, so ``accounts_outside_the_wall`` would catch it as a bug
     if the plan ever tried to touch anything else.
 
-    Own clientId (120) — distinct from page_group_trade.py's send connection (116).
+    Own clientId (120) — distinct from page_trade_execution.py's send connection (116).
     """
     from ib_async import IB
     import group_execute as ge

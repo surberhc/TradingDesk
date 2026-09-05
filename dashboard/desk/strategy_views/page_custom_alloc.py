@@ -61,8 +61,8 @@ import page_models
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
 # Same sys.path bootstrap desk_app.py / page_control_plane.py use. This module lives at
-# dashboard/desk/page_custom_alloc.py, so the repo root is parents[2].
-REPO = Path(__file__).resolve().parents[2]
+# dashboard/desk/strategy_views/page_custom_alloc.py, so the repo root is parents[3].
+REPO = Path(__file__).resolve().parents[3]
 for _sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport",
              "livebot"):
     _p = REPO / _sub

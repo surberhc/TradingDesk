@@ -38,6 +38,16 @@ for sub in ("paperbot", "backtester", "connections", "strategies",
 _conn = REPO / "connections"
 if str(_conn) not in sys.path:
     sys.path.insert(0, str(_conn))
+# The page modules are grouped into sub-folders by what they are for
+# (strategy_views/ = the per-strategy read-only views, execution/ = the pages that
+# can send a trade). Streamlit only puts THIS file's own directory on sys.path, so
+# those two folders are added here — that is what keeps the bare `import page_s0`
+# style imports below working exactly as they did when every page sat in one folder.
+_DESK = Path(__file__).resolve().parent
+for _grp in ("strategy_views", "execution"):
+    _gp = _DESK / _grp
+    if str(_gp) not in sys.path:
+        sys.path.insert(0, str(_gp))
 
 import streamlit as st
 
@@ -53,7 +63,7 @@ T.inject_theme()
 import emergency
 import page_action_center
 import page_control_plane
-import page_group_trade
+import page_trade_execution
 import page_custom_alloc
 import page_feeds
 import page_history
@@ -100,8 +110,8 @@ pages = [
             title="Strategy Models — all models", icon="🗂️"),
     st.Page(page_custom_alloc.render_custom_alloc,
             title="Custom allocation — models Andrew writes himself", icon="✍️"),
-    st.Page(page_group_trade.render_group_trade,
-            title="Group trade — pick, prepare, send", icon="📦"),
+    st.Page(page_trade_execution.render_trade_execution,
+            title="Trade Execution — pick, prepare, send", icon="📦"),
     st.Page(page_withdrawal_cash_raise.render_withdrawal_cash_raise,
             title="Raise withdrawal cash — reserve-short accounts only", icon="💵"),
     st.Page(page_control_plane.render_control_plane,

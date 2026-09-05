@@ -33,6 +33,15 @@ from pathlib import Path
 
 import streamlit as st
 
+# page_s0_model.py lives in the strategy_views/ sub-folder, and this file does not.
+# That folder has to be on sys.path BEFORE the import just below runs, because this
+# page reuses page_s0_model's renderers. desk_app.py adds the same folder when the
+# dashboard starts; this line is what lets this page also be imported on its own,
+# such as from a test.
+_STRATEGY_VIEWS = str(Path(__file__).resolve().parent / "strategy_views")
+if _STRATEGY_VIEWS not in sys.path:
+    sys.path.insert(0, _STRATEGY_VIEWS)
+
 import theme
 import page_s0_model as s0m
 

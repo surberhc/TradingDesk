@@ -10,15 +10,20 @@ from pathlib import Path
 
 from streamlit.testing.v1 import AppTest
 
+# page_s0_model.py lives in the strategy_views/ sub-folder, so that folder goes on
+# sys.path too — exactly as desk_app.py does when the dashboard starts.
 _HERE = Path(__file__).resolve().parent
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+_STRATEGY_VIEWS = _HERE / "strategy_views"
+for _p in (_HERE, _STRATEGY_VIEWS):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 
 _SCRIPT = (
     "import sys\n"
     "from pathlib import Path\n"
     f"sys.path.insert(0, r'{_HERE}')\n"
+    f"sys.path.insert(0, r'{_STRATEGY_VIEWS}')\n"
     "import page_s0_model\n"
     "page_s0_model.render_s0_model()\n"
 )

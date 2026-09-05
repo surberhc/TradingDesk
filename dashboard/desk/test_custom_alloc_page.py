@@ -34,23 +34,28 @@ from streamlit.testing.v1 import AppTest
 
 # page_custom_alloc imports the paperbot modules by bare name, relying on desk_app.py's
 # sys.path bootstrap. Reproduce it here so the module imports standalone under pytest.
+# The page itself now lives in the strategy_views/ sub-folder, so that folder goes on
+# sys.path too — exactly as desk_app.py does when the dashboard starts.
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
+_STRATEGY_VIEWS = _HERE / "strategy_views"
 for _sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport",
              "livebot"):
     _p = _REPO / _sub
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+for _p in (_HERE, _STRATEGY_VIEWS):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import page_custom_alloc  # noqa: E402
 
-_MODULE_SRC = (_HERE / "page_custom_alloc.py").read_text(encoding="utf-8")
+_MODULE_SRC = (_STRATEGY_VIEWS / "page_custom_alloc.py").read_text(encoding="utf-8")
 
 _SCRIPT = (
     "import sys\n"
     f"sys.path.insert(0, r'{_HERE}')\n"
+    f"sys.path.insert(0, r'{_STRATEGY_VIEWS}')\n"
     "import page_custom_alloc\n"
     "page_custom_alloc.render_custom_alloc()\n"
 )
@@ -342,6 +347,7 @@ def test_drift_scan_reports_in_line_when_the_account_already_matches():
 _SYNTHETIC_SCRIPT = """
 import sys
 sys.path.insert(0, r'{here}')
+sys.path.insert(0, r'{views}')
 import pandas as pd
 import page_custom_alloc as p          # its bootstrap puts paperbot on sys.path
 from strategy_target import Target
@@ -396,7 +402,9 @@ p.render_custom_alloc()
 
 
 def _run_synthetic():
-    at = AppTest.from_string(_SYNTHETIC_SCRIPT.format(here=str(_HERE)), default_timeout=300)
+    at = AppTest.from_string(
+        _SYNTHETIC_SCRIPT.format(here=str(_HERE), views=str(_STRATEGY_VIEWS)),
+        default_timeout=300)
     return at.run()
 
 

@@ -1,4 +1,4 @@
-r"""Offline tests for the S8 page's PURE helpers (dashboard/desk/page_s8.py).
+r"""Offline tests for the S8 page's PURE helpers (dashboard/desk/strategy_views/page_s8.py).
 
 These exercise the store-record selection and the distance-to-stop math WITHOUT a
 Streamlit runtime, without IBKR, and without touching the real capture store (the temp
@@ -17,15 +17,19 @@ from pathlib import Path
 
 # page_s8 imports the pure livebot modules by bare name, relying on desk_app.py's
 # sys.path bootstrap. Reproduce it here so the page imports standalone under pytest.
+# The page itself now lives in the strategy_views/ sub-folder, so that folder goes on
+# sys.path too — exactly as desk_app.py does when the dashboard starts.
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
+_STRATEGY_VIEWS = _HERE / "strategy_views"
 for _sub in ("paperbot", "backtester", "connections", "strategies",
              "dailyreport", "livebot"):
     _p = _REPO / _sub
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
-if str(_HERE) not in sys.path:
-    sys.path.insert(0, str(_HERE))
+for _p in (_HERE, _STRATEGY_VIEWS):
+    if str(_p) not in sys.path:
+        sys.path.insert(0, str(_p))
 
 import warnings
 
