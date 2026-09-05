@@ -38,11 +38,39 @@ class Flow:
 
 
 # Per-account monthly flows. EDIT with each client's real schedule. An account with no
-# entry has no scheduled flows (reserve = 0). Amounts are PER OCCURRENCE. Placeholders
-# are commented out so nothing is assumed until you fill in real numbers.
+# entry has no scheduled flows (reserve = 0). Amounts are PER OCCURRENCE.
+#
+# Populated 2026-09-05 from the CRM's IBKR-configured recurring withdrawal instructions
+# (accounts.recurring_transactions, ingested nightly by ibkr-flex-sync -- see
+# SYSTEM_MAP.md and paperbot/crm_cashflows.py). These are the 9 accounts with an ACTIVE,
+# MONTHLY, USD withdrawal instruction as of that date, per Andrew's explicit go-ahead to
+# merge them. crm_cashflows.build_draft() also derived 35 deposit-only accounts that same
+# run -- deliberately NOT merged here (a contribution adds no reserve; see
+# cashflows.reserve_for) -- and correctly excluded 2 accounts whose instruction had already
+# expired. This dict does NOT auto-update: re-run `python crm_cashflows.py` periodically
+# (or when a new withdrawal client is onboarded) and merge any changes by hand, the same
+# deliberate way this batch was added.
 SCHEDULE: dict[str, list[Flow]] = {
-    # "DU8922142": [Flow("distribution", amount=2500.0, pct_nav=0.0, day=1,  note="monthly income")],
-    # "DU8922145": [Flow("contribution", amount=1000.0, pct_nav=0.0, day=15, note="monthly add")],
+    "U10555316": [Flow("distribution", amount=8500.0, pct_nav=0.0, day=15,
+                       note="CRM recurring_transactions (ACH, since 2025-06-15)")],
+    "U13221397": [Flow("distribution", amount=5359.57, pct_nav=0.0, day=24,
+                       note="CRM recurring_transactions (ACH, since 2026-04-24)"),
+                  Flow("distribution", amount=5359.57, pct_nav=0.0, day=16,
+                       note="CRM recurring_transactions (ACH, since 2026-05-16)")],
+    "U15715611": [Flow("distribution", amount=1765.0, pct_nav=0.0, day=12,
+                       note="CRM recurring_transactions (ACH, since 2025-02-12)")],
+    "U22011673": [Flow("distribution", amount=1000.0, pct_nav=0.0, day=3,
+                       note="CRM recurring_transactions (ACH, since 2026-08-03)")],
+    "U22848377": [Flow("distribution", amount=3846.0, pct_nav=0.0, day=24,
+                       note="CRM recurring_transactions (ACH, since 2026-09-24)")],
+    "U7349619": [Flow("distribution", amount=5000.0, pct_nav=0.0, day=15,
+                      note="CRM recurring_transactions (ACH, since 2024-09-15)")],
+    "U7349974": [Flow("distribution", amount=2500.0, pct_nav=0.0, day=27,
+                      note="CRM recurring_transactions (ACH, since 2023-01-27)")],
+    "U7355827": [Flow("distribution", amount=2941.18, pct_nav=0.0, day=5,
+                      note="CRM recurring_transactions (ACH, since 2022-11-05)")],
+    "U8147914": [Flow("distribution", amount=2000.0, pct_nav=0.0, day=23,
+                      note="CRM recurring_transactions (ACH, since 2026-09-23)")],
 }
 
 
