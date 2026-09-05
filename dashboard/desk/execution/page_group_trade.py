@@ -22,7 +22,9 @@ from pathlib import Path
 import pandas as pd
 import streamlit as st
 
-_PAPERBOT = str(Path(__file__).resolve().parents[2] / "paperbot")
+# This module lives at dashboard/desk/execution/page_group_trade.py, so the repo root
+# is parents[3].
+_PAPERBOT = str(Path(__file__).resolve().parents[3] / "paperbot")
 if _PAPERBOT not in sys.path:
     sys.path.insert(0, _PAPERBOT)
 

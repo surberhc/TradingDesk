@@ -38,7 +38,11 @@ import streamlit as st
 
 _PAPERBOT = str(Path(__file__).resolve().parents[2] / "paperbot")
 _DAILYREPORT = str(Path(__file__).resolve().parents[2] / "dailyreport")
-for _p in (_PAPERBOT, _DAILYREPORT):
+# The Trade Execution page lives in the execution/ sub-folder, and this file does not.
+# That folder has to be on sys.path BEFORE the import just below runs, because this page
+# reuses that page's checks and result renderer.
+_EXECUTION = str(Path(__file__).resolve().parent / "execution")
+for _p in (_PAPERBOT, _DAILYREPORT, _EXECUTION):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

@@ -34,8 +34,8 @@ import theme
 
 # --- Make the existing packages importable (reuse, don't rebuild) --------------
 # Same sys.path bootstrap app.py / desk_app.py use. This module lives at
-# dashboard/desk/page_s0.py, so the repo root is parents[2].
-REPO = Path(__file__).resolve().parents[2]
+# dashboard/desk/strategy_views/page_s0.py, so the repo root is parents[3].
+REPO = Path(__file__).resolve().parents[3]
 for _sub in ("paperbot", "backtester", "connections", "strategies", "dailyreport",
              "livebot"):
     _p = REPO / _sub

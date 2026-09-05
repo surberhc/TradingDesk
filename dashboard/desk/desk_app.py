@@ -38,6 +38,16 @@ for sub in ("paperbot", "backtester", "connections", "strategies",
 _conn = REPO / "connections"
 if str(_conn) not in sys.path:
     sys.path.insert(0, str(_conn))
+# The page modules are grouped into sub-folders by what they are for
+# (strategy_views/ = the per-strategy read-only views, execution/ = the pages that
+# can send a trade). Streamlit only puts THIS file's own directory on sys.path, so
+# those two folders are added here — that is what keeps the bare `import page_s0`
+# style imports below working exactly as they did when every page sat in one folder.
+_DESK = Path(__file__).resolve().parent
+for _grp in ("strategy_views", "execution"):
+    _gp = _DESK / _grp
+    if str(_gp) not in sys.path:
+        sys.path.insert(0, str(_gp))
 
 import streamlit as st
 
