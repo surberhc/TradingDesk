@@ -37,6 +37,8 @@ that.
 """
 from __future__ import annotations
 
+import os
+
 import fa_group_sync
 import group_rebalance
 import reconcile
@@ -47,6 +49,25 @@ from live_fa_block_execute import TargetGateway
 # is DF8922141. NEVER traded and NEVER pinned — the master's own account-update stream hangs
 # the session (memory: fa-block-order-allocation), which is why connect pins to a client sub.
 LIVE_MASTER_ACCOUNT = "F6795549"
+
+# KILL SWITCH — same sentinel every other transmit-capable rail honors (s0_live_deploy.py,
+# batch_rebalance_execute.py, morning_execute_run.py). Mirrored as a literal, exactly like
+# those callers, so this module pulls in none of their module-level state.
+#
+# WHY THE CHECK LIVES HERE, NOT INSIDE safe_execute.armed_session(). armed_session() is also
+# entered by purge_run_groups() below (purpose="fa_group_purge"), which deletes spent
+# throwaway FA groups and places NO order — a housekeeping write a halt should not have to
+# block, and the exact kind of legitimate read/no-order use this rail was told to carve out.
+# Putting the check inside armed_session() would refuse that purge too, so instead it sits at
+# THIS rail's one order-transmitting chokepoint (execute_group_run, below) — the same place
+# transmit_guard is already checked just a few lines down — where it can refuse before any
+# group is created or any order is placed, without touching the purge path at all.
+KILL_SWITCH = r"C:\TradingDesk-Local\AUTOTRADE_DISABLED"
+
+
+def _kill_switch_present() -> bool:
+    """True if the AUTOTRADE_DISABLED sentinel exists -> Group Trade refuses to transmit."""
+    return os.path.exists(KILL_SWITCH)
 
 
 def live_gateway(enrollment: dict, *, pin_account: str | None = None) -> TargetGateway:
@@ -467,6 +488,19 @@ def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool =
     if not routes:
         return {"created": {"created": 0, "previewed": 0, "results": []}, "executed": None,
                 "note": "Nothing in this scope needs to trade."}
+
+    # KILL SWITCH — checked BEFORE anything is created or transmitted, exactly like every other
+    # transmit-capable rail (s0_live_deploy, batch_rebalance_execute): the sentinel forces the
+    # WHOLE armed path to refuse, group creation included, matching Control Plane's own
+    # preview-only-on-halt behavior. Surfaced as a plain sentence via `note` (rendered by
+    # dashboard/desk/page_group_trade.py's _render_result as st.warning), never a raw
+    # exception or a silent no-op.
+    if _kill_switch_present():
+        return {"created": {"created": 0, "previewed": 0, "results": []}, "executed": None,
+                "note": (f"AUTOTRADE_DISABLED sentinel present ({KILL_SWITCH}) — trading is "
+                        f"halted. Refusing to transmit: no group was created, no FA config "
+                        f"was written and no order was placed. Delete the sentinel file to "
+                        f"resume.")}
 
     # THE ARM GATE. config.READONLY / config.DRY_RUN are committed True on disk on purpose, so
     # nothing transmits from a fresh process no matter what a caller passes. armed_session is

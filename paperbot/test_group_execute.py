@@ -366,3 +366,58 @@ def test_scope_limits_dust_to_this_runs_own_sell_pairs():
 
 def test_no_dust_when_nothing_is_off_target():
     assert ge.dust_stubs_from_sync(_sync_with([])) == []
+
+
+# ========================================================================================
+# execute_group_run - the KILL SWITCH must refuse the send BEFORE anything is created or
+# transmitted (conductor gap: armed_session() itself does not check AUTOTRADE_DISABLED, and
+# Group Trade's send called it directly, so the sentinel was silently ignored).
+# ========================================================================================
+class _TargetStub:
+    clientid_consumer = "live_fa_block_exec"
+
+
+def test_kill_switch_refuses_before_any_group_or_order(monkeypatch):
+    """AUTOTRADE_DISABLED must refuse Group Trade's send before ANY group is created or ANY
+    order is placed - mirrors test_s0_live_deploy.test_kill_switch_forces_preview's
+    monkeypatch-the-check pattern (paperbot/test_s0_live_deploy.py) rather than touching the
+    real sentinel file, so a failed test run can never leave the real kill switch stuck on."""
+    monkeypatch.setattr(ge, "_kill_switch_present", lambda: True)
+
+    run = _run([_plan("U1", "G", {"XLE": 10})])
+    assert run["routes"], ("test needs a non-empty route list, or 'nothing to trade' would "
+                           "refuse this run for an unrelated reason")
+
+    def _must_not_be_called(*a, **k):
+        raise AssertionError("must not be called while AUTOTRADE_DISABLED is present")
+
+    monkeypatch.setattr(ge, "create_run_groups", _must_not_be_called)
+    import live_fa_block_execute as fab
+    monkeypatch.setattr(fab, "execute_fa_block_routes", _must_not_be_called)
+
+    ib = _FakeIB(_BASE_XML)   # no order/replaceFA method is ever exercised by this test
+    built = {"account_inputs": {}, "targets": {}, "summaries": {}}
+    result = ge.execute_group_run(ib, _TargetStub(), run, built,
+                                  allowed_accounts=["U1"], armed=True)
+
+    assert result["executed"] is None
+    assert result["created"] == {"created": 0, "previewed": 0, "results": []}
+    assert "AUTOTRADE_DISABLED" in result["note"]
+    assert ge.KILL_SWITCH in result["note"]
+    assert ib.replaced == [], "the FA groups document must not have been touched"
+
+
+def test_kill_switch_absent_does_not_short_circuit(monkeypatch):
+    """Converse sanity check: with the sentinel absent, execute_group_run does NOT take the
+    kill-switch early-return - it proceeds to create_run_groups instead. Kept narrow
+    (unarmed) so it does not also have to stand up the real gateway_lock/armed_session
+    machinery, which nothing in this test file otherwise exercises."""
+    monkeypatch.setattr(ge, "_kill_switch_present", lambda: False)
+
+    run = _run([_plan("U1", "G", {"XLE": 10})])
+    built = {"account_inputs": {}, "targets": {}, "summaries": {}}
+    result = ge.execute_group_run(_FakeIB(_BASE_XML), _TargetStub(), run, built,
+                                  allowed_accounts=["U1"], armed=False)
+
+    assert result["note"] == ("Preview only - no group was created, no FA config was written "
+                              "and no order was placed.")
