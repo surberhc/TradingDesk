@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import datetime
 import sys
+import time
 from pathlib import Path
 
 import pandas as pd
@@ -30,6 +31,18 @@ if _PAPERBOT not in sys.path:
 
 CONFIRM_PHRASE = "SEND GROUP TRADE"
 _STATE = "group_trade_prepared"
+
+# HOW OLD A PREPARED TRADE MAY BE BEFORE IT HAS TO BE PREPARED AGAIN.
+# _prepare() reads positions and live prices ONCE and stores the sized plan; _send() then
+# reuses that stored plan word for word — it never re-reads the accounts and never works the
+# share counts out again. So an operator who prepares a trade, leaves the tab open and comes
+# back later would send share counts and prices from whenever they pressed Prepare. Nothing
+# caught that: the only staleness check was on changing the strategy selection, which says
+# nothing about how much time has passed. A prepared trade therefore EXPIRES and has to be
+# prepared again. This can only ever STOP a send; it can never allow one the existing checks
+# would have refused. 30 minutes matches the window the Control Plane already uses for its
+# own reviewed preview (PREVIEW_FRESHNESS_SECS in page_control_plane.py).
+PREPARED_FRESHNESS_SECS = 1800.0
 
 
 def _strategies() -> list:
@@ -64,6 +77,10 @@ def _prepare(models: list) -> dict:
     import group_execute as ge
 
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    # A plain epoch timestamp ALONGSIDE stamp, never instead of it — other code reads
+    # stamp, and it is minute-resolution text rather than something to do arithmetic on.
+    # This is what the freshness gate below measures the run's age against.
+    prepared_at = time.time()
     ib = IB()
     ib.connect("127.0.0.1", 4003, clientId=115, readonly=True, timeout=30)
     try:
@@ -73,11 +90,89 @@ def _prepare(models: list) -> dict:
         run["skipped"] = built["skipped"]
         run["outside"] = ge.accounts_outside_the_wall(run["group_plans"], built["roster"])
         run["stamp"] = stamp
+        run["prepared_at"] = prepared_at
         run["models"] = list(models)
         run["_built"] = built
         return run
     finally:
         ib.disconnect()
+
+
+def _freshness_of(prepared_at, now: float,
+                  window_secs: float = PREPARED_FRESHNESS_SECS) -> tuple:
+    """Pure freshness decision — unit-testable without Streamlit. Both times are plain
+    epoch seconds. Returns (age_secs, is_fresh). A missing or unusable prepared_at gives
+    (None, False), so a run that never recorded when it was prepared counts as stale
+    rather than being waved through. Fresh iff age <= window (a small negative age from
+    clock skew counts as fresh)."""
+    if prepared_at is None:
+        return (None, False)
+    try:
+        age = float(now) - float(prepared_at)
+    except (TypeError, ValueError):  # a bad timestamp is simply "not fresh"
+        return (None, False)
+    if age != age:  # not-a-number never compares true, so say so plainly
+        return (None, False)
+    return (age, age <= window_secs)
+
+
+def _age_phrase(age_secs) -> str:
+    """How long ago, spelled out in full English words — no shorthand, no abbreviations."""
+    if age_secs is None:
+        return "at a time that was not recorded"
+    if age_secs < 0:
+        return "just now"
+    minutes = int(age_secs // 60)
+    if minutes < 1:
+        return "less than a minute ago"
+    if minutes == 1:
+        return "about 1 minute ago"
+    if minutes < 60:
+        return "about {} minutes ago".format(minutes)
+    hours, rest = divmod(minutes, 60)
+    hour_words = "1 hour" if hours == 1 else "{} hours".format(hours)
+    if rest == 0:
+        return "about {} ago".format(hour_words)
+    minute_words = "1 minute" if rest == 1 else "{} minutes".format(rest)
+    return "about {} and {} ago".format(hour_words, minute_words)
+
+
+def _freshness_check(run: dict, now: float = None) -> tuple:
+    """The prepared-trade freshness line, in the same (ok, sentence) shape as _checks()'s
+    own lines so it renders and blocks exactly like them.
+
+    KEPT OUT OF _checks() ON PURPOSE. The Raise withdrawal cash page reuses _checks()
+    word for word, but it prepares its runs through paperbot/withdrawal_cash_raise.py,
+    which records no prepare time — so folding this line into _checks() would leave that
+    page permanently unable to send. This check belongs to this page's own Send step.
+    """
+    age, fresh = _freshness_of(run.get("prepared_at"),
+                               time.time() if now is None else now)
+    minutes = int(PREPARED_FRESHNESS_SECS // 60)
+    if fresh:
+        return (True, "This trade was prepared {}, so the share counts and prices below "
+                      "are still current.".format(_age_phrase(age)))
+    if age is None:
+        return (False, "This trade did not record when it was prepared, so there is no way "
+                       "to tell whether its share counts and prices are still current. "
+                       "Press Prepare again before sending.")
+    return (False, "This trade was prepared {} and is now too old to send. The share counts "
+                   "and prices were worked out at that moment and are not checked again "
+                   "when you press Send, so a trade older than {} minutes has to be "
+                   "prepared again. Press Prepare again.".format(_age_phrase(age), minutes))
+
+
+def _prepared_at_text(run: dict) -> str:
+    """The clock time the run was prepared, for showing the operator. Never blank — an
+    unrecorded time says so in words rather than showing nothing."""
+    prepared_at = run.get("prepared_at")
+    if prepared_at is None:
+        return "a time that was not recorded"
+    try:
+        when = datetime.datetime.fromtimestamp(float(prepared_at))
+    except (TypeError, ValueError, OSError, OverflowError):
+        return "a time that could not be read"
+    return when.strftime("%I:%M %p on %B %d").lstrip("0")
 
 
 def _checks(run: dict) -> list:
@@ -207,8 +302,18 @@ def render_trade_execution() -> None:
             "Accounts": g.n_accounts,
         } for g in groups]), hide_index=True, use_container_width=True)
 
+    # WHEN this was prepared, always on screen. _send() reuses the plan above word for
+    # word, so the age of that plan is part of what the operator is approving and must
+    # never be invisible.
+    _age, _fresh = _freshness_of(run.get("prepared_at"), time.time())
+    st.caption("Prepared at {} — {}. The share counts above were worked out then and are "
+               "not checked again when you press Send.".format(
+                   _prepared_at_text(run), _age_phrase(_age)))
+
     st.markdown("#### 3. Checks")
-    checks = _checks(run)
+    # The freshness line is appended here rather than inside _checks(), which the Raise
+    # withdrawal cash page reuses word for word — see _freshness_check's own note.
+    checks = _checks(run) + [_freshness_check(run)]
     for ok, text in checks:
         st.markdown("{} {}".format("PASS -" if ok else "STOP -", text))
     blocking = [t for ok, t in checks if not ok]
@@ -238,9 +343,21 @@ def _send(run: dict) -> dict:
     The gateway's own Read-Only toggle is the physical wall: connecting with readonly=False
     only succeeds if a human has turned it off, and the executor probes it again before
     writing anything. Nothing here can arm the gateway.
+
+    The freshness refusal below is deliberately repeated here as well as in the checks the
+    operator reads. The checks already stop a stale run from reaching this function, so
+    this is the backstop that keeps that true if the page is ever rearranged: it refuses
+    BEFORE the gateway is contacted, so a stale run opens no connection and sends nothing.
     """
     from ib_async import IB
     import group_execute as ge
+
+    _age, _fresh = _freshness_of(run.get("prepared_at"), time.time())
+    if not _fresh:
+        raise RuntimeError(
+            "This trade was prepared {} and is too old to send, so nothing was sent. The "
+            "share counts and prices were worked out at that moment and are not checked "
+            "again at send time. Press Prepare again.".format(_age_phrase(_age)))
 
     built = run["_built"]
     target = ge.live_gateway(built["versions"])
