@@ -116,8 +116,7 @@ def render_action_center() -> None:
         "Things that want your attention — proposals and heads-ups the desk surfaces for you "
         "to review. Nothing here trades on its own: each item just points you at the page "
         "where you can act (for a rebalance, the Trade Execution page). Dismiss an item once "
-        "you've "
-        "handled it, or Ignore it for a set number of days to stop the daily reminder."
+        "you've handled it, or Ignore it for a set number of days to stop the daily reminder."
     )
 
     notices = action_center.read_notices(include_dismissed=False)
