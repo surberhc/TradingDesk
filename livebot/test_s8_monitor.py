@@ -25,7 +25,7 @@ from s8_schema import (
     Provenance,
     TradeRecord,
 )
-from s8_strategy import stop_price as frozen_stop_price
+from strategies.s8_strategy import stop_price as frozen_stop_price
 
 CREDIT = 4.05
 STOP_MULTIPLE = 2.0

@@ -39,7 +39,7 @@ from s8_schema import (
     TradeRecord,
     make_trade_id,
 )
-from s8_strategy import stop_price as frozen_stop_price
+from strategies.s8_strategy import stop_price as frozen_stop_price
 
 DATE = "20260717"
 TEMPLATE = "Puts-80-$4"

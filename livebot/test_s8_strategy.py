@@ -46,8 +46,7 @@ from pathlib import Path
 import pandas as pd
 import pytest
 
-import s8_config
-import s8_strategy
+from strategies import s8_config, s8_strategy
 
 _BACKTESTER = Path(__file__).resolve().parent.parent / "backtester"
 if str(_BACKTESTER) not in sys.path:

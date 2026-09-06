@@ -95,11 +95,15 @@ import status as dr_status
 # _s8_connect_readonly_short(), same convention render_accounts() already uses for
 # `from connections import ibkr_paper`. These all live in livebot/ (S8 was relocated out
 # of paperbot/ into its own package, commit 321b5cf) — hence livebot on sys.path above.
-import s8_config
 import s8_monitor_core
 import s8_report
 import s8_schema
 import s8_store
+
+# s8_config is S8's DEFINITION layer and was folded into the shared `strategies` package
+# (alongside S0's config.py). Same local name, so `s8_config.*` below is unchanged;
+# `strategies` is already on sys.path from the bootstrap above. Still data-only.
+from strategies import s8_config
 
 # --- Local data locations (off-Drive, on C:) -----------------------------------
 # (WAREHOUSE/derived-GEX-parquet paths are no longer needed here — that's the

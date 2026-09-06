@@ -42,12 +42,18 @@ import streamlit as st
 
 # PURE / data-only modules (live in livebot/, on sys.path via desk_app.py's bootstrap).
 # NONE of these opens a socket at import time. The broker import stays lazy (below).
-import s8_config
 import s8_monitor_core
 import s8_report
 import s8_schema
 import s8_store
 import theme as T
+
+# S8's frozen constants are its DEFINITION layer and now live in the shared `strategies`
+# package (folded in alongside S0's config.py). Bound to the same local name, so every
+# `s8_config.*` reference below is unchanged. desk_app.py's bootstrap already puts
+# <repo>/strategies on sys.path, so this needs no change there. Still import-cheap and
+# socket-free: s8_config is data only.
+from strategies import s8_config
 
 # --- Constants (ported verbatim from app.py) -----------------------------------
 CT_ZONE = ZoneInfo("America/Chicago")     # matches s8_config.ENTRY_GRID_CT's convention

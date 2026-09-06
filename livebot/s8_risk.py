@@ -10,7 +10,7 @@ s8_runner.py routes its live cycle exclusively through `connections.ibkr_live_tr
 live-TRADING Gateway, port 4003 — a funded, transmit-capable test account, connected
 read-only during the pilot), not the paper Gateway. That login exposes MORE THAN ONE
 managed account (a trust + an individual test account), so s8_runner.py filters
-`ib.accountSummary()` down to `livebot/s8_config.py`'s `ACCOUNT` BEFORE calling this
+`ib.accountSummary()` down to `strategies/strategies/s8_config.py`'s `ACCOUNT` BEFORE calling this
 function (see `s8_runner.filter_account_summary`). The `summary` this function receives is
 therefore the TARGET account's own rows only. This function is generic over any
 accountSummary shape (dict or ib_async row list, see `_summary_map`) and does not itself

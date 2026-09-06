@@ -36,8 +36,8 @@ from datetime import time as dt_time
 import pandas as pd
 import pytest
 
-import s8_config
 import s8_runner as runner
+from strategies import s8_config
 
 
 # --- PILOT_MODE defaults True -------------------------------------------------------
@@ -260,8 +260,8 @@ def test_full_due_cycle_builds_a_stop_parent_and_b2_child(monkeypatch):
     monkeypatch.setattr(runner, "_alert_email", lambda *a, **k: None)
 
     # Reach into the pipeline directly to inspect the built order group.
-    import s8_config as cfg_mod
-    import s8_strategy
+    from strategies import s8_config as cfg_mod
+    from strategies import s8_strategy
     chain = _synthetic_chain_snapshot()
     cfg = cfg_mod.TEMPLATES["Puts-80-$4"]
     pick = s8_strategy.pick_spread_by_credit(
