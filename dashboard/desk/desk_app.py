@@ -101,7 +101,7 @@ pages = [
     st.Page(page_trade_execution.render_trade_execution,
             title="Trade Execution — pick, prepare, send", icon="📦"),
     st.Page(page_withdrawal_cash_raise.render_withdrawal_cash_raise,
-            title="Raise withdrawal cash — reserve-short accounts only", icon="💵"),
+            title="Monthly Cash Distributions", icon="💵"),
     st.Page(page_s8.render_s8_full,
             title="Strategy 8 — British Iron Condor (0DTE)", icon="🎯"),
     st.Page(page_research.render_research_full, title="Research shelf", icon="🔬"),
