@@ -46,27 +46,23 @@ def test_build_notice_is_plain_english():
     assert "Trade Execution" in hint
 
 
-def test_main_snooze_skips_repost(tmp_path, monkeypatch, capsys):
-    """While the operator has the idle-cash notice snoozed, the daily run must SKIP posting —
-    the poster-side is_snoozed skip is what actually silences the re-nag (dismiss alone
-    re-posts)."""
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, capsys):
+    """While an idle-cash alert is still OPEN in the CRM, the daily run must SKIP posting —
+    that poster-side skip is what silences the re-nag. Snooze is gone; Andrew closing the task
+    in the CRM is what lets the alert be raised again."""
+    import action_center
+
     # force a should-propose scenario without touching the broker
     monkeypatch.setattr(job, "read_cash",
                         lambda: {"net_liq": 100_000, "total_cash": 5_000})
-    import importlib
-    import action_center
-    importlib.reload(action_center)
 
-    # first run posts the idle-cash notice
+    # first run posts the idle-cash alert
     assert job.main([]) == 0
     assert action_center.has_open(job._DEDUP_KEY)
+    assert len(crm) == 1
 
-    # operator ignores it for 5 days
-    assert action_center.snooze(job._DEDUP_KEY, 5)
-
-    # next run must skip posting; the hidden notice is left untouched
+    # next run must skip posting; the open alert is left untouched
     assert job.main([]) == 0
     assert "snoozed" in capsys.readouterr().out.lower()
-    assert action_center.read_notices() == []
+    assert len(crm) == 1
     assert action_center.is_snoozed(job._DEDUP_KEY)
