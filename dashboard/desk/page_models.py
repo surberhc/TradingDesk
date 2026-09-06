@@ -6,6 +6,23 @@ strategy model concretely — its exact resolved holdings (ticker + %), today's 
 band, its version allowance, its tradeable universe, and a version/changelog line —
 all pulled LIVE from the frozen shared brain so the page can never drift from the code.
 
+TWO FAMILIES OF MODEL, BOTH SHOWN (2026-09-05). "All models" previously meant only the
+four versions Strategy 0's code computes. The book that is actually traded runs mostly on
+the models Andrew writes HIMSELF in the client system, so those are shown here too and the
+page is honest about the word "all". The two families are rendered as two clearly-labelled
+sections and are never mixed:
+  * The computed family keeps the "S0 " prefix on its DISPLAY label ("S0 Growth", "S0
+    Balanced", "S0 Conservative", "S0 Growth (Small)") so a computed Growth can never be
+    read as the hand-written Growth. The prefix is display text ONLY — the `version` value
+    the engine resolves against stays the frozen identifier ("Growth", "Balanced",
+    "Conservative"), untouched.
+  * The hand-written family is read LIVE from the client system by CALLING the Custom
+    allocation page's own single loader (`page_custom_alloc._load_state`) and its own book
+    renderer (`_render_allocation`). This page runs no query of its own: one read path,
+    one presentation, so the two model pages cannot drift apart or disagree. If the client
+    system cannot be reached, that section says so in one plain sentence and the computed
+    section still renders in full.
+
 Two non-negotiables shape this page (CLAUDE.md §"two non-negotiables"):
   * RULE #1 (never curve-fit): every weight, band, allowance, and ticker is IMPORTED
     LIVE — resolved holdings come from `strategy_target.current_target(version)` →
@@ -62,27 +79,34 @@ if str(_conn) not in sys.path:
 # Which frozen version/tier to resolve and render. Descriptive metadata only — no
 # weights, no decision. Growth-Small is PROPOSED (undefined in strategies/); its
 # intended holdings live here purely as display text, flagged not-yet-deployed.
+#
+# THE "S0 " PREFIX IS DISPLAY TEXT ONLY. `label` is what the screen shows; `version` is the
+# frozen identifier the engine resolves against and MUST stay exactly "Growth" / "Balanced"
+# / "Conservative". The prefix exists because Andrew also hand-writes a model called
+# "Growth (Custom)" — without it the page would show two different books both called
+# "Growth". Never fold the prefix into `version`.
 MODELS = [
     {
-        "key": "growth", "label": "Growth", "version": "Growth", "status": "live",
+        "key": "growth", "label": "S0 Growth", "version": "Growth", "status": "live",
         "note": "Strategy 0 (Adaptive All-Weather Core) runs this version live on the "
                 "paper account. Highest equity allowance, no minimum cash floor.",
     },
     {
-        "key": "balanced", "label": "Balanced", "version": "Balanced", "status": "resolves",
-        "note": "Same engine as Growth with a 5% minimum cash (T-bill) floor — resolves "
+        "key": "balanced", "label": "S0 Balanced", "version": "Balanced",
+        "status": "resolves",
+        "note": "Same engine as S0 Growth with a 5% minimum cash (T-bill) floor — resolves "
                 "to a distinct book (more USFR, less equity per sleeve).",
     },
     {
-        "key": "conservative", "label": "Conservative", "version": "Conservative",
+        "key": "conservative", "label": "S0 Conservative", "version": "Conservative",
         "status": "resolves",
         "note": "Same engine with an 80% equity allowance and a 10% cash floor — the "
                 "most defensive version; resolves to a distinct, lower-equity book.",
     },
     {
-        "key": "growth_small", "label": "Growth (Small)", "version": "Growth",
+        "key": "growth_small", "label": "S0 Growth (Small)", "version": "Growth",
         "status": "proposed",
-        "note": "A whole-share-feasible PROXY of Growth for small accounts — Growth's "
+        "note": "A whole-share-feasible PROXY of S0 Growth for small accounts — S0 Growth's "
                 "engine, version, regime band and re-entry ladder, with the equity sleeve "
                 "collapsed to one cheap total-market ETF (SCHB) and the defensive sleeve "
                 "to the same USFR cash instrument Growth already uses.",
@@ -142,20 +166,34 @@ def _sleeve_of(ticker: str) -> str:
 # =========================================================================== #
 # Renderers.                                                                   #
 # =========================================================================== #
+def _section_with_badge(label: str, badge_html: str) -> str:
+    """A section heading reading "<model name> — <coloured status badge>".
+
+    ``theme.section()`` escapes its ENTIRE argument, so handing it a ``<span>`` puts the raw
+    tag on screen as literal text — which is exactly what this page did until 2026-09-05.
+    The heading is assembled here instead, using the same ``dk-section`` class so it looks
+    identical to every other heading: the model name is escaped (it is data), the badge is
+    kept as markup (it is this module's own fixed string, never user input)."""
+    return f'<div class="dk-section">{theme._esc(label)} {badge_html}</div>'
+
+
 def _render_frozen_banner() -> None:
     """Models-hub frozen banner — worded for the gated change pipeline (spec §3)."""
     st.markdown(
         theme.status_card(
-            "These models are frozen — this page only displays them",
+            "This page only displays these models — it cannot change any of them",
             "warn",
             "Read-only — no in-app editing",
-            "Every holding, weight, band, allowance and ticker below is pulled LIVE from "
-            "the frozen, anti-curve-fit strategy code — the resolved holdings come from "
-            "the exact validated engine the paperbot executes, so this view can never "
-            "drift from the real book. Changing any model is NOT an in-app edit: it goes "
-            "through the gated review → validate → deploy flow (out-of-sample and "
-            "per-regime checks, maker-checker approval) — a later stage. Nothing on this "
-            "page connects to a broker, places, arms, or transmits.",
+            "Nothing below is written down in this page. The automatic models are pulled "
+            "LIVE from the frozen, anti-curve-fit strategy code — their holdings come from "
+            "the exact validated engine the paperbot executes — and the models Andrew "
+            "writes himself are read LIVE from the client system, read-only and one way. "
+            "So this view can never drift from the real book, either way. Changing an "
+            "automatic model is NOT an in-app edit: it goes through the gated review → "
+            "validate → deploy flow (out-of-sample and per-regime checks, maker-checker "
+            "approval) — a later stage. Changing a hand-written model means Andrew "
+            "publishing a new version in the client system, which is also not done here. "
+            "Nothing on this page connects to a broker, places, arms, or transmits.",
         ),
         unsafe_allow_html=True,
     )
@@ -242,7 +280,7 @@ def _render_model_card(model: dict, state: dict) -> None:
     else:
         badge = (f'<span style="color:{theme.MUTED};font-weight:600">'
                  f'— resolves to a distinct book</span>')
-    st.markdown(theme.section(f"{theme._esc(label)} {badge}"), unsafe_allow_html=True)
+    st.markdown(_section_with_badge(label, badge), unsafe_allow_html=True)
     st.caption(model["note"])
 
     # --- Resolved (or proposed) holdings — the headline ---
@@ -251,21 +289,21 @@ def _render_model_card(model: dict, state: dict) -> None:
             theme.status_card(
                 "Intended holdings (PROPOSED — not resolved from code)",
                 "warn",
-                "SCHB 85% + USFR 15% · whole-share proxy of Growth",
-                "Growth (Small) is APPROVED but NOT YET DEFINED in strategies/, so these "
+                "SCHB 85% + USFR 15% · whole-share proxy of S0 Growth",
+                "S0 Growth (Small) is APPROVED but NOT YET DEFINED in strategies/, so these "
                 "weights are the intended design shape — NOT a live engine resolution. "
-                "In production it would track Growth's dynamic equity/defensive split "
+                "In production it would track S0 Growth's dynamic equity/defensive split "
                 "(the 85/15 moves with the regime band, 0–100%). It is whole-share "
-                "feasible down to $500. Auto-tier: an account assigned Growth with NAV "
-                "below $25,000 resolves to Growth (Small); it auto-promotes to full "
-                "Growth past $25k (hysteresis: promote ≥ $27,500, demote < $22,500).",
+                "feasible down to $500. Auto-tier: an account assigned S0 Growth with NAV "
+                "below $25,000 resolves to S0 Growth (Small); it auto-promotes to full "
+                "S0 Growth past $25k (hysteresis: promote ≥ $27,500, demote < $22,500).",
             ),
             unsafe_allow_html=True,
         )
         _render_holdings_table(model["proposed_rows"], proposed=True)
         st.caption("Display-only intended weights — no engine was run for this card. "
-                   "Growth (Small) is not present in strategies/; defining it in code is "
-                   "a later stage.")
+                   "S0 Growth (Small) is not present in strategies/; defining it in code "
+                   "is a later stage.")
     else:
         h = _resolve_holdings(version)
         if "error" in h:
@@ -331,13 +369,16 @@ def _render_shared_engine() -> None:
     """The engine detail shared by Growth / Balanced / Conservative (identical frozen
     config): regime ladder, re-entry ladder + whipsaw, the full version-allowances table,
     and the full ticker universe. Reuses page_s0_model's renderers verbatim."""
-    st.markdown(theme.section("The shared engine behind these models"),
+    st.markdown(theme.section("The shared engine behind the four models above"),
                 unsafe_allow_html=True)
-    st.caption("Growth, Balanced and Conservative are one validated brain — they share "
-               "the SAME regime ladder, re-entry ladder, whipsaw controls and ticker "
+    st.caption("S0 Growth, S0 Balanced and S0 Conservative are one validated brain — they "
+               "share the SAME regime ladder, re-entry ladder, whipsaw controls and ticker "
                "universe; they differ only in the version allowance / cash floor shown on "
                "each card above (which is what makes their resolved books distinct). "
-               "Growth (Small) shares this engine too, over a two-ticker universe.")
+               "S0 Growth (Small) shares this engine too, over a two-ticker universe. None "
+               "of this applies to the models Andrew writes himself, further down the page "
+               "— those have no engine behind them at all, because Andrew picks their "
+               "holdings directly.")
     s0m._render_regime_ladder()
     s0m._render_reentry_and_whipsaw()
     s0m._render_version_allowances()
@@ -345,26 +386,189 @@ def _render_shared_engine() -> None:
 
 
 # =========================================================================== #
+# The models Andrew writes himself — read LIVE from the client system by       #
+# CALLING the Custom allocation page's loader. This page runs no query.        #
+# =========================================================================== #
+def _load_custom_models() -> dict:
+    """Return the hand-written models exactly as the Custom allocation page sees them.
+
+    REUSE, NOT A SECOND COPY. ``page_custom_alloc._load_state`` is the one read path to the
+    client system's read-only view ``v_tradingdesk_custom_allocations`` (a SELECT under the
+    ``tradingdesk_readonly`` role), and it is called here verbatim. No query, no connection
+    string and no ticker/percentage is written down in this file — so a hand-written book
+    shown on this page IS the published book, and the two model pages cannot disagree.
+    It is also the SAME cached loader object, so opening both pages reads the client system
+    once, not twice.
+
+    Never raises to the page: any problem comes back as ``{"error": ...}`` so the section
+    degrades to one plain-English sentence and the computed models still render."""
+    try:
+        import page_custom_alloc          # lives in strategy_views/, already on sys.path
+    except Exception as exc:  # noqa: BLE001 — never take the page down
+        return {"error": f"{type(exc).__name__}: {exc}"}
+    try:
+        return page_custom_alloc._load_state()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"{type(exc).__name__}: {exc}"}
+
+
+def _assigned_value(accounts) -> float:
+    """Total recorded value of the accounts assigned to a model. Display only."""
+    total = 0.0
+    for a in accounts or []:
+        try:
+            total += float(a.get("total_value") or 0.0)
+        except (TypeError, ValueError):
+            continue
+    return total
+
+
+def _render_custom_model_card(label: str, entry: dict) -> None:
+    """One hand-written model: its holdings (ticker + percent), which published version it
+    is, and how many accounts are on it. The book and the version card are rendered by the
+    Custom allocation page's OWN renderer, so the two pages present a book identically."""
+    import page_custom_alloc as ca
+
+    accounts = entry.get("accounts") or []
+    n_accounts = len(accounts)
+
+    if not entry.get("published"):
+        st.markdown(
+            _section_with_badge(
+                label,
+                f'<span style="color:{theme.MUTED};font-weight:600">'
+                f"— written by Andrew · nothing published yet</span>"),
+            unsafe_allow_html=True)
+        st.markdown(
+            theme.status_card(
+                label, "unknown", "No holdings published yet",
+                "Andrew has named this model in the client system but has not published a "
+                "list of holdings for it, so there is no book to show here and nothing the "
+                "desk could trade an account to. Publishing a version in the client system "
+                "makes it appear here."
+                + (f" {n_accounts} account(s) are already assigned to it, and they have no "
+                   f"book to be brought in line with." if n_accounts else ""),
+            ),
+            unsafe_allow_html=True)
+        return
+
+    st.markdown(
+        _section_with_badge(
+            label,
+            f'<span style="color:{theme.ACCENT};font-weight:700">'
+            f"— written by Andrew · {n_accounts} account(s) on it</span>"),
+        unsafe_allow_html=True)
+    st.caption("Andrew chose these holdings and percentages himself in the client system. "
+               "There is no strategy engine behind this model and no regime band applies to "
+               "it — it holds exactly what is listed below until Andrew publishes a new "
+               "version.")
+
+    # The published book + its version card, rendered by the Custom allocation page itself.
+    ca._render_allocation(label, entry)
+
+    # What that page does not show and this one needs: how much of the book is on this model.
+    value = _assigned_value(accounts)
+    st.markdown(
+        theme.card(
+            f"{label} — how much of the book is on this model",
+            "".join([
+                theme.row("Accounts assigned to this model",
+                          f'<span style="color:{theme.TEXT};font-weight:650">'
+                          f'{n_accounts}</span>',
+                          "assigning an account to a model is done in the client system, "
+                          "never on this page"),
+                theme.row("Total recorded value of those accounts",
+                          f'<span style="color:{theme.TEXT};font-weight:650">'
+                          f'${value:,.0f}</span>' if value > 0 else
+                          f'<span style="color:{theme.MUTED}">not recorded</span>'),
+                theme.row("Who decides the holdings",
+                          f'<span style="color:{theme.TEXT}">Andrew, by hand, in the '
+                          f'client system</span>',
+                          "read here one way and read-only — this page cannot publish, "
+                          "edit or send anything"),
+            ]),
+        ),
+        unsafe_allow_html=True)
+
+
+def _render_custom_section() -> None:
+    """The whole hand-written family: its plain-English explanation, then one card per
+    model. If the client system cannot be read, says so in one sentence and stops."""
+    st.markdown(theme.section("Models Andrew writes himself"), unsafe_allow_html=True)
+    st.caption("These are the models Andrew authors by hand in the client system: he picks "
+               "the funds and the percentages directly, and the desk reads them one way, "
+               "read-only. Most of the accounts the desk actually manages are on one of "
+               "these. They are shown separately from the four models above because the "
+               "difference is simply WHO CHOSE THE HOLDINGS — the strategy code chose the "
+               "ones above, Andrew chose the ones here.")
+
+    state = _load_custom_models()
+
+    if state.get("error") == "not_configured":
+        st.warning(
+            "The connection to the client system is not set up on this machine, so the "
+            "models Andrew writes himself cannot be read right now. The four computed "
+            "models above are unaffected.")
+        return
+    if state.get("error"):
+        st.warning(
+            "The models Andrew writes himself could not be read from the client system "
+            f"right now ({state['error']}). Nothing about any model has changed, and the "
+            "four computed models above are unaffected.")
+        return
+
+    labels = state.get("labels", [])
+    models = state.get("models", {})
+    if not labels:
+        st.info("The client system has no hand-written models to show.")
+        return
+
+    n_published = sum(1 for m in models.values() if m.get("published"))
+    st.caption(f"{len(labels)} hand-written model(s), {n_published} of them with holdings "
+               f"published, covering {state.get('assigned_total', 0)} account(s). Read "
+               f"{state.get('built_at_str', '—')} from the client system's read-only view, "
+               f"across a book of {state.get('n_roster', 0)} accounts — the exact same read "
+               f"the Custom allocation page uses, so the two pages can never disagree.")
+
+    for label in labels:
+        _render_custom_model_card(label, models.get(label, {"published": False}))
+
+
+# =========================================================================== #
 # Page entry point.                                                           #
 # =========================================================================== #
 def render_models() -> None:
-    """Render the read-only Models hub: frozen banner, today's shared market regime read,
-    one card per client-facing model (Growth / Balanced / Conservative resolved live, plus
-    the PROPOSED Growth (Small) card), and the shared engine detail. Every number is pulled
-    live from the frozen engine/config; nothing here edits, writes, arms, or transmits."""
+    """Render the read-only Models hub in TWO clearly-separated families: the models the
+    strategy code computes (S0 Growth / S0 Balanced / S0 Conservative resolved live, plus
+    the PROPOSED S0 Growth (Small) card) with the shared market regime read and the shared
+    engine detail; then the models Andrew writes himself, read live from the client system.
+    Every number is pulled live — from the frozen engine/config for the computed family, and
+    from the client system's read-only view for the hand-written one. Nothing here edits,
+    writes, arms, or transmits."""
     st.subheader("Strategy Models — every model, concretely")
-    st.caption("What each strategy model IS right now: its exact resolved holdings, "
-               "today's regime band, version allowance, tradeable universe and version. "
-               "Read-only and pulled live from the frozen shared brain — there is no edit "
-               "control on this page. This extends the single-model Strategy 0 view to all "
-               "models (Models management, Stage 1).")
+    st.caption("Every model the desk knows about, in two groups: the ones the strategy code "
+               "works out automatically, and the ones Andrew writes himself. For each one: "
+               "its exact holdings, and — for the automatic ones — today's regime band, "
+               "version allowance and tradeable universe. Read-only throughout, pulled live "
+               "from the frozen shared brain and from the client system, so nothing on this "
+               "page can drift from what is really being traded. There is no edit control "
+               "here (Models management, Stage 1).")
 
     _render_frozen_banner()
 
+    # ---- FAMILY 1: the models the strategy code works out by itself. --------------
+    st.markdown(theme.section("Models the strategy code works out automatically"),
+                unsafe_allow_html=True)
+    st.caption("These four are computed by the desk's own validated strategy code — nobody "
+               "picks their holdings by hand; the code decides what to hold from how the "
+               "market is behaving. Their names all start with \"S0\", short for Strategy 0, "
+               "the strategy that runs them, so that the automatic Growth is never confused "
+               "with the Growth that Andrew writes himself further down this page.")
+
     # Shared market regime read — the regime is a market-wide fact, the same for every
-    # model; each card then shows its own version-scaled band. Reused verbatim.
+    # computed model; each card then shows its own version-scaled band. Reused verbatim.
     st.markdown(theme.section("Where the market is right now "
-                              "(shared by every model below)"),
+                              "(shared by the four automatic models)"),
                 unsafe_allow_html=True)
     state = s0m._compute_live_state()
     if "error" in state:
@@ -380,15 +584,20 @@ def render_models() -> None:
                 f"Market Health Score (as of {state['as_of']})",
                 tier,
                 f"{state['score']:.1f} out of 100 — {conf}",
-                "This confirmed regime governs the equity band for every model; each "
-                "model's card scales this band by its own version allowance.",
+                "This confirmed regime governs the equity band for every automatic model; "
+                "each model's card scales this band by its own version allowance. It does "
+                "not apply to the models Andrew writes himself — those hold exactly what "
+                "he published, whatever the market is doing.",
             ),
             unsafe_allow_html=True,
         )
 
-    # One card per model.
+    # One card per computed model.
     for model in MODELS:
         _render_model_card(model, state)
 
-    # The engine detail shared across the Growth-family models (rendered once).
+    # The engine detail shared across the four computed models (rendered once).
     _render_shared_engine()
+
+    # ---- FAMILY 2: the models Andrew writes himself, read live from the client system.
+    _render_custom_section()
