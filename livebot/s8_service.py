@@ -64,13 +64,18 @@ for _pkg_parent in ("paperbot", "connections", "strategies"):
         sys.path.insert(0, _p)
 
 import s8_chain            # noqa: E402
-import s8_config           # noqa: E402
 import s8_gateway_alert    # noqa: E402  (gateway down/relaunch email failsafe — best-effort)
 import s8_lock             # noqa: E402  (single-instance / orphan guard — shared pure seam)
 import s8_monitor          # noqa: E402  (S8Monitor — exit side reused VERBATIM)
 import s8_runner           # noqa: E402  (evaluate_and_capture_due_template — entry side, shared)
 import s8_startup          # noqa: E402  (bounded startup connect-retry — shared pure seam)
 import s8_store            # noqa: E402
+
+# S8's DEFINITION layer (frozen constants) now lives in the shared `strategies` package
+# alongside S0's config.py — same local name, so every call site below is unchanged. The
+# `strategies` parent is added to sys.path by the bootstrap above, and run_s8_service.cmd
+# also puts %REPO%\strategies on PYTHONPATH, so this resolves under the scheduled task.
+from strategies import s8_config  # noqa: E402
 
 _CT_ZONE = ZoneInfo("America/Chicago")
 

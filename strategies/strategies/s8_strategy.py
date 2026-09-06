@@ -66,8 +66,13 @@ import numpy as np
 # backtester folder: path derived relative to this file, not the current directory,
 # and s6_recon.py itself has NO IBKR imports (pure numpy/pandas), so this does not
 # violate the "no IBKR imports in this file" rule.
+#
+# DEPTH: this file is <repo>/strategies/strategies/s8_strategy.py, so the repo root is
+# parents[2] (parents[0]=strategies/strategies, parents[1]=strategies). It was parents[1]
+# (`.parent.parent`) while this module lived in livebot/; the fold into the strategies
+# package moved it one level deeper. Derived from __file__ per CLAUDE.md, never hardcoded.
 # --------------------------------------------------------------------------- #
-_BACKTESTER = Path(__file__).resolve().parent.parent / "backtester"
+_BACKTESTER = Path(__file__).resolve().parents[2] / "backtester"
 if str(_BACKTESTER) not in sys.path:
     sys.path.insert(0, str(_BACKTESTER))
 

@@ -175,11 +175,19 @@ import ledger  # noqa: E402
 import order_router  # noqa: E402
 import s8_capture  # noqa: E402
 import s8_chain  # noqa: E402
-import s8_config  # noqa: E402
 import s8_risk  # noqa: E402
-import s8_strategy  # noqa: E402
 import version  # noqa: E402
 from connections import ibkr_live_trade  # noqa: E402
+
+# s8_config (frozen constants) and s8_strategy (pure pick/stop logic) are S8's DEFINITION
+# layer; they were folded into the shared `strategies` package so every algorithm-derived
+# strategy definition lives in one place (S0's all_weather.py + config.py already do).
+# Bound to the SAME local names, so every call site below is unchanged. The `strategies`
+# parent is already on sys.path from the bootstrap above (and on PYTHONPATH from
+# run_s8_service.cmd / run_s8_collector.cmd), so this resolves under the scheduled tasks.
+# s8_risk stays in livebot/: it gates on live ACCOUNT margin state and imports paperbot's
+# s4_risk internals, so it is execution-layer, not definition.
+from strategies import s8_config, s8_strategy  # noqa: E402
 from order_router import _base_fields, _check_limit_price  # noqa: E402
 
 # NOTE on gateway_lock: every OTHER paperbot script that imports gateway_lock does so

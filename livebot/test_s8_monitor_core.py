@@ -28,7 +28,7 @@ from s8_monitor_core import (
 # The stored stop_price is the FROZEN one computed at entry by s8_strategy.stop_price.
 # We import it to tie these tests to the real frozen formula rather than hardcoding a
 # level (the core itself never recomputes it — it reads position.stop_price verbatim).
-from s8_strategy import stop_price as frozen_stop_price
+from strategies.s8_strategy import stop_price as frozen_stop_price
 
 
 # --------------------------------------------------------------------------- #
