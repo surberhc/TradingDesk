@@ -1,5 +1,23 @@
 """action_center.py — the desk dashboard's in-app Action Center notice store.
 
+NO IN-APP READER AS OF 2026-09-05. The desk's Action Center PAGE was retired by owner
+decision: Andrew does not want to monitor things on the trading desk — he goes there to
+trade, and warnings belong in the CRM, whose own Action Center already tracks these more
+currently than the desk copy ever did. This store is deliberately LEFT IN PLACE because four
+nightly dailyreport jobs still post notices into it, and deleting it would break them:
+
+    dailyreport/outofspec_scan_check.py                 (kind "outofspec")
+    dailyreport/s0_cash_deploy_check.py                 (kind "cash_deploy")
+    dailyreport/withdrawal_reserve_check.py             (kind "withdrawal_reserve")
+    dailyreport/withdrawal_cash_raise_monthly_check.py  (kind "withdrawal_cash_raise_monthly")
+
+Those writes still succeed and still de-duplicate and snooze exactly as before — but nothing
+in the desk UI displays them any more, so a notice posted here is effectively write-only
+until the FOLLOW-UP lands: route those four alerts to the CRM's Action Center instead, and
+only then retire this store. Their operator-facing wording still says "the Action Center",
+which from now on means the CRM's, not the desk's. Do not treat this store as a live
+operator surface.
+
 The Action Center is the desk's propose-and-arm INBOX: a durable, plain-English list of
 things that want the operator's attention but NEVER act on their own. Today it carries the
 "idle cash — consider deploying" proposal (dailyreport/s0_cash_deploy_check.py); it is built
