@@ -4,7 +4,6 @@ Covers the PURE notice/detail assembly and the poster-side snooze skip (the piec
 silences the daily re-nag). The CRM/engine scan itself is monkeypatched — this file never
 touches a broker or the live CRM.
 """
-import json
 import sys
 from pathlib import Path
 
@@ -73,50 +72,39 @@ def test_build_notice_flags_unidentified_and_held_back_accounts():
     assert detail[1]["held_back"] is True
 
 
-def test_main_snooze_skips_repost(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, capsys):
+    """The poster-side skip that silences the daily re-nag. Snooze is gone: the job now skips
+    because an OPEN alert is already sitting in the CRM, and it stays skipped until Andrew
+    closes that task."""
     monkeypatch.setattr(job, "run_scan", lambda: _scan())
-    import importlib
-    import action_center
-    importlib.reload(action_center)
 
-    # first run posts ONE consolidated notice with detail_json
+    # first run posts ONE consolidated alert
     assert job.main([]) == 0
-    n = action_center.read_notices()
-    assert len(n) == 1 and n[0]["kind"] == "outofspec"
-    assert len(json.loads(n[0]["detail_json"])) == 2
-    first_ts = n[0]["ts"]
+    assert len(crm) == 1
+    assert crm[0]["category"] == "outofspec"
+    assert crm[0]["dedup_key"] == "outofspec_open"
 
-    # operator ignores it for 10 days
-    assert action_center.snooze("outofspec_open", 10)
-
-    # next scheduled run must SKIP posting while snoozed
+    # next scheduled run must SKIP posting while that alert is still open
     assert job.main([]) == 0
-    out = capsys.readouterr().out
-    assert "snoozed" in out.lower()
-    assert action_center.read_notices() == []          # still hidden
-    snz = action_center.read_snoozed()
-    assert len(snz) == 1 and snz[0]["ts"] == first_ts   # untouched, not refreshed
+    assert "snoozed" in capsys.readouterr().out.lower()
+    assert len(crm) == 1                       # untouched, not duplicated
+
+    # once Andrew closes it in the CRM, the next run may raise it again
+    crm[0]["status"] = "done"
+    assert job.main([]) == 0
+    assert len(crm) == 2
 
 
-def test_main_posts_nothing_when_all_in_spec(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac2.db"))
+def test_main_posts_nothing_when_all_in_spec(crm, monkeypatch, capsys):
     monkeypatch.setattr(job, "run_scan",
                         lambda: {"verdicts": [], "skipped": [], "n_accounts": 5,
                                  "n_out_of_spec": 0, "n_in_spec": 5, "bad_versions": []})
-    import importlib
-    import action_center
-    importlib.reload(action_center)
     assert job.main([]) == 0
-    assert action_center.read_notices() == []
+    assert crm == []
 
 
-def test_main_dry_run_posts_nothing(tmp_path, monkeypatch, capsys):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac3.db"))
+def test_main_dry_run_posts_nothing(crm, monkeypatch, capsys):
     monkeypatch.setattr(job, "run_scan", lambda: _scan())
-    import importlib
-    import action_center
-    importlib.reload(action_center)
     assert job.main(["--dry-run"]) == 0
-    assert action_center.read_notices() == []
+    assert crm == []
     assert "WOULD post" in capsys.readouterr().out

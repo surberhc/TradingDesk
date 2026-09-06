@@ -160,31 +160,26 @@ def test_main_one_account_failure_does_not_block_the_rest(monkeypatch, capsys):
     assert rc == 1  # non-zero because one account failed, but it still ran to completion
 
 
-def test_main_snooze_skips_repost(tmp_path, monkeypatch, capsys):
-    """While the operator has an account's withdrawal-reserve notice snoozed, the run must
-    SKIP posting for that account — dismiss alone re-posts a fresh notice next run."""
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, capsys):
+    """While an account's withdrawal-reserve alert is still OPEN in the CRM, the run must SKIP
+    posting for that account. Snooze is gone; Andrew closing the task is what re-arms it."""
     fake_schedule = {
         "UZ": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
     }
     monkeypatch.setattr(cashflows, "SCHEDULE", fake_schedule)
     monkeypatch.setattr(job, "read_cash",
                         lambda account: {"net_liq": 500_000, "total_cash": 1_000})
-    import importlib
     import action_center
-    importlib.reload(action_center)
 
     dedup_key = "withdrawal_reserve_UZ"
 
-    # first run posts the notice
+    # first run posts the alert
     assert job.main([]) == 0
     assert action_center.has_open(dedup_key)
+    assert len(crm) == 1
 
-    # operator ignores it for 5 days
-    assert action_center.snooze(dedup_key, 5)
-
-    # next run must skip posting; the hidden notice is left untouched
+    # next run must skip posting; the open alert is left untouched
     assert job.main([]) == 0
     assert "snoozed" in capsys.readouterr().out.lower()
-    assert action_center.read_notices() == []
+    assert len(crm) == 1
     assert action_center.is_snoozed(dedup_key)

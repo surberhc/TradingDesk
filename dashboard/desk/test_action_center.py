@@ -1,191 +1,174 @@
-"""Tests for the Action Center store (post / read / dedup / dismiss / unread), temp DB."""
+"""Tests for the Action Center poster.
+
+It no longer keeps a SQLite notice store — it files each alert as a row in the CRM's
+``public.tasks``. These tests replace the old store tests (post/read/dedup/dismiss/unread/
+snooze/migration), which exercised a database that no longer exists. Coverage is kept on the
+behaviour that still matters: the column mapping, the ONE de-duplication rule, the
+``is_snoozed`` call site the four nightly jobs still use, and the promise that a CRM outage
+never takes a nightly job down with it.
+
+The CRM is faked here so the suite stays hermetic — no network, no credential, no live DB.
+"""
 import sys
+import uuid
 from pathlib import Path
+
+import pytest
 
 _HERE = Path(__file__).resolve().parent
 if str(_HERE) not in sys.path:
     sys.path.insert(0, str(_HERE))
 
+import action_center  # noqa: E402
 
-def test_post_read_dedup_dismiss(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
-    import action_center  # imported AFTER env override; db_path() reads env per call
 
-    assert action_center.read_notices() == []
-    assert action_center.unread_count() == 0
+class _FakeCursor:
+    """Understands exactly the two statements action_center issues."""
 
-    k1 = action_center.post_notice("cash_deploy", "T1", "B1", severity="warn", dedup_key="d")
-    assert k1
-    assert action_center.unread_count() == 1
+    def __init__(self, rows):
+        self.rows = rows
+        self._result = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def execute(self, sql, params=()):
+        if sql.lstrip().upper().startswith("SELECT"):
+            source, dedup_key = params
+            self._result = (1,) if any(
+                r["source"] == source and r["dedup_key"] == dedup_key
+                and r["status"] == "open" for r in self.rows) else None
+        else:
+            title, description, severity, category, dedup_key, source = params
+            row = {"id": str(uuid.uuid4()), "title": title, "description": description,
+                   "severity": severity, "category": category, "dedup_key": dedup_key,
+                   "source": source, "status": "open"}
+            self.rows.append(row)
+            self._result = (row["id"],)
+
+    def fetchone(self):
+        return self._result
+
+
+class _FakeConn:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def cursor(self):
+        return _FakeCursor(self.rows)
+
+    def commit(self):
+        pass
+
+    def close(self):
+        pass
+
+
+@pytest.fixture
+def crm(monkeypatch):
+    """A stand-in CRM: the list IS the tasks table."""
+    rows = []
+    monkeypatch.setattr(action_center, "_connect", lambda: _FakeConn(rows))
+    return rows
+
+
+# --------------------------------------------------------------------------- #
+# column mapping                                                               #
+# --------------------------------------------------------------------------- #
+def test_post_notice_maps_columns_onto_a_crm_task(crm):
+    task_id = action_center.post_notice(
+        "cash_deploy", "Idle cash is sitting uninvested", "There is $5,000 in free cash.",
+        severity="warn", action_hint="Open the Trade Execution page.",
+        dedup_key="s0_cash_deploy_open")
+
+    assert task_id and len(crm) == 1
+    row = crm[0]
+    assert row["id"] == task_id
+    assert row["title"] == "Idle cash is sitting uninvested"
+    assert row["category"] == "cash_deploy"          # kind -> category
+    assert row["dedup_key"] == "s0_cash_deploy_open"
+    assert row["status"] == "open"
+    # the RLS policy refuses any other source, so this must be exact
+    assert row["source"] == "trading_desk"
+    # the CRM only accepts error/warning/info; the desk's jobs all say "warn"
+    assert row["severity"] == "warning"
+    # the CRM has no action_hint column, so the hint is folded into the description
+    assert "There is $5,000 in free cash." in row["description"]
+    assert "Open the Trade Execution page." in row["description"]
+
+
+def test_severity_falls_back_to_info_when_unrecognised(crm):
+    action_center.post_notice("x", "T", "B", severity="whatever")
+    assert crm[0]["severity"] == "info"
+
+
+def test_detail_json_and_ts_are_accepted_and_ignored(crm):
+    """The four nightly jobs still pass these; the CRM has no column for either. The call must
+    keep working rather than raising a TypeError on an unexpected keyword."""
+    task_id = action_center.post_notice(
+        "outofspec", "T", "B", dedup_key="oos",
+        detail_json=[{"account": "U1", "model": "Growth"}], ts="2026-09-05 10:00:00")
+    assert task_id and len(crm) == 1
+
+
+# --------------------------------------------------------------------------- #
+# the ONE de-duplication rule                                                  #
+# --------------------------------------------------------------------------- #
+def test_open_alert_with_same_dedup_key_posts_nothing(crm):
+    first = action_center.post_notice("cash_deploy", "T1", "B1", dedup_key="d")
+    assert first and len(crm) == 1
+
+    # the desk has no UPDATE permission: the original is left standing, not refreshed
+    second = action_center.post_notice("cash_deploy", "T2", "B2", dedup_key="d")
+    assert second is None
+    assert len(crm) == 1
+    assert crm[0]["title"] == "T1"
+
+
+def test_closing_the_task_lets_a_fresh_alert_through(crm):
+    action_center.post_notice("cash_deploy", "T1", "B1", dedup_key="d")
     assert action_center.has_open("d")
 
-    # same open dedup_key -> update in place, no new row, key unchanged
-    k2 = action_center.post_notice("cash_deploy", "T2", "B2", severity="warn", dedup_key="d")
-    assert k2 == k1
-    assert action_center.unread_count() == 1
-    assert action_center.read_notices()[0]["title"] == "T2"
-
-    # dismiss
-    assert action_center.dismiss(k1)
-    assert action_center.unread_count() == 0
+    crm[0]["status"] = "done"                   # Andrew closes it in the CRM
     assert not action_center.has_open("d")
 
-    # after dismiss, same dedup_key creates a FRESH notice
-    k3 = action_center.post_notice("cash_deploy", "T3", "B3", dedup_key="d")
-    assert k3 and k3 != k1
-    assert action_center.unread_count() == 1
+    assert action_center.post_notice("cash_deploy", "T2", "B2", dedup_key="d")
+    assert len(crm) == 2
 
 
-def test_no_dedup_key_always_inserts(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac2.db"))
-    import importlib
-    import action_center
-    importlib.reload(action_center)
+def test_no_dedup_key_always_inserts(crm):
     a = action_center.post_notice("x", "A", "a")
     b = action_center.post_notice("x", "B", "b")
     assert a and b and a != b
-    assert action_center.unread_count() == 2
+    assert len(crm) == 2
 
 
-# --------------------------------------------------------------------------- #
-# detail_json round-trip                                                       #
-# --------------------------------------------------------------------------- #
-def test_detail_json_round_trip(tmp_path, monkeypatch):
-    import json
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "det.db"))
-    import action_center
-
-    detail = [{"account": "U1", "model": "Growth", "net_liq": 123456.0,
-               "managed_net_liq": 113456.0, "n_held_aside": 1,
-               "held_aside_value": 10000.0, "held_back": False},
-              {"account": "U2", "model": "Growth", "net_liq": 5000.0,
-               "managed_net_liq": 5000.0, "n_held_aside": 0,
-               "held_aside_value": 0.0, "held_back": False}]
-    # pass a Python list -> serialized by the store
-    k = action_center.post_notice("outofspec", "T", "B", dedup_key="oos",
-                                  detail_json=detail)
-    assert k
-    n = action_center.read_notices()[0]
-    assert json.loads(n["detail_json"]) == detail
-
-    # dedup update-in-place refreshes the detail too
-    detail2 = detail[:1]
-    action_center.post_notice("outofspec", "T2", "B2", dedup_key="oos",
-                              detail_json=detail2)
-    n = action_center.read_notices()[0]
-    assert json.loads(n["detail_json"]) == detail2
-
-    # old-style notice (no detail) reads NULL
-    action_center.post_notice("cash_deploy", "C", "c", dedup_key="cash")
-    row = [x for x in action_center.read_notices() if x["kind"] == "cash_deploy"][0]
-    assert row["detail_json"] is None
-
-
-# --------------------------------------------------------------------------- #
-# snooze / is_snoozed / read_snoozed / unsnooze                                #
-# --------------------------------------------------------------------------- #
-def test_snooze_hides_from_active_and_badge(tmp_path, monkeypatch):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "snz.db"))
-    import action_center
-
+def test_is_snoozed_is_now_the_same_already_open_check(crm):
+    """Snooze is gone as a concept. The four jobs still call is_snoozed() before posting, and
+    it must now mean 'an open alert is already waiting in the CRM'."""
+    assert action_center.is_snoozed("d") is False
     action_center.post_notice("cash_deploy", "T", "B", dedup_key="d")
-    assert action_center.unread_count() == 1
-    assert not action_center.is_snoozed("d")
-
-    # snooze 5 days -> hidden from active list AND the badge, but is_snoozed True
-    assert action_center.snooze("d", 5)
-    assert action_center.is_snoozed("d")
-    assert action_center.read_notices() == []          # hidden from active
-    assert action_center.unread_count() == 0           # doesn't light the badge
-    snz = action_center.read_snoozed()
-    assert len(snz) == 1 and snz[0]["dedup_key"] == "d"
-    assert snz[0]["snoozed_until"] is not None
-
-    # un-snooze brings it straight back
-    assert action_center.unsnooze("d")
-    assert not action_center.is_snoozed("d")
-    assert action_center.unread_count() == 1
-    assert len(action_center.read_notices()) == 1
-
-
-def test_snooze_poster_skips_while_snoozed(tmp_path, monkeypatch):
-    """The POSTER-facing contract: while snoozed, is_snoozed(dedup_key) is True so the poster
-    skips re-posting; the ONE existing (hidden) notice is untouched. This is what silences the
-    daily re-nag that dismiss alone cannot."""
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "skip.db"))
-    import action_center
-
-    action_center.post_notice("cash_deploy", "orig", "b", dedup_key="d")
-    action_center.snooze("d", 10)
-
-    # simulate a poster's guard: it must see the snooze and NOT post
-    if not action_center.is_snoozed("d"):
-        action_center.post_notice("cash_deploy", "renagged", "b2", dedup_key="d")
-    # nothing new surfaced; the single hidden notice still carries the ORIGINAL title
-    assert action_center.read_notices() == []
-    assert action_center.read_snoozed()[0]["title"] == "orig"
-
-
-def test_snooze_expiry_re_enables(tmp_path, monkeypatch):
-    """When snoozed_until passes, the notice re-surfaces automatically (no cron)."""
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "exp.db"))
-    import sqlite3
-    import action_center
-
-    action_center.post_notice("cash_deploy", "T", "B", dedup_key="d")
-    action_center.snooze("d", 5)
-    assert action_center.is_snoozed("d")
-
-    # force the stamp into the past (a real snooze would reach this time-wise)
-    con = sqlite3.connect(str(tmp_path / "exp.db"))
-    con.execute("UPDATE notices SET snoozed_until = '2000-01-01 00:00:00' WHERE dedup_key='d'")
-    con.commit()
-    con.close()
-
-    assert not action_center.is_snoozed("d")
-    assert action_center.unread_count() == 1
-    assert len(action_center.read_notices()) == 1
-    assert action_center.read_snoozed() == []
+    assert action_center.is_snoozed("d") is True
+    assert action_center.is_snoozed("d") == action_center.has_open("d")
+    assert action_center.is_snoozed("") is False
 
 
 # --------------------------------------------------------------------------- #
-# schema migration: an OLD DB (no detail_json / snoozed_until) upgrades cleanly #
+# a CRM outage must never take a nightly job down                              #
 # --------------------------------------------------------------------------- #
-def test_migration_upgrades_old_db(tmp_path, monkeypatch):
-    import sqlite3
-    old = tmp_path / "old.db"
-    # Build a pre-migration store: the ORIGINAL 12-column schema + one row.
-    con = sqlite3.connect(str(old))
-    con.execute(
-        "CREATE TABLE notices (notice_key TEXT UNIQUE, ts TEXT, day TEXT, kind TEXT, "
-        "severity TEXT, title TEXT, body TEXT, action_hint TEXT, dedup_key TEXT, "
-        "status TEXT, created_at TEXT, dismissed_at TEXT)")
-    con.execute(
-        "INSERT INTO notices VALUES ('abc','2026-08-01 10:00:00','20260801','cash_deploy',"
-        "'warn','Old title','Old body','hint','s0_cash_deploy_open','unread',"
-        "'2026-08-01 10:00:00',NULL)")
-    con.commit()
-    con.close()
+def test_crm_unreachable_degrades_quietly(monkeypatch, capsys):
+    def _boom():
+        raise RuntimeError("could not connect to the CRM database")
 
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(old))
-    import action_center
+    monkeypatch.setattr(action_center, "_connect", _boom)
 
-    # first touch runs the additive migration; old row survives, new cols read NULL
-    notices = action_center.read_notices()
-    assert len(notices) == 1
-    n = notices[0]
-    assert n["title"] == "Old title"
-    assert n["detail_json"] is None
-    assert n["snoozed_until"] is None
-    assert action_center.unread_count() == 1
+    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") is None
+    assert action_center.has_open("d") is False      # fail-open
+    assert action_center.is_snoozed("d") is False
 
-    # the upgraded store now supports snooze on the migrated row
-    assert action_center.snooze("s0_cash_deploy_open", 5)
-    assert action_center.is_snoozed("s0_cash_deploy_open")
-    assert action_center.read_notices() == []
-
-    # and the new columns physically exist
-    con = sqlite3.connect(str(old))
-    cols = {r[1] for r in con.execute("PRAGMA table_info(notices)").fetchall()}
-    con.close()
-    assert "detail_json" in cols and "snoozed_until" in cols
+    # and it says so in plain English rather than dying silently
+    err = capsys.readouterr().err.lower()
+    assert "could not file this alert" in err

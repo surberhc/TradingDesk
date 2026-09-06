@@ -51,8 +51,7 @@ def test_build_notice_singular_wording_for_one_account(monkeypatch):
 # --------------------------------------------------------------------------- #
 # main() — empty list posts nothing
 # --------------------------------------------------------------------------- #
-def test_main_empty_list_posts_nothing(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_main_empty_list_posts_nothing(monkeypatch, capsys):
     monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [])
     calls = []
     import action_center
@@ -68,8 +67,7 @@ def test_main_empty_list_posts_nothing(monkeypatch, tmp_path, capsys):
 # --------------------------------------------------------------------------- #
 # main() — non-empty list posts exactly ONE consolidated notice
 # --------------------------------------------------------------------------- #
-def test_main_nonempty_posts_exactly_one_notice_with_all_accounts(monkeypatch, tmp_path):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_main_nonempty_posts_exactly_one_notice_with_all_accounts(monkeypatch, crm):
     rows = [_row("UA", 1_000.0), _row("UB", 2_500.0), _row("UC", 300.0)]
     monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: rows)
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
@@ -96,8 +94,10 @@ def test_main_nonempty_posts_exactly_one_notice_with_all_accounts(monkeypatch, t
     assert action_center.has_open("withdrawal_cash_raise_monthly")
 
 
-def test_main_rerun_updates_the_one_notice_not_a_duplicate(monkeypatch, tmp_path):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_main_rerun_leaves_the_one_open_alert_alone(monkeypatch, crm):
+    """A re-run must never stack a duplicate. The desk has no UPDATE permission on the CRM, so
+    the second run leaves the ORIGINAL alert standing rather than refreshing it — the newly
+    added account shows up only after Andrew closes the open task."""
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
 
     monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
@@ -107,24 +107,22 @@ def test_main_rerun_updates_the_one_notice_not_a_duplicate(monkeypatch, tmp_path
                         lambda: [_row("UA", 1_000.0), _row("UB", 500.0)])
     assert job.main([]) == 0
 
-    import action_center
-    notices = [n for n in action_center.read_notices()
-               if n["dedup_key"] == "withdrawal_cash_raise_monthly"]
-    assert len(notices) == 1
-    assert "UB" in notices[0]["body"]
+    alerts = [r for r in crm if r["dedup_key"] == "withdrawal_cash_raise_monthly"]
+    assert len(alerts) == 1
+    assert "UA" in alerts[0]["description"]
+    assert "UB" not in alerts[0]["description"]
 
 
 # --------------------------------------------------------------------------- #
-# main() — snoozed posts nothing
+# main() — an already-open alert posts nothing
 # --------------------------------------------------------------------------- #
-def test_main_snoozed_posts_nothing(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_main_posts_nothing_while_an_alert_is_already_open(monkeypatch, crm, capsys):
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
     monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
 
     import action_center
-    assert job.main([]) == 0  # first run posts + creates the open notice
-    assert action_center.snooze("withdrawal_cash_raise_monthly", 5)
+    assert job.main([]) == 0  # first run posts + creates the open alert
+    assert action_center.has_open("withdrawal_cash_raise_monthly")
 
     calls = []
     real_post_notice = action_center.post_notice
@@ -141,8 +139,7 @@ def test_main_snoozed_posts_nothing(monkeypatch, tmp_path, capsys):
 # --------------------------------------------------------------------------- #
 # --dry-run — prints, posts nothing
 # --------------------------------------------------------------------------- #
-def test_dry_run_prints_and_posts_nothing(monkeypatch, tmp_path, capsys):
-    monkeypatch.setenv("TRADINGDESK_ACTION_CENTER_DB", str(tmp_path / "ac.db"))
+def test_dry_run_prints_and_posts_nothing(monkeypatch, capsys):
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
     monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
 
