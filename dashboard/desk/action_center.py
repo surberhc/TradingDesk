@@ -4,7 +4,7 @@ The Action Center is the desk's propose-and-arm INBOX: a durable, plain-English 
 things that want the operator's attention but NEVER act on their own. Today it carries the
 "idle cash — consider deploying" proposal (dailyreport/s0_cash_deploy_check.py); it is built
 to hold any future propose-and-arm notice. A notice only ever POINTS the operator at a page
-(e.g. the Control Plane) — it places, arms, and transmits nothing.
+(e.g. the Trade Execution page) — it places, arms, and transmits nothing.
 
 This mirrors eventlog.py's discipline: it is a WRITE module, and it writes to exactly one
 place — its own SQLite store at

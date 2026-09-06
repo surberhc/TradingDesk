@@ -59,7 +59,7 @@ def test_build_notice_plain_english_and_counts():
     assert "never trades" in body.lower()
     assert "outside the model allocation" in body.lower()
     assert "liquidation" not in body.lower()
-    assert "Control Plane" in hint
+    assert "Trade Execution" in hint
     assert len(detail) == 2
 
 

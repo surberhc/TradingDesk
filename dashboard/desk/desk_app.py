@@ -62,7 +62,6 @@ T.inject_theme()
 # the persistent emergency control strip.
 import emergency
 import page_action_center
-import page_control_plane
 import page_trade_execution
 import page_custom_alloc
 import page_feeds
@@ -114,8 +113,6 @@ pages = [
             title="Trade Execution — pick, prepare, send", icon="📦"),
     st.Page(page_withdrawal_cash_raise.render_withdrawal_cash_raise,
             title="Raise withdrawal cash — reserve-short accounts only", icon="💵"),
-    st.Page(page_control_plane.render_control_plane,
-            title="Control Plane — S0 rebalance", icon="🎛️"),
     st.Page(page_s8.render_s8_full,
             title="Strategy 8 — British Iron Condor (0DTE)", icon="🎯"),
     st.Page(page_research.render_research_full, title="Research shelf", icon="🔬"),

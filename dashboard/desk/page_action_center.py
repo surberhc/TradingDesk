@@ -4,7 +4,7 @@ Shows the plain-English notices in action_center.py, newest first, each with a D
 and an "Ignore for N days" (snooze) control; dismissed history and currently-snoozed items sit
 in their own expanders. A notice may carry structured detail (detail_json) — e.g. the list of
 out-of-spec accounts — rendered in an expandable table. READ-ONLY with respect to trading: a
-notice only POINTS at another page (e.g. the Control Plane) — nothing here places, arms, or
+notice only POINTS at another page (e.g. the Trade Execution page) — nothing here places, arms, or
 transmits an order. The only writes are marking a notice dismissed / snoozed in the store.
 """
 from __future__ import annotations
@@ -115,8 +115,8 @@ def render_action_center() -> None:
     st.caption(
         "Things that want your attention — proposals and heads-ups the desk surfaces for you "
         "to review. Nothing here trades on its own: each item just points you at the page "
-        "where you can act (for a rebalance, the Control Plane). Dismiss an item once you've "
-        "handled it, or Ignore it for a set number of days to stop the daily reminder."
+        "where you can act (for a rebalance, the Trade Execution page). Dismiss an item once "
+        "you've handled it, or Ignore it for a set number of days to stop the daily reminder."
     )
 
     notices = action_center.read_notices(include_dismissed=False)

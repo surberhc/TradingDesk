@@ -32,8 +32,9 @@ Informational email to the owner only (same recipient as the nightly EOD report)
 itself connects to NO gateway and reads NO account live — it only reads the JSON snapshot Job
 A already wrote and runs the pure, offline planner. It transmits NOTHING and touches no order
 path. It reuses the existing EOD mailer (dailyreport\\mailer.py). Not order-affecting: no
-paperbot version bump. The exact trade list still lives behind the arm gate in the Control
-Plane; this email is a heads-up computed from the snapshot + model, not a transmit path.
+paperbot version bump. The exact trade list still lives behind the arm gate on the Trade
+Execution page; this email is a heads-up computed from the snapshot + model, not a transmit
+path.
 
 CALENDAR SOURCE
 ---------------
@@ -91,8 +92,10 @@ _DEFAULT_SNAPSHOT = Path(r"C:\TradingDesk-Local\state\dailyreport\s0_month_end_s
 # The model version whose target drives the verdict (owner's choice for the S0 pilot account).
 STRATEGY_VERSION = "Growth"
 
-# Control Plane pointer used in the email body (desk dashboard on :8502).
-_CONTROL_PLANE = 'the Control Plane (desk dashboard, port 8502, "Control Plane — S0 rebalance")'
+# Execution-page pointer used in the email body (desk dashboard on :8502). The Control Plane
+# page this used to name was retired on 2026-09-05 and replaced by the Trade Execution page.
+_EXECUTION_PAGE = ('the Trade Execution page (desk dashboard, port 8502, '
+                   '"Trade Execution — pick, prepare, send")')
 
 # --- verdict subjects ------------------------------------------------------- #
 SUBJECT_NO_TRADE = "S0: NO trade tomorrow — account already conforms"
@@ -302,7 +305,7 @@ def build_verdict(as_of: dt.date, next_session: dt.date, approximated: bool,
             f"scheduled for the next trading session, {nice_next}. But the close-time holdings "
             f"snapshot is missing or failed, so this notice CANNOT compute an exact "
             f"trade / no-trade verdict — and it will not guess one.\n\n"
-            f"In the morning, open {_CONTROL_PLANE} to check the exact trades and execute them "
+            f"In the morning, open {_EXECUTION_PAGE} to check the exact trades and execute them "
             f"behind the arm gate if needed. If the preview there shows 0 legs, the account "
             f"already conforms and nothing needs doing."
             f"{approx_note}\n")
@@ -314,7 +317,7 @@ def build_verdict(as_of: dt.date, next_session: dt.date, approximated: bool,
             f'snapshot is <b>missing or failed</b>{why}, so this notice cannot compute an exact '
             f'verdict — and it will not guess one.</div>'
             f'<div style="font-size:14px;color:#374151;margin-top:12px;line-height:1.5;">'
-            f'In the morning, open {_CONTROL_PLANE} to check the exact trades and execute them '
+            f'In the morning, open {_EXECUTION_PAGE} to check the exact trades and execute them '
             f'behind the arm gate if needed. If the preview there shows <b>0 legs</b>, the '
             f'account already conforms and nothing needs doing.</div>')
         return SUBJECT_NO_READ, text, html
@@ -326,7 +329,7 @@ def build_verdict(as_of: dt.date, next_session: dt.date, approximated: bool,
             f"close-time holdings and the model target computed on the final close, the account "
             f"already conforms: 0 order legs. Nothing needs to be done at the next session "
             f"({nice_next}).\n\n"
-            f"No action required. (You can still open {_CONTROL_PLANE} to confirm.)"
+            f"No action required. (You can still open {_EXECUTION_PAGE} to confirm.)"
             f"{approx_note}\n")
         html = _wrap(
             "S0 month-end — NO trade tomorrow", "#166534",
@@ -336,7 +339,7 @@ def build_verdict(as_of: dt.date, next_session: dt.date, approximated: bool,
             f'<b>already conforms: 0 order legs</b>. Nothing needs doing at the next session '
             f'(<b>{nice_next}</b>).</div>'
             f'<div style="font-size:13px;color:#6b7280;margin-top:12px;line-height:1.5;">'
-            f'No action required. You can still open {_CONTROL_PLANE} to confirm.</div>')
+            f'No action required. You can still open {_EXECUTION_PAGE} to confirm.</div>')
         return SUBJECT_NO_TRADE, text, html
 
     # case == "trade"
@@ -350,7 +353,7 @@ def build_verdict(as_of: dt.date, next_session: dt.date, approximated: bool,
         f"rebalance at the next session ({nice_next}) — {n} order leg"
         f"{'s' if n != 1 else ''}:\n\n"
         + "\n".join(order_lines) +
-        f"\n\nBefore that session, open {_CONTROL_PLANE} to review these exact trades and "
+        f"\n\nBefore that session, open {_EXECUTION_PAGE} to review these exact trades and "
         f"execute them behind the arm gate."
         f"{approx_note}\n")
 
@@ -372,7 +375,7 @@ def build_verdict(as_of: dt.date, next_session: dt.date, approximated: bool,
         f'leg{"s" if n != 1 else ""}</b>:</div>'
         f'<table style="font-size:14px;margin-top:10px;border-collapse:collapse;">{rows}</table>'
         f'<div style="font-size:14px;color:#374151;margin-top:12px;line-height:1.5;">'
-        f'Before that session, open {_CONTROL_PLANE} to review these exact trades and execute '
+        f'Before that session, open {_EXECUTION_PAGE} to review these exact trades and execute '
         f'them behind the arm gate.</div>')
     return subject_trade(n), text, html
 

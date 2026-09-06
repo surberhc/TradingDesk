@@ -102,14 +102,16 @@ def test_no_unsuppressible_process_launchers_in_desk():
 
 @pytest.mark.parametrize(
     "module_name, minimum",
-    [("deskdata.py", 1), ("emergency.py", 1), ("eventlog.py", 1),
-     ("page_control_plane.py", 5)],
+    [("deskdata.py", 1), ("emergency.py", 1), ("eventlog.py", 1)],
 )
 def test_known_call_sites_still_route_through_deskproc(module_name, minimum):
-    """The eight known shell-outs still go through the shared helper.
+    """The known shell-outs still go through the shared helper.
 
-    Minimums, not exact counts: adding a ninth call site is fine, silently
+    Minimums, not exact counts: adding another call site is fine, silently
     dropping one back to a raw subprocess call is not.
+
+    The Control Plane page was retired on 2026-09-05 (superseded by the Trade
+    Execution page), so its own five call sites are no longer listed here.
     """
     src = (DESK_DIR / module_name).read_text(encoding="utf-8")
     assert src.count("deskproc.run(") >= minimum, (
