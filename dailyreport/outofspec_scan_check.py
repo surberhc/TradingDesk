@@ -165,7 +165,7 @@ def build_notice(scan: dict) -> tuple[str, str, str, list[dict]]:
             f"That needs a look."
         )
     hint = (
-        "Open the Control Plane -> Whole-book out-of-spec read to review these accounts and, "
+        "Open the Trade Execution page on the desk dashboard to review these accounts and, "
         "behind the review -> arm -> transmit gate, pull them into one batch rebalance. "
         "Nothing trades until you arm it there — this is only a heads-up."
     )

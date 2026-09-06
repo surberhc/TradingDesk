@@ -1,5 +1,27 @@
 # Production Strategy & Rebalance Control Plane
 
+> **RETIRED ON 2026-09-05 — kept as a compliance record, not as a description of the live desk.**
+>
+> The dashboard page this document describes, "Control Plane — S0 rebalance"
+> (`dashboard/desk/page_control_plane.py`), was removed from the desk dashboard on 2026-09-05 with
+> the account owner's explicit approval. It has been superseded by the **Trade Execution** page
+> (`dashboard/desk/execution/page_trade_execution.py`), which does the same review, arm and transmit
+> work through the advisor group rail and covers the same real-money trust account (U14438624) that
+> the Control Plane's single-account rail was pinned to.
+>
+> This document is retained unchanged below because it is the written design and safety rationale
+> behind a real-money execution surface, and that record has to survive the page itself. Read
+> everything after this note as a description of how the retired page worked, not as instructions
+> for operating the desk today.
+>
+> The shared safe-execution layer this document called for was built and is still live: the batch
+> rail `paperbot/batch_rebalance_execute.py` and the shared engine `paperbot/safe_execute.py` are
+> both still in service, now used by the group rail (`paperbot/group_execute.py`) behind the Trade
+> Execution page. The single-account executor `paperbot/s0_live_deploy.py` also still exists and is
+> still reachable from its desktop shortcut; only the dashboard page was retired.
+
+---
+
 **Status: DRAFT proposal for review — dated 2026-07-29.**
 Nothing in this document arms, transmits, schedules, or authorizes any real-money order. It is a
 design/scaffold spec. No executor or UI code is written here. The desk's two non-negotiables and the

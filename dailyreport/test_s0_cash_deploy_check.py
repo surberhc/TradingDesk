@@ -43,7 +43,7 @@ def test_build_notice_is_plain_english():
     title, body, hint = job.build_notice(d)
     assert "Idle cash" in title
     assert job.ACCOUNT in body
-    assert "Control Plane" in hint
+    assert "Trade Execution" in hint
 
 
 def test_main_snooze_skips_repost(tmp_path, monkeypatch, capsys):

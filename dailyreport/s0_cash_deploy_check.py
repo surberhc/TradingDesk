@@ -163,8 +163,9 @@ def build_notice(d: dict) -> tuple[str, str, str]:
         f"enough to consider putting to work in the Strategy 0 target."
     )
     hint = (
-        "Open the Control Plane to review a read-only preview and, if you want to deploy, arm "
-        "and execute it there. Nothing trades until you do — this is only a heads-up."
+        "Open the Trade Execution page on the desk dashboard to review a read-only preview "
+        "and, if you want to deploy, arm and execute it there. Nothing trades until you do — "
+        "this is only a heads-up."
     )
     return title, body, hint
 

@@ -607,9 +607,9 @@ def _render_accounts_and_drift(label: str, entry: dict, show_in_line: bool) -> N
     c2.metric("Out of line with the allocation", n_oos)
     c3.metric("In line with the allocation", scan.get("n_in_spec", 0))
     st.caption(
-        f"Checked with the same pure engine the Control Plane's read-only out-of-spec panel "
-        f"uses — it sizes the account against the published book and reports what would "
-        f"trade. It builds and sends nothing. "
+        f"Checked with the same read-only engine the desk uses everywhere else to look for "
+        f"accounts that are out of line with their allocation — it sizes the account against "
+        f"the published book and reports what would trade. It builds and sends nothing. "
         + (f"{len(skipped)} unfunded/no-snapshot account(s) skipped. " if skipped else "")
         + (f"{len(excluded)} account(s) held out for manual review (recorded value "
            f"disagrees with holdings). " if excluded else ""))
