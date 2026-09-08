@@ -1,9 +1,36 @@
-# Gateways — the three IBKR lanes (authoritative)
+# Gateways — the IBKR lanes (authoritative)
 
-This desk runs **three separate IB Gateway instances**, one per lane. They are fully
-symmetric in naming and never share an install dir, port, connection module, or
-launch-lock. This file is the single source of truth for that map; if code and this
-file ever disagree, fix whichever is wrong so they match.
+**As of 2026-09-08 the desk runs ONE gateway: live-trade on port 4003.** The other two
+lanes are retired but their code and installs remain on disk, so this file still maps all
+three. This file is the single source of truth for that map; if code and this file ever
+disagree, fix whichever is wrong so they match.
+
+| Lane | Port | State |
+|------|------|-------|
+| **Live-Trade** | 4003 | **ACTIVE — the only lane.** Trading, S8/S0 pilots, and (since 2026-09-08) the nightly EOD option-chain pull. |
+| Live-Data | 4001 | **RETIRED 2026-09-08.** All four scheduled tasks disabled; nothing launches it. See "Why 4001 was retired" below. |
+| Paper | 4002 | **RETIRED 2026-08-24** on Andrew's call. Down on purpose — never flag it as an outage. |
+
+## Why 4001 was retired (read before resurrecting it)
+
+4001 was never an architectural separation. It was created 2026-07-10 to dodge a
+market-data-subscription collision with another advisor on the PAPER gateway — and that
+paper lane was itself retired 2026-08-24, so the reason expired. 4003 arrived separately
+on 2026-07-15 because S8 needed real-time data that 4001's delayed-only account could not
+give it; nobody revisited whether the EOD collector should follow.
+
+Two lanes cost more than they bought: 4001 needed its OWN 2FA, was only ever launched in
+an 08:05–12:00 window gated on 4003 already being up, and had to survive unattended until
+17:30 — which it stopped doing. It died before the pull on 2026-09-02, 09-03 and 09-04,
+the 09-05 run never fired at all, and four trading days of chain data were lost while the
+GEX build kept reporting "ok" (an incremental build that finds nothing new still
+succeeds). 4003 also serves the data better: an SPX/SPXW chain request returns clean,
+where 4001 logged ~48,000 "not subscribed, displaying delayed" messages a night.
+
+**What was given up, deliberately:** on 4001, read-only was STRUCTURAL — `connect()` had
+no `readonly` parameter and the account had no execution capability. On 4003 it is an
+explicit argument. `datacollector/` passes `readonly=True` at every call site and contains
+no order call of any kind; that discipline is now the wall. Do not flip it.
 
 | Lane | Port | Connection module | Install bat | Launch-lock env var | Launch-lock dir |
 |------|------|-------------------|-------------|---------------------|-----------------|
@@ -19,9 +46,11 @@ Each lane has its OWN IBKR login. They are never the same username on two ports 
 |------|------|---------------------|
 | Paper | 4002 | `apsvpaper` |
 | Live-Data | 4001 | `databot0001` |
-| Live-Trade | 4003 | `apsv1816` |
+| Live-Trade | 4003 | `asurber219` (advisor master `F6795549`, 356 managed accounts) |
 
-> Passwords and 2FA are the user's and are never stored in the repo. This records only which login belongs to which lane. Confirmed by Andrew 2026-07-24.
+> Passwords and 2FA are the user's and are never stored in the repo. This records only which login belongs to which lane.
+
+> **CORRECTED 2026-09-08.** This table said the live-trade login was `apsv1816` from 2026-07-24 until today. It is `asurber219` — verified against `C:\IBC-Live-Trade\config.ini` (`IbLoginId=`) and the 2026-09-04 group-trading handoff. The wrong value was also carried in Claude's memory. Since only 4003 is still launched, this is the one login field that matters.
 
 > **Machine-side install dirs** (`C:\IBC`, `C:\IBC-Live-Data`, `C:\IBC-Live-Trade`)
 > are set up separately by the user and **must match the `GATEWAY_BAT` constant** in each
@@ -29,22 +58,26 @@ Each lane has its OWN IBKR login. They are never the same username on two ports 
 
 ## Purpose and safety posture per lane
 
-### Paper (4002) — `ibkr_paper.py`
-Simulated paper account **DU…141**. No real money, ever. The default connection is
+### Paper (4002) — `ibkr_paper.py` — RETIRED 2026-08-24
+Down on purpose, on Andrew's call. Never report it as an outage. Historical description
+follows. Simulated paper account **DU…141**. No real money, ever. The default connection is
 read-only (`connect(readonly=True)`); the paperbot only flips to `readonly=False` when a
 human deliberately arms order transmission through the review → arm → transmit gate. The
 only login this Gateway can reach is the paper account, so live trading is not reachable
-by accident. This is the lane essentially the whole desk uses (S0, S4, datacollector,
-dailyreport, canslim gap-fill, reconciliation, etc.).
+by accident. This WAS the lane essentially the whole desk used (S0, S4, datacollector,
+dailyreport, canslim gap-fill, reconciliation) before the live lanes existed; that is no
+longer true and this sentence is kept only to explain what the old code paths meant.
 
-### Live-Data (4001) — `ibkr_live_data.py`
-A **live** connection to a deliberately access-restricted personal account that IBKR
+### Live-Data (4001) — `ibkr_live_data.py` — RETIRED 2026-09-08
+Nothing launches this lane any more; its last consumer (the nightly EOD option-chain
+pull) moved to 4003. The module and install remain on disk. Historical description
+follows. A **live** connection to a deliberately access-restricted personal account that IBKR
 grants visibility into with **NO execution capability at the account-permission level**.
 The module is **structurally read-only**: `connect()` has no `readonly` parameter at all,
 always connects read-only, and the module never exposes, wraps, or re-exports any
 order-placement method. Read-only is enforced twice over — by the account's IBKR
-permissions and by the module's construction. Used for live market-data gathering only
-(nightly forward-fill; S8 read paths historically).
+permissions and by the module's construction. Was used for live market-data gathering only (nightly forward-fill; S8 read paths
+historically). Note its account is DELAYED-DATA-ONLY, which is why S8 never stayed on it.
 
 ### Live-Trade (4003) — `ibkr_live_trade.py`
 A real, **FUNDED, transmit-CAPABLE** account — S8's zero-transmit live pilot. Unlike
@@ -80,13 +113,14 @@ call sites, which are authoritative over any drifted registry comment).
 - 46 `paperbot_nightly_monitor`, 47 `paperbot_morning_execute`
 - 49 `paperbot_s8`, 50 `paperbot_s8_exec` (reserved, future paper-account transmission path)
 
-**Live-Data (4001)**
-- 48 `live_data_forward`
+**Live-Data (4001) — retired, ids kept reserved so they are never reused**
+- 48 `live_data_forward` (RETIRED — the nightly EOD collector now runs on 4003 as `live_trade_forward` 68)
 - 51 `paperbot_s8_livedata` (retired S8 live-data read path; still registered)
 - 53 `live_data_order_verify` (one-off account-permission order-rejection probe)
 
 **Live-Trade (4003)**
 - 52 `dashboard_s8` (dashboard S8 tab read-only display re-marking)
+- 68 `live_trade_forward` (nightly EOD option-chain collector, moved here 2026-09-08; connects `readonly=True`, runs POST-CLOSE at 17:30 CT — after the 15:05 S8 teardown — so its `LINE_LIMIT=90` batches never contend with `s8_collector`/`s8_monitor` for the ~100-line account-wide budget)
 - 54 `s8_live_pilot` (s8_runner live-cycle read: account summary + 0DTE chain)
 - 55 `s8_monitor` (streaming exit-monitor read-only; runs concurrently with s8_live_pilot)
 - 56 `s8_collector` (intraday ATM-band market collector read-only; runs concurrently with s8_live_pilot + s8_monitor; band bounded to a conservative line budget so the monitor's position-leg lines keep headroom)

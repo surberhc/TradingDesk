@@ -1,15 +1,23 @@
 """
 forward_daily_live.py — ONE daily EOD pass of the IBKR forward option collector,
-against the SECOND, restricted, read-only-only LIVE-DATA Gateway instance.
+against the LIVE-TRADING Gateway (port 4003).
 
-Mirrors forward_daily.py exactly, repointed at connections.ibkr_live_data (port
-4001) instead of connections.ibkr_paper (paper, port 4002). This is NOT paper and NOT
-live trading — it is a read-only market-data-only Gateway, backed by a personal
-live IBKR login that IBKR itself restricts to visibility into exactly one account
-with no execution capability at the account-permission level, and whose connect()
-has no `readonly` parameter at all (every connection it makes is hardcoded
-read-only). Nothing in this module or in ibkr_forward_live.py places, modifies, or
-cancels an order.
+CONSOLIDATED 2026-09-08. This job used to run on a third Gateway instance — the
+restricted live-DATA login on port 4001, which was read-only by construction. That
+lane is retired: it required its own separate 2FA, was only ever launched inside an
+08:05–12:00 window gated on 4003 already being up, and repeatedly died before the
+17:30 run, losing four trading days of chain data (2026-09-02..05). Port 4003 is the
+one Gateway that survives IBKR's nightly restart on a stored session token, and it
+serves this data BETTER: SPX/SPXW chains return with no entitlement complaints at
+all, where 4001 logged ~48,000 "not subscribed, displaying delayed" messages a night.
+See connections/GATEWAYS.md.
+
+THE TRADE-OFF, STATED PLAINLY: 4003 is transmit-CAPABLE. On the old lane read-only
+was structural — connect() had no `readonly` parameter and the account had no
+execution capability. Here it is an explicit argument, passed at every call site in
+_connect() below and in ibkr_forward_live.main(). Nothing in datacollector/ places,
+modifies, or cancels an order, and readonly=True must never be removed or flipped
+from this package. That discipline is now the wall.
 
 Fired once per trading day by Windows Task Scheduler (mirror of run_forward.bat,
 not yet created). This is the production wrapper around ibkr_forward_live: it is a
@@ -18,8 +26,10 @@ ONE-SHOT (connect -> snapshot today's full chains for the whole universe -> writ
 same warehouse schema/writer as the paper variant; only the Gateway connection
 differs.
 
-Resilience: weekday guard, launches the live-data Gateway if it's down (via
-connections.ibkr_live_data.ensure_gateway()), per-root error isolation (one bad
+Resilience: weekday guard, launches the live-trading Gateway if it's down (via
+connections.ibkr_live_trade.ensure_gateway() — note that a cold launch needs Andrew's
+IBKR Mobile 2FA, so an unattended run only succeeds if the Gateway is already up),
+per-root error isolation (one bad
 root never aborts the run), resumable (skips any root already on disk for today).
 Logs to warehouse\\forward_live.log and updates warehouse\\forward_heartbeat_live.txt
 so a glance confirms it ran and how far it got. As of the 2026-07-27 ThetaData->IBKR
@@ -42,7 +52,7 @@ from datetime import date
 
 import config
 import ibkr_forward_live as fwd
-from connections import ibkr_live_data as gw
+from connections import ibkr_live_trade as gw
 
 # status.py lives in the sibling dailyreport project (the EOD reporter reads it).
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent.parent / "dailyreport"))
@@ -63,12 +73,15 @@ def log(msg: str) -> None:
 
 
 def _connect(real_errors: list[str]):
-    """Fresh read-only connection (clientId 48) with farm-OK error filtering.
+    """Fresh read-only connection (clientId 68) with farm-OK error filtering.
 
-    connections.ibkr_live_data.connect() has no `readonly` parameter — every
-    connection it makes is hardcoded read-only, so there is nothing to pass here.
+    Consolidated onto the live-TRADING Gateway (port 4003) on 2026-09-08. That lane
+    is transmit-CAPABLE, so `readonly=True` is passed EXPLICITLY here and is the wall
+    that keeps this nightly data job a reader. The old ibkr_live_data lane made that
+    structural (no readonly parameter existed); here it is a deliberate argument.
+    Never remove it, and never pass readonly=False from datacollector/.
     """
-    ib = gw.connect(fwd.CLIENT)
+    ib = gw.connect(fwd.CLIENT, readonly=True)
     ib.errorEvent += lambda rid, code, msg, c: (
         real_errors.append(f"[{code}] {msg}") if code not in fwd.OK_STATUS else None)
     ib.reqMarketDataType(3)              # delayed — EOD snapshot doesn't need live entitlement
@@ -167,7 +180,7 @@ def main() -> int:
     jobstatus.write("forward", overall, day=daystr,
                     metrics={"roots": len(roots), "ok": ok, "skip": skip,
                              "empty": empty, "fail": fail, "real_errors": len(real_errors)},
-                    message=f"EOD option-chain collect, live-data Gateway ({ok} roots written)")
+                    message=f"EOD option-chain collect, live-trading Gateway 4003 ({ok} roots written)")
 
     # Exit non-zero ONLY when nothing was collected on a trading day ("fail"): that is
     # a genuine outage the scheduler must show red. "partial" (some roots written, some

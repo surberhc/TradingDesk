@@ -1,14 +1,16 @@
 """
-ibkr_forward_live.py — forward EOD option-chain collector, LIVE-DATA-GATEWAY variant.
+ibkr_forward_live.py — forward EOD option-chain collector, LIVE-TRADE-GATEWAY variant.
 
 Byte-for-byte the same collection logic as ibkr_forward.py (same warehouse schema,
-same universe, same build/snapshot/write pipeline), repointed at the SECOND, separate
-IBKR Gateway instance: the restricted, read-only-only live-data login on port 4001
-(connections.ibkr_live_data), NOT the paper Gateway on port 4002. That Gateway's
-account has visibility into exactly one personal live account with no execution
-capability at the account-permission level, and connections.ibkr_live_data.connect()
-has no `readonly` parameter at all — every connection it makes is hardcoded
-read-only. This module never places, modifies, or cancels an order; it only reads.
+same universe, same build/snapshot/write pipeline), pointed at the LIVE-TRADING
+Gateway on port 4003 (connections.ibkr_live_trade). Consolidated there 2026-09-08
+from the retired live-DATA lane on port 4001; see connections/GATEWAYS.md and the
+header of forward_daily_live.py for why.
+
+READER ONLY, and the discipline is now explicit rather than structural: the old lane
+could not be told to connect write-capable, this one can. Every connect() in this
+module passes readonly=True, and datacollector/ contains no order-placement,
+modification or cancellation call of any kind. Do not flip that argument here.
 
 Design choices that keep it safe alongside other Gateway clients:
   * Its OWN clientId (`live_data_forward` = 48, see connections.clientids). Distinct
@@ -46,11 +48,15 @@ from ib_async import IB, Index, Option, Stock, util
 import config
 import storage
 
-# The shared LIVE-DATA connection layer: separate Gateway (port 4001), read-only
-# by construction, own clientId registry entry, own launch mutex.
-from connections import ibkr_live_data as gw
+# The LIVE-TRADE connection layer: Gateway port 4003 (consolidated 2026-09-08 -- the
+# live-DATA lane on 4001 was retired; see connections/GATEWAYS.md). This module is a
+# READER ONLY: every connect() below passes readonly=True and datacollector/ contains
+# no order-placement call of any kind. Unlike the old ibkr_live_data lane, readonly is
+# a real honored parameter here rather than a structural property, so it must be
+# passed explicitly at every call site and must never be flipped in this package.
+from connections import ibkr_live_trade as gw
 
-CLIENT = "live_data_forward"          # clientId 48 (see connections.clientids)
+CLIENT = "live_trade_forward"         # clientId 68 (see connections.clientids)
 
 # Exact warehouse column order (matches the ThetaData parquet so a future cutover can
 # union or repoint cleanly; during the A/B window these land in raw/options_ibkr).
@@ -336,7 +342,7 @@ def main() -> None:
         band = max_exps = None           # per-root via config.forward_depth() below
 
     real_errors: list[str] = []
-    ib = gw.connect(CLIENT, launch=launch)     # always read-only; no readonly param exists
+    ib = gw.connect(CLIENT, launch=launch, readonly=True)   # reader only -- never flip this
     ib.errorEvent += lambda rid, code, msg, c: (
         real_errors.append(f"[{code}] {msg}") if code not in OK_STATUS else None)
     ib.reqMarketDataType(3)              # ask for delayed — EOD snapshot doesn't need live entitlement

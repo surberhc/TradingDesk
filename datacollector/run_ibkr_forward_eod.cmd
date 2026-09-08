@@ -7,16 +7,17 @@ REM  Launcher for the IbkrForwardEodDaily scheduled task (~17:30 CT; Andrew
 REM  registers the task himself -- this build deliberately does NOT register any
 REM  task). Replaces the retired ThetaEodDaily/eod_daily.py path.
 REM
-REM  Runs forward_daily_live.py against the SECOND, read-only-only live-data
-REM  Gateway (port 4001) for the INDEX-ONLY universe SPX SPXW RUT NDX. These are
+REM  Runs forward_daily_live.py against the LIVE-TRADING Gateway (port 4003) for
+REM  the INDEX-ONLY universe SPX SPXW RUT NDX (consolidated off the retired
+REM  live-data lane on port 4001, 2026-09-08). These are
 REM  the only roots with an IBKR options-data entitlement; SPY/QQQ/ETFs were
 REM  dropped in the cutover (no entitlement -> Error 10091). The collector writes
 REM  the MAIN warehouse namespace (raw/options) and the canonical "forward"
 REM  jobstatus key that the EOD report + heartbeat_alarm's "forward" watchdog read.
 REM
-REM  This job is READ-ONLY market data: the live-data Gateway login has no
-REM  execution capability and connections.ibkr_live_data.connect() is hardcoded
-REM  read-only. Nothing here places, modifies, or transmits an order.
+REM  This job is READ-ONLY market data, but note the lane is transmit-CAPABLE:
+REM  connections.ibkr_live_trade.connect() is called with readonly=True explicitly
+REM  at every site. Nothing here places, modifies, or transmits an order.
 REM ===========================================================================
 
 set "VENV_PY=C:\TradingDesk-Local\venv\Scripts\python.exe"

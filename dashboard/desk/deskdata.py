@@ -56,25 +56,17 @@ def _is_market_hours(now: datetime | None = None) -> bool:
 # --------------------------------------------------------------------------- #
 @st.cache_data(ttl=15)
 def gateway_status() -> list[dict]:
-    """The 3 IBKR gateways as short one-word status rows. TCP probe only.
+    """The IBKR gateways as short one-word status rows. TCP probe only.
 
     The owner's model: a gateway that isn't in use right now isn't an error — it's
     just staged. So up is always "Connected" (green); a down market-data or paper
     gateway is "Waiting" (grey, the normal resting state); and only the live TRADING
     gateway goes "Not connected" (red) when it's down DURING the pilot session
     (weekday market hours) — the one case where we actually need it.
-    """
-    # --- 4001 Live market-data gateway: staged when down, never an alarm. ---
-    data_up = _port_open("127.0.0.1", 4001)
-    live_data = {
-        "port": 4001,
-        "label": "Live market-data gateway (port 4001)",
-        "up": data_up,
-        "tier": "good" if data_up else "unknown",
-        "phrase": "Connected" if data_up else "Waiting",
-        "context": "used for the evening data pulls",
-    }
 
+    As of 2026-09-08 the live-trading gateway also carries the evening end-of-day
+    option-chain pull, which used to run on a separate market-data gateway (4001).
+    """
     # --- 4002 Paper trading gateway: staged when down, never an alarm. ---
     paper_up = _port_open("127.0.0.1", 4002)
     paper = {
@@ -107,7 +99,10 @@ def gateway_status() -> list[dict]:
         "context": trade_context,
     }
 
-    return [live_data, paper, live_trade]
+    # NOTE (2026-09-08): the live market-data gateway (port 4001) used to be listed
+    # here. That lane was retired when the evening data pulls were consolidated onto
+    # 4003 — showing a tile for a gateway nothing launches any more is a false signal.
+    return [paper, live_trade]
 
 
 # --------------------------------------------------------------------------- #

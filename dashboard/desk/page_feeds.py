@@ -2,9 +2,10 @@
 
 Answers the owner's plain question: is my data correct, coming in, and being
 logged? Every value comes from deskfeeds.py (real reads, no mock data). The live
-TRADING gateway (port 4003 — the future real-trading platform) is the headline;
-then the market-data gateway (4001); then the live option-quote recording for the
-Strategy 8 pilot; then the nightly end-of-day feeds. If a read fails, deskfeeds
+TRADING gateway (port 4003 — the future real-trading platform) is the headline,
+and since 2026-09-08 it is the desk's only gateway: the separate market-data gateway
+on port 4001 was retired and its evening data pull moved onto 4003. Then the live
+option-quote recording for the Strategy 8 pilot; then the nightly end-of-day feeds. If a read fails, deskfeeds
 returns a safe value and this page shows a plain message instead of crashing.
 
 PLAIN-ENGLISH RULE (#1): every status is a full sentence; color only sorts it.
@@ -39,7 +40,6 @@ def render_feeds() -> None:
 
     gw = F.gateway_feed_focus()
     live = gw["live_trade"]
-    data = gw["market_data"]
     ticks = F.s8_tick_feed_status()
 
     # ---- Headline: the LIVE trading gateway (4003) ----
@@ -107,18 +107,6 @@ def render_feeds() -> None:
         T.row("Live trading gateway (port 4003)",
               T.pill(connected_phrase, connected_tier, pulse=live_pulse)),
         unsafe_allow_html=True)
-
-    # ---- Market-data gateway (4001) ----
-    st.markdown(T.section("Market-data gateway — feeds the evening data pulls"),
-                unsafe_allow_html=True)
-    st.markdown(
-        T.row("Market-data gateway (port 4001)",
-              T.pill("Connected and responding" if data["up"]
-                     else "Not connected right now", data["tier"])),
-        unsafe_allow_html=True)
-    st.markdown(
-        f"<div style='font-size:12px;color:{T.MUTED};margin:-.15rem 0 .4rem .2rem'>"
-        f"{data['phrase']}</div>", unsafe_allow_html=True)
 
     # ---- Live option-quote recording (Strategy 8) ----
     st.markdown(T.section("Live option-quote recording (Strategy 8 pilot)"),

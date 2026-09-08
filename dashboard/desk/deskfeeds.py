@@ -210,12 +210,14 @@ def eod_feed_status() -> list[dict]:
 
 
 # --------------------------------------------------------------------------- #
-# 3. Gateway focus — the LIVE trading gateway (4003) gets prominence.          #
+# 3. Gateway focus — the LIVE trading gateway (4003), now the only lane.       #
 # --------------------------------------------------------------------------- #
 def gateway_feed_focus() -> dict:
-    """Cheap TCP probes of the live-trading gateway (4003) and the market-data
-    gateway (4001), each as a plain phrase. The live-trading gateway (the future
-    real-trading platform) is the headline. TCP probe only — no session opened."""
+    """Cheap TCP probe of the live-trading gateway (4003), as a plain phrase.
+
+    It is the desk's ONLY gateway as of 2026-09-08: the separate market-data gateway
+    on port 4001 was retired and its evening end-of-day option-chain pull moved here,
+    so there is no second lane left to probe. TCP probe only — no session opened."""
     now = _ct_now()
     market = dd._is_market_hours(now)
     weekend = dd._is_weekend(now)
@@ -247,22 +249,4 @@ def gateway_feed_focus() -> dict:
             "phrase": "The live trading gateway is " + reason,
         }
 
-    data_up = dd._port_open("127.0.0.1", 4001)
-    if data_up:
-        data = {
-            "port": 4001, "up": True, "tier": "good",
-            "headline": "Connected",
-            "phrase": ("The market-data gateway is connected and responding — it "
-                       "feeds the evening end-of-day data pulls."),
-        }
-    else:
-        data = {
-            "port": 4001, "up": False, "tier": "unknown",
-            "headline": "Not connected",
-            "phrase": ("The market-data gateway is not up right now — it is normally "
-                       "brought up on its own before the evening data pull, so this "
-                       "is expected during the day."),
-        }
-
-    return {"live_trade": live, "market_data": data,
-            "market_hours": market, "weekend": weekend}
+    return {"live_trade": live, "market_hours": market, "weekend": weekend}

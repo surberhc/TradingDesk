@@ -149,7 +149,7 @@ def render_pulse() -> None:
     # ==================== FOUR expanders — detail on demand =================== #
     st.markdown("<div style='height:.35rem'></div>", unsafe_allow_html=True)
 
-    # --- Trading gateways (always visible — three short statuses at a glance) --- #
+    # --- Trading gateways (always visible — a short status each at a glance) --- #
     st.markdown(T.section("Trading gateways"), unsafe_allow_html=True)
     for g in gateways:
         right = T.pill(
