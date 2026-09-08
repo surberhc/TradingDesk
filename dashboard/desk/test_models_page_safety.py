@@ -11,13 +11,17 @@ line with them — and it must be STRUCTURALLY INCAPABLE of sending any of it. "
 easy to promise in a docstring and easy to lose in a later edit, so it is asserted here
 four ways:
 
-  1. NO CONTROL AT ALL. The merged page carries ZERO widgets — that was the deliberate
-     choice when the Custom allocation page's cache-refresh button and its
-     already-in-line filter checkbox were folded in (both capabilities were kept; see
-     page_models.py). So there is no free-text box a confirm phrase could be typed into,
-     no button that could stand in for one, and nothing to relabel into an arm control
-     later. The widget-vocabulary check is kept as well, so that if a control is ever
-     added deliberately it still cannot be an arm/execute/send affordance.
+  1. EXACTLY ONE CONTROL, AND ITS ONLY EFFECT IS TO CLEAR A CACHE. The merged page carries
+     a single widget: the "Re-read the models Andrew writes himself from the client system"
+     button, restored 2026-09-08 because without it Andrew had to wait out a 10-minute cache
+     to see a model he had just published. Its whole effect is to discard that cached read.
+     This file allows that ONE control BY EXACT LABEL and permits nothing else, so any other
+     widget — above all anything that could be relabelled into an arm/execute/send/confirm
+     affordance — still fails the suite loudly. There is still no free-text box, no number
+     input and no second button of any kind, so the typed confirm phrase the transmit rails
+     require cannot be entered here. The widget-vocabulary check is kept on top of that.
+     (The retired Custom allocation page's already-in-line filter checkbox did NOT come
+     across: the page always lists both, which shows strictly more than that filter did.)
   2. NO ARM TOKEN, ANYWHERE. Neither the module source nor the rendered page contains the
      literal arm token the executors require ("--arm-i-understand"), or the batch confirm
      phrase, or an armed=True construction.
@@ -137,6 +141,14 @@ _FORBIDDEN_SPAWN = (
     "live_fa_block_execute", "rebalance_run", "morning_execute",
 )
 
+# THE ONE CONTROL THIS PAGE MAY CARRY — as an exact (kind, label) pair. Everything the
+# page renders must match this and only this. Spelled out literally rather than pattern
+# matched, so a relabelled or extra control cannot slip through as "close enough".
+_ALLOWED_CONTROL = (
+    "button",
+    "Re-read the models Andrew writes himself from the client system",
+)
+
 # Every interactive widget class AppTest can surface.
 _WIDGET_KINDS = ("button", "text_input", "number_input", "text_area", "checkbox",
                  "radio", "selectbox", "multiselect", "slider", "toggle",
@@ -155,17 +167,37 @@ def _all_widgets(at):
     return out
 
 
-def test_page_carries_no_control_of_any_kind():
-    """THE DELIBERATE CHOICE made when the three model pages were merged: the merged page
-    renders ZERO widgets. The retired Custom allocation page had a cache-refresh button and
-    an already-in-line filter checkbox; both capabilities were kept (the read renews itself
-    on a timer whose age is stated on screen, and the in-line accounts are simply always
-    listed) but neither control came across, because a page with no controls at all cannot
-    grow one into an arm affordance by accident."""
+def test_page_carries_exactly_the_one_allowed_control_and_nothing_else():
+    """THE WHOLE ALLOWANCE, spelled out: the page may render the re-read button and MAY NOT
+    render anything else. This is an exact-match assertion on purpose — a new widget of any
+    kind, or a re-labelled version of this one, fails here immediately rather than being
+    waved through as "just one more control". A cache-refresh button starts no program,
+    opens no broker socket and holds no arm token, which is why this one is compatible with
+    the read-only guarantee; a second control would have to prove that again."""
     at = _run()
     widgets = _all_widgets(at)
-    assert widgets == [], (
-        f"the Strategy Models page must render no control at all: {widgets}")
+    assert widgets == [_ALLOWED_CONTROL], (
+        f"the Strategy Models page may render ONLY the re-read control "
+        f"{_ALLOWED_CONTROL!r}, and rendered: {widgets}")
+
+
+def test_the_one_control_clears_the_cached_read():
+    """The button must actually do its job — clear this page's cached read of the
+    hand-written allocations — because a button that only looks like a refresh would leave
+    Andrew staring at a stale model for up to ten minutes and believing it was current.
+    The cached loader is swapped for a recorder that counts ``.clear()`` calls, so this
+    asserts the real click path, not the label."""
+    page_models.CLEARED = []
+    at = AppTest.from_string(
+        _CLEAR_SCRIPT.format(here=str(_HERE), views=str(_STRATEGY_VIEWS)),
+        default_timeout=300).run()
+    assert not at.exception, f"page raised: {at.exception}"
+    assert page_models.CLEARED == [], "the cached read was cleared without a click"
+
+    assert len(at.button) == 1, "the re-read control is missing"
+    at.button[0].click().run()
+    assert len(page_models.CLEARED) == 1, (
+        "clicking the re-read control did not clear the cached read — the button is inert")
 
 
 def test_no_arm_or_execute_affordance():
@@ -439,6 +471,21 @@ _STATE = {{
 p._load_custom_state = lambda: _STATE
 p.render_models()
 """
+
+
+# The same synthetic page, but with the cached loader replaced by a recorder that COUNTS
+# the ``.clear()`` calls the re-read button makes. ``page_models.CLEARED`` survives across
+# AppTest re-runs (the script only seeds it when it is missing), which is what lets the test
+# compare before-click with after-click.
+_CLEAR_SCRIPT = _SYNTHETIC_SCRIPT.replace(
+    "p._load_custom_state = lambda: _STATE",
+    "class _Recorder:\n"
+    "    def __call__(self): return _STATE\n"
+    "    def clear(self): p.CLEARED.append(1)\n"
+    "if not hasattr(p, 'CLEARED'): p.CLEARED = []\n"
+    "p._load_custom_state = _Recorder()",
+)
+assert "_Recorder" in _CLEAR_SCRIPT, "the synthetic script's loader stub was renamed"
 
 
 def _run_synthetic():

@@ -84,9 +84,13 @@ def test_page_renders_without_exception():
 
 def test_no_edit_or_write_widgets():
     """The whole point: this view DISPLAYS models, never edits them. Editing is the
-    later gated review->validate->deploy stage, not an in-app control."""
+    later gated review->validate->deploy stage, not an in-app control. The single
+    permitted button re-reads the hand-written allocations and changes nothing — see
+    test_models_page_safety.py, which pins it by exact label."""
     at = _run()
-    assert len(at.button) == 0, "found a button — this page must be read-only"
+    assert len(at.button) == 1, "the page must carry exactly one button (the re-read)"
+    assert "Re-read" in at.button[0].label, (
+        f"the one button is not the re-read control: {at.button[0].label!r}")
     assert len(at.text_input) == 0, "found a text_input — read-only violation"
     assert len(at.number_input) == 0, "found a number_input — read-only violation"
     assert len(at.text_area) == 0, "found a text_area — read-only violation"
@@ -328,11 +332,16 @@ def test_status_badges_render_as_markup_not_as_literal_tag_text():
 
 
 def test_custom_section_stays_read_only():
-    """Folding the hand-written family in must not add a single control — the retired
-    Custom allocation page had a refresh button and a filter checkbox, and neither came
-    across."""
+    """Folding the hand-written family in adds exactly ONE control and no other: the
+    re-read button, which clears this page's cached read of the hand-written allocations.
+    The retired Custom allocation page also had an already-in-line filter checkbox; that one
+    did NOT come across. Every other kind of control must stay at zero — see
+    test_models_page_safety.py, which owns the full read-only guarantee."""
     at = _run_script(_CUSTOM_SCRIPT)
-    for kind in ("button", "text_input", "number_input", "text_area", "checkbox",
+    assert len(at.button) == 1, "the Models page must carry exactly one button"
+    assert "Re-read" in at.button[0].label, (
+        f"the one button is not the re-read control: {at.button[0].label!r}")
+    for kind in ("text_input", "number_input", "text_area", "checkbox",
                  "radio", "selectbox", "multiselect", "slider", "toggle"):
         assert len(getattr(at, kind)) == 0, (
             f"found a {kind} — the Models page must stay read-only")

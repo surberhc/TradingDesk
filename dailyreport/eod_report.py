@@ -522,12 +522,56 @@ def _overall(sections):
     return worst
 
 
+# Jobs that write a status file but have NO section in this report. The report was
+# deliberately trimmed to Strategy 0 on 2026-07-07 and STAYS trimmed — nothing here
+# re-sections them. But until now nothing read them at all, so any of them could fail every
+# night in complete silence, which is what happened straight through the live-data Gateway
+# outage of 2026-09-02/03/04. One line naming any that reported trouble is the whole fix.
+# account_monitor is deliberately NOT in this list: it is paused on purpose (gateway
+# quarantine, 2026-07-08) and naming it would recreate the nightly false alarm that got its
+# section de-listed on 2026-07-28 in the first place.
+UNSECTIONED_JOBS = ("forward", "gex", "tiingo", "morning_execute", "nightly_monitor",
+                    "s0_live_pilot")
+
+# status.py's four values, spelled out — the house rule is plain English, never shorthand.
+_STATUS_ENGLISH = {"ok": "fine", "partial": "only partly finished",
+                   "fail": "FAILED", "stale": "out of date"}
+
+
+def _unsectioned_trouble() -> list[str]:
+    """``"<job> — <plain English>"`` for every job in UNSECTIONED_JOBS whose OWN last
+    written status is not "ok".
+
+    This reports what each job WROTE about itself. It deliberately does NOT judge a job by
+    the date on its status file: a job paused on purpose writes nothing new and would then
+    read as broken every single night — the exact false alarm that got the account
+    monitor's section removed. A job that has never written a status file is skipped."""
+    out = []
+    for job in UNSECTIONED_JOBS:
+        try:
+            s = status.read(job)
+        except Exception:      # a status file must never be able to take the report down
+            continue
+        if not s:
+            continue
+        st = str(s.get("status", "")).lower()
+        if st and st != "ok":
+            out.append(f"{job} — {_STATUS_ENGLISH.get(st, st)}")
+    return out
+
+
 def _status_banner(sections, overall) -> str:
     """One-line, phone-first banner: overall dot + today's confirmed regime + equity
     band + a fresh/stale summary across sections. Reuses values already computed by
     build_s0_regime's section dict (its 'rows' list) — does NOT recompute regime or
     band independently, so this can never drift from the S0 Regime section below it.
-    """
+
+    THE BANNER STATES ITS OWN SCOPE. It used to end "all systems fresh", computed from
+    ``len(sections)`` — which, since the report was trimmed to Strategy 0, is a sample of
+    exactly two. That read as a whole-desk all-clear and was published as one every night
+    of the 2026-09-02/03/04 live-data Gateway outage, when Strategy 0's own inputs really
+    were fine and something else was not. It now says WHAT was checked, and adds a second
+    line naming any unsectioned job that reported trouble."""
     regime_txt = "regime unknown"
     band_txt = ""
     s0 = next((s for s in sections if s.get("key") == "s0_regime"), None)
@@ -542,13 +586,23 @@ def _status_banner(sections, overall) -> str:
 
     n = len(sections)
     n_ok = sum(1 for s in sections if s.get("status") == "ok")
-    systems_txt = "all systems fresh" if n_ok == n else f"{n_ok}/{n} systems fresh"
+    checked_txt = (f"Strategy 0's own inputs: all {n} fresh" if n_ok == n
+                   else f"Strategy 0's own inputs: {n_ok} of {n} fresh")
 
     dot_html = (f'<span style="display:inline-block;width:11px;height:11px;'
                 f'border-radius:50%;background:{DOT.get(overall, "#9ca3af")};'
                 f'margin-right:8px;"></span>')
-    return (f'<div style="font-size:15px;font-weight:600;color:#111827;margin:2px 0 8px;">'
-            f'{dot_html}S0: {regime_txt}{band_txt} · {systems_txt}</div>')
+    banner = (f'<div style="font-size:15px;font-weight:600;color:#111827;margin:2px 0 8px;">'
+              f'{dot_html}S0: {regime_txt}{band_txt} · {checked_txt}</div>')
+
+    trouble = _unsectioned_trouble()
+    if trouble:
+        banner += (f'<div style="font-size:12px;background:#fef3c7;color:#92400e;'
+                   f'border-radius:6px;padding:7px 10px;margin:6px 0;">'
+                   f'⚠ This report covers Strategy 0 only. These other jobs are not '
+                   f'reported on below, and last reported trouble: '
+                   f'{"; ".join(trouble)}.</div>')
+    return banner
 
 
 def _session_banner() -> str:
@@ -664,7 +718,16 @@ def main() -> bool:
         sections = [s0_regime_sec, s0_data_sec]
         overall = _overall(sections)
         html = render_html(sections, overall)
-        subject = f"Trading Desk EOD — {TODAY.strftime('%b %d')} — {overall.upper()}"
+        # The subject says WHAT was checked. A bare "— OK" off these two sections read as
+        # a whole-desk all-clear; only Strategy 0's own inputs were ever checked. Any
+        # unsectioned job reporting trouble is counted in the subject too, so a silent
+        # failure elsewhere is visible without opening the email.
+        trouble = _unsectioned_trouble()
+        subject = (f"Trading Desk EOD — {TODAY.strftime('%b %d')} — "
+                   f"Strategy 0 inputs {overall.upper()}")
+        if trouble:
+            subject += (f" — plus {len(trouble)} other job"
+                        f"{'s' if len(trouble) != 1 else ''} reporting trouble")
         sent = mailer.send_html(subject, html)
         _log(f"sections={[s['status'] for s in sections]} overall={overall} "
              f"emailed={'YES' if sent else 'NO'} -> {mailer.recipient()}")
