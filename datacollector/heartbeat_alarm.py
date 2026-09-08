@@ -363,10 +363,18 @@ DEADLINE_JOBS: list[dict] = [
 ]
 
 
+# A job that RAN is not the same as a job that WORKED. "stale" was a documented status
+# value in dailyreport/status.py that nothing ever alarmed on — so a job could report its
+# own data as out of date and still show green here. Found 2026-09-08 (conductor #81) via
+# the GEX build, which read status "ok" with data four trading days old because an
+# incremental build that finds no new input succeeds by construction.
+_OUTSTANDING_STATUSES = ("fail", "stale")
+
+
 def handle_deadline(job: dict, state: dict, now: float) -> tuple[str, dict | None]:
     """Assess a once-daily job against its deadline WITHOUT sending. After the deadline,
-    the job is OUTSTANDING if the status JSON's date != today OR its status == 'fail' OR
-    it's missing/unreadable. Returns (one-line status, problem|None); a non-None problem
+    the job is OUTSTANDING if the status JSON's date != today OR its status is one of
+    _OUTSTANDING_STATUSES ('fail' or 'stale') OR it's missing/unreadable. Returns (one-line status, problem|None); a non-None problem
     is folded into the daily consolidated digest by main(). Recovery/pre-deadline clears
     any legacy cooldown key so state stays clean and logs stay accurate."""
     name = job["name"]
@@ -409,7 +417,7 @@ def handle_deadline(job: dict, state: dict, now: float) -> tuple[str, dict | Non
         s = json.loads(status_file.read_text())
         st = s.get("status")
         date_ok = s.get("date") == today
-        if date_ok and st != "fail":
+        if date_ok and st not in _OUTSTANDING_STATUSES:
             ok = True
         else:
             detail = f"date={s.get('date')} status={st}"

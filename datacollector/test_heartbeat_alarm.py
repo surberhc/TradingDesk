@@ -18,6 +18,8 @@ import datetime as dt
 import json
 import os
 
+import pytest
+
 import heartbeat_alarm as hba
 
 
@@ -562,3 +564,46 @@ def test_handle_job_returns_none_when_fresh(tmp_path):
     line, problem = hba.handle_job(job, state, now)
     assert problem is None
     assert "no alert" in line
+
+
+# --------------------------------------------------------------------------- #
+# A job that RAN is not a job that WORKED (conductor #81, 2026-09-08)
+# --------------------------------------------------------------------------- #
+
+def _post_deadline_now():
+    """A moment safely after the fixture job's 21:00 deadline."""
+    return dt.datetime.now().replace(hour=23, minute=30, second=0, microsecond=0)
+
+
+def _write_status(tmp_path, status):
+    today = dt.datetime.now().strftime("%Y%m%d")
+    (tmp_path / "tiingo.json").write_text(
+        json.dumps({"job": "tiingo", "date": today, "status": status}))
+
+
+@pytest.mark.parametrize("status", ["fail", "stale"])
+def test_failed_or_stale_status_is_outstanding(tmp_path, monkeypatch, status):
+    """'stale' was a documented status value that nothing alarmed on.
+
+    That is how the GEX build reported "ok" with four-trading-day-old data while its
+    upstream feed was dead. A job reporting its own data as out of date must page.
+    """
+    hba._task_deadline_cache.clear()
+    monkeypatch.setattr(hba, "_latest_task_trigger_hhmm", lambda task_name: (20, 45))
+    _write_status(tmp_path, status)
+
+    line, problem = hba.handle_deadline(_deadline_job(tmp_path), {}, _post_deadline_now().timestamp())
+
+    assert problem is not None, f"status={status!r} must be reported as outstanding"
+    assert status in line
+
+
+def test_ok_status_is_not_outstanding(tmp_path, monkeypatch):
+    """The contrast case — a genuinely healthy job must stay quiet."""
+    hba._task_deadline_cache.clear()
+    monkeypatch.setattr(hba, "_latest_task_trigger_hhmm", lambda task_name: (20, 45))
+    _write_status(tmp_path, "ok")
+
+    _line, problem = hba.handle_deadline(_deadline_job(tmp_path), {}, _post_deadline_now().timestamp())
+
+    assert problem is None

@@ -77,6 +77,50 @@ def _write_gex_status(st: str, metrics: dict | None = None, message: str = "") -
         pass
 
 
+def _expected_newest_date(now=None) -> str | None:
+    """The date the GEX tables SHOULD contain by the time this runs, as YYYYMMDD.
+
+    The nightly build fires ~19:30 CT, after the ~17:30 option-chain pull, so on a
+    trading day today's own data is expected; otherwise the last trading day is.
+    Returns None if the calendar cannot answer — an unknown expectation must never
+    manufacture a false alarm.
+    """
+    try:
+        import datetime as _dt
+        from connections import market_calendar as _cal  # noqa: PLC0415
+        today = (now or _dt.datetime.now()).date()
+        expected = today if _cal.is_trading_day(today) else _cal.last_trading_day(today)
+        return expected.strftime("%Y%m%d")
+    except Exception:  # noqa: BLE001 — a calendar hiccup must not fail the build
+        return None
+
+
+def _score_freshness(summary: dict, now=None) -> tuple[str, str]:
+    """(status, message) for an incremental run — judged on the DATA, not the exit code.
+
+    WHY THIS EXISTS (conductor #81, 2026-09-08). This build is INCREMENTAL: when its
+    upstream produces nothing new it does no work, raises nothing, and used to report
+    "ok". So when the nightly option-chain pull silently stopped landing data, gex.json
+    read status "ok" with newest_date 20260901 for four trading days and nobody was
+    told. A build that succeeds at doing nothing is not a healthy build. Freshness is
+    therefore part of the verdict, not a detail in the metrics.
+    """
+    newest = summary.get("newest_date")
+    rows = summary.get("rows")
+    expected = _expected_newest_date(now)
+    base = f"(newest {newest}, {rows} rows)"
+    if newest is None:
+        return "fail", f"incremental build produced NO data at all {base}"
+    if expected is None:
+        return "ok", f"incremental build ok {base} — freshness unchecked (no calendar)"
+    if str(newest) >= expected:
+        return "ok", f"incremental build ok {base}"
+    return "stale", (
+        f"STALE: newest GEX data is {newest} but {expected} was expected {base}. "
+        f"The build itself did not fail — it had nothing new to add, which means its "
+        f"UPSTREAM (the nightly option-chain pull) has not been landing data.")
+
+
 def _gex_table_summary() -> dict:
     """Newest date + row count across the report symbols' derived tables, for the
     status metrics. Best-effort; returns {} on any trouble."""
@@ -202,12 +246,9 @@ if __name__ == "__main__":
         try:
             main_incremental(args[1:])
             summary = _gex_table_summary()
-            _write_gex_status("ok", metrics=summary,
-                              message=f"incremental build ok "
-                                      f"(newest {summary.get('newest_date')}, "
-                                      f"{summary.get('rows')} rows)")
-            _log(f"incremental build done "
-                 f"(newest {summary.get('newest_date')}, {summary.get('rows')} rows)")
+            st, msg = _score_freshness(summary)
+            _write_gex_status(st, metrics=summary, message=msg)
+            _log(f"incremental build done [{st}] {msg}")
         except Exception as e:
             _write_gex_status("fail", message=f"{type(e).__name__}: {e}")
             _log(f"incremental build FAILED: {type(e).__name__}: {e}")
