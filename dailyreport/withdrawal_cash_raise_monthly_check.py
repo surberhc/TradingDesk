@@ -157,17 +157,16 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     import action_center
-    if action_center.is_snoozed(_DEDUP_KEY):
-        print("Monthly withdrawal-cash-raise notice is snoozed (ignored) by the operator; "
-              "posting nothing.")
-        return 0
-
     key = action_center.post_notice(kind="withdrawal_cash_raise_monthly", title=title,
                                     body=body, severity="warn", action_hint=hint,
                                     dedup_key=_DEDUP_KEY)
     if key:
         print(f"Posted the consolidated withdrawal-cash-raise notice to the Action Center "
               f"(notice {key}), naming {len(rows)} account(s).")
+        return 0
+    if key == action_center.SKIPPED:
+        print("Posting nothing: a withdrawal-cash-raise alert is already open in the Action "
+              "Center, or the Action Center could not be asked.")
         return 0
     _log("posting the Action Center notice failed.")
     return 1

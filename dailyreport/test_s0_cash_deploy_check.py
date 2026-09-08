@@ -48,8 +48,11 @@ def test_build_notice_is_plain_english():
 
 def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, capsys):
     """While an idle-cash alert is still OPEN in the CRM, the daily run must SKIP posting —
-    that poster-side skip is what silences the re-nag. Snooze is gone; Andrew closing the task
-    in the CRM is what lets the alert be raised again."""
+    that poster-side skip is what silences the re-nag. Andrew closing the task in the CRM is
+    what lets the alert be raised again.
+
+    The job no longer pre-checks this itself: it calls post_notice and reads the SKIPPED
+    answer. And it never claims the operator snoozed anything, because nobody did."""
     import action_center
 
     # force a should-propose scenario without touching the broker
@@ -63,9 +66,23 @@ def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, caps
 
     # next run must skip posting; the open alert is left untouched
     assert job.main([]) == 0
-    assert "snoozed" in capsys.readouterr().out.lower()
+    out = capsys.readouterr().out.lower()
+    assert "already open" in out
+    assert "snoozed" not in out
     assert len(crm) == 1
-    assert action_center.is_snoozed(job._DEDUP_KEY)
+    assert action_center.has_open(job._DEDUP_KEY)
+
+
+def test_main_reports_failure_when_the_alert_cannot_be_filed(crm_write_broken, monkeypatch,
+                                                             capsys):
+    """An outage on the reporting channel is a FAILED run. Non-zero exit, and never a claim
+    that the operator snoozed a notice nobody snoozed."""
+    monkeypatch.setattr(job, "read_cash",
+                        lambda: {"net_liq": 100_000, "total_cash": 5_000})
+
+    assert job.main([]) == 1
+    assert crm_write_broken == []
+    assert "snoozed" not in capsys.readouterr().out.lower()
 
 
 def test_main_survives_a_failed_duplicate_check_and_posts_nothing(crm, monkeypatch):

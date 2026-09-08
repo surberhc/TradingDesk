@@ -130,10 +130,14 @@ def test_main_posts_nothing_while_an_alert_is_already_open(monkeypatch, crm, cap
                         lambda *a, **k: calls.append(k) or real_post_notice(*a, **k))
 
     rc = job.main([])
-    out = capsys.readouterr().out
+    out = capsys.readouterr().out.lower()
     assert rc == 0
-    assert "snoozed" in out.lower()
-    assert calls == []
+    # The job no longer decides this for itself: it ASKS post_notice, which declines to file a
+    # second alert and says so. The wording must never blame a snooze nobody set.
+    assert "already open" in out
+    assert "snoozed" not in out
+    assert len(calls) == 1
+    assert len(crm) == 1          # nothing new was filed
 
 
 # --------------------------------------------------------------------------- #
@@ -154,3 +158,15 @@ def test_dry_run_prints_and_posts_nothing(monkeypatch, capsys):
     assert "[dry-run]" in out
     assert "UA" in out
     assert calls == []
+
+
+def test_main_reports_failure_when_the_alert_cannot_be_filed(crm_write_broken, monkeypatch,
+                                                             capsys):
+    """An outage on the reporting channel is a FAILED run. Non-zero exit, and never a claim
+    that the operator snoozed a notice nobody snoozed."""
+    monkeypatch.setattr(job, "_household_names", lambda accounts: {})
+    monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
+
+    assert job.main([]) == 1
+    assert crm_write_broken == []
+    assert "snoozed" not in capsys.readouterr().out.lower()
