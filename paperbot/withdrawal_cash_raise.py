@@ -58,6 +58,47 @@ for _p in (str(_HERE), str(_REPO / "dailyreport"), str(_REPO / "connections")):
 #    decide() + read_cash() directly. This is NOT a second implementation of the
 #    shortfall decision; it is the same one, called live.
 # --------------------------------------------------------------------------- #
+def accounts_needing_cash_and_unreadable(as_of=None) -> tuple[list[dict], list[str]]:
+    """LIVE read, reporting BOTH what was found short AND what could not be examined.
+
+    Returns ``(short_rows, unreadable_accounts)``. ``short_rows`` is described under
+    :func:`accounts_needing_cash`. ``unreadable_accounts`` names every tracked account whose
+    live read raised, or whose cash check came back inconclusive — i.e. the accounts that were
+    NOT examined at all. A caller must consult it: with the Gateway down EVERY account lands
+    here and ``short_rows`` is empty, which is NOT the same answer as "nobody is short".
+    Mirrors withdrawal_reserve_check.main's own ``any_failure`` handling.
+    """
+    import withdrawal_reserve_check as wrc
+
+    out: list[dict] = []
+    unreadable: list[str] = []
+    for account in wrc.accounts_to_check():
+        try:
+            data = wrc.read_cash(account)
+        except Exception as exc:  # noqa: BLE001
+            print(f"withdrawal_cash_raise: {account}: could not read the account live "
+                  f"({type(exc).__name__}: {exc}); NOT examined, reported as unreadable.",
+                  file=sys.stderr)
+            unreadable.append(account)
+            continue
+        d = wrc.decide(account, data.get("net_liq"), data.get("total_cash"))
+        if not d.get("ok"):
+            print(f"withdrawal_cash_raise: {account}: cash check inconclusive "
+                  f"({d.get('reason', '')}); NOT examined, reported as unreadable.",
+                  file=sys.stderr)
+            unreadable.append(account)
+            continue
+        if d.get("should_alert"):
+            out.append({
+                "account": account,
+                "net_liq": d["net_liq"],
+                "total_cash": d["total_cash"],
+                "reserve": d["reserve"],
+                "shortfall": d["shortfall"],
+            })
+    return sorted(out, key=lambda r: r["account"]), sorted(unreadable)
+
+
 def accounts_needing_cash(as_of=None) -> list[dict]:
     """LIVE read: every account withdrawal_reserve_check tracks that is CURRENTLY short of
     its withdrawal reserve.
@@ -68,35 +109,13 @@ def accounts_needing_cash(as_of=None) -> list[dict]:
 
     Returns ``[{account, net_liq, total_cash, reserve, shortfall}]``, sorted by account, for
     exactly the accounts where withdrawal_reserve_check.decide()'s ``should_alert`` is True.
-    An account that cannot be read live (gateway down, account not visible under this login)
-    is SKIPPED, never guessed at, with a note to stderr — mirroring
-    withdrawal_reserve_check.main's own failure handling exactly.
-    """
-    import withdrawal_reserve_check as wrc
 
-    out: list[dict] = []
-    for account in wrc.accounts_to_check():
-        try:
-            data = wrc.read_cash(account)
-        except Exception as exc:  # noqa: BLE001
-            print(f"withdrawal_cash_raise: {account}: could not read the account live "
-                  f"({type(exc).__name__}: {exc}); skipped, not counted as short.",
-                  file=sys.stderr)
-            continue
-        d = wrc.decide(account, data.get("net_liq"), data.get("total_cash"))
-        if not d.get("ok"):
-            print(f"withdrawal_cash_raise: {account}: cash check inconclusive "
-                  f"({d.get('reason', '')}); skipped, not counted as short.", file=sys.stderr)
-            continue
-        if d.get("should_alert"):
-            out.append({
-                "account": account,
-                "net_liq": d["net_liq"],
-                "total_cash": d["total_cash"],
-                "reserve": d["reserve"],
-                "shortfall": d["shortfall"],
-            })
-    return sorted(out, key=lambda r: r["account"])
+    NOTE: an empty list from THIS function cannot distinguish "nobody is short" from "nobody
+    could be read". Any caller that must tell those apart (a scheduled job reporting an exit
+    code) should call :func:`accounts_needing_cash_and_unreadable` instead.
+    """
+    rows, _unreadable = accounts_needing_cash_and_unreadable(as_of)
+    return rows
 
 
 # --------------------------------------------------------------------------- #

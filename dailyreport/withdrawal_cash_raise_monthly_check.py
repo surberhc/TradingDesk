@@ -139,8 +139,26 @@ def main(argv: list[str] | None = None) -> int:
 
     import withdrawal_cash_raise as wcr
 
-    rows = wcr.accounts_needing_cash()
+    rows, unreadable = wcr.accounts_needing_cash_and_unreadable()
+
+    # An account that could not be read was NOT examined. Saying nothing here would let a
+    # gateway outage — where every account is unreadable and the short list is empty — read
+    # exactly like a clean "nobody needs cash", so it is reported loudly and exits non-zero,
+    # the same way withdrawal_reserve_check.main's any_failure does.
+    if unreadable:
+        count = len(unreadable)
+        noun = "account" if count == 1 else "accounts"
+        it_they = "It was" if count == 1 else "They were"
+        msg = (f"Could not read {count} withdrawal {noun}: {', '.join(unreadable)}. "
+               f"{it_they} not checked for a withdrawal cash shortfall, so this run is "
+               f"incomplete and must not be read as meaning no accounts need cash raised. "
+               f"The live-trading Gateway on port 4003 may be down or not logged in.")
+        _log(msg)
+        print(msg)
+
     if not rows:
+        if unreadable:
+            return 1
         _log("No accounts need withdrawal cash raised this cycle.")
         print("No accounts need withdrawal cash raised this cycle.")
         return 0
@@ -154,7 +172,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"  title: {title}")
         print(f"  body:  {body}")
         print(f"  hint:  {hint}")
-        return 0
+        return 1 if unreadable else 0
 
     import action_center
     key = action_center.post_notice(kind="withdrawal_cash_raise_monthly", title=title,
@@ -163,11 +181,11 @@ def main(argv: list[str] | None = None) -> int:
     if key:
         print(f"Posted the consolidated withdrawal-cash-raise notice to the Action Center "
               f"(notice {key}), naming {len(rows)} account(s).")
-        return 0
+        return 1 if unreadable else 0
     if key == action_center.SKIPPED:
         print("Posting nothing: a withdrawal-cash-raise alert is already open in the Action "
               "Center.")
-        return 0
+        return 1 if unreadable else 0
     _log("posting the Action Center notice failed.")
     return 1
 
