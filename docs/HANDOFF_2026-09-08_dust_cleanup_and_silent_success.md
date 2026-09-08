@@ -269,3 +269,157 @@ Open the Advisor Portal's Allocation Order Tool, select the affected accounts, c
 click **Calculate Proposed Orders**. Read the number.
 
 A decimal means go. A zero means stop and rethink the route. Nothing transmits either way.
+
+---
+
+# ADDENDUM — 2026-09-08, later the same day
+
+**Everything above stays as written. This section records what changed after it was written.**
+Where the two disagree, this section is the newer and correct one.
+
+The one-sentence version of this addendum: **the fractional-trading blocker described in Part B
+is gone — fractional trading is already switched on for the whole book — and the only thing left
+to confirm is whether the Allocation Order Tool itself will hand out fractional quantities.**
+
+---
+
+## 1. Fractional trading is already enabled. This was the blocker, and it is resolved.
+
+All **300 accounts** — Andrew's 185, Ted Perez's 98, and Douglas Garrett's 17 — sit under **one
+single Interactive Brokers master account: APS Ventures, LLC, under IBLLC-US.** There is not one
+master per advisor. There is one master, and all three books hang off it.
+
+That matters because Interactive Brokers switches fractional trading on for an advisor's clients
+on an **all-or-none basis**. It is one switch for the entire book. There is no per-account
+version of it.
+
+And that one switch is demonstrably already on. The proof is in our own fill history:
+**79 of Ted's accounts and 5 of Andrew's accounts show fractional fills**, and Andrew's most
+recent fractional fill was on **2026-09-04**. A fractional fill cannot happen in an account that
+is not enabled. Since the setting is all-or-none across one master, fills anywhere on that master
+prove the setting is on everywhere on it.
+
+**Part B above says "3 of 185 accounts proven enabled" for Andrew's book. That reading was wrong,
+and it should not be relied on.** It was not measuring configuration at all. It was measuring
+which accounts happened to place a fractional trade during the seven weeks of trade history we
+hold. An account that is enabled but simply had no reason to trade a fraction in those seven weeks
+looks identical to a disabled one in that count. The number is a count of recent activity, not a
+count of permissions.
+
+**Consequences, plainly:**
+
+- Nothing needs to be enabled. There is no setting to change.
+- **No signed disclosure is required.** Part B's statement that turning the setting on "requires a
+  signed disclosure" describes turning it *on*. It is already on, so that step does not arise.
+- This is no longer a firm-level decision waiting on Andrew.
+
+---
+
+## 2. What is genuinely still unknown — and it is one click
+
+The only remaining question is narrower than the two questions in Part B. It is:
+
+> **Does the Allocation Order Tool itself emit fractional orders?**
+
+The account permission is settled. The tool's own behaviour is not, because of the contradiction
+already noted in Part B: Interactive Brokers has an error whose text says fractional shares are
+not supported for allocation orders, while the Allocation Order Tool's documentation says enabled
+accounts receive fractional orders. That may be a distinction between the point-and-click tool and
+the programmatic interface. We still should not guess.
+
+**The check, unchanged, and it transmits nothing:**
+
+> Advisor Portal, then **Trade**, then **Order Ticket**, then ticker **BIL**, then select the
+> account group, then set the allocation method, then click **Calculate Proposed Orders**, and
+> read the quantity.
+>
+> - Quantities **with decimals** mean **go**.
+> - Quantities of **zero** mean **stop**, and the route needs rethinking.
+
+Clicking Calculate Proposed Orders sends nothing to the market. It only shows what it would do.
+
+---
+
+## 3. The cleanup task now exists in the client system, assigned to Andrew
+
+A Task List item titled **"Dust Cleanup — sell out 12 leftover tickers across the book"** is
+**open and assigned to Andrew, not to Ted.** That was Andrew's own decision, and it supersedes the
+plan in Part B to hand the work to Ted.
+
+The task contains everything needed to do the work without reading this handoff:
+
+- All twelve tickers.
+- The **twelve passes, not 158 account visits** approach.
+- The Allocation Order Tool check above, written in as **step one**.
+- The **four whole-share BUCK trades marked do-not-touch**, because the desk places those itself.
+
+---
+
+## 4. Client-system alert cleanup done today
+
+**Open alerts fell from 554 to 83.** That came from closing 458 fractional-dust alerts — one had
+been raised per leftover position, and they are all now superseded by the single Dust Cleanup task
+above — plus 11 alerts about individual bonds.
+
+### Where these alerts actually come from — it is not this repository
+
+The generator is on the **client-system side**: a database function named
+**public.run_foreign_holding_scan()**, written in the database's own procedural language, fired
+by a scheduled database job (job 18) at **12:02 UTC every day**. **Nothing in the TradingDesk
+repository generates these alerts.** Anyone looking for the code in this repo will not find it.
+
+### Closing an alert does not stop it coming back
+
+This is worth understanding before anyone is surprised by it. The insert guard inside that
+function only skips a de-duplication key when the matching alert is currently **open** or **in
+progress**. An alert that has been marked **done** is therefore no longer a match, and the next
+run inserts it again.
+
+So the **457 dust alerts will reappear every day until the dust is actually sold.** That is
+correct behaviour, not a fault — the underlying condition is still true, and the system is
+supposed to keep saying so. They will stop by themselves the day the cleanup is executed.
+
+### The 11 bond alerts are fixed permanently, at the source
+
+These were not just closed. Eleven rows were added to the client system's **holding_exceptions**
+table — a table that run_foreign_holding_scan already consults and which had been sitting empty.
+They cover the individual bonds that are **deliberately held** in accounts **U7552751, U7552750,
+U7349974, U7349657 and U7333246**. Those bonds are on the desk's never-trade list and sit outside
+the model on purpose. Because the exception is now recorded where the scan reads it, those alerts
+will not come back.
+
+### The 20 remaining data-quality alerts were each verified as genuinely live
+
+Not assumed, and not stale. The current field values behind every one of the 20 were checked, and
+separately the client system's own run_book_scan() automatically resolves an alert once its
+condition clears. Between those two facts, anything still showing as open is still actually true.
+
+---
+
+## 5. Two things noticed in passing and deliberately not acted on
+
+- **"Cole L Strathman" exists as two separate person records, in two different households**, each
+  raising its own alert. This looks like a duplicate that should be merged, but merging people
+  across households is not a change to make in passing.
+- **Three accounts still have no date of birth recorded.** Two of them are substantial:
+  **Hettie Leary's trust, $211,648**, and **Gerald Boyd's individual retirement account, $149,264**.
+
+---
+
+## 6. Still open and still unbuilt — Part C is unchanged
+
+Trade Execution should end every run by **naming what it could not place**, and drop a worklist
+into the client system carrying a **"Dust cleanup needed"** alert. Scope stays exactly as agreed:
+**only what the rail could not place**, and a **worklist rather than an executable order file**.
+
+This remains **blocked on the Allocation Order Tool check in section 2** — not on anything about
+permissions, which are now settled.
+
+---
+
+## THE SINGLE NEXT ACTION — restated
+
+Advisor Portal, then Trade, then Order Ticket, then BIL, then select the account group, then set
+the allocation method, then **Calculate Proposed Orders**, and read the quantity.
+
+**Decimals mean go. Zeros mean stop.** Nothing transmits either way.
