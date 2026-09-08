@@ -2,6 +2,8 @@
 import sys
 from pathlib import Path
 
+import pytest
+
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 for _p in (str(_HERE), str(_REPO / "connections"), str(_REPO / "paperbot"),
@@ -201,3 +203,35 @@ def test_main_reports_failure_when_the_alert_cannot_be_filed(crm_write_broken, m
     assert job.main([]) == 1
     assert crm_write_broken == []
     assert "snoozed" not in capsys.readouterr().out.lower()
+
+
+# --------------------------------------------------------------------------- #
+# The withdrawal list now comes LIVE from the client system. An unreadable or empty list
+# means NO account was examined -- which must never finish like a clean "nobody is short".
+# --------------------------------------------------------------------------- #
+def _schedule_unavailable(monkeypatch):
+    def boom():
+        raise cashflows.ScheduleUnavailable("connection refused")
+    monkeypatch.setattr(job, "accounts_to_check", boom)
+
+
+def test_unreadable_schedule_fails_and_never_claims_no_accounts_need_cash(monkeypatch,
+                                                                          capsys):
+    _schedule_unavailable(monkeypatch)
+    monkeypatch.setattr(job, "read_cash",
+                        lambda account: pytest.fail("must not read any account"))
+
+    assert job.main([]) == 1
+    out = capsys.readouterr().out.lower()
+    assert "could not read the list of clients who take a scheduled withdrawal" in out
+    assert "must not be read as meaning no accounts need cash raised" in out
+
+
+def test_empty_schedule_is_a_loud_failure_not_a_clean_run(monkeypatch, capsys):
+    """Before this, an empty schedule exited 0 saying there was nothing to check."""
+    monkeypatch.setattr(cashflows, "SCHEDULE", {})
+
+    assert job.main([]) == 1
+    out = capsys.readouterr().out.lower()
+    assert "no account with a scheduled withdrawal" in out
+    assert "must not be read as meaning no accounts need cash raised" in out

@@ -137,9 +137,21 @@ def main(argv: list[str] | None = None) -> int:
                          "the Action Center.")
     args = ap.parse_args(argv)
 
+    import cashflows
     import withdrawal_cash_raise as wcr
 
-    rows, unreadable = wcr.accounts_needing_cash_and_unreadable()
+    # The withdrawal list comes live from the client system (paperbot/cashflows.SCHEDULE).
+    # An unreadable list means NO account was examined — reported loudly and non-zero, the
+    # same way an unreadable ACCOUNT is below, never as a clean "nobody needs cash".
+    try:
+        rows, unreadable = wcr.accounts_needing_cash_and_unreadable()
+    except cashflows.ScheduleUnavailable as exc:
+        msg = (f"Could not read the list of clients who take a scheduled withdrawal: {exc} "
+               f"No account was checked for a withdrawal cash shortfall, so this run is "
+               f"incomplete and must not be read as meaning no accounts need cash raised.")
+        _log(msg)
+        print(msg)
+        return 1
 
     # An account that could not be read was NOT examined. Saying nothing here would let a
     # gateway outage — where every account is unreadable and the short list is empty — read

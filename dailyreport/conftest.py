@@ -75,6 +75,15 @@ def crm(monkeypatch):
     return rows
 
 
+@pytest.fixture(autouse=True)
+def _no_live_withdrawal_schedule(monkeypatch):
+    """``cashflows.SCHEDULE`` now reads the live client system on first use. Autouse so no
+    test in this suite can reach Andrew's real client withdrawal schedule; a test that wants
+    one monkeypatches cashflows.SCHEDULE itself, exactly as before."""
+    import cashflows
+    monkeypatch.setattr(cashflows, "SCHEDULE", {})
+
+
 class _InsertBrokenCursor(_FakeCursor):
     """A CRM that can still be asked whether an alert is open, but fails the write itself."""
 

@@ -184,10 +184,26 @@ def main(argv: list[str] | None = None) -> int:
                          "NOTHING to the Action Center.")
     args = ap.parse_args(argv)
 
-    accounts = accounts_to_check()
+    # The withdrawal list comes live from the client system. If it cannot be read, NO
+    # account was examined — which must never be reported the way a clean "nobody is
+    # short" run is. Loud, non-zero, same shape as the any_failure handling below.
+    try:
+        accounts = accounts_to_check()
+    except cashflows.ScheduleUnavailable as exc:
+        msg = (f"Could not read the list of clients who take a scheduled withdrawal: {exc} "
+               f"No account was checked for a withdrawal cash shortfall, so this run is "
+               f"incomplete and must not be read as meaning no accounts need cash raised.")
+        _log(msg)
+        print(msg)
+        return 1
     if not accounts:
-        _log("no accounts in cashflows.SCHEDULE have a distribution flow; nothing to check.")
-        return 0
+        msg = ("The client system returned no account with a scheduled withdrawal. Treating "
+               "that as a failed read rather than as a real answer: no account was checked "
+               "for a withdrawal cash shortfall, so this run must not be read as meaning no "
+               "accounts need cash raised.")
+        _log(msg)
+        print(msg)
+        return 1
 
     action_center = None
     if not args.dry_run:
