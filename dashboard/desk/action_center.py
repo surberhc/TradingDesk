@@ -34,10 +34,22 @@ old "update the open notice in place" dedup AND the old "ignore for N days" snoo
 The desk has no UPDATE permission, so a repeat run cannot refresh an open alert's numbers —
 it leaves the original standing rather than stacking a duplicate.
 
+THE DE-DUPLICATION CHECK FAILS CLOSED. If the CRM cannot be asked whether an alert is already
+open, the answer is taken to be "yes, it probably is", and nothing is posted. The desk can
+create a task but has no permission to delete one, so a duplicate filed during a network blip
+could only be cleared by Andrew dismissing it by hand — whereas a report skipped tonight comes
+back on its own, because these jobs run every night. A missed report is the cheaper mistake.
+
+WHAT ``post_notice`` GIVES BACK says which of the three things happened, so a caller can tell
+"already reported" apart from "reporting is broken": the new task's id when it posted,
+``SKIPPED`` (an empty string) when it deliberately posted nothing, and ``FAILED`` (None) when
+the post could not be made. Both of the "nothing was written" answers are still falsy, so the
+four calling jobs, which test the answer for truth, keep behaving exactly as they did.
+
 PLAIN-ENGLISH RULE (#1): every title/body posted is a full, non-technical sentence.
 
-FAILURE IS NEVER FATAL: every function here swallows its errors and returns a neutral value
-after logging a plain-English line. A nightly job's whole purpose is to report a problem; it
+FAILURE IS NEVER FATAL: every function here swallows its errors and returns the safe answer
+(the one that touches the CRM least) after logging a plain-English line. A nightly job's whole purpose is to report a problem; it
 must not die because the CRM happened to be unreachable while it was doing so.
 """
 from __future__ import annotations
@@ -55,6 +67,12 @@ if _PAPERBOT.is_dir() and str(_PAPERBOT) not in sys.path:
 
 # Required by the RLS policy `tradingdesk_insert_own_alerts` — an insert without it is refused.
 SOURCE = "trading_desk"
+
+# The two ways post_notice can write nothing. Both are falsy, so a caller that simply tests the
+# answer for truth still reads them as "nothing was written"; a caller that wants the reason can
+# compare against these instead.
+SKIPPED = ""      # on purpose: an alert for this is already open, or could not be checked
+FAILED = None     # not on purpose: the CRM could not be reached or refused the insert
 
 # The CRM's tasks.severity only accepts error/warning/info; the desk's posters all say "warn".
 # Translate here rather than edit the four calling jobs.
@@ -85,8 +103,10 @@ def _connect():
 def has_open(dedup_key: str) -> bool:
     """Whether the CRM already holds an OPEN trading-desk alert carrying this ``dedup_key``.
 
-    False on any error (fail-open: better to risk a duplicate note than to silently swallow a
-    real condition because the CRM was briefly unreachable)."""
+    True on any error (fail CLOSED): an answer we could not get is treated as "one is probably
+    already open", so the caller posts nothing. The desk can file a task but cannot delete one,
+    so a duplicate filed during a blip would have to be dismissed by hand, while a report held
+    back tonight is raised again by tomorrow night's run."""
     if not dedup_key:
         return False
     try:
@@ -101,8 +121,9 @@ def has_open(dedup_key: str) -> bool:
             con.close()
     except Exception as exc:  # noqa: BLE001
         _log(f"could not ask the CRM whether a '{dedup_key}' alert is already open "
-             f"({exc}); assuming it is not.")
-        return False
+             f"({exc}); treating it as already open, so nothing will be posted this time. "
+             f"If the problem is still there, tomorrow night's run will report it.")
+        return True
 
 
 def is_snoozed(dedup_key: str) -> bool:
@@ -118,27 +139,27 @@ def is_snoozed(dedup_key: str) -> bool:
 def post_notice(kind: str, title: str, body: str, *, severity: str = "info",
                 action_hint: str = "", dedup_key: str | None = None,
                 detail_json=None, ts: str | None = None) -> str | None:
-    """File ONE alert in the CRM's Action Center. Returns the new task's id, or None if
-    nothing was written — either a matching open alert already exists, or the CRM could not be
-    reached. NEVER raises: a nightly job must survive its own alert failing to file.
+    """File ONE alert in the CRM's Action Center. Returns the new task's id when it posted,
+    ``SKIPPED`` (an empty string) when it deliberately posted nothing, and ``FAILED`` (None)
+    when the post could not be made — so a caller can tell "already reported" apart from
+    "reporting is broken". Both "nothing written" answers are falsy, exactly as the single old
+    None was. NEVER raises: a nightly job must survive its own alert failing to file.
 
     The signature is unchanged so the four calling jobs need no edit. ``action_hint`` is
     appended to the description (the CRM has no separate hint column). ``detail_json`` and
     ``ts`` are accepted and ignored — the CRM has no column for the structured blob and stamps
     its own ``created_at``."""
     description = f"{body}\n\n{action_hint}".strip() if action_hint else (body or "")
+    # Fails closed: has_open() answers "yes" when it could not find out, and either way the
+    # right move is to leave the CRM alone. It logs the specific reason when it is a failure.
+    if dedup_key and has_open(dedup_key):
+        _log(f"posting nothing about '{dedup_key}': the CRM Action Center either already "
+             f"holds an open alert for it, or could not be asked.")
+        return SKIPPED
     try:
         con = _connect()
         try:
             with con.cursor() as cur:
-                if dedup_key:
-                    cur.execute(
-                        "SELECT 1 FROM public.tasks WHERE source = %s AND dedup_key = %s "
-                        "AND status = 'open' LIMIT 1", (SOURCE, dedup_key))
-                    if cur.fetchone():
-                        _log(f"an open '{dedup_key}' alert is already in the CRM Action "
-                             f"Center; leaving it alone and posting nothing.")
-                        return None
                 cur.execute(
                     "INSERT INTO public.tasks "
                     "(title, description, severity, category, dedup_key, source, status) "
@@ -154,4 +175,4 @@ def post_notice(kind: str, title: str, body: str, *, severity: str = "info",
     except Exception as exc:  # noqa: BLE001
         _log(f"could not file this alert in the CRM Action Center ({exc}); the desk job "
              f"carries on. The alert was: {title}")
-        return None
+        return FAILED
