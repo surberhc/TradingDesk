@@ -1,27 +1,38 @@
-r"""Read-only enforcement + render tests for the Custom allocation page.
+r"""Read-only enforcement + validation tests for the merged Strategy Models page.
 
-THE POINT OF THIS FILE is the read-only guarantee. page_custom_alloc.py shows Andrew's
+This file was test_custom_alloc_page.py until the three model pages were merged into one
+(2026-09-08). The page it guards is now page_models.py, but its job is unchanged and every
+guarantee it enforced is still enforced here — the module it reads and the render entry
+point it drives were retargeted, nothing was dropped.
+
+THE POINT OF THIS FILE is the read-only guarantee. page_models.py shows Andrew's
 hand-authored model allocations and previews the trades that would bring accounts back in
 line with them — and it must be STRUCTURALLY INCAPABLE of sending any of it. "Read-only" is
 easy to promise in a docstring and easy to lose in a later edit, so it is asserted here
-three ways, mirroring the spirit of test_models_page.py's zero-widget assertion:
+four ways:
 
-  1. NO ARM/EXECUTE AFFORDANCE. Every interactive widget the page renders is enumerated and
-     its label checked against the arming vocabulary; there is no free-text box at all (so
-     no confirm phrase can be typed) and no form.
+  1. NO CONTROL AT ALL. The merged page carries ZERO widgets — that was the deliberate
+     choice when the Custom allocation page's cache-refresh button and its
+     already-in-line filter checkbox were folded in (both capabilities were kept; see
+     page_models.py). So there is no free-text box a confirm phrase could be typed into,
+     no button that could stand in for one, and nothing to relabel into an arm control
+     later. The widget-vocabulary check is kept as well, so that if a control is ever
+     added deliberately it still cannot be an arm/execute/send affordance.
   2. NO ARM TOKEN, ANYWHERE. Neither the module source nor the rendered page contains the
      literal arm token the executors require ("--arm-i-understand"), or the batch confirm
      phrase, or an armed=True construction.
   3. IT CANNOT START A PROGRAM. The module source contains no process-spawning machinery of
      any kind, and names no executor script, so it cannot invoke an executor with OR without
      an arm flag. The whole preview is built in-process from the pure engine instead.
+  4. NO WRITE PATH. The seam to the client system is one-way: no write verb anywhere in the
+     module.
 
 The pure helpers (whole-share viability, the minimum viable account size, the percentage
 read, and the drift/would-trade scan) are tested directly on synthetic data — which is the
 only way to exercise the drift path today, since no account is assigned to a custom model
 yet in the live book.
 
-Run from dashboard/:
+Run from dashboard/desk/:
     "C:\TradingDesk-Local\venv\Scripts\python.exe" -m pytest -q
 """
 from __future__ import annotations
@@ -30,12 +41,13 @@ import sys
 from pathlib import Path
 
 import pandas as pd
+import pytest
 from streamlit.testing.v1 import AppTest
 
-# page_custom_alloc imports the paperbot modules by bare name, relying on desk_app.py's
-# sys.path bootstrap. Reproduce it here so the module imports standalone under pytest.
-# The page itself now lives in the strategy_views/ sub-folder, so that folder goes on
-# sys.path too — exactly as desk_app.py does when the dashboard starts.
+# page_models imports the paperbot modules by bare name, relying on desk_app.py's sys.path
+# bootstrap. Reproduce it here so the module imports standalone under pytest. The
+# strategy_views/ folder goes on sys.path too — exactly as desk_app.py does when the
+# dashboard starts — because the other pages there are still imported that way.
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parents[1]
 _STRATEGY_VIEWS = _HERE / "strategy_views"
@@ -48,17 +60,29 @@ for _p in (_HERE, _STRATEGY_VIEWS):
     if str(_p) not in sys.path:
         sys.path.insert(0, str(_p))
 
-import page_custom_alloc  # noqa: E402
+import page_models  # noqa: E402
 
-_MODULE_SRC = (_STRATEGY_VIEWS / "page_custom_alloc.py").read_text(encoding="utf-8")
+_MODULE_SRC = (_HERE / "page_models.py").read_text(encoding="utf-8")
 
 _SCRIPT = (
     "import sys\n"
     f"sys.path.insert(0, r'{_HERE}')\n"
     f"sys.path.insert(0, r'{_STRATEGY_VIEWS}')\n"
-    "import page_custom_alloc\n"
-    "page_custom_alloc.render_custom_alloc()\n"
+    "import page_models\n"
+    "page_models.render_models()\n"
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_the_client_system_loader():
+    """AppTest runs its script in THIS process, so the synthetic-state tests below mutate
+    the real page_models module when they stub ``_load_custom_state``. Snapshot it and put
+    it back after each test, so no stub leaks into a later test or a later file."""
+    original = page_models._load_custom_state
+    try:
+        yield
+    finally:
+        page_models._load_custom_state = original
 
 
 def _run():
@@ -78,13 +102,13 @@ def test_page_shows_its_read_only_statement():
     at = _run()
     heads = "\n".join(h.value for h in at.subheader)
     blob = "\n".join(md.value for md in at.markdown)
-    assert "Custom allocation" in heads
+    assert "Strategy Models" in heads
     assert "read-only" in blob.lower()
     assert "cannot send anything" in blob.lower()
 
 
 # --------------------------------------------------------------------------- #
-# 2. READ-ONLY ENFORCEMENT — no arm/execute affordance, no arm token, no spawn.
+# 2. READ-ONLY ENFORCEMENT — no control at all, no arm token, no spawn, no write.
 # --------------------------------------------------------------------------- #
 # The vocabulary of transmission. A widget on this page must never be labelled with any of
 # these: they are the words an operator would look for to make something happen for real.
@@ -113,13 +137,16 @@ _FORBIDDEN_SPAWN = (
     "live_fa_block_execute", "rebalance_run", "morning_execute",
 )
 
+# Every interactive widget class AppTest can surface.
+_WIDGET_KINDS = ("button", "text_input", "number_input", "text_area", "checkbox",
+                 "radio", "selectbox", "multiselect", "slider", "toggle",
+                 "date_input", "time_input", "color_picker")
+
 
 def _all_widgets(at):
     """Every interactive element the page rendered, as (kind, label) pairs."""
     out = []
-    for kind in ("button", "text_input", "number_input", "text_area", "checkbox",
-                 "radio", "selectbox", "multiselect", "slider", "toggle",
-                 "date_input", "time_input", "color_picker"):
+    for kind in _WIDGET_KINDS:
         block = getattr(at, kind, None)
         if block is None:
             continue
@@ -128,10 +155,23 @@ def _all_widgets(at):
     return out
 
 
+def test_page_carries_no_control_of_any_kind():
+    """THE DELIBERATE CHOICE made when the three model pages were merged: the merged page
+    renders ZERO widgets. The retired Custom allocation page had a cache-refresh button and
+    an already-in-line filter checkbox; both capabilities were kept (the read renews itself
+    on a timer whose age is stated on screen, and the in-line accounts are simply always
+    listed) but neither control came across, because a page with no controls at all cannot
+    grow one into an arm affordance by accident."""
+    at = _run()
+    widgets = _all_widgets(at)
+    assert widgets == [], (
+        f"the Strategy Models page must render no control at all: {widgets}")
+
+
 def test_no_arm_or_execute_affordance():
-    """No control on this page may be an arm/execute/send affordance, and there is no
-    free-text box at all — so the typed confirmation the transmit rails require cannot even
-    be entered here."""
+    """Belt and braces for the day a control IS added deliberately: no control on this page
+    may be an arm/execute/send affordance, and there is no free-text box at all — so the
+    typed confirmation the transmit rails require cannot even be entered here."""
     at = _run()
     widgets = _all_widgets(at)
 
@@ -151,7 +191,7 @@ def test_module_source_has_no_arm_token():
     """The arm token / confirm phrase must not appear in this module at all."""
     for token in _FORBIDDEN_TOKENS:
         assert token not in _MODULE_SRC, (
-            f"page_custom_alloc.py contains the arming token {token!r} — this page must be "
+            f"page_models.py contains the arming token {token!r} — this page must be "
             f"structurally incapable of transmitting")
 
 
@@ -171,15 +211,15 @@ def test_module_cannot_start_a_program():
     executor with or without an arm flag, because it cannot shell anything."""
     for name in _FORBIDDEN_SPAWN:
         assert name not in _MODULE_SRC, (
-            f"page_custom_alloc.py references {name!r} — this page must start no program "
+            f"page_models.py references {name!r} — this page must start no program "
             f"and name no executor")
 
 
 def test_module_declares_no_write_path():
-    """Belt and braces: the CRM seam is one-way. No write verb anywhere in the module."""
+    """Belt and braces: the client-system seam is one-way. No write verb anywhere."""
     lowered = _MODULE_SRC.lower()
     for verb in ("insert into", "update ", "delete from", " commit(", "executemany"):
-        assert verb not in lowered, f"page_custom_alloc.py contains a write verb {verb!r}"
+        assert verb not in lowered, f"page_models.py contains a write verb {verb!r}"
 
 
 # --------------------------------------------------------------------------- #
@@ -187,7 +227,7 @@ def test_module_declares_no_write_path():
 # --------------------------------------------------------------------------- #
 def test_pct_rows_converts_percent_to_fraction_and_keeps_the_total():
     rows = [{"ticker": "usfr", "weight_pct": 40.0}, {"ticker": "SCHB", "weight_pct": 60.0}]
-    out, total = page_custom_alloc._pct_rows(rows)
+    out, total = page_models._pct_rows(rows)
     assert total == 100.0
     assert out[0] == ("SCHB", 0.6)          # sorted heaviest first, ticker upper-cased
     assert out[1] == ("USFR", 0.4)
@@ -196,7 +236,7 @@ def test_pct_rows_converts_percent_to_fraction_and_keeps_the_total():
 def test_pct_rows_surfaces_a_total_that_is_not_100():
     """A book that does not add up must SHOW that it does not add up, never be normalised."""
     rows = [{"ticker": "SCHB", "weight_pct": 60.0}, {"ticker": "USFR", "weight_pct": 30.0}]
-    _out, total = page_custom_alloc._pct_rows(rows)
+    _out, total = page_models._pct_rows(rows)
     assert total == 90.0
 
 
@@ -205,7 +245,7 @@ def test_whole_share_check_flags_a_position_that_rounds_to_zero():
     $5,000 account buys ZERO shares — never held, and never band-breaching."""
     weights = {"SCHB": 0.97, "XLK": 0.03}
     prices = {"SCHB": 30.0, "XLK": 180.0}
-    rows = page_custom_alloc.whole_share_rows(weights, prices, 5_000.0)
+    rows = page_models.whole_share_rows(weights, prices, 5_000.0)
     by = {r["ticker"]: r for r in rows}
     assert by["SCHB"]["whole_shares"] == 161 and by["SCHB"]["buyable"] is True
     assert by["XLK"]["whole_shares"] == 0
@@ -216,13 +256,13 @@ def test_whole_share_check_flags_a_position_that_rounds_to_zero():
 def test_whole_share_check_passes_a_viable_book():
     weights = {"SCHB": 0.6, "USFR": 0.4}
     prices = {"SCHB": 29.52, "USFR": 50.49}
-    rows = page_custom_alloc.whole_share_rows(weights, prices, 5_000.0)
+    rows = page_models.whole_share_rows(weights, prices, 5_000.0)
     assert all(r["buyable"] for r in rows)
     assert all(r["invested"] <= r["target_dollars"] + 1e-9 for r in rows)
 
 
 def test_whole_share_check_flags_an_unpriced_leg():
-    rows = page_custom_alloc.whole_share_rows({"ZZZZ": 1.0}, {}, 10_000.0)
+    rows = page_models.whole_share_rows({"ZZZZ": 1.0}, {}, 10_000.0)
     assert rows[0]["buyable"] is False
     assert rows[0]["price"] is None
 
@@ -230,16 +270,16 @@ def test_whole_share_check_flags_an_unpriced_leg():
 def test_min_nav_for_whole_book():
     """The plain-English 'how small can an account be and still hold this properly' number:
     max(price / weight) over the book."""
-    got = page_custom_alloc.min_nav_for_whole_book({"SCHB": 0.6, "USFR": 0.4},
-                                                   {"SCHB": 29.52, "USFR": 50.49})
+    got = page_models.min_nav_for_whole_book({"SCHB": 0.6, "USFR": 0.4},
+                                             {"SCHB": 29.52, "USFR": 50.49})
     assert got == max(29.52 / 0.6, 50.49 / 0.4)
-    assert page_custom_alloc.min_nav_for_whole_book({"ZZZZ": 1.0}, {}) is None
+    assert page_models.min_nav_for_whole_book({"ZZZZ": 1.0}, {}) is None
 
 
 def test_small_model_labels_are_display_only_and_cover_the_three_small_models():
-    assert page_custom_alloc._is_small_model("Growth (Small, Custom)")
-    assert not page_custom_alloc._is_small_model("Growth (Custom)")
-    assert page_custom_alloc.SMALL_MODEL_LABELS <= set(page_custom_alloc.CUSTOM_MODEL_LABELS)
+    assert page_models._is_small_model("Growth (Small, Custom)")
+    assert not page_models._is_small_model("Growth (Custom)")
+    assert page_models.SMALL_MODEL_LABELS <= set(page_models.CUSTOM_MODEL_LABELS)
 
 
 # --------------------------------------------------------------------------- #
@@ -282,8 +322,8 @@ def test_drift_scan_produces_a_would_trade_preview_for_a_custom_model():
     roster, holdings = _synthetic_book()
     universe = {"SCHB", "USFR"}
 
-    scan = page_custom_alloc.scan_accounts_for_model(target, roster, holdings,
-                                                     universe=universe)
+    scan = page_models.scan_accounts_for_model(target, roster, holdings,
+                                               universe=universe)
     assert scan["n_accounts"] == 1
     assert scan["n_out_of_spec"] == 1
     verdict = scan["verdicts"][0]
@@ -329,8 +369,8 @@ def test_drift_scan_reports_in_line_when_the_account_already_matches():
              "market_value": usfr * 50.0, "as_of_date": "2026-08-24"},
         ]
     }
-    scan = page_custom_alloc.scan_accounts_for_model(target, roster, holdings,
-                                                     universe={"SCHB", "USFR"})
+    scan = page_models.scan_accounts_for_model(target, roster, holdings,
+                                               universe={"SCHB", "USFR"})
     assert scan["n_out_of_spec"] == 0
     assert scan["verdicts"][0]["n_legs"] == 0
 
@@ -338,18 +378,18 @@ def test_drift_scan_reports_in_line_when_the_account_already_matches():
 # --------------------------------------------------------------------------- #
 # 5. The LOUD-FAILURE render paths, driven with a synthetic state.
 # --------------------------------------------------------------------------- #
-# The live CRM has exactly one published allocation and it is healthy (SCHB/USFR, both
-# priceable, both buyable), and no account is assigned to any custom model — so the failure
-# paths cannot be exercised against live data without publishing a bad allocation, which
-# this stage is forbidden to do (the seam is read-only). Instead the page's single loader is
-# replaced with a synthetic state so the RENDERING of both validations and of the drift
-# preview is proved end to end.
+# The live client system has exactly one published allocation and it is healthy (SCHB/USFR,
+# both priceable, both buyable), and no account is assigned to any custom model — so the
+# failure paths cannot be exercised against live data without publishing a bad allocation,
+# which this stage is forbidden to do (the seam is read-only). Instead the page's single
+# hand-written-model loader is replaced with a synthetic state so the RENDERING of both
+# validations and of the drift preview is proved end to end.
 _SYNTHETIC_SCRIPT = """
 import sys
 sys.path.insert(0, r'{here}')
 sys.path.insert(0, r'{views}')
 import pandas as pd
-import page_custom_alloc as p          # its bootstrap puts paperbot on sys.path
+import page_models as p          # its bootstrap puts paperbot on sys.path
 from strategy_target import Target
 
 _ACC = 'aaaaaaaa-0000-0000-0000-000000000001'
@@ -396,8 +436,8 @@ _STATE = {{
     }},
 }}
 
-p._load_state = lambda: _STATE
-p.render_custom_alloc()
+p._load_custom_state = lambda: _STATE
+p.render_models()
 """
 
 
@@ -434,7 +474,7 @@ def test_drift_and_would_trade_preview_render_for_an_assigned_account():
     metrics = {m.label: m.value for m in at.metric}
     assert metrics.get("Accounts on this model") == "1"
     assert metrics.get("Out of line with the allocation") == "1"
-    # The would-trade legs are rendered as a dataframe inside the preview expander.
+    # The would-trade legs are rendered as a dataframe in the model's own section.
     frames = [df.value for df in at.dataframe]
     legs = [f for f in frames if list(f.columns) == ["symbol", "side", "shares"]]
     assert legs, "no would-trade leg table rendered"

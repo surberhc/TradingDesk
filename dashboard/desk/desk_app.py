@@ -61,13 +61,11 @@ T.inject_theme()
 # the persistent emergency control strip.
 import emergency
 import page_trade_execution
-import page_custom_alloc
 import page_feeds
 import page_history
 import page_models
 import page_research
 import page_s0
-import page_s0_model
 import page_s8
 import page_withdrawal_cash_raise
 import pulse
@@ -92,12 +90,12 @@ pages = [
     st.Page(page_history.render_history, title="History & Event Log", icon="📜"),
     st.Page(page_s0.render_s0_full,
             title="Strategy 0 — Adaptive All-Weather Core", icon="📈"),
-    st.Page(page_s0_model.render_s0_model,
-            title="Strategy 0 — Model & Parameters", icon="📋"),
+    # ONE page where there used to be three (merged 2026-09-08). "Strategy 0 — Model
+    # & Parameters", "Strategy Models — all models" and "Custom allocation — models
+    # Andrew writes himself" all answered the same question, so they are now one page
+    # and nothing any of them showed was dropped. See page_models.py's docstring.
     st.Page(page_models.render_models,
-            title="Strategy Models — all models", icon="🗂️"),
-    st.Page(page_custom_alloc.render_custom_alloc,
-            title="Custom allocation — models Andrew writes himself", icon="✍️"),
+            title="Strategy Models — what each model holds and why", icon="🗂️"),
     st.Page(page_trade_execution.render_trade_execution,
             title="Trade Execution — pick, prepare, send", icon="📦"),
     st.Page(page_withdrawal_cash_raise.render_withdrawal_cash_raise,
