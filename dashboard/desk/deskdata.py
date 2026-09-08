@@ -382,9 +382,27 @@ def data_freshness() -> list[dict]:
             age_word = "1 day ago"
         else:
             age_word = f"{age} days ago"
+        # A job's OWN declared outcome outranks how fresh its date is. A job that ran on
+        # schedule and honestly reported failure is NOT healthy just because it reported
+        # today — that is how three days of live-data Gateway failures showed up green.
+        # A declared outcome may only make the tier worse, never better.
+        declared = str(js.get("status") or "").strip().lower()
+        note = ""
+        if declared == "fail":
+            tier = "bad"
+            note = "This job reported that it did not finish successfully. "
+        elif declared == "stale":
+            tier = "bad"
+            note = "This job reported that its data is out of date. "
+        elif declared == "partial":
+            tier = "bad" if tier == "bad" else "warn"
+            note = "This job reported that it only partly finished. "
+        elif declared not in ("ok", ""):
+            tier = "unknown"
+            note = "This job reported an outcome this dashboard does not recognize. "
         rows.append({
             "label": label, "tier": tier, "schedule": schedule,
-            "phrase": f"Updated {_fmt_date(d)} ({age_word})",
+            "phrase": f"{note}Updated {_fmt_date(d)} ({age_word})",
         })
     return rows
 
