@@ -217,8 +217,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Posted idle-cash deploy proposal to the Action Center (notice {key}).")
         return 0
     if key == action_center.SKIPPED:
-        print("Posting nothing: an idle-cash alert is already open in the Action Center, or "
-              "the Action Center could not be asked.")
+        print("Posting nothing: an idle-cash alert is already open in the Action Center.")
         return 0
     _log("posting the Action Center notice failed.")
     return 1

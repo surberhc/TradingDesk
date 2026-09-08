@@ -237,7 +237,7 @@ def main(argv: list[str] | None = None) -> int:
                   f"Center (notice {key}).")
         elif key == action_center.SKIPPED:
             print(f"{account}: posting nothing — a withdrawal-reserve alert for it is already "
-                  f"open in the Action Center, or the Action Center could not be asked.")
+                  f"open in the Action Center.")
         else:
             any_failure = True
             _log(f"account={account}: posting the Action Center notice failed.")

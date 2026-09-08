@@ -558,8 +558,8 @@ def main(argv: list[str] | None = None) -> int:
                       f"accounts were not checked for drift (notice {c_key}).")
             elif c_key == action_center.SKIPPED:
                 print("Posting nothing more: an alert about accounts going unchecked is "
-                      "already open in the Action Center, or the Action Center could not be "
-                      "asked. The unchecked accounts above are still unchecked.")
+                      "already open in the Action Center. The unchecked accounts above are "
+                      "still unchecked.")
             else:
                 _log("posting the unchecked-accounts alert failed.")
                 exit_code = _EXIT_COULD_NOT_RUN
@@ -599,8 +599,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Posted consolidated out-of-spec proposal to the Action Center (notice {key}).")
         return exit_code
     if key == action_center.SKIPPED:
-        print("Posting nothing: an out-of-spec alert is already open in the Action Center, or "
-              "the Action Center could not be asked.")
+        print("Posting nothing: an out-of-spec alert is already open in the Action Center.")
         return exit_code
     _log("posting the Action Center notice failed.")
     return _EXIT_COULD_NOT_RUN

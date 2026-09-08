@@ -166,7 +166,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if key == action_center.SKIPPED:
         print("Posting nothing: a withdrawal-cash-raise alert is already open in the Action "
-              "Center, or the Action Center could not be asked.")
+              "Center.")
         return 0
     _log("posting the Action Center notice failed.")
     return 1
