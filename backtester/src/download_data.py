@@ -260,43 +260,62 @@ def _save_macro(frame: pd.DataFrame, filename: str, source_label: str) -> Path:
 # Data-quality checks (DATA.md §"Data-quality checks")
 # ---------------------------------------------------------------------------
 def _quality_check(symbol: str, frame: pd.DataFrame) -> list[str]:
-    """Return a list of human-readable QC flags for one ticker (empty = clean)."""
+    """Return a list of human-readable QC flags for one ticker (empty = clean).
+
+    This runs nightly, so it asks "did tonight's data arrive clean" — every check
+    except zero/negative prices looks ONLY at the last QC_RECENT_WINDOW_DAYS of bars.
+    A big move, a stale run or a gap from years ago is a fact about market history,
+    not about tonight's download, and re-judging all of it pinned real crash days
+    (GDX 2008-11-21, GDXJ 2020-03-12, SIVR 2026-01-30) as permanent alerts. A zero or
+    negative price is never a legitimate market move, so that check keeps full history.
+
+    Each flag starts with a stable machine-readable tag ([zero]/[move]/[stale]/[gap])
+    so consumers can classify severity without substring-matching the prose.
+    """
     flags: list[str] = []
     prices = frame[symbol]
 
-    # Zero or negative prices — a hard data error.
+    # Zero or negative prices — a hard data error, never a real move: full history.
     if (prices <= 0).any():
         n = int((prices <= 0).sum())
-        flags.append(f"{n} zero/negative price(s)")
+        flags.append(f"[zero] {n} zero/negative price(s)")
 
-    # Suspicious single-day moves: possible unadjusted split.
-    daily_ret = prices.pct_change()
+    # Everything below judges only recently-added bars.
+    cutoff = prices.index.max() - pd.Timedelta(days=config.QC_RECENT_WINDOW_DAYS)
+    recent = prices[prices.index >= cutoff]
+    if len(recent) < 2:
+        return flags
+
+    # Suspicious single-day moves: possible unadjusted split. Returns come off the
+    # FULL series so the window's first bar is still compared against the bar before
+    # it, then are narrowed to the window.
+    daily_ret = prices.pct_change().loc[recent.index]
     big = daily_ret.abs() > config.QC_MAX_SINGLE_DAY_MOVE
     if big.any():
         worst = daily_ret[big].abs().max()
         flags.append(
-            f"{int(big.sum())} day(s) move >"
+            f"[move] {int(big.sum())} day(s) move >"
             f"{config.QC_MAX_SINGLE_DAY_MOVE:.0%} (worst {worst:.0%}) — check split adj"
         )
 
     # Stale prices: same value many days running.
-    run = (prices.diff() == 0)
+    run = (recent.diff() == 0)
     if run.any():
         # Longest run of consecutive unchanged prices.
         groups = (~run).cumsum()
         longest = run.groupby(groups).sum().max()
         if longest >= config.QC_STALE_PRICE_RUN:
-            flags.append(f"stale run of {int(longest)} identical prices")
+            flags.append(f"[stale] stale run of {int(longest)} identical prices")
 
     # Calendar gaps within active life (business days only, to avoid weekends).
-    bdays = pd.bdate_range(prices.index.min(), prices.index.max())
-    missing = bdays.difference(prices.index)
+    bdays = pd.bdate_range(recent.index.min(), recent.index.max())
+    missing = bdays.difference(recent.index)
     if len(missing) > 0:
         # Collapse to runs and flag any gap longer than the threshold.
-        gap_lengths = _max_consecutive_gap(prices.index, bdays)
+        gap_lengths = _max_consecutive_gap(recent.index, bdays)
         if gap_lengths > config.QC_MAX_GAP_DAYS:
             flags.append(
-                f"{len(missing)} missing business day(s); "
+                f"[gap] {len(missing)} missing business day(s); "
                 f"longest gap {gap_lengths} days"
             )
     return flags

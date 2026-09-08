@@ -262,6 +262,11 @@ CREDIT_PROXY = ("HYG", "IEF")
 QC_MAX_SINGLE_DAY_MOVE = 0.25      # flag > 25% one-day move (possible bad split)
 QC_STALE_PRICE_RUN = 5             # flag this many identical consecutive prices
 QC_MAX_GAP_DAYS = 5                # flag gaps longer than this within active life
+# The nightly check asks "did tonight's data arrive clean", not "was 2008 volatile",
+# so it judges only the most recent bars. Scanning all stored history re-flagged real
+# historic crash days (GDX 2008-11-21, GDXJ 2020-03-12, SIVR 2026-01-30) every night,
+# forever — noise that would mask a genuine unadjusted split when one arrives.
+QC_RECENT_WINDOW_DAYS = 90         # calendar days of recent bars the nightly QC judges
 
 
 # ---------------------------------------------------------------------------
