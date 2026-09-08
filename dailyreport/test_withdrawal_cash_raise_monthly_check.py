@@ -21,6 +21,13 @@ def _row(account, shortfall, total_cash=1_000.0, reserve=None, net_liq=100_000.0
             "reserve": reserve, "shortfall": shortfall}
 
 
+def _patch_report(monkeypatch, rows, unreadable=()):
+    """Stand in for the LIVE read, which reports BOTH the accounts found short AND the
+    accounts that could not be read at all."""
+    monkeypatch.setattr(wcr, "accounts_needing_cash_and_unreadable",
+                        lambda: (list(rows), list(unreadable)))
+
+
 # --------------------------------------------------------------------------- #
 # build_notice() — pure
 # --------------------------------------------------------------------------- #
@@ -52,7 +59,7 @@ def test_build_notice_singular_wording_for_one_account(monkeypatch):
 # main() — empty list posts nothing
 # --------------------------------------------------------------------------- #
 def test_main_empty_list_posts_nothing(monkeypatch, capsys):
-    monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [])
+    _patch_report(monkeypatch, [])
     calls = []
     import action_center
     monkeypatch.setattr(action_center, "post_notice",
@@ -69,7 +76,7 @@ def test_main_empty_list_posts_nothing(monkeypatch, capsys):
 # --------------------------------------------------------------------------- #
 def test_main_nonempty_posts_exactly_one_notice_with_all_accounts(monkeypatch, crm):
     rows = [_row("UA", 1_000.0), _row("UB", 2_500.0), _row("UC", 300.0)]
-    monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: rows)
+    _patch_report(monkeypatch, rows)
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
 
     calls = []
@@ -100,11 +107,10 @@ def test_main_rerun_leaves_the_one_open_alert_alone(monkeypatch, crm):
     added account shows up only after Andrew closes the open task."""
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
 
-    monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
+    _patch_report(monkeypatch, [_row("UA", 1_000.0)])
     assert job.main([]) == 0
 
-    monkeypatch.setattr(wcr, "accounts_needing_cash",
-                        lambda: [_row("UA", 1_000.0), _row("UB", 500.0)])
+    _patch_report(monkeypatch, [_row("UA", 1_000.0), _row("UB", 500.0)])
     assert job.main([]) == 0
 
     alerts = [r for r in crm if r["dedup_key"] == "withdrawal_cash_raise_monthly"]
@@ -118,7 +124,7 @@ def test_main_rerun_leaves_the_one_open_alert_alone(monkeypatch, crm):
 # --------------------------------------------------------------------------- #
 def test_main_posts_nothing_while_an_alert_is_already_open(monkeypatch, crm, capsys):
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
-    monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
+    _patch_report(monkeypatch, [_row("UA", 1_000.0)])
 
     import action_center
     assert job.main([]) == 0  # first run posts + creates the open alert
@@ -145,7 +151,7 @@ def test_main_posts_nothing_while_an_alert_is_already_open(monkeypatch, crm, cap
 # --------------------------------------------------------------------------- #
 def test_dry_run_prints_and_posts_nothing(monkeypatch, capsys):
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
-    monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
+    _patch_report(monkeypatch, [_row("UA", 1_000.0)])
 
     calls = []
     import action_center
@@ -165,8 +171,78 @@ def test_main_reports_failure_when_the_alert_cannot_be_filed(crm_write_broken, m
     """An outage on the reporting channel is a FAILED run. Non-zero exit, and never a claim
     that the operator snoozed a notice nobody snoozed."""
     monkeypatch.setattr(job, "_household_names", lambda accounts: {})
-    monkeypatch.setattr(wcr, "accounts_needing_cash", lambda: [_row("UA", 1_000.0)])
+    _patch_report(monkeypatch, [_row("UA", 1_000.0)])
 
     assert job.main([]) == 1
     assert crm_write_broken == []
     assert "snoozed" not in capsys.readouterr().out.lower()
+
+
+# --------------------------------------------------------------------------- #
+# main() — accounts that could NOT be read are a failed run, never a clean "nobody is short".
+# With the Gateway down every account is unreadable and the short list is empty, which must
+# not be reported the same way as an all-clear.
+# --------------------------------------------------------------------------- #
+def test_every_account_unreadable_fails_and_never_claims_no_accounts_need_cash(
+        monkeypatch, capsys):
+    _patch_report(monkeypatch, [], unreadable=["UA", "UB", "UC"])
+    calls = []
+    import action_center
+    monkeypatch.setattr(action_center, "post_notice",
+                        lambda *a, **k: calls.append(k) or "should-not-be-called")
+
+    rc = job.main([])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "No accounts need withdrawal cash raised this cycle." not in out
+    assert "Could not read 3 withdrawal accounts" in out
+    for acct in ("UA", "UB", "UC"):
+        assert acct in out
+    assert calls == []
+
+
+def test_readable_and_fine_mixed_with_unreadable_still_reports_failure(monkeypatch, capsys):
+    """Some accounts read fine and were genuinely not short, one could not be read at all.
+    The run is still incomplete, so it must exit non-zero and say so."""
+    _patch_report(monkeypatch, [], unreadable=["UB"])
+    rc = job.main([])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "No accounts need withdrawal cash raised this cycle." not in out
+    assert "Could not read 1 withdrawal account:" in out
+    assert "UB" in out
+
+
+def test_short_account_posts_its_notice_but_still_fails_when_one_was_unreadable(
+        monkeypatch, crm, capsys):
+    """A real shortfall is still reported, but an unexamined account keeps the exit non-zero."""
+    monkeypatch.setattr(job, "_household_names", lambda accounts: {})
+    _patch_report(monkeypatch, [_row("UA", 1_000.0)], unreadable=["UB"])
+
+    rc = job.main([])
+    out = capsys.readouterr().out
+
+    assert rc == 1
+    assert "UB" in out
+    import action_center
+    assert action_center.has_open("withdrawal_cash_raise_monthly")
+
+
+def test_dry_run_also_fails_when_an_account_was_unreadable(monkeypatch, capsys):
+    monkeypatch.setattr(job, "_household_names", lambda accounts: {})
+    _patch_report(monkeypatch, [_row("UA", 1_000.0)], unreadable=["UB"])
+    assert job.main(["--dry-run"]) == 1
+    assert "[dry-run]" in capsys.readouterr().out
+
+
+def test_all_accounts_readable_and_none_short_exits_zero_cleanly(monkeypatch, capsys):
+    """The good case is preserved: an account that is genuinely not short is NOT an error."""
+    _patch_report(monkeypatch, [], unreadable=[])
+    rc = job.main([])
+    out = capsys.readouterr().out
+
+    assert rc == 0
+    assert "No accounts need withdrawal cash raised this cycle." in out
+    assert "Could not read" not in out

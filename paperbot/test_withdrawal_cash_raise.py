@@ -74,6 +74,68 @@ def test_a_live_read_failure_skips_that_account_without_raising(monkeypatch):
     assert [r["account"] for r in rows] == ["UGOOD"]
 
 
+# --------------------------------------------------------------------------- #
+# accounts_needing_cash_and_unreadable() — an account that could not be read is REPORTED,
+# never silently dropped. Empty-short-list plus a gateway outage must stay distinguishable
+# from a genuine all-clear.
+# --------------------------------------------------------------------------- #
+def test_unreadable_accounts_are_reported_not_silently_dropped(monkeypatch):
+    fake_schedule = {
+        "UGOOD": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
+        "UBAD": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
+    }
+    monkeypatch.setattr(cashflows, "SCHEDULE", fake_schedule)
+
+    def fake_read_cash(account):
+        if account == "UBAD":
+            raise RuntimeError("account UBAD not found under the live-trading login")
+        return {"net_liq": 500_000, "total_cash": 10_000}
+
+    monkeypatch.setattr(wrc, "read_cash", fake_read_cash)
+    rows, unreadable = wcr.accounts_needing_cash_and_unreadable()
+    assert [r["account"] for r in rows] == ["UGOOD"]
+    assert unreadable == ["UBAD"]
+
+
+def test_gateway_down_reports_every_account_as_unreadable_with_no_short_rows(monkeypatch):
+    fake_schedule = {
+        "UA": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
+        "UB": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
+    }
+    monkeypatch.setattr(cashflows, "SCHEDULE", fake_schedule)
+
+    def boom(account):
+        raise ConnectionRefusedError("the live-trading Gateway is not listening on port 4003")
+
+    monkeypatch.setattr(wrc, "read_cash", boom)
+    rows, unreadable = wcr.accounts_needing_cash_and_unreadable()
+    assert rows == []
+    assert unreadable == ["UA", "UB"]
+
+
+def test_an_inconclusive_cash_check_counts_as_unreadable(monkeypatch):
+    """decide() returning ok=False means the account was not actually evaluated."""
+    fake_schedule = {
+        "UA": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
+    }
+    monkeypatch.setattr(cashflows, "SCHEDULE", fake_schedule)
+    monkeypatch.setattr(wrc, "read_cash",
+                        lambda account: {"net_liq": None, "total_cash": None})
+    rows, unreadable = wcr.accounts_needing_cash_and_unreadable()
+    assert rows == []
+    assert unreadable == ["UA"]
+
+
+def test_all_readable_and_none_short_reports_nothing_unreadable(monkeypatch):
+    fake_schedule = {
+        "UOK": [cashflows.Flow("distribution", amount=1000.0, pct_nav=0.0, day=15)],
+    }
+    monkeypatch.setattr(cashflows, "SCHEDULE", fake_schedule)
+    monkeypatch.setattr(wrc, "read_cash",
+                        lambda account: {"net_liq": 100_000, "total_cash": 50_000})
+    assert wcr.accounts_needing_cash_and_unreadable() == ([], [])
+
+
 def test_sorted_by_account(monkeypatch):
     fake_schedule = {
         "UB": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
