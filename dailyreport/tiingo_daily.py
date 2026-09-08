@@ -159,9 +159,12 @@ def main() -> int:
                 flags = v.get("qc_flags", [])
                 if flags:
                     qc_flagged += 1
-                # Critical = real data errors (bad splits / zero or negative prices).
-                # "stale run" on cash-like ETFs (SGOV/BIL/…) is benign and ignored.
-                if any(("zero" in f.lower() or "split" in f.lower()) for f in flags):
+                # Critical = real data errors (bad splits / zero or negative prices),
+                # matched on the QC's stable leading tag rather than on its prose —
+                # the old test substring-matched the word "split", so any flag whose
+                # wording happened to mention splits escalated.
+                # "[stale]" on cash-like ETFs (SGOV/BIL/…) is benign and ignored.
+                if any(str(f).startswith(("[zero]", "[move]")) for f in flags):
                     critical_tickers.append(sym)
             fresh = manifest_is_fresh(mani, TODAY)
         except Exception as e:
