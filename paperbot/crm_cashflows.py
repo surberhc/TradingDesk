@@ -26,9 +26,12 @@ QUARTERLY, or ANNUAL. Folding a quarterly/annual amount straight into a monthly 
 silently over- or under-reserve real client money, so anything not MONTHLY is flagged for a
 human decision instead of guessed at — same posture as an unparseable entry.
 
-This module ONLY produces a draft (parses + reports). It does NOT write into cashflows.py's
-SCHEDULE dict — that stays a deliberate, reviewed, separate step (see crm_cashflows_report.py
-/ the docstring on build_draft below). Never called from any live rebalance path.
+SINCE 2026-09-08 THIS IS THE LIVE SOURCE, not just a draft generator. `cashflows.SCHEDULE`
+calls `build_draft()` on first use and IS its `.schedule` — there is no hand-merge step and
+no hand-maintained dict any more (a newly-onboarded withdrawal client used to be silently
+unwatched until someone remembered to re-run this by hand). `.flagged` is still advisory:
+an instruction withheld here (non-monthly, expired, unparseable) simply does not reserve,
+exactly as before. Reading is READ-ONLY throughout; this module still writes nothing.
 """
 from __future__ import annotations
 

@@ -11,11 +11,21 @@ bearing holding rather than sitting idle; only the part of a client's distributi
 that exceeds the model's natural cash sleeve is a deliberate, consistent, documented
 extra-cash deviation for that account.
 
-This module owns the SCHEDULE (data you maintain) and the reserve POLICY. It places
-no orders and touches no broker.
+This module owns the SCHEDULE and the reserve POLICY. It places no orders and touches
+no broker.
+
+THE SCHEDULE IS LIVE, NOT HAND-MAINTAINED (changed 2026-09-08). It used to be a dict
+typed in by hand, which meant a newly-onboarded withdrawal client was silently absent
+from every reserve check until someone remembered to refresh it. SCHEDULE now reads the
+client system (the CRM) through crm_cashflows -- the one existing derivation of IBKR's
+own configured recurring instructions, reused, not re-queried. Read-only, lazily on
+first use, cached for the life of the process. If that read fails, or comes back with
+no withdrawal instructions at all, every access raises ScheduleUnavailable: an
+unreadable schedule must never be mistaken for "no client takes a withdrawal".
 """
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 
 # How many months of an upcoming distribution to hold liquid at all times. 1 month is
@@ -37,41 +47,66 @@ class Flow:
     note: str = ""
 
 
-# Per-account monthly flows. EDIT with each client's real schedule. An account with no
-# entry has no scheduled flows (reserve = 0). Amounts are PER OCCURRENCE.
-#
-# Populated 2026-09-05 from the CRM's IBKR-configured recurring withdrawal instructions
-# (accounts.recurring_transactions, ingested nightly by ibkr-flex-sync -- see
-# SYSTEM_MAP.md and paperbot/crm_cashflows.py). These are the 9 accounts with an ACTIVE,
-# MONTHLY, USD withdrawal instruction as of that date, per Andrew's explicit go-ahead to
-# merge them. crm_cashflows.build_draft() also derived 35 deposit-only accounts that same
-# run -- deliberately NOT merged here (a contribution adds no reserve; see
-# cashflows.reserve_for) -- and correctly excluded 2 accounts whose instruction had already
-# expired. This dict does NOT auto-update: re-run `python crm_cashflows.py` periodically
-# (or when a new withdrawal client is onboarded) and merge any changes by hand, the same
-# deliberate way this batch was added.
-SCHEDULE: dict[str, list[Flow]] = {
-    "U10555316": [Flow("distribution", amount=8500.0, pct_nav=0.0, day=15,
-                       note="CRM recurring_transactions (ACH, since 2025-06-15)")],
-    "U13221397": [Flow("distribution", amount=5359.57, pct_nav=0.0, day=24,
-                       note="CRM recurring_transactions (ACH, since 2026-04-24)"),
-                  Flow("distribution", amount=5359.57, pct_nav=0.0, day=16,
-                       note="CRM recurring_transactions (ACH, since 2026-05-16)")],
-    "U15715611": [Flow("distribution", amount=1765.0, pct_nav=0.0, day=12,
-                       note="CRM recurring_transactions (ACH, since 2025-02-12)")],
-    "U22011673": [Flow("distribution", amount=1000.0, pct_nav=0.0, day=3,
-                       note="CRM recurring_transactions (ACH, since 2026-08-03)")],
-    "U22848377": [Flow("distribution", amount=3846.0, pct_nav=0.0, day=24,
-                       note="CRM recurring_transactions (ACH, since 2026-09-24)")],
-    "U7349619": [Flow("distribution", amount=5000.0, pct_nav=0.0, day=15,
-                      note="CRM recurring_transactions (ACH, since 2024-09-15)")],
-    "U7349974": [Flow("distribution", amount=2500.0, pct_nav=0.0, day=27,
-                      note="CRM recurring_transactions (ACH, since 2023-01-27)")],
-    "U7355827": [Flow("distribution", amount=2941.18, pct_nav=0.0, day=5,
-                      note="CRM recurring_transactions (ACH, since 2022-11-05)")],
-    "U8147914": [Flow("distribution", amount=2000.0, pct_nav=0.0, day=23,
-                      note="CRM recurring_transactions (ACH, since 2026-09-23)")],
-}
+class ScheduleUnavailable(RuntimeError):
+    """The withdrawal schedule could not be read from the client system. Raised INSTEAD of
+    returning an empty schedule, because an empty schedule would make every reserve check
+    conclude that no client takes a withdrawal and finish clean."""
+
+
+def load_schedule() -> dict[str, list[Flow]]:
+    """Read every account's recurring monthly flows from the client system (the CRM).
+
+    Delegates to crm_cashflows, which is the single derivation of IBKR's own configured
+    recurring instructions (accounts.recurring_transactions) -- this is not a second query.
+    Read-only. Raises ScheduleUnavailable rather than ever returning nothing."""
+    import crm_cashflows  # noqa: PLC0415 — lazy: importing cashflows must do no I/O
+
+    try:
+        draft = crm_cashflows.build_draft()
+    except crm_cashflows.CrmCashflowsUnavailable as exc:
+        raise ScheduleUnavailable(
+            f"the scheduled-withdrawal list could not be read from the client system: {exc}"
+        ) from exc
+    schedule = draft.schedule
+    if not any(f.kind == "distribution" for flows in schedule.values() for f in flows):
+        raise ScheduleUnavailable(
+            "the client system returned no active monthly withdrawal instruction for any "
+            "account at all. That is being treated as a failed read, not as a real answer, "
+            "because every client who takes a scheduled withdrawal would otherwise go "
+            "unchecked without anyone being told.")
+    return schedule
+
+
+class _LiveSchedule(Mapping):
+    """Per-account monthly flows, read from the client system on first use and cached for
+    the life of the process. Behaves exactly like the dict it replaced (`.get`, `.items`,
+    `in`, iteration), so no caller had to change. Reading is LAZY so importing this module
+    never touches the network, and every read either yields the client system's real
+    records or raises ScheduleUnavailable -- never a quiet empty answer."""
+
+    def __init__(self) -> None:
+        self._loaded: dict | None = None
+
+    def _data(self) -> dict:
+        if self._loaded is None:
+            self._loaded = load_schedule()
+        return self._loaded
+
+    def __getitem__(self, account):
+        return self._data()[account]
+
+    def __iter__(self):
+        return iter(self._data())
+
+    def __len__(self) -> int:
+        return len(self._data())
+
+    def __repr__(self) -> str:
+        state = "not read yet" if self._loaded is None else f"{len(self._loaded)} accounts"
+        return f"<live withdrawal schedule from the client system ({state})>"
+
+
+SCHEDULE = _LiveSchedule()
 
 
 def _occurrence_amount(flow: Flow, nav: float) -> float:

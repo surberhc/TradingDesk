@@ -3,6 +3,8 @@ shape; no broker, no live CRM)."""
 import sys
 from pathlib import Path
 
+import pytest
+
 _HERE = Path(__file__).resolve().parent
 _REPO = _HERE.parent
 for _p in (str(_HERE), str(_REPO / "connections"), str(_REPO / "paperbot"),
@@ -246,3 +248,41 @@ def test_all_accounts_readable_and_none_short_exits_zero_cleanly(monkeypatch, ca
     assert rc == 0
     assert "No accounts need withdrawal cash raised this cycle." in out
     assert "Could not read" not in out
+
+
+# --------------------------------------------------------------------------- #
+# The withdrawal list now comes LIVE from the client system. An unreadable or empty list
+# means NO account was examined -- the same silent-success failure an unreadable ACCOUNT
+# already guards against, so it gets the same loud, non-zero treatment.
+# --------------------------------------------------------------------------- #
+def test_unreadable_schedule_fails_and_never_claims_no_accounts_need_cash(monkeypatch,
+                                                                          capsys):
+    import cashflows
+
+    def boom(*a, **k):
+        raise cashflows.ScheduleUnavailable("connection refused")
+    monkeypatch.setattr(wcr, "accounts_needing_cash_and_unreadable", boom)
+    import action_center
+    monkeypatch.setattr(action_center, "post_notice",
+                        lambda **kw: pytest.fail("must post nothing"))
+
+    assert job.main([]) == 1
+    out = capsys.readouterr().out.lower()
+    assert "could not read the list of clients who take a scheduled withdrawal" in out
+    assert "must not be read as meaning no accounts need cash raised" in out
+    assert "no accounts need withdrawal cash raised this cycle" not in out
+
+
+def test_empty_schedule_reaches_the_job_as_a_loud_failure(monkeypatch, capsys):
+    """End to end through the real call chain: an empty client-system result raises out of
+    cashflows.load_schedule, through accounts_to_check, and fails this job non-zero."""
+    import cashflows
+    import crm_cashflows
+
+    monkeypatch.setattr(crm_cashflows, "build_draft",
+                        lambda *a, **k: crm_cashflows.DraftResult(schedule={}, flagged=[]))
+    monkeypatch.setattr(cashflows, "SCHEDULE", cashflows._LiveSchedule())
+
+    assert job.main([]) == 1
+    assert "must not be read as meaning no accounts need cash raised" in \
+        capsys.readouterr().out.lower()
