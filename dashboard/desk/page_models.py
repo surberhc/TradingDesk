@@ -45,9 +45,14 @@ Two non-negotiables shape this page (CLAUDE.md §"two non-negotiables"):
     hardcoded, so this view cannot silently disagree with the executed book.
   * READ-ONLY, AND STRUCTURALLY INCAPABLE OF TRANSMITTING. Not "guarded", not "gated" —
     incapable, and the suite enforces it (test_models_page_safety.py):
-      - ZERO edit/input/button widgets of any kind. There is no control on this page at
-        all, so there is no free-text box a confirm phrase could be typed into, no button
-        that could stand in for one, and no filter or refresh control either.
+      - EXACTLY ONE control, and it only clears a cache. The page carries a single button,
+        "Re-read the models Andrew writes himself from the client system", which discards
+        this page's own 10-minute cached read so the next render fetches the published
+        allocations again. That is the whole of its effect. There is NO free-text box a
+        confirm phrase could be typed into, no number or selection input, and no second
+        button of any kind — so there is nothing here that could be relabelled into an arm,
+        send, execute or confirm affordance later. The suite enforces both halves: the one
+        control must exist, and NOTHING else may appear beside it.
       - It spawns NO process. There is no shell-out of any kind, so it cannot invoke an
         executor with or without an arm flag. The whole drift preview is built IN PROCESS
         from the pure `rebalance_engine.build_plan` path (via
@@ -241,9 +246,10 @@ EXAMPLE_NAV_SMALL = 5_000.0
 EXAMPLE_NAV_FULL = 25_000.0
 
 # How long the whole client-system read (view + targets + engine run) is held before it is
-# read again. There is deliberately NO manual re-read control: this page carries zero
-# widgets (see the module docstring), so the age of the read is STATED on screen instead
-# and the read renews itself on its own once this many seconds have passed.
+# read again. The read renews itself on its own once this many seconds have passed, the age
+# of the read is STATED on screen, AND the page's one control re-reads it on demand — so a
+# model Andrew has just published in the client system can be seen immediately instead of
+# after a wait of up to this long.
 _CACHE_TTL_SECS = 600
 
 
@@ -1564,9 +1570,9 @@ def _render_accounts_and_drift(label: str, entry: dict) -> None:
     read-only preview of the trades that would bring them back.
 
     Both halves are always rendered — the accounts that need attention AND the ones already
-    in line. The retired Custom allocation page hid the in-line ones behind a checkbox; this
-    page carries no controls at all, so it simply shows both, which is strictly more than
-    that checkbox showed by default."""
+    in line. The retired Custom allocation page hid the in-line ones behind a checkbox; that
+    filter was NOT carried across, so this page simply shows both, which is strictly more
+    than that checkbox showed by default."""
     accounts = entry.get("accounts") or []
     if not accounts:
         st.markdown(
@@ -1773,10 +1779,10 @@ def _render_custom_family(custom: dict) -> None:
     s2.metric("With an allocation published", n_published)
     s3.metric("Accounts assigned to one", custom.get("assigned_total", 0))
     st.caption(f"Read {custom.get('built_at_str', '—')} from the client system's read-only "
-               f"view, across a book of {custom.get('n_roster', 0)} accounts. This page has "
-               f"no controls of any kind, so there is no re-read button: the read renews "
-               f"itself automatically once it is "
-               f"{_CACHE_TTL_SECS // 60} minutes old.")
+               f"view, across a book of {custom.get('n_roster', 0)} accounts. The read "
+               f"renews itself automatically once it is {_CACHE_TTL_SECS // 60} minutes "
+               f"old; to see a model published just now, use the re-read button at the top "
+               f"of this page.")
 
     if n_broken:
         st.error(
@@ -1799,8 +1805,9 @@ def render_models() -> None:
     ticker priceability, whole-share viability, the accounts assigned, their drift and the
     trades that would bring them back). Every number is pulled live — from the frozen
     engine and config for the computed family, and from the client system's read-only view
-    for the hand-written one. Nothing here edits, writes, arms, or transmits, and the page
-    renders no control of any kind."""
+    for the hand-written one. Nothing here edits, writes, arms, or transmits. The page
+    renders exactly ONE control — a button that re-reads the hand-written allocations from
+    the client system — and it only clears a cache."""
     st.subheader("Strategy Models — what each model holds and why")
     st.caption("Every model the desk knows about, in one place: the ones the strategy code "
                "works out automatically and the ones Andrew writes himself. For each one, "
@@ -1809,10 +1816,23 @@ def render_models() -> None:
                "for the hand-written ones, which accounts are on them, how far those "
                "accounts have drifted and the trades that would bring them back. Read-only "
                "throughout and pulled live, so nothing on this page can drift from what is "
-               "really being traded. There is no edit control here, and no control of any "
-               "other kind either.")
+               "really being traded. There is no edit control here; the one button on this "
+               "page only re-reads the hand-written allocations.")
 
     _render_readonly_banner()
+
+    # THE PAGE'S ONE AND ONLY CONTROL. It clears this page's own cached read of the
+    # hand-written allocations and nothing else — it starts no program, opens no broker
+    # connection, holds no arm token and sends nothing. It sits HERE, above the read on the
+    # next line, so a click takes effect on this same render rather than the next one; that
+    # is exactly how the retired Custom allocation page did it. Without it Andrew has to
+    # wait out the 10-minute cache to see a model he has just published.
+    if st.button("Re-read the models Andrew writes himself from the client system",
+                 key="models_reread_custom",
+                 help="Throws away this page's 10-minute cached read and reads the "
+                      "published allocations from the client system again straight away. "
+                      "Reading only — this changes nothing and sends nothing."):
+        _load_custom_state.clear()
 
     # The two live reads, done once each and shared by every section below.
     state = _compute_live_state()
