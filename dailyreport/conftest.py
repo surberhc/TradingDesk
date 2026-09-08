@@ -73,3 +73,29 @@ def crm(monkeypatch):
     import action_center
     monkeypatch.setattr(action_center, "_connect", lambda: _FakeConn(rows))
     return rows
+
+
+class _InsertBrokenCursor(_FakeCursor):
+    """A CRM that can still be asked whether an alert is open, but fails the write itself."""
+
+    def execute(self, sql, params=()):
+        if not sql.lstrip().upper().startswith("SELECT"):
+            raise RuntimeError("the connection dropped while filing the alert")
+        super().execute(sql, params)
+
+
+class _InsertBrokenConn(_FakeConn):
+    def cursor(self):
+        return _InsertBrokenCursor(self.rows)
+
+
+@pytest.fixture
+def crm_write_broken(crm, monkeypatch):
+    """An OUTAGE on the reporting channel: post_notice cannot file the alert and answers
+    FAILED. Every nightly job must surface that as a failure. Before the four jobs stopped
+    pre-checking is_snoozed themselves, an outage instead made each one print that the operator
+    had snoozed the notice — which nobody had — and exit 0, so a broken night looked like a
+    successful one."""
+    import action_center
+    monkeypatch.setattr(action_center, "_connect", lambda: _InsertBrokenConn(crm))
+    return crm

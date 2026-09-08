@@ -35,11 +35,14 @@ zero accounts is reported as a failed run, never as a clean one.
 Exit codes: 0 the whole book was checked; 1 the job could not run at all (client system not
 configured or unreachable); 2 the job ran but some or all of the book went unchecked.
 
-SNOOZE / IGNORE-FOR-N-DAYS
---------------------------
-If the operator snoozed this notice in the Action Center, the job SKIPS posting while the
-snooze is live (via action_center.is_snoozed). Dismiss alone does not durably suppress — the
-poster-side snooze skip is what silences the daily re-nag.
+NOT POSTING TWICE — ONE CHECK, IN ONE PLACE
+-------------------------------------------
+``action_center.post_notice`` already refuses to file a second alert while one with the same
+key is open, and says which of the three things it did: the new task's id when it posted,
+SKIPPED when it deliberately posted nothing, FAILED when it could not post. This job reads
+that answer and nothing else. It used to ALSO ask ``is_snoozed`` first and return early — a
+duplicate of the same check that turned a CRM outage into a clean exit 0 claiming the operator
+had snoozed the notice. Removed 2026-09-08: an outage is a failure, and it is reported as one.
 
 SCOPE / SAFETY — INFORMATIONAL + READ-ONLY, ZERO-TRANSMIT
 --------------------------------------------------------
@@ -162,8 +165,14 @@ def _merge_scans(parts: list[dict]) -> dict:
 # Streamlit — same pure engine, same read-only CRM path).
 # --------------------------------------------------------------------------- #
 def run_scan() -> dict:
-    """Read the whole blessed roster + latest holdings from the CRM (read-only role) and run
-    the frozen engine for every account's in-spec / out-of-spec verdict.
+    """Read ANDREW'S blessed roster + latest holdings from the CRM (read-only role) and run the
+    frozen engine for every account's in-spec / out-of-spec verdict.
+
+    WHOSE BOOK (fixed 2026-09-08). "Whole book" here means the whole of ANDREW'S book, never
+    the whole view. ``v_tradingdesk_roster`` carries Ted's and Doug's clients too, and this job
+    used to read it raw and then report their 115 accounts as accounts nobody was checking for
+    drift — a false alarm about other advisors' clients. Scoping now goes through
+    ``roster.enrolled_roster_scan``, the same advisor wall the execution rail gates on.
 
     MODEL RESOLUTION IS THE TRADING RAIL'S, NOT THIS FILE'S (fixed 2026-09-08). This job used
     to ask ``strategy_target.current_target`` directly, which only knows Strategy 0's computed
@@ -191,15 +200,45 @@ def run_scan() -> dict:
     import crm_roster
     import crm_outofspec
     import batch_rebalance_execute as bre
+    import roster as roster_mod
 
     if not crm_roster.is_configured():
         return {"error": "not_configured"}
+
+    # WHOSE BOOK THIS JOB IS FOR — the desk's OWN advisor wall, not this file's idea of it.
+    # ``v_tradingdesk_roster`` deliberately carries all three advisors' books, and reading it
+    # raw is how this job came to treat Ted's 98 accounts and Doug's 17 as a monitoring gap in
+    # Andrew's book. They are not: those clients are Ted's and Doug's to watch and rebalance,
+    # and Doug is his own advisor. ``roster.enrolled_roster_scan`` is the same allow-list the
+    # execution rail gates on (batch_rebalance_execute.main, group_execute.build_plans), so the
+    # accounts this monitor reports on are exactly the accounts the desk would act on.
     try:
-        rows = crm_roster.fetch_roster(advisor_name=None)  # whole book
+        book = roster_mod.enrolled_roster_scan()
+    except Exception as exc:  # noqa: BLE001
+        return {"error": f"could not resolve whose accounts to check: {exc}"}
+    # The wall's three parts ARE Andrew's book: in-scope-and-tradeable, plus the ones it held
+    # back and says so by name. Drift monitoring is read-only, so a no-trade hold or a missing
+    # funded reality is no reason to stop LOOKING at an account — those are reported by the
+    # engine below as skipped/held out. What none of them may be is another advisor's client.
+    my_book = set(book.get("accounts") or ()) | set(book.get("held") or ()) \
+        | set(book.get("unfunded") or ())
+    if book.get("source") != "crm":
+        # The degraded config.ENROLLMENT fallback is a hardcoded allow-list with no advisor
+        # information in it. Scoping a whole-book drift report to it would silently report on
+        # the wrong set of accounts, so refuse and say why rather than answer from it.
+        return {"error": "the blessed roster came from the local fallback list rather than "
+                         "the client system, so this run cannot tell whose accounts these are"}
+
+    try:
+        rows = [r for r in crm_roster.fetch_roster(advisor_name=None)
+                if crm_roster.account_identifier(r) in my_book]
         holdings = crm_roster.fetch_holdings_latest([r["account_id"] for r in rows])
     except crm_roster.CrmRosterUnavailable as exc:
         return {"error": str(exc)}
 
+    # Every count this job reports — scanned, unchecked, the roster total the alert compares
+    # against — is now over ANDREW'S book alone. Another advisor's account is not scanned and
+    # is not a coverage gap, because it was never this desk's account to check.
     n_roster = len(rows)
 
     # An account with NO model recorded is unmonitored, not a default. It is held out of the
@@ -511,19 +550,19 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  hint:   {c_hint}")
         else:
             import action_center
-            if action_center.is_snoozed(_COVERAGE_DEDUP_KEY):
-                print("An alert about accounts going unchecked is already open in the Action "
-                      "Center; leaving it alone and posting nothing.")
+            c_key = action_center.post_notice(
+                kind="outofspec_coverage", title=c_title, body=c_body, severity="error",
+                action_hint=c_hint, dedup_key=_COVERAGE_DEDUP_KEY, detail_json=c_detail)
+            if c_key:
+                print(f"Posted an alert to the Action Center: {n_unmon} of {n_roster} "
+                      f"accounts were not checked for drift (notice {c_key}).")
+            elif c_key == action_center.SKIPPED:
+                print("Posting nothing more: an alert about accounts going unchecked is "
+                      "already open in the Action Center, or the Action Center could not be "
+                      "asked. The unchecked accounts above are still unchecked.")
             else:
-                c_key = action_center.post_notice(
-                    kind="outofspec_coverage", title=c_title, body=c_body, severity="error",
-                    action_hint=c_hint, dedup_key=_COVERAGE_DEDUP_KEY, detail_json=c_detail)
-                if c_key:
-                    print(f"Posted an alert to the Action Center: {n_unmon} of {n_roster} "
-                          f"accounts were not checked for drift (notice {c_key}).")
-                else:
-                    _log("posting the unchecked-accounts alert failed.")
-                    exit_code = _EXIT_COULD_NOT_RUN
+                _log("posting the unchecked-accounts alert failed.")
+                exit_code = _EXIT_COULD_NOT_RUN
         # Scanning NOTHING is a failure, full stop. There is no drift result to report.
         if n_acct <= 0:
             print(f"The nightly drift check covered NONE of the {n_roster} accounts on the "
@@ -553,17 +592,15 @@ def main(argv: list[str] | None = None) -> int:
         return exit_code
 
     import action_center
-    # Snooze / "ignore for N days": SKIP posting while the operator has this notice snoozed.
-    # The poster-side is_snoozed skip is what actually silences the daily nag (dismiss alone
-    # re-posts on the next run).
-    if action_center.is_snoozed(_DEDUP_KEY):
-        print("Out-of-spec notice is snoozed (ignored) by the operator; posting nothing.")
-        return exit_code
     key = action_center.post_notice(
         kind="outofspec", title=title, body=body, severity="warn",
         action_hint=hint, dedup_key=_DEDUP_KEY, detail_json=detail)
     if key:
         print(f"Posted consolidated out-of-spec proposal to the Action Center (notice {key}).")
+        return exit_code
+    if key == action_center.SKIPPED:
+        print("Posting nothing: an out-of-spec alert is already open in the Action Center, or "
+              "the Action Center could not be asked.")
         return exit_code
     _log("posting the Action Center notice failed.")
     return _EXIT_COULD_NOT_RUN

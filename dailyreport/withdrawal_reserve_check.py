@@ -230,15 +230,14 @@ def main(argv: list[str] | None = None) -> int:
             print(f"  hint:  {hint}")
             continue
 
-        if action_center.is_snoozed(dedup_key):
-            print(f"{account}: withdrawal-reserve notice is snoozed (ignored) by the "
-                  f"operator; posting nothing.")
-            continue
         key = action_center.post_notice(kind="withdrawal_reserve", title=title, body=body,
                                         severity="warn", action_hint=hint, dedup_key=dedup_key)
         if key:
             print(f"{account}: posted withdrawal-reserve shortfall notice to the Action "
                   f"Center (notice {key}).")
+        elif key == action_center.SKIPPED:
+            print(f"{account}: posting nothing — a withdrawal-reserve alert for it is already "
+                  f"open in the Action Center, or the Action Center could not be asked.")
         else:
             any_failure = True
             _log(f"account={account}: posting the Action Center notice failed.")

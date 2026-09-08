@@ -162,7 +162,8 @@ def test_main_one_account_failure_does_not_block_the_rest(monkeypatch, capsys):
 
 def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, capsys):
     """While an account's withdrawal-reserve alert is still OPEN in the CRM, the run must SKIP
-    posting for that account. Snooze is gone; Andrew closing the task is what re-arms it."""
+    posting for that account. Andrew closing the task is what re-arms it. The job reads
+    post_notice's SKIPPED answer for this, and never says the operator snoozed anything."""
     fake_schedule = {
         "UZ": [cashflows.Flow("distribution", amount=8500.0, pct_nav=0.0, day=15)],
     }
@@ -180,6 +181,23 @@ def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, caps
 
     # next run must skip posting; the open alert is left untouched
     assert job.main([]) == 0
-    assert "snoozed" in capsys.readouterr().out.lower()
+    out = capsys.readouterr().out.lower()
+    assert "already open" in out
+    assert "snoozed" not in out
     assert len(crm) == 1
-    assert action_center.is_snoozed(dedup_key)
+    assert action_center.has_open(dedup_key)
+
+
+def test_main_reports_failure_when_the_alert_cannot_be_filed(crm_write_broken, monkeypatch,
+                                                             capsys):
+    """An outage on the reporting channel is a FAILED run for that account. Non-zero exit, and
+    never a claim that the operator snoozed a notice nobody snoozed."""
+    monkeypatch.setattr(cashflows, "SCHEDULE",
+                        {"UZ": [cashflows.Flow("distribution", amount=8500.0,
+                                               pct_nav=0.0, day=15)]})
+    monkeypatch.setattr(job, "read_cash",
+                        lambda account: {"net_liq": 500_000, "total_cash": 1_000})
+
+    assert job.main([]) == 1
+    assert crm_write_broken == []
+    assert "snoozed" not in capsys.readouterr().out.lower()
