@@ -74,7 +74,58 @@ def _log(msg: str) -> None:
         pass
 
 
-def main() -> None:
+def manifest_is_fresh(mani: dict, today: dt.date) -> bool:
+    """True when the manifest's dataset really is dated today, in LOCAL time.
+
+    `data_end` is the downloader's own local run date, so it is the honest field to
+    compare and is preferred. `generated_at` is stamped in UTC: after about 18:00
+    Central it has already rolled over to tomorrow's UTC date, so the old comparison of
+    its first ten characters against the local date read as stale on every evening run.
+    Convert it to local time before falling back to it.
+    """
+    data_end = (mani.get("data_end") or "").strip()
+    if data_end:
+        return data_end[:10] == today.isoformat()
+    generated = (mani.get("generated_at") or "").strip()
+    if not generated:
+        return False
+    try:
+        stamp = dt.datetime.fromisoformat(generated)
+    except ValueError:
+        return False
+    if stamp.tzinfo is not None:
+        stamp = stamp.astimezone()  # into this machine's local time
+    return stamp.date() == today
+
+
+def verdict(exit_code: int, fresh: bool, critical_tickers: list[str],
+            qc_flagged: int, tickers: int, data_end: str) -> tuple[str, str]:
+    """Decide the job's status and the operator-facing message.
+
+    A serious data-quality finding is judged BEFORE freshness. It used to sit in a
+    branch after the freshness test, so a manifest that merely looked stale hid it
+    entirely and the warning never once reached the operator.
+    """
+    if exit_code != 0:
+        return "fail", f"the downloader exited with code {exit_code}"
+    if critical_tickers:
+        names = ", ".join(critical_tickers)
+        return "partial", (
+            f"refreshed {tickers} tickers, but {len(critical_tickers)} of them have a "
+            f"serious data-quality problem that needs a human look: {names}. Each one "
+            f"shows a single-day price move bigger than the quality limit, which is "
+            f"either a real market move or a stock split the data vendor never adjusted "
+            f"for. Check before trusting these prices.")
+    if not fresh:
+        return "partial", (
+            "the downloader ran, but the dataset is not dated today — usually a vendor "
+            "rate limit, or today's closing prices are not published yet (the dataset "
+            f"currently runs through {data_end or 'an unknown date'})")
+    note = f" ({qc_flagged} harmless data-quality notes)" if qc_flagged else ""
+    return "ok", f"refreshed {tickers} tickers, data through {data_end}{note}"
+
+
+def main() -> int:
     _log(f"=== Tiingo refresh {TODAY_STR} start ===")
     try:
         proc = subprocess.run(
@@ -90,10 +141,11 @@ def main() -> None:
     except Exception as e:
         _log(f"downloader failed to launch: {type(e).__name__}: {e}")
         status.write("tiingo", "fail", message=f"downloader launch error: {e}", day=TODAY_STR)
-        return
+        return 1
 
     # Read the manifest the downloader just (re)built for status detail.
-    tickers = qc_flagged = critical = 0
+    tickers = qc_flagged = 0
+    critical_tickers: list[str] = []
     data_end = generated = ""
     fresh = False
     if MANIFEST.exists():
@@ -103,34 +155,29 @@ def main() -> None:
             data_end = mani.get("data_end", "")
             tk = mani.get("tickers", {})
             tickers = len(tk)
-            for v in tk.values():
+            for sym, v in sorted(tk.items()):
                 flags = v.get("qc_flags", [])
                 if flags:
                     qc_flagged += 1
                 # Critical = real data errors (bad splits / zero or negative prices).
                 # "stale run" on cash-like ETFs (SGOV/BIL/…) is benign and ignored.
                 if any(("zero" in f.lower() or "split" in f.lower()) for f in flags):
-                    critical += 1
-            fresh = generated[:10] == TODAY.isoformat()
+                    critical_tickers.append(sym)
+            fresh = manifest_is_fresh(mani, TODAY)
         except Exception as e:
             _log(f"manifest read error: {e}")
 
-    if exit_code != 0:
-        st, msg = "fail", f"downloader exited {exit_code}"
-    elif not fresh:
-        st, msg = "partial", "ran, but manifest date isn't today (rate limit / no new EOD yet?)"
-    elif critical:
-        st, msg = "partial", f"refreshed, but {critical} ticker(s) have CRITICAL QC flags — check"
-    else:
-        note = f" ({qc_flagged} benign QC notes)" if qc_flagged else ""
-        st, msg = "ok", f"refreshed {tickers} tickers, data through {data_end}{note}"
+    st, msg = verdict(exit_code, fresh, critical_tickers, qc_flagged, tickers, data_end)
 
     status.write("tiingo", st, day=TODAY_STR,
-                 metrics={"tickers": tickers, "qc_flags": qc_flagged, "critical_qc": critical,
+                 metrics={"tickers": tickers, "qc_flags": qc_flagged,
+                          "critical_qc": len(critical_tickers),
+                          "critical_tickers": critical_tickers,
                           "data_end": data_end, "generated_at": generated},
                  message=msg)
     _log(f"=== Tiingo refresh {TODAY_STR} done: {st} — {msg} ===")
+    return 0 if st == "ok" else 1
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
