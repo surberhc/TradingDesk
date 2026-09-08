@@ -29,16 +29,20 @@ DE-DUPLICATION is now the WHOLE story — the old dismiss/snooze/expiry machiner
 Before inserting, this checks for an existing OPEN trading-desk task with the same
 ``dedup_key``; if one is already sitting there, it posts nothing. Andrew closing the task in
 the CRM is what lets the next nightly run raise it again. That single rule replaces both the
-old "update the open notice in place" dedup AND the old "ignore for N days" snooze, so
-``is_snoozed()`` (which the four jobs call before posting) now answers exactly that question.
+old "update the open notice in place" dedup AND the old "ignore for N days" snooze.
 The desk has no UPDATE permission, so a repeat run cannot refresh an open alert's numbers —
 it leaves the original standing rather than stacking a duplicate.
 
-THE DE-DUPLICATION CHECK FAILS CLOSED. If the CRM cannot be asked whether an alert is already
-open, the answer is taken to be "yes, it probably is", and nothing is posted. The desk can
-create a task but has no permission to delete one, so a duplicate filed during a network blip
-could only be cleared by Andrew dismissing it by hand — whereas a report skipped tonight comes
-back on its own, because these jobs run every night. A missed report is the cheaper mistake.
+THE DE-DUPLICATION CHECK FAILS CLOSED, AND SAYS SO OUT LOUD (2026-09-08). If the CRM cannot be
+asked whether an alert is already open, nothing is posted — the desk can create a task but has
+no permission to delete one, so a duplicate filed during a network blip could only be cleared
+by Andrew dismissing it by hand, whereas a report skipped tonight comes back on its own because
+these jobs run every night. A missed report is the cheaper mistake. What CHANGED is the
+reporting: ``has_open`` used to answer "yes, already open" when it simply could not reach the
+CRM, so a complete outage and a genuine duplicate both came back as ``SKIPPED`` and every one
+of the four nightly jobs exited 0 — a night when NOTHING could be reported looked like a clean
+night. It now returns a third answer, ``COULD_NOT_TELL``, and ``post_notice`` turns that into
+``FAILED``: still nothing written, but the calling job now exits non-zero and the outage shows.
 
 WHAT ``post_notice`` GIVES BACK says which of the three things happened, so a caller can tell
 "already reported" apart from "reporting is broken": the new task's id when it posted,
@@ -71,8 +75,13 @@ SOURCE = "trading_desk"
 # The two ways post_notice can write nothing. Both are falsy, so a caller that simply tests the
 # answer for truth still reads them as "nothing was written"; a caller that wants the reason can
 # compare against these instead.
-SKIPPED = ""      # on purpose: an alert for this is already open, or could not be checked
+SKIPPED = ""      # on purpose: an alert for this is already open
 FAILED = None     # not on purpose: the CRM could not be reached or refused the insert
+
+# has_open()'s THIRD answer, alongside True and False: the CRM could not be reached, so whether
+# an alert is already open is simply not known. Deliberately TRUTHY, so a caller that forgets
+# this case and just tests the answer still posts nothing — the safe direction.
+COULD_NOT_TELL = "could not tell"
 
 # The CRM's tasks.severity only accepts error/warning/info; the desk's posters all say "warn".
 # Translate here rather than edit the four calling jobs.
@@ -100,13 +109,17 @@ def _connect():
     return psycopg2.connect(os.environ[crm_roster.DSN_ENV].strip())
 
 
-def has_open(dedup_key: str) -> bool:
+def has_open(dedup_key: str) -> bool | str:
     """Whether the CRM already holds an OPEN trading-desk alert carrying this ``dedup_key``.
 
-    True on any error (fail CLOSED): an answer we could not get is treated as "one is probably
-    already open", so the caller posts nothing. The desk can file a task but cannot delete one,
-    so a duplicate filed during a blip would have to be dismissed by hand, while a report held
-    back tonight is raised again by tomorrow night's run."""
+    Three answers, not two: True (one is already open), False (none is open), and
+    ``COULD_NOT_TELL`` (the CRM could not be reached, so the question has no answer). Keeping
+    the third one separate is the whole point — a real duplicate and a total outage used to
+    look identical, so a night when nothing could be reported looked like a clean night.
+
+    Nothing is posted for either True or COULD_NOT_TELL (fail CLOSED): the desk can file a task
+    but cannot delete one, so a duplicate filed during a blip would have to be dismissed by
+    hand, while a report held back tonight is raised again by tomorrow night's run."""
     if not dedup_key:
         return False
     try:
@@ -120,20 +133,11 @@ def has_open(dedup_key: str) -> bool:
         finally:
             con.close()
     except Exception as exc:  # noqa: BLE001
-        _log(f"could not ask the CRM whether a '{dedup_key}' alert is already open "
-             f"({exc}); treating it as already open, so nothing will be posted this time. "
-             f"If the problem is still there, tomorrow night's run will report it.")
-        return True
-
-
-def is_snoozed(dedup_key: str) -> bool:
-    """Kept under its original name because the four nightly jobs call it before posting.
-
-    Snooze as a separate concept is GONE. This now answers the single de-duplication question:
-    is an open trading-desk alert for this ``dedup_key`` already waiting in the CRM? If it is,
-    the job skips posting — exactly the re-nag silencing the old snooze provided, except the
-    operator clears it by closing the task in the CRM instead of setting a timer."""
-    return has_open(dedup_key)
+        _log(f"could not reach the CRM Action Center to ask whether a '{dedup_key}' alert is "
+             f"already open ({exc}). Nothing will be posted this time, and the run will be "
+             f"reported as a failure. If the problem is still there, tomorrow night's run "
+             f"will report it.")
+        return COULD_NOT_TELL
 
 
 def post_notice(kind: str, title: str, body: str, *, severity: str = "info",
@@ -150,11 +154,17 @@ def post_notice(kind: str, title: str, body: str, *, severity: str = "info",
     ``ts`` are accepted and ignored — the CRM has no column for the structured blob and stamps
     its own ``created_at``."""
     description = f"{body}\n\n{action_hint}".strip() if action_hint else (body or "")
-    # Fails closed: has_open() answers "yes" when it could not find out, and either way the
-    # right move is to leave the CRM alone. It logs the specific reason when it is a failure.
-    if dedup_key and has_open(dedup_key):
-        _log(f"posting nothing about '{dedup_key}': the CRM Action Center either already "
-             f"holds an open alert for it, or could not be asked.")
+    # Fails closed BOTH ways — nothing is written unless we KNOW no alert is open — but the two
+    # reasons are reported differently, because an outage is a failure and a duplicate is not.
+    already = has_open(dedup_key) if dedup_key else False
+    if already == COULD_NOT_TELL:
+        _log(f"posting nothing about '{dedup_key}': the CRM Action Center could not be "
+             f"reached, so there is no way to tell whether this was already reported. "
+             f"Nothing was written, and this run counts as a failure to report.")
+        return FAILED
+    if already:
+        _log(f"posting nothing about '{dedup_key}': the CRM Action Center already holds an "
+             f"open alert for it.")
         return SKIPPED
     try:
         con = _connect()

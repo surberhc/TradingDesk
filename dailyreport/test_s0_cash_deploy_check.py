@@ -85,11 +85,17 @@ def test_main_reports_failure_when_the_alert_cannot_be_filed(crm_write_broken, m
     assert "snoozed" not in capsys.readouterr().out.lower()
 
 
-def test_main_survives_a_failed_duplicate_check_and_posts_nothing(crm, monkeypatch):
-    """If the CRM cannot be asked whether an alert is already open, the job must post nothing
-    and still finish normally. The desk can file a task but cannot delete one, so a duplicate
-    filed during a blip would have to be dismissed by hand; a report held back tonight is
-    raised again by tomorrow night's run."""
+def test_main_reports_failure_when_the_duplicate_check_cannot_be_made(crm, monkeypatch,
+                                                                      capsys):
+    """END TO END: a CRM outage on the de-duplication read must post NOTHING and still exit
+    NON-ZERO (fixed 2026-09-08).
+
+    Nothing is written, because the desk can file a task but cannot delete one, so a duplicate
+    filed during a blip would have to be dismissed by hand. What changed is that the run no
+    longer LOOKS CLEAN while that happens: this used to exit 0 — identical to a night when the
+    alert was genuinely already open — so a total outage of the reporting channel was
+    indistinguishable from a quiet, healthy night. The job must also survive it: the reporting
+    channel breaking is not a reason for the job to crash."""
     import action_center
     import conftest
 
@@ -109,5 +115,8 @@ def test_main_survives_a_failed_duplicate_check_and_posts_nothing(crm, monkeypat
                         lambda: {"net_liq": 100_000, "total_cash": 5_000})
     monkeypatch.setattr(action_center, "_connect", lambda: _SelectBrokenConn(crm))
 
-    assert job.main([]) == 0        # the reporting channel broke; the job did not
+    assert job.main([]) == 1        # the outage is REPORTED as a failure, not hidden
     assert crm == []                # and no alert was written
+    out = capsys.readouterr().out.lower()
+    assert "already open" not in out   # never claim it was reported when it was not
+    assert "snoozed" not in out

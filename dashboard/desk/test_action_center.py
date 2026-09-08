@@ -4,8 +4,8 @@ It no longer keeps a SQLite notice store — it files each alert as a row in the
 ``public.tasks``. These tests replace the old store tests (post/read/dedup/dismiss/unread/
 snooze/migration), which exercised a database that no longer exists. Coverage is kept on the
 behaviour that still matters: the column mapping, the ONE de-duplication rule, the
-``is_snoozed`` call site the four nightly jobs still use, and the promise that a CRM outage
-never takes a nightly job down with it.
+three-way answer a caller needs to tell a real duplicate from an outage, and the promise that a
+CRM outage never takes a nightly job down with it.
 
 The CRM is faked here so the suite stays hermetic — no network, no credential, no live DB.
 """
@@ -157,41 +157,42 @@ def test_no_dedup_key_always_inserts(crm):
     assert len(crm) == 2
 
 
-def test_is_snoozed_is_now_the_same_already_open_check(crm):
-    """Snooze is gone as a concept. The four jobs still call is_snoozed() before posting, and
-    it must now mean 'an open alert is already waiting in the CRM'."""
-    assert action_center.is_snoozed("d") is False
+# --------------------------------------------------------------------------- #
+# the duplicate check fails CLOSED — and now SAYS which of the two reasons      #
+# --------------------------------------------------------------------------- #
+def test_has_open_gives_three_answers_not_two(crm, monkeypatch):
+    """"Already open", "none is open", and "could not tell" are three different facts. Telling
+    the third apart from the first is the whole fix: they used to be the same answer."""
+    assert action_center.has_open("d") is False
     action_center.post_notice("cash_deploy", "T", "B", dedup_key="d")
-    assert action_center.is_snoozed("d") is True
-    assert action_center.is_snoozed("d") == action_center.has_open("d")
-    assert action_center.is_snoozed("") is False
-
-
-# --------------------------------------------------------------------------- #
-# the duplicate check fails CLOSED                                             #
-# --------------------------------------------------------------------------- #
-def test_a_failed_duplicate_check_reads_as_already_open(crm, monkeypatch):
-    """An answer we could not get counts as "one is probably already open"."""
-    monkeypatch.setattr(action_center, "_connect",
-                        lambda: _FakeConn(crm, _SelectBrokenCursor))
     assert action_center.has_open("d") is True
-    assert action_center.is_snoozed("d") is True
+
+    monkeypatch.setattr(action_center, "_connect",
+                        lambda: _FakeConn(crm, _SelectBrokenCursor))
+    assert action_center.has_open("d") == action_center.COULD_NOT_TELL
+    # truthy on purpose, so a caller that forgets the third answer still posts nothing
+    assert action_center.COULD_NOT_TELL
 
 
-def test_a_failed_duplicate_check_posts_nothing(crm, monkeypatch, capsys):
-    """The whole point: the desk can file a task but has no permission to delete one, so a
-    duplicate filed during a blip could only be cleared by hand. Post nothing instead — the
-    next nightly run raises it again if the problem is still there."""
+def test_an_unreachable_crm_posts_nothing_and_reports_failure(crm, monkeypatch, capsys):
+    """Both halves matter. NOTHING IS WRITTEN: the desk can file a task but has no permission
+    to delete one, so a duplicate filed during a blip could only be cleared by hand, and the
+    next nightly run raises the alert again anyway. AND IT IS REPORTED AS FAILED: this used to
+    answer SKIPPED, exactly like a genuine duplicate, so a total outage looked like a clean
+    night to every one of the four nightly jobs."""
     monkeypatch.setattr(action_center, "_connect",
                         lambda: _FakeConn(crm, _SelectBrokenCursor))
 
-    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") == \
-        action_center.SKIPPED
+    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") is \
+        action_center.FAILED
     assert crm == []                                 # nothing was written
 
     err = capsys.readouterr().err.lower()
-    assert "could not ask the crm" in err
-    assert "nothing will be posted" in err
+    assert "could not be reached" in err
+    assert "counts as a failure" in err
+    # it must never claim the alert was already reported, or that anyone snoozed anything
+    assert "already holds an open alert" not in err
+    assert "snooz" not in err
 
 
 # --------------------------------------------------------------------------- #
@@ -205,15 +206,15 @@ def test_crm_unreachable_degrades_quietly(monkeypatch, capsys):
     monkeypatch.setattr(action_center, "_connect", _boom)
 
     # no exception escapes, and with the CRM unreachable the duplicate check cannot be made,
-    # so the alert is held back rather than risking a duplicate nobody can remove
-    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") == \
-        action_center.SKIPPED
-    assert action_center.has_open("d") is True       # fail CLOSED
-    assert action_center.is_snoozed("d") is True
+    # so the alert is held back rather than risking a duplicate nobody can remove — but the
+    # caller is told it FAILED, not that it was skipped on purpose
+    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") is \
+        action_center.FAILED
+    assert action_center.has_open("d") == action_center.COULD_NOT_TELL   # fail CLOSED
 
     # and it says so in plain English rather than dying silently
     err = capsys.readouterr().err.lower()
-    assert "could not ask the crm" in err
+    assert "could not reach the crm action center" in err
 
 
 def test_the_three_answers_are_told_apart(crm, monkeypatch):
