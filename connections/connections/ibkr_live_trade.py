@@ -178,9 +178,38 @@ def port_listening(port: int = LIVE_TRADE_PORT, host: Optional[str] = None,
         return False
 
 
-def ensure_gateway(wait_secs: int = 180) -> bool:
-    """Make sure the live-trading Gateway is up; launch it (IBC auto-login) if not.
-    Returns True once it's serving data, False if it never came up within wait_secs.
+def ensure_gateway(wait_secs: int = 180, allow_launch: bool = False) -> bool:
+    """Make sure the live-trading Gateway is up. Returns True once it's serving data.
+
+    **IT WILL NOT START THE GATEWAY UNLESS ``allow_launch=True`` IS PASSED
+    EXPLICITLY (default False, added 2026-09-08 — conductor #82/#83).**
+
+    WHY THE DEFAULT FLIPPED. Starting this gateway sends an IBKR Mobile 2FA push to
+    Andrew's phone. An automated caller that launches on a retry loop therefore dings
+    him repeatedly, and every unanswered push fails a login that IBKR counts against
+    the account. Before this change EVERY automated path through here could launch —
+    the S8 collector/service on mid-session disconnect (a loop with a 5-minute alert
+    dedup but NO hard cap, so a gateway down through one 08:05-15:00 session could
+    fire dozens of pushes), plus the S0 cash-deploy, month-end and withdrawal-reserve
+    checks, each on its own schedule. Andrew travels; unattended pushes are exactly
+    what he cannot answer.
+
+    THE SUPPORTED WAY TO START IT IS A HUMAN TAP: `livebot/s8_desk_launch_link.py`
+    emails one button, and the tap runs `run_live_trade_gateway_open.cmd` directly —
+    it does NOT come through here, so this gate cannot block it. That is deliberate:
+    a tap means Andrew is holding his phone, which is the whole point.
+
+    So an automated caller now gets an honest "the gateway is down" (False) and must
+    degrade — skip, report, alert — instead of starting a login nobody can finish.
+    Pass ``allow_launch=True`` ONLY from a path a human is actively driving.
+
+    When a launch IS authorized, everything below is unchanged, including the NARROW
+    launch mutex (see module docstring): an atomic local lockfile so at most ONE
+    StartGatewayLiveTrade.bat launch is ever in flight across all our processes, and
+    no relaunch within RELAUNCH_COOLDOWN_SECS of the previous attempt. Own lockfile,
+    entirely separate from the paper and live-data modules' locks. Note that mutex
+    serializes CONCURRENT launches; it has never been, and cannot be, a cap on a
+    periodic caller — that is what this gate is for.
 
     NARROW launch mutex (see module docstring): coordinates via an atomic local
     lockfile so at most ONE StartGatewayLiveTrade.bat launch is ever in flight
@@ -197,7 +226,15 @@ def ensure_gateway(wait_secs: int = 180) -> bool:
     if gateway_running():
         return True
 
-    # Below here the gateway is down. Coordinate a launch via the lockfile.
+    # Down. Unless a human authorized this call, STOP HERE — no launch, no 2FA push.
+    if not allow_launch:
+        print("ensure_gateway: the live-trading Gateway is DOWN and this caller is not "
+              "authorized to start it (allow_launch=False). NOT launching — a launch "
+              "would send a 2FA push that may go unanswered. Bring it up with the "
+              "tap-to-launch email button.")
+        return False
+
+    # Below here the gateway is down AND a launch is authorized. Coordinate via the lockfile.
     # Same pattern as ibkr_paper.py / datacollector/spxw_1m_supervisor.py's acquire_lock:
     # O_CREAT|O_EXCL create -> launcher; existing+live+recent -> waiter;
     # existing+dead/stale -> reclaim (unlink + retry) -> launcher.
@@ -326,8 +363,15 @@ def connect(consumer: str, launch: bool = False, readonly: bool = True, timeout:
     """
     client_id = clientids.get(consumer)
     if launch and not gateway_running():
+        # NOTE (2026-09-08): `launch=True` no longer STARTS the gateway. ensure_gateway()
+        # refuses to launch without explicit human authorization, so this is now a check
+        # that raises honestly when the gateway is down rather than firing an unattended
+        # 2FA push. Callers that used to rely on auto-start must degrade instead.
         if not ensure_gateway():
-            raise RuntimeError("live-trading Gateway did not come up")
+            raise RuntimeError(
+                "live-trading Gateway (port 4003) is not up, and nothing may start it "
+                "automatically — that would send a 2FA push nobody may be able to "
+                "answer. Bring it up with the tap-to-launch email button, then re-run.")
     ib = IB()
     ib.connect(HOST, LIVE_TRADE_PORT, clientId=client_id, readonly=readonly, timeout=timeout)
     return ib

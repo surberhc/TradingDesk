@@ -26,10 +26,9 @@ ONE-SHOT (connect -> snapshot today's full chains for the whole universe -> writ
 same warehouse schema/writer as the paper variant; only the Gateway connection
 differs.
 
-Resilience: weekday guard, launches the live-trading Gateway if it's down (via
-connections.ibkr_live_trade.ensure_gateway() — note that a cold launch needs Andrew's
-IBKR Mobile 2FA, so an unattended run only succeeds if the Gateway is already up),
-per-root error isolation (one bad
+Resilience: weekday guard, then a TCP probe of the Gateway — if 4003 is down this run
+SKIPS and EMAILS rather than launching (a 17:30 launch fires a 2FA push nobody may be
+there to answer; see gateway_up() below), per-root error isolation (one bad
 root never aborts the run), resumable (skips any root already on disk for today).
 Logs to warehouse\\forward_live.log and updates warehouse\\forward_heartbeat_live.txt
 so a glance confirms it ran and how far it got. As of the 2026-07-27 ThetaData->IBKR
@@ -47,6 +46,7 @@ from __future__ import annotations
 
 import datetime as dt
 import pathlib
+import socket
 import sys
 from datetime import date
 
@@ -70,6 +70,57 @@ def log(msg: str) -> None:
         pass
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(line + "\n")
+
+
+def gateway_up(timeout: float = 3.0) -> bool:
+    """Is the live-trading Gateway (4003) listening? A PLAIN TCP PROBE — it NEVER
+    launches anything.
+
+    This deliberately does NOT call ``gw.ensure_gateway()``. A launch from here fires
+    an IBKR Mobile 2FA push at 17:30 CT that nobody may be there to answer, which is
+    exactly the pattern the tap-to-launch design (livebot/s8_desk_launch_link.py)
+    removed from the morning: an unanswered push fails the login and burns one of the
+    failed logins IBKR counts. If the gateway is down at 17:30 the right answer is to
+    skip tonight's pull and say so, not to start a login nobody can finish.
+
+    A listening port is the right go/no-go here precisely because we are not launching.
+    (The "port is blind during login" lesson in connections/GATEWAYS.md applies to
+    LAUNCH decisions — a wedged login looks identical to no gateway. Here a false
+    "up" just means _connect() fails and the per-root error handling reports it.)
+    """
+    try:
+        with socket.create_connection((gw.HOST, gw.LIVE_TRADE_PORT), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def alert_gateway_down(daystr: str) -> bool:
+    """Email that tonight's pull was SKIPPED. Best-effort — never raises.
+
+    Uses the EXISTING dailyreport mailer (already importable: this module puts
+    dailyreport on sys.path for status.py). No new mail config, no new credentials.
+    """
+    try:
+        import mailer  # noqa: PLC0415 — lazy so offline tests never touch mail config
+        html = (
+            "<p><b>Tonight's end-of-day option-chain pull did not run.</b></p>"
+            f"<p>Date: {daystr}. The live-trading gateway on port 4003 was not up when "
+            "the job started at 17:30 Central.</p>"
+            "<p>The job <b>deliberately did not try to start the gateway</b>. Starting it "
+            "would send a 2FA approval to your phone that may go unanswered, which fails "
+            "the login and counts against IBKR's failed-login limit. Skipping is the "
+            "safer choice.</p>"
+            "<p><b>What this costs:</b> one day of SPX / SPXW / RUT / NDX end-of-day "
+            "option-chain data. It cannot be back-filled later — these are daily "
+            "snapshots of live chains, which is why they are captured nightly.</p>"
+            "<p><b>What to do:</b> bring the gateway up when convenient (the tap-to-launch "
+            "email button is the normal way). Tomorrow's run needs no action.</p>")
+        return bool(mailer.send_html(
+            f"Trading Desk — EOD option pull SKIPPED {daystr} (gateway 4003 not up)", html))
+    except Exception as e:                # noqa: BLE001 — a broken mailer must not change the outcome
+        log(f"  (gateway-down alert email failed: {e!r})")
+        return False
 
 
 def _connect(real_errors: list[str]):
@@ -118,9 +169,14 @@ def main() -> int:
     log(f"=== forward_live run {daystr} start (per-root depth: SPX/SPXW band=+/-"
         f"{config.FORWARD_DEEP_STRIKE_BAND} exps<={config.FORWARD_DEEP_MAX_EXPIRATIONS}; "
         f"others band=+/-{config.FORWARD_STRIKE_BAND} exps<={config.FORWARD_MAX_EXPIRATIONS}) ===")
-    if not gw.ensure_gateway():
-        log("Live-data Gateway did not come up within timeout - aborting; retry next scheduled run.")
-        jobstatus.write("forward", "fail", message="Gateway did not come up", day=daystr)
+    if not gateway_up():
+        log("Live-trading Gateway (4003) is NOT up - SKIPPING tonight's pull. "
+            "Deliberately NOT launching it: a launch fires a 2FA push nobody may be "
+            "there to answer. Emailing instead; retry is tomorrow's scheduled run.")
+        jobstatus.write("forward", "fail",
+                        message="SKIPPED - gateway 4003 not up (no launch attempted)",
+                        day=daystr)
+        alert_gateway_down(daystr)
         return 1
 
     real_errors: list[str] = []

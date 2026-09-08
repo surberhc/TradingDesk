@@ -72,8 +72,13 @@ def _probes(port_listening=False, process_alive=True):
 
 
 def _kwargs(tmp_path, mailer, clock, ensure, **extra):
+    # relaunch=True because these tests exercise the RELAUNCH machinery. It became
+    # opt-in on 2026-09-08 (conductor #83) so a polling caller can no longer fire a
+    # series of unattended 2FA pushes; the new default is covered by its own tests
+    # below (test_default_never_relaunches / test_default_down_email_says_no_push).
     kw = dict(
         mailer=mailer,
+        relaunch=True,
         ensure_gateway=ensure,
         clock=clock,
         lock_path=tmp_path / "state" / ga.ALERT_LOCK_NAME,
@@ -585,3 +590,55 @@ def test_every_email_carries_the_state_classification(tmp_path):
     for _subject, body in m.sent:
         assert "WHAT HAPPENED" in body
         assert "API SESSION DROPPED" in body
+
+
+# --------------------------------------------------------------------------- #
+# The 2026-09-08 default: report the outage, never start a login (conductor #83)
+# --------------------------------------------------------------------------- #
+
+def test_default_never_relaunches(tmp_path):
+    """A polling caller must not be able to fire a 2FA push, however often it calls."""
+    m = FakeMailer()
+    clock = FakeClock()
+    calls = []
+
+    def _must_not_run():
+        calls.append(1)
+        return True
+
+    for _ in range(20):
+        res = ga.handle_gateway_down(
+            "s8_collector",
+            mailer=m,
+            ensure_gateway=_must_not_run,
+            clock=clock,
+            lock_path=tmp_path / "state" / ga.ALERT_LOCK_NAME,
+            log=lambda *_a, **_k: None,
+            **_probes(),
+        )
+        # Either this cycle reported the outage (relaunched False) or it was deduped
+        # against the previous one (relaunched left None). Never a relaunch.
+        assert res["relaunched"] is not True
+
+    assert calls == [], "the default path must NEVER attempt a relaunch"
+
+
+def test_default_down_email_says_no_push_is_coming(tmp_path):
+    """The email's premise is load-bearing: an unexpected push must always look wrong.
+
+    If the desk is not relaunching, the alert must not tell Andrew to approve a 2FA.
+    """
+    m = FakeMailer()
+    ga.handle_gateway_down(
+        "s8_service",
+        mailer=m,
+        ensure_gateway=lambda: True,
+        clock=FakeClock(),
+        lock_path=tmp_path / "state" / ga.ALERT_LOCK_NAME,
+        log=lambda *_a, **_k: None,
+        **_probes(),
+    )
+    assert m.sent, "an outage must still be reported"
+    subject, body = m.sent[0][0], m.sent[0][1]
+    assert "no relaunch attempted" in subject.lower()
+    assert "should NOT expect a 2FA push" in body

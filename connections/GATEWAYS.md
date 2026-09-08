@@ -11,6 +11,30 @@ disagree, fix whichever is wrong so they match.
 | Live-Data | 4001 | **RETIRED 2026-09-08.** All four scheduled tasks disabled; nothing launches it. See "Why 4001 was retired" below. |
 | Paper | 4002 | **RETIRED 2026-08-24** on Andrew's call. Down on purpose — never flag it as an outage. |
 
+## ONLY A HUMAN TAP STARTS THE GATEWAY (2026-09-08)
+
+Starting 4003 sends an IBKR Mobile 2FA push. An unanswered push fails a login, and IBKR
+counts those. So **no automated path may start the gateway**, and this is enforced in code,
+not by convention:
+
+- `ibkr_live_trade.ensure_gateway()` takes `allow_launch` and **defaults to False** — it
+  reports the gateway down and returns, rather than launching. `connect(launch=True)` now
+  raises an explanatory error instead of auto-starting.
+- `s8_gateway_alert.handle_gateway_down()` takes `relaunch` and **defaults to False** — a
+  mid-session drop is EMAILED, not relaunched. Its 5-minute alert dedup was never a cap;
+  a gateway down through one 08:05–15:00 session could otherwise have fired dozens of
+  pushes at someone who is travelling.
+- The nightly EOD pull PROBES the port and, if down, skips and emails.
+- The scheduled openers (`LiveTradeGatewayOpen_0800CT` / `_0815CT`) are disabled.
+
+**The one way in:** `livebot/s8_desk_launch_link.py` emails one button; the tap runs
+`run_live_trade_gateway_open.cmd` directly and never goes through `ensure_gateway()`, so
+the gate above cannot block it. A tap means a human is holding the phone — the point.
+
+This makes the down-alert email's premise sound again: it now says no push is coming, so
+**an unexpected 2FA push should always be treated as suspicious.** Anything that reverses
+one of these defaults must reckon with that.
+
 ## Why 4001 was retired (read before resurrecting it)
 
 4001 was never an architectural separation. It was created 2026-07-10 to dodge a

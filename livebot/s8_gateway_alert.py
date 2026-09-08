@@ -785,6 +785,7 @@ def handle_gateway_down(
     port: int = LIVE_TRADE_PORT,
     mailer=None,
     ensure_gateway: Optional[Callable[[], bool]] = None,
+    relaunch: bool = False,
     clock: Callable[[], float] = time.time,
     lock_path=None,
     cooldown_secs: float = ALERT_COOLDOWN_SECS,
@@ -792,10 +793,19 @@ def handle_gateway_down(
     probe_process: Callable[[], Optional[bool]] = gateway_process_alive,
     log: Callable[[str], Any] = print,
 ) -> Dict[str, Any]:
-    """Capture -> dedup -> alert -> relaunch -> follow up. **NEVER raises into the caller.**
+    """Capture -> dedup -> alert (-> optional relaunch -> follow up). **NEVER raises.**
 
-    Order matters: the DOWN email goes out BEFORE the relaunch is started, so the email
-    reliably beats (or at worst races closely with) the 2FA push it authorises.
+    **``relaunch`` DEFAULTS TO FALSE since 2026-09-08 (conductor #83).** Callers here are
+    polling loops: this runs on every cycle the connection is down, and the 5-minute alert
+    dedup was never a cap on relaunches. A gateway down through one 08:05-15:00 session
+    could therefore fire a long series of IBKR Mobile 2FA pushes at a man who may be
+    nowhere near his phone, each unanswered one failing a login IBKR counts. So the desk
+    now REPORTS the outage and stops; the human brings the gateway back with the
+    tap-to-launch email button. The DOWN email correctly says no push is coming.
+
+    Order matters when a relaunch IS requested: the DOWN email goes out BEFORE the
+    relaunch starts, so the email reliably beats (or at worst races closely with) the 2FA
+    push it authorises.
 
     Relaunching is delegated to ``ibkr_live_trade.ensure_gateway`` (its own launch mutex +
     relaunch cooldown means concurrent callers cannot stack Gateway launches). The result
@@ -837,7 +847,17 @@ def handle_gateway_down(
             result["deduped"] = True
             return result
 
-        result["alerted"] = send_gateway_down_alert(diag, True, mailer=mailer, log=log)
+        result["alerted"] = send_gateway_down_alert(diag, relaunch, mailer=mailer, log=log)
+
+        if not relaunch:
+            # DEFAULT since 2026-09-08 (conductor #83). Relaunching from a mid-session
+            # retry loop is exactly how Andrew gets dinged repeatedly while away: this is
+            # called on every polling cycle the connection is down, and the 5-minute alert
+            # dedup is not a cap. The email above now says NO push is coming, which is both
+            # true and the safer default — an unexpected 2FA push should always look wrong.
+            # Bring the gateway back with the tap-to-launch email (s8_desk_launch_link).
+            result["relaunched"] = False
+            return result
 
         started = clock()
         try:
