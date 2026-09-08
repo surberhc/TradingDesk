@@ -1,34 +1,45 @@
-"""AppTest render + read-only guard for the Strategy Models hub page.
+"""AppTest render + read-only guard for the merged Strategy Models page.
 
-Mirrors test_s0_model_page.py. Renders page_models through streamlit's AppTest and
-asserts (a) it renders without exception, (b) it shows the frozen banner, every model
-card (Growth/Balanced/Conservative resolved live + the PROPOSED Growth (Small) card),
-and the shared engine content, (c) the resolved holdings shown MATCH what
-strategy_target.current_target returns (no drift, no hardcoding), and (d) it exposes NO
-edit/write widget of any kind — this view is display-only. Model editing is a later,
-gated stage, not an in-app control.
+Renders page_models through streamlit's AppTest and asserts (a) it renders without
+exception, (b) it shows the frozen banner, every model card (Growth/Balanced/Conservative
+resolved live + the PROPOSED Growth (Small) card), and the shared engine content, (c) the
+resolved holdings shown MATCH what strategy_target.current_target returns (no drift, no
+hardcoding), and (d) it exposes NO edit/write widget of any kind — this view is
+display-only. Model editing is a later, gated stage, not an in-app control.
 
-IT ALSO GUARDS THE TWO-FAMILY SPLIT (2026-09-05). The page shows BOTH the models the
-strategy code computes and the models Andrew writes himself, and the whole point of the
-change is that the two can be told apart at a glance:
+THREE PAGES BECAME ONE (2026-09-08). "Strategy 0 — Model & Parameters",
+"Strategy Models — all models" and "Custom allocation — models Andrew writes himself" were
+merged into this single page. Two of the checks below came across from the retired
+test_s0_model_page.py, because the content they guard now lives here and nowhere else:
+  * the FULL live regime read — the score's three components, raw versus confirmed regime,
+    the live version's equity band, the next scheduled monthly rebalance and which data
+    source each stress input came from;
+  * the regime ladder's numbers matching the frozen config LIVE, which is what proves the
+    rulebook is imported rather than typed in.
+The read-only enforcement and the two desk-only validations that came from the Custom
+allocation page live in test_models_page_safety.py, its renamed test file.
+
+IT ALSO GUARDS THE TWO-FAMILY SPLIT. The page shows BOTH the models the strategy code
+computes and the models Andrew writes himself, and the whole point is that the two can be
+told apart at a glance:
   * The computed labels must carry the "S0 " prefix on screen, while the `version` values
     the engine resolves against must stay the bare frozen identifiers. Both halves are
     asserted, because prefixing the wrong one would silently break resolution.
   * The hand-written models must appear when the client system returns rows. That read is
-    STUBBED — the tests replace ``page_custom_alloc._load_state`` (the same seam
-    test_custom_alloc_page.py stubs) so the suite never needs a live database, and so the
-    stub proves page_models really goes through that loader rather than a query of its own.
+    STUBBED — the tests replace ``page_models._load_custom_state`` (the same seam
+    test_models_page_safety.py stubs) so the suite never needs a live database.
   * When the client-system read fails, the page must degrade to one plain sentence and the
     computed models must still render in full.
 """
 import sys
 from pathlib import Path
 
+import pytest
 from streamlit.testing.v1 import AppTest
 
-# page_models.py stays put, but it reuses page_s0_model's renderers and that module now
-# lives in the strategy_views/ sub-folder, so that folder goes on sys.path too — exactly
-# as desk_app.py does when the dashboard starts.
+# page_models.py sits in dashboard/desk/. The strategy_views/ sub-folder goes on sys.path
+# as well — exactly as desk_app.py does when the dashboard starts — because the other page
+# modules there are still imported by bare name.
 _HERE = Path(__file__).resolve().parent
 _STRATEGY_VIEWS = _HERE / "strategy_views"
 for _p in (_HERE, _STRATEGY_VIEWS):
@@ -44,6 +55,21 @@ _SCRIPT = (
     "import page_models\n"
     "page_models.render_models()\n"
 )
+
+
+@pytest.fixture(autouse=True)
+def _restore_the_client_system_loader():
+    """AppTest runs its script in THIS process, so a test that stubs
+    ``page_models._load_custom_state`` mutates the real module and every later test — in
+    this file and in every file that runs after it — would inherit the stub. Snapshot the
+    loader and put it back after each test so the stubs cannot leak."""
+    import page_models
+
+    original = page_models._load_custom_state
+    try:
+        yield
+    finally:
+        page_models._load_custom_state = original
 
 
 def _run():
@@ -88,11 +114,77 @@ def test_shows_banner_all_models_and_shared_engine():
     # Growth (Small) proposed holdings + auto-tier note.
     assert "SCHB" in blob and "USFR" in blob
     assert "$25,000" in blob or "25,000" in blob or "$25k" in blob.lower()
-    # Shared engine (reused S0 renderers): regime ladder + universe tickers.
+    # Shared engine (Strategy 0's rulebook): regime ladder + universe tickers.
     for label in ("Risk-On", "Caution", "Defensive", "Capital preservation"):
         assert label in blob, f"missing regime row: {label}"
-    for tkr in ("XLK", "SGOV", "GLDM"):
+    for tkr in ("SPY", "XLK", "SGOV", "GLDM"):
         assert tkr in blob, f"missing universe ticker: {tkr}"
+    # The re-entry ladder and the whipsaw controls — the rest of S0's rulebook, which
+    # only the retired Strategy 0 page used to carry.
+    assert "Re-entry stages" in blob
+    assert "Whipsaw controls" in blob
+    assert "Confirmation days before a regime change is accepted" in blob
+    assert "Client-version allowances" in blob
+
+
+# --------------------------------------------------------------------------- #
+# THE LIST — every model on one screen, before any of the detail.
+# --------------------------------------------------------------------------- #
+def test_every_model_is_listed_once_up_front():
+    """Progressive disclosure starts with a plain list of every model the desk knows about,
+    so one page out of three stays readable."""
+    at = _run()
+    blob = "\n".join(md.value for md in at.markdown)
+    assert "Every model the desk knows about" in blob
+    for column in ("Who chose the holdings", "Number of holdings", "Accounts assigned",
+                   "Anything to look at"):
+        assert column in blob, f"the model list is missing its {column!r} column"
+    # Both families are named in the list in spelled-out plain English.
+    assert "The strategy code, automatically" in blob
+    assert "Andrew, by hand" in blob or "could not be read from the client" in blob
+
+
+# --------------------------------------------------------------------------- #
+# The FULL live regime read — carried over from the retired page_s0_model view.
+# --------------------------------------------------------------------------- #
+def test_full_live_regime_read_survives_the_merge():
+    """Only the retired "Strategy 0 — Model & Parameters" page showed the score's three
+    components, the raw-versus-confirmed regime, the live version's band, the next
+    scheduled rebalance and the stress data sources. All of it must be here now — or, if
+    the read genuinely failed, the page must say so in one plain sentence instead."""
+    at = _run()
+    blob = "\n".join(md.value for md in at.markdown)
+    caps = "\n".join(c.value for c in at.caption)
+    warns = "\n".join(w.value for w in at.warning)
+
+    assert "Where the market is right now" in blob
+
+    if "regime could not be computed" in warns:
+        return  # the read failed and the page said so plainly — that IS the contract
+
+    assert "Market Health Score" in blob
+    for gloss in ("Broad equity trend", "Market breadth", "Market stress"):
+        assert gloss in blob, f"missing score component: {gloss}"
+    assert "Raw regime" in blob, "the raw (pre-smoothing) regime is missing"
+    assert "Confirmed regime" in blob, "the confirmed (traded) regime is missing"
+    assert "Equity-allowance band for the live version" in blob
+    assert "Next scheduled monthly rebalance" in blob
+    assert "Data sources for the stress component" in caps
+
+
+def test_ladder_values_match_frozen_config():
+    """Carried over from test_s0_model_page.py. The ladder must reflect config LIVE, not
+    hardcoded numbers — this is the anti-drift check for Strategy 0's rulebook."""
+    import page_models  # noqa: F401  (its bootstrap puts strategies/ on sys.path)
+    from strategies import config as scfg
+
+    at = _run()
+    blob = "\n".join(md.value for md in at.markdown)
+    # RiskOn score floor + equity band top come straight from config.
+    lo, hi = scfg.REGIME_BANDS["RiskOn"]["score"]
+    e_lo, e_hi = scfg.REGIME_BANDS["RiskOn"]["equity"]
+    assert f"{lo:.0f}–{hi:.0f}" in blob or f"{lo:.0f}-{hi:.0f}" in blob
+    assert f"{e_lo * 100:.0f}%" in blob and f"{e_hi * 100:.0f}%" in blob
 
 
 # --------------------------------------------------------------------------- #
@@ -127,11 +219,10 @@ def test_rendered_page_shows_the_prefixed_s0_labels():
 
 
 # --------------------------------------------------------------------------- #
-# The models Andrew writes himself — read through page_custom_alloc's loader.
+# The models Andrew writes himself — read through the page's own single loader.
 # --------------------------------------------------------------------------- #
-# The client-system read is STUBBED at exactly the seam page_models reuses
-# (page_custom_alloc._load_state), so these tests need no database AND they prove the
-# reuse: if page_models ran a query of its own, stubbing this would change nothing.
+# The client-system read is STUBBED at exactly the seam the page reads through
+# (page_models._load_custom_state), so these tests need no database.
 _ACC = "aaaaaaaa-0000-0000-0000-000000000001"
 
 _CUSTOM_SCRIPT = """
@@ -139,7 +230,6 @@ import sys
 sys.path.insert(0, r'{here}')
 sys.path.insert(0, r'{views}')
 import page_models
-import page_custom_alloc
 
 _ROWS = [{{'ticker': 'SCHB', 'weight_pct': 60.0, 'version_number': 4,
            'effective_from': '2026-08-01', 'published_at': '2026-08-01 09:00'}},
@@ -162,7 +252,7 @@ _STATE = {{
     }},
 }}
 
-page_custom_alloc._load_state = lambda: _STATE
+page_models._load_custom_state = lambda: _STATE
 page_models.render_models()
 """
 
@@ -171,14 +261,13 @@ import sys
 sys.path.insert(0, r'{here}')
 sys.path.insert(0, r'{views}')
 import page_models
-import page_custom_alloc
 
 
 def _boom():
     raise RuntimeError('connection refused to the client system')
 
 
-page_custom_alloc._load_state = _boom
+page_models._load_custom_state = _boom
 page_models.render_models()
 """
 
@@ -239,8 +328,9 @@ def test_status_badges_render_as_markup_not_as_literal_tag_text():
 
 
 def test_custom_section_stays_read_only():
-    """Adding the hand-written family must not add a single control — the Custom allocation
-    page has a refresh button and a filter checkbox, and neither may leak in here."""
+    """Folding the hand-written family in must not add a single control — the retired
+    Custom allocation page had a refresh button and a filter checkbox, and neither came
+    across."""
     at = _run_script(_CUSTOM_SCRIPT)
     for kind in ("button", "text_input", "number_input", "text_area", "checkbox",
                  "radio", "selectbox", "multiselect", "slider", "toggle"):
@@ -276,3 +366,25 @@ def test_resolved_holdings_match_engine():
             cell = f"{w * 100:.3f}%"
             assert str(tkr) in blob, f"{version}: ticker {tkr} missing from page"
             assert cell in blob, f"{version}: weight {cell} for {tkr} missing from page"
+
+
+# --------------------------------------------------------------------------- #
+# The menu wiring: three pages really did become one.
+# --------------------------------------------------------------------------- #
+def test_desk_app_wires_one_models_page_and_nothing_to_the_retired_ones():
+    """The merge is only real if the menu reflects it: one entry, and no import of or
+    reference to either retired module anywhere in the app wiring."""
+    src = (_HERE / "desk_app.py").read_text(encoding="utf-8")
+    assert "page_s0_model" not in src, (
+        "desk_app.py still references the retired page_s0_model module")
+    assert "page_custom_alloc" not in src, (
+        "desk_app.py still references the retired page_custom_alloc module")
+    assert src.count("page_models.render_models") == 1, (
+        "the merged Models page must be wired exactly once")
+    assert "Strategy Models — what each model holds and why" in src
+
+
+def test_the_retired_page_modules_are_gone():
+    """Both retired modules were deleted, not left behind to rot next to the merged page."""
+    assert not (_STRATEGY_VIEWS / "page_s0_model.py").exists()
+    assert not (_STRATEGY_VIEWS / "page_custom_alloc.py").exists()
