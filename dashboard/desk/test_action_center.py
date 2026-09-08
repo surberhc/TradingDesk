@@ -53,12 +53,23 @@ class _FakeCursor:
         return self._result
 
 
+class _SelectBrokenCursor(_FakeCursor):
+    """A CRM that would still accept an insert, but blows up on the "is one already open?"
+    question — the case that used to let a duplicate alert through."""
+
+    def execute(self, sql, params=()):
+        if sql.lstrip().upper().startswith("SELECT"):
+            raise RuntimeError("the connection dropped while reading")
+        super().execute(sql, params)
+
+
 class _FakeConn:
-    def __init__(self, rows):
+    def __init__(self, rows, cursor_class=_FakeCursor):
         self.rows = rows
+        self.cursor_class = cursor_class
 
     def cursor(self):
-        return _FakeCursor(self.rows)
+        return self.cursor_class(self.rows)
 
     def commit(self):
         pass
@@ -123,7 +134,7 @@ def test_open_alert_with_same_dedup_key_posts_nothing(crm):
 
     # the desk has no UPDATE permission: the original is left standing, not refreshed
     second = action_center.post_notice("cash_deploy", "T2", "B2", dedup_key="d")
-    assert second is None
+    assert second == action_center.SKIPPED
     assert len(crm) == 1
     assert crm[0]["title"] == "T1"
 
@@ -157,18 +168,66 @@ def test_is_snoozed_is_now_the_same_already_open_check(crm):
 
 
 # --------------------------------------------------------------------------- #
+# the duplicate check fails CLOSED                                             #
+# --------------------------------------------------------------------------- #
+def test_a_failed_duplicate_check_reads_as_already_open(crm, monkeypatch):
+    """An answer we could not get counts as "one is probably already open"."""
+    monkeypatch.setattr(action_center, "_connect",
+                        lambda: _FakeConn(crm, _SelectBrokenCursor))
+    assert action_center.has_open("d") is True
+    assert action_center.is_snoozed("d") is True
+
+
+def test_a_failed_duplicate_check_posts_nothing(crm, monkeypatch, capsys):
+    """The whole point: the desk can file a task but has no permission to delete one, so a
+    duplicate filed during a blip could only be cleared by hand. Post nothing instead — the
+    next nightly run raises it again if the problem is still there."""
+    monkeypatch.setattr(action_center, "_connect",
+                        lambda: _FakeConn(crm, _SelectBrokenCursor))
+
+    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") == \
+        action_center.SKIPPED
+    assert crm == []                                 # nothing was written
+
+    err = capsys.readouterr().err.lower()
+    assert "could not ask the crm" in err
+    assert "nothing will be posted" in err
+
+
+# --------------------------------------------------------------------------- #
 # a CRM outage must never take a nightly job down                              #
 # --------------------------------------------------------------------------- #
-def test_crm_unreachable_degrades_quietly(monkeypatch, capsys):
-    def _boom():
-        raise RuntimeError("could not connect to the CRM database")
+def _boom():
+    raise RuntimeError("could not connect to the CRM database")
 
+
+def test_crm_unreachable_degrades_quietly(monkeypatch, capsys):
     monkeypatch.setattr(action_center, "_connect", _boom)
 
-    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") is None
-    assert action_center.has_open("d") is False      # fail-open
-    assert action_center.is_snoozed("d") is False
+    # no exception escapes, and with the CRM unreachable the duplicate check cannot be made,
+    # so the alert is held back rather than risking a duplicate nobody can remove
+    assert action_center.post_notice("cash_deploy", "T", "B", dedup_key="d") == \
+        action_center.SKIPPED
+    assert action_center.has_open("d") is True       # fail CLOSED
+    assert action_center.is_snoozed("d") is True
 
     # and it says so in plain English rather than dying silently
     err = capsys.readouterr().err.lower()
-    assert "could not file this alert" in err
+    assert "could not ask the crm" in err
+
+
+def test_the_three_answers_are_told_apart(crm, monkeypatch):
+    """posted / skipped on purpose / failed — a caller can now tell which happened."""
+    posted = action_center.post_notice("cash_deploy", "T", "B", dedup_key="d")
+    assert posted and posted != action_center.SKIPPED and posted is not action_center.FAILED
+
+    skipped = action_center.post_notice("cash_deploy", "T", "B", dedup_key="d")
+    assert skipped == action_center.SKIPPED
+
+    monkeypatch.setattr(action_center, "_connect", _boom)
+    failed = action_center.post_notice("cash_deploy", "T", "B")   # no key, so no check to fail
+    assert failed is action_center.FAILED
+
+    # both "nothing was written" answers stay falsy, so the four nightly jobs — which simply
+    # test the answer for truth — behave exactly as they did before
+    assert not action_center.SKIPPED and not action_center.FAILED

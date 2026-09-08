@@ -66,3 +66,31 @@ def test_main_skips_repost_while_an_alert_is_already_open(crm, monkeypatch, caps
     assert "snoozed" in capsys.readouterr().out.lower()
     assert len(crm) == 1
     assert action_center.is_snoozed(job._DEDUP_KEY)
+
+
+def test_main_survives_a_failed_duplicate_check_and_posts_nothing(crm, monkeypatch):
+    """If the CRM cannot be asked whether an alert is already open, the job must post nothing
+    and still finish normally. The desk can file a task but cannot delete one, so a duplicate
+    filed during a blip would have to be dismissed by hand; a report held back tonight is
+    raised again by tomorrow night's run."""
+    import action_center
+    import conftest
+
+    class _SelectBrokenCursor(conftest._FakeCursor):
+        """Would happily accept an insert, but breaks on the "is one already open?" read."""
+
+        def execute(self, sql, params=()):
+            if sql.lstrip().upper().startswith("SELECT"):
+                raise RuntimeError("the connection dropped while reading")
+            super().execute(sql, params)
+
+    class _SelectBrokenConn(conftest._FakeConn):
+        def cursor(self):
+            return _SelectBrokenCursor(self.rows)
+
+    monkeypatch.setattr(job, "read_cash",
+                        lambda: {"net_liq": 100_000, "total_cash": 5_000})
+    monkeypatch.setattr(action_center, "_connect", lambda: _SelectBrokenConn(crm))
+
+    assert job.main([]) == 0        # the reporting channel broke; the job did not
+    assert crm == []                # and no alert was written
