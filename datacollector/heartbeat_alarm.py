@@ -55,6 +55,11 @@ DIGEST (2026-08-05) — ONE EMAIL PER DAY, SILENT OVERNIGHT
     * Outside the window, already-sent-today, or zero problems -> assess + log only, no
       email. Overnight is silent. A problem that clears before the morning window simply
       never appears in that day's digest (recovery = absence from the digest).
+    * An outstanding problem is WRITTEN INTO THE STATE FILE and stays there until the
+      job is verified healthy again (fix 2026-09-08 — see _record_outstanding). Without
+      that the digest could never report a nightly job at all: the deadlines are all in
+      the evening and the send window is the next morning, two windows that never
+      intersect, so every evening finding was thrown away at midnight.
   The Drive-sync tripwire (Google-Drive corruption risk) is currently immediate; per
   the one-email-a-day rule it is FOLDED INTO THE SAME DAILY DIGEST rather than sent
   separately. (Whether that one guard deserves an overnight-exception is an open owner
@@ -371,6 +376,61 @@ DEADLINE_JOBS: list[dict] = [
 _OUTSTANDING_STATUSES = ("fail", "stale")
 
 
+# --------------------------------------------------------------------------- #
+# An outstanding problem SURVIVES until the job actually recovers (2026-09-08)
+# --------------------------------------------------------------------------- #
+# THE BUG THIS FIXES. The problem list was rebuilt from scratch on every sweep and never
+# written down, and the two windows involved never intersect: every deadline is in the
+# EVENING (18:30 forward, 19:45 gex, 21:00 tiingo, 21:15 eod_report) while the digest may
+# only SEND in the morning (07:00-12:00). So a job was "outstanding" only between its
+# evening deadline and midnight — outside the send window — and by 07:00 the calendar date
+# had rolled over, so every job read "pre-deadline — no check" and the digest had nothing
+# to send. The live-data Gateway failed three nights running (2026-09-02, 03, 04): each
+# evening the log said OUTSTANDING, each morning it said "0 outstanding — nothing to
+# send", and NO EMAIL WAS EVER SENT. Three sessions of SPX/SPXW options data were lost,
+# and IBKR's own documentation confirms expired-option data can never be backfilled.
+#
+# THE FIX. An outstanding problem is written into the state file this module already
+# keeps, and stays there until the job itself is verified healthy again — at which point
+# it is cleared automatically, with no human clearing anything by hand. A check that
+# CANNOT reach a verdict this run (before its deadline, market closed, or a check error)
+# leaves the record exactly as it was: it neither raises a new alarm nor clears a standing
+# one. Nothing here changes the send gate — the sweep is still silent overnight, and still
+# sends at most one email per calendar day.
+_OUTSTANDING_STATE_KEY = "_outstanding"
+
+
+def _record_outstanding(state: dict, name: str, problem: dict | None,
+                        now: float) -> None:
+    """Write down one check's VERDICT so it outlives this sweep.
+
+    problem=None means the check verified the job HEALTHY, so any standing record is
+    cleared and the job stops being reported. Otherwise the problem is stored, carrying
+    the time it was first seen — which is what lets the morning digest say when last
+    night it broke. Call this ONLY when the check actually reached a verdict."""
+    book = state.setdefault(_OUTSTANDING_STATE_KEY, {})
+    if problem is None:
+        book.pop(name, None)
+        return
+    first_seen = ((book.get(name) or {}).get("first_seen")
+                  or f"{dt.datetime.fromtimestamp(now):%Y-%m-%d %H:%M}")
+    problem["first_seen"] = first_seen
+    problem["rows"] = list(problem.get("rows", [])) + [("First seen", first_seen)]
+    book[name] = problem
+
+
+def _outstanding_problems(state: dict) -> list[dict]:
+    """Every problem still outstanding, INCLUDING ones recorded on an earlier sweep —
+    last night's, which is the entire point. Records belonging to a check that is no
+    longer configured are dropped here, so a job we de-list cannot page forever."""
+    book = state.setdefault(_OUTSTANDING_STATE_KEY, {})
+    known = ({j["name"] for j in JOBS} | {j["name"] for j in DEADLINE_JOBS}
+             | {_TRIPWIRE_NAME})
+    for gone in [k for k in book if k not in known]:
+        book.pop(gone)
+    return list(book.values())
+
+
 def handle_deadline(job: dict, state: dict, now: float) -> tuple[str, dict | None]:
     """Assess a once-daily job against its deadline WITHOUT sending. After the deadline,
     the job is OUTSTANDING if the status JSON's date != today OR its status is one of
@@ -427,6 +487,7 @@ def handle_deadline(job: dict, state: dict, now: float) -> tuple[str, dict | Non
     if ok:
         if js.pop("last_alert_ts", None) is not None:
             log(f"{name}: recovered — cleared alert cooldown")
+        _record_outstanding(state, name, None, now)   # verified healthy — clear the record
         return f"{name}: OK (today's {label} confirmed by status file)", None
 
     # OUTSTANDING — build a problem for the digest (no immediate send).
@@ -441,7 +502,8 @@ def handle_deadline(job: dict, state: dict, now: float) -> tuple[str, dict | Non
         "rows": [("Detail", detail), ("Status file", str(status_file)),
                  ("Owning task", task_name)],
     }
-    return f"{name}: MISSING ({detail}) — OUTSTANDING (folded into daily digest)", problem
+    _record_outstanding(state, name, problem, now)
+    return f"{name}: MISSING ({detail}) — OUTSTANDING (kept until this job recovers)", problem
 
 
 # --------------------------------------------------------------------------- #
@@ -484,6 +546,7 @@ def handle_tripwire(state: dict, now: float) -> tuple[str, dict | None]:
     if not v.get("should_page"):
         if js.pop("last_alert_ts", None) is not None:
             log(f"{name}: recovered (GREEN) — cleared alert cooldown")
+        _record_outstanding(state, name, None, now)   # verified healthy — clear the record
         return f"{name}: GREEN (TradingDesk-Local not under Drive management) — no alert", None
 
     kind = "TRIPPED" if v.get("tripped") else "UNEVALUABLE"
@@ -511,7 +574,8 @@ def handle_tripwire(state: dict, now: float) -> tuple[str, dict | None]:
         "cause": cause,
         "rows": [("Kind", kind), ("Protected", protected)],
     }
-    return f"{name}: {kind} — OUTSTANDING (folded into daily digest)", problem
+    _record_outstanding(state, name, problem, now)
+    return f"{name}: {kind} — OUTSTANDING (kept until this job recovers)", problem
 
 
 # --------------------------------------------------------------------------- #
@@ -854,12 +918,15 @@ def handle_job(job: dict, state: dict, now: float,
         # Recovered / fresh / complete -> clear any legacy cooldown so state stays clean.
         if js.pop("last_alert_ts", None) is not None:
             log(f"{name}: recovered ({a['status']}) — cleared alert cooldown")
+        _record_outstanding(state, name, None, now)   # verified healthy — clear the record
         return (f"{name}: {a['status'].upper()} (age {age}, "
                 f"progress {a['progress']}) — no alert"), None
 
-    # OUTSTANDING (stale/missing) — build a problem for the digest, no immediate send.
+    # OUTSTANDING (stale/missing) — record it, no immediate send.
+    problem = _job_problem(job, a)
+    _record_outstanding(state, name, problem, now)
     return (f"{name}: {a['status'].upper()} (age {age}) — OUTSTANDING "
-            f"(folded into daily digest)"), _job_problem(job, a)
+            f"(kept until this job recovers)"), problem
 
 
 # --------------------------------------------------------------------------- #
@@ -898,8 +965,10 @@ def _build_digest(problems: list[dict], now_dt: "dt.datetime") -> tuple[str, str
         f'<div style="font-size:18px;font-weight:700;color:#ef4444;">'
         f'&#9679; TradingDesk overnight status — {n} {noun} {verb} attention</div>'
         f'<div style="font-size:12px;color:#6b7280;margin:6px 0 2px;">'
-        f'Consolidated once-daily digest as of {now_dt:%Y-%m-%d %H:%M} local. Items that '
-        f'cleared before this morning are not listed. This is the ONLY alarm email today.'
+        f'Consolidated once-daily digest as of {now_dt:%Y-%m-%d %H:%M} local. This lists '
+        f'everything still outstanding, including problems first seen last night. '
+        f'Anything that has since recovered is not listed. '
+        f'This is the ONLY alarm email today.'
         f'</div>'
         f'{"".join(sections)}'
         f'<div style="font-size:11px;color:#9ca3af;margin-top:12px;">'
@@ -963,14 +1032,14 @@ def main() -> int:
     now = dt.datetime.now().timestamp()
     state = _load_state()
     lines: list[str] = []
-    problems: list[dict] = []  # currently-outstanding items -> consolidated digest
 
+    # Each handler RECORDS its own verdict into the state file (see _record_outstanding),
+    # so a problem found in the evening is still there for the morning digest. A check
+    # that raises here records nothing, which correctly leaves any standing record alone.
     for i, job in enumerate(JOBS):
         override = args.test_stale if (args.test_stale and i == 0) else None
         try:
-            line, problem = handle_job(job, state, now, heartbeat_override=override)
-            if problem:
-                problems.append(problem)
+            line, _problem = handle_job(job, state, now, heartbeat_override=override)
         except Exception as e:  # noqa: BLE001 — one bad job must not kill the sweep
             line = f"{job.get('name', '?')}: CHECK ERROR — {type(e).__name__}: {e}"
         lines.append(line)
@@ -978,9 +1047,7 @@ def main() -> int:
 
     for job in DEADLINE_JOBS:
         try:
-            line, problem = handle_deadline(job, state, now)
-            if problem:
-                problems.append(problem)
+            line, _problem = handle_deadline(job, state, now)
         except Exception as e:  # noqa: BLE001 — one bad check must not kill the sweep
             line = f"{job.get('name', '?')}: CHECK ERROR — {type(e).__name__}: {e}"
         lines.append(line)
@@ -989,20 +1056,20 @@ def main() -> int:
     # Drive-sync tripwire (state assertion, not staleness). Same sweep; folded into the
     # SAME daily digest per the one-email-a-day rule (overnight-exception open decision).
     try:
-        line, problem = handle_tripwire(state, now)
-        if problem:
-            problems.append(problem)
+        line, _problem = handle_tripwire(state, now)
     except Exception as e:  # noqa: BLE001 — one bad check must not kill the sweep
         line = f"{_TRIPWIRE_NAME}: CHECK ERROR — {type(e).__name__}: {e}"
     lines.append(line)
     log(line)
 
     # EMAIL GATE: at most one consolidated digest per day, only in the morning window.
-    digest_line = maybe_send_digest(state, now, problems, args.dry_run)
+    # The digest reports everything still outstanding, including last night's findings.
+    digest_line = maybe_send_digest(state, now, _outstanding_problems(state), args.dry_run)
     lines.append(digest_line)
     log(digest_line)
 
-    if not args.dry_run:
+    # A --test-stale self-test must not plant a fake problem in the real state file.
+    if not args.dry_run and not args.test_stale:
         _save_state(state)
 
     # Mutual-watchdog proof-of-life: record that THIS alarm actually ran, so the EOD
