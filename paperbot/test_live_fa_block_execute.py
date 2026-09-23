@@ -515,11 +515,26 @@ CARVE_NET_LIQ = 1_000_000.0
 class _CarveIB:
     """Broker double for build_account_inputs: each account holds one MANAGED equity plus one
     individual BOND, and the bond has NO strategy close and NO live quote (exactly like the
-    real thing) — so only the broker's reported marketValue can price it."""
+    real thing) — so only the broker's own reported position VALUE can price it.
 
-    def __init__(self, accounts, equity_symbol):
+    That value arrives on the reqPnLSingle stream, which is how this lane has read it since
+    2026-09-23. ib.portfolio() is deliberately NOT implemented here: on the real FA-master
+    login it returns an EMPTY list for every account (ib_async fills that cache only from a
+    reqAccountUpdates subscription, and connecting to an FA master subscribes to nothing), so
+    a double that answered portfolio() would be exercising a reader production does not have.
+
+    `bond_value=None` reproduces the broker giving no usable value at all — the holding must
+    then stay ABSENT from the values map so the carve-out still blocks the account."""
+
+    def __init__(self, accounts, equity_symbol, bond_value=BOND_MV, holdings=None):
         self._accounts = list(accounts)
         self._equity = equity_symbol
+        self._bond_value = bond_value
+        self._holdings = holdings if holdings is not None else [
+            (equity_symbol, "STK", 10.0), (BOND_SYM, "BOND", 100_000.0)]
+        self._con_ids = {equity_symbol: 101, BOND_SYM: 202}
+        self.pnl_calls: list = []          # every (account, conId) the value reader asked for
+        self.cancelled: list = []
 
     def accountSummary(self, *_a, **_k):
         rows = []
@@ -530,20 +545,22 @@ class _CarveIB:
         return rows
 
     def positions(self, account=None):
-        return [
-            SimpleNamespace(account=account, position=10.0,
-                            contract=SimpleNamespace(symbol=self._equity, secType="STK")),
-            SimpleNamespace(account=account, position=100_000.0,
-                            contract=SimpleNamespace(symbol=BOND_SYM, secType="BOND")),
-        ]
+        return [SimpleNamespace(account=account, position=qty,
+                                contract=SimpleNamespace(symbol=sym, secType=st,
+                                                         conId=self._con_ids[sym]))
+                for sym, st, qty in self._holdings]
 
-    def portfolio(self, account=None):
-        return [
-            SimpleNamespace(account=account, marketValue=1_000.0,
-                            contract=SimpleNamespace(symbol=self._equity, secType="STK")),
-            SimpleNamespace(account=account, marketValue=BOND_MV,
-                            contract=SimpleNamespace(symbol=BOND_SYM, secType="BOND")),
-        ]
+    # --- the reqPnLSingle value stream (live_quotes.position_values drives these) ---------
+    def reqPnLSingle(self, account, _model, con_id):
+        self.pnl_calls.append((account, con_id))
+        value = self._bond_value if con_id == self._con_ids[BOND_SYM] else 1_000.0
+        return SimpleNamespace(account=account, conId=con_id, position=100_000.0, value=value)
+
+    def cancelPnLSingle(self, account, _model, con_id):
+        self.cancelled.append((account, con_id))
+
+    def sleep(self, _secs):
+        return None
 
 
 def _carve_quotes(t, extra=None):
@@ -644,6 +661,104 @@ def test_plan_for_rederives_the_same_investable_as_the_engine():
     rederived = lx._plan_for(account_inputs[0], targets)
     assert rederived.investable == pytest.approx(engine_plan.investable)
     assert rederived.managed_net_liq == pytest.approx(engine_plan.managed_net_liq)
+
+
+# ========================================================================================
+# (j.2) THE HELD-ASIDE VALUE SOURCE — reqPnLSingle, not ib.portfolio() (2026-09-23).
+#
+# build_account_inputs read `values` from recon_report._portfolio_values, which is backed by
+# ib.portfolio(). On THIS login that reader returns an EMPTY list for every account —
+# ib_async fills its portfolio cache only from a reqAccountUpdates subscription and
+# connecting to an FA master subscribes to nothing — so every bond-holding account got {},
+# hit holding_class.UNPRICED_BLOCK_REASON and emitted no orders at all (U7333246, U7349657,
+# U7552750, U7552751). Subscribing per account is NOT the workaround: measured 2026-09-01,
+# only the first account per connection answers and the SECOND call hangs the run forever
+# (IB.RequestTimeout defaults to 0). The batch rail moved to live_quotes.held_aside_values
+# first; these tests pin the same move on the FA GROUP block rail.
+# ========================================================================================
+def test_held_aside_values_come_from_the_pnl_reader_not_ib_portfolio():
+    # (a) A BOND-holding account gets a POPULATED values= map, and it was built by the
+    # reqPnLSingle reader — the double implements no portfolio() at all, so a values map that
+    # is populated here can only have come from the value stream.
+    ib, clients, targets, equity = _carve_setup()
+    assert not hasattr(ib, "portfolio")
+    account_inputs, _s = lx.build_account_inputs(
+        ib, clients, targets, quotes=_carve_quotes(targets['Balanced']))
+
+    for ai in account_inputs:
+        assert ai["values"] == {BOND_SYM: BOND_MV}      # the BOND only — never the equity
+    # One subscription per held-aside holding, on the account that holds it, and every one
+    # cancelled on the way out so the run leaves nothing behind on the connection.
+    assert ib.pnl_calls == [(clients[0].number, 202), (clients[1].number, 202)]
+    assert sorted(ib.cancelled) == sorted(ib.pnl_calls)
+
+    # ...and the consequence that matters: the bond is PRICED, so the account is not benched.
+    plan = lx.build_plan(account_inputs, targets)["plans"][0]
+    assert plan.blocked_reasons == []
+    assert plan.held_aside[0].market_value == pytest.approx(BOND_MV)
+
+
+def test_all_stk_account_never_calls_the_value_reader(monkeypatch):
+    # (b) PERFORMANCE + BLAST-RADIUS GUARD. An account holding nothing but STK has no
+    # held-aside candidate, so the value reader must not be called AT ALL and the account
+    # must plan exactly as it did before the fix.
+    import strategy_target
+    t = strategy_target.current_target(version="Balanced")
+    equity = str(list(t.weights.index)[0])
+    ib = _CarveIB(["DU8922143"], equity, holdings=[(equity, "STK", 10.0)])
+    clients = [SimpleNamespace(number="DU8922143", version="Balanced",
+                               net_liq=CARVE_NET_LIQ)]
+
+    def _boom(*_a, **_k):
+        raise AssertionError("the value reader must not be called for an all-STK account")
+
+    monkeypatch.setattr(lx.live_quotes, "held_aside_values", _boom)
+    account_inputs, _s = lx.build_account_inputs(ib, clients, {"Balanced": t},
+                                                 quotes=_carve_quotes(t))
+
+    assert ib.pnl_calls == []                       # zero extra broker round-trips
+    assert account_inputs[0]["values"] == {}
+    assert account_inputs[0]["sec_types"] == {equity: "STK"}
+    plan = lx.build_plan(account_inputs, {"Balanced": t})["plans"][0]
+    assert plan.held_aside == []
+    assert plan.managed_net_liq == CARVE_NET_LIQ
+
+
+def test_the_gate_reuses_holding_class_own_predicate():
+    # The conditional fetch must key off holding_class's OWN predicate, never a locally
+    # invented list of secTypes — otherwise a type added to HELD_ASIDE_TYPES later would be
+    # carved out by the engine but skipped by the fetch, and silently block accounts.
+    import holding_class
+    assert lx.holding_class is holding_class
+    assert holding_class.is_held_aside("BOND") is True
+    assert holding_class.is_held_aside("STK") is False
+    assert holding_class.is_held_aside(None) is True        # fail closed on unknown
+
+
+def test_a_bond_the_broker_will_not_value_stays_absent_and_blocks_the_account(monkeypatch):
+    # (c) FAIL CLOSED, UNCHANGED. If the broker reports no usable value for the bond, the
+    # symbol must be ABSENT from values= — never a substituted zero — so the carve-out still
+    # raises its unpriced block and the account emits no orders.
+    monkeypatch.setattr(lx.live_quotes, "FUND_VALUE_WAIT_SEC", 0.0)
+    import strategy_target
+    t = strategy_target.current_target(version="Balanced")
+    equity = str(list(t.weights.index)[0])
+    ib = _CarveIB(["DU8922143"], equity, bond_value=None)
+    clients = [SimpleNamespace(number="DU8922143", version="Balanced",
+                               net_liq=CARVE_NET_LIQ)]
+    account_inputs, _s = lx.build_account_inputs(ib, clients, {"Balanced": t},
+                                                 quotes=_carve_quotes(t))
+
+    assert ib.pnl_calls == [("DU8922143", 202)]     # it DID ask the broker...
+    assert BOND_SYM not in account_inputs[0]["values"]   # ...and got nothing usable
+    assert account_inputs[0]["values"] == {}             # NOT {BOND_SYM: 0.0}
+
+    out = lx.build_plan(account_inputs, {"Balanced": t},
+                        tier_groups={"Balanced": "tier_balanced"})
+    plan = out["plans"][0]
+    assert plan.blocked_reasons                      # the account is BLOCKED, as before
+    assert all(int(q) == 0 for q in plan.orders.values())
+    assert out["routes"] == []                       # and nothing is routed for it
 
 
 # ========================================================================================

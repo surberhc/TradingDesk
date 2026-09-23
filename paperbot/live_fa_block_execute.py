@@ -109,12 +109,13 @@ from ib_async import IB   # noqa: E402
 
 import accounts           # noqa: E402
 import config             # noqa: E402
+import holding_class      # noqa: E402  (is_held_aside — the carve-out's OWN predicate)
 import ledger             # noqa: E402
 import live_quotes        # noqa: E402
 import order_router       # noqa: E402
 import rebalance_execute  # noqa: E402  (backup_fa_groups + the shared group-XML primitives)
 import rebalance_run      # noqa: E402  (resolve_tier_groups + build_preview + prices_for)
-import recon_report       # noqa: E402  (_portfolio_values — the ONE held-aside pricing reader)
+import recon_report       # noqa: E402  (strategy_universe_or_refuse — the corp-action guard)
 import s0_live            # noqa: E402  (filter_account_summary — the per-account summary filter)
 import strategy_target    # noqa: E402
 import version            # noqa: E402
@@ -532,8 +533,10 @@ def build_account_inputs(ib, clients, targets, quotes: dict | None = None) -> tu
     sleeve as its own 100%. The per-account batch rail (batch_rebalance_execute.py) has always
     built sec_types this way; this lane did not, which is the defect this function closes.
 
-    `values` reuses recon_report's ONE portfolio reader; any failure there degrades to {} and
-    the plan then reports the holding UNPRICED and withholds orders (fail closed).
+    `values` comes from the broker's own reqPnLSingle stream (live_quotes.held_aside_values),
+    paid ONLY by an account that actually holds a held-aside instrument; a holding the broker
+    gives no value for is simply ABSENT, and the plan then reports it UNPRICED and withholds
+    that account's orders (fail closed) — never a silent zero.
 
     `quotes` defaults to the module quote cache the connected driver populated.
     Broker reads only — nothing is built, armed or transmitted here."""
@@ -548,7 +551,37 @@ def build_account_inputs(ib, clients, targets, quotes: dict | None = None) -> tu
         positions = {p.contract.symbol: p.position for p in positions_raw}
         sec_types = {p.contract.symbol: getattr(p.contract, "secType", None)
                      for p in positions_raw}
-        values = recon_report._portfolio_values(ib, info.number)
+        # HELD-ASIDE VALUES (owner decision D6). An individual bond has no strategy close, no
+        # model weight and NO QUOTE — IBKR returns bid/ask/last/close ALL NaN — so nothing
+        # else on this lane knows what it is worth. Without a value the carve-out raises
+        # holding_class.UNPRICED_BLOCK_REASON and withholds the WHOLE account's orders.
+        #
+        # THE VALUE COMES FROM reqPnLSingle, NOT FROM ib.portfolio() (2026-09-23). This lane
+        # used recon_report._portfolio_values, which returned ZERO items on this FA-master
+        # login and benched four real accounts (U7333246, U7349657, U7552750, U7552751):
+        # ib_async fills its portfolio cache ONLY from a reqAccountUpdates subscription, and
+        # connecting to an FA master subscribes to nothing. Subscribing per account is NOT
+        # the workaround — measured 2026-09-01, only the FIRST account per connection ever
+        # answers and the second call HANGS THE RUN FOREVER, because ib_async awaits
+        # accountDownloadEnd under IB.RequestTimeout, which defaults to 0 (see
+        # live_quotes.position_values). reqPnLSingle is per-POSITION, many subscriptions
+        # coexist on one connection, and it is non-blocking — the wait is a poll against a
+        # deadline and can never hang.
+        #
+        # Paid ONLY by an account that actually holds one, keyed off holding_class's OWN
+        # predicate so a type added to HELD_ASIDE_TYPES later is covered for free. An account
+        # holding nothing but STK reads the broker exactly as many times as it did before.
+        # The values never touch `prices`, so a held-aside holding still cannot become a
+        # tradeable leg; a holding the broker gave no value for is simply ABSENT from the
+        # map, which blocks its account exactly as before — fail-closed, never a zero.
+        values: dict = {}
+        ha_positions = [(info.number, p.contract) for p in positions_raw
+                        if holding_class.is_held_aside(
+                            getattr(p.contract, "secType", None))]
+        if ha_positions:
+            by_account, unvalued = live_quotes.held_aside_values(ib, ha_positions)
+            live_quotes.report_held_aside_values(by_account, unvalued)
+            values = by_account.get(info.number, {})
         tier_prices = targets[info.version].prices
         # LIVE QUOTE ONLY (owner decision, v0.42.0): the tier's stored daily close is no
         # longer substituted for a quote IBKR would not give. A symbol with no live quote
