@@ -167,11 +167,25 @@ def _finite(x) -> bool:
 def position_value(quantity, price, sec_type, reported_value=None):
     """Dollar market value of one position, or ``None`` when it cannot be priced.
 
-    Precedence (deliberate, and identical to the pre-existing bond valuation so numbers do
-    not move): a real POSITIVE price wins, using this type's price convention; otherwise
-    the broker's own reported market value is used if it is a real non-zero number;
-    otherwise ``None`` — which callers must treat as "cannot value, fail closed", never
-    as zero."""
+    Precedence: for a HELD-ASIDE holding the broker's OWN reported market value wins, then
+    a real POSITIVE price using this type's price convention; for a MANAGED holding the
+    price still wins first (unchanged — every managed number is sized off the live quote).
+    Failing both, ``None`` — which callers must treat as "cannot value, fail closed", never
+    as zero.
+
+    WHY THE BROKER WINS FOR HELD-ASIDE (2026-09-23). ``PRICE_MULTIPLIER["BOND"] = 0.01``
+    assumes a FACE quantity (e.g. 10000 units against a percent-of-par mark). IBKR's
+    ``positions()`` reports these bonds in $1,000 units instead — MEASURED LIVE 2026-09-23:
+    797843BE8 qty=10, avgCost=1000.0, broker value 10,010.80, i.e. 1,001.08 per unit.
+    Multiplying a percent-of-par mark (100.108) by 0.01 against THAT quantity values the
+    bond at 10.01 — 1000x low — which under-carves the held-aside block and OVER-INVESTS the
+    managed sleeve. The broker's own value cannot be mis-scaled, so for the one class we
+    never trade anyway it is the authority. PRICE_MULTIPLIER is LEFT ALONE: it is still
+    correct for a face-quantity feed (the CRM/Flex rows confirmed 2026-08-05) and is now
+    only the fallback."""
+    if is_held_aside(sec_type) and reported_value is not None \
+            and _finite(reported_value) and float(reported_value) != 0.0:
+        return float(reported_value)
     if _finite(price) and float(price) > 0 and _finite(quantity):
         return float(quantity) * float(price) * price_multiplier(sec_type)
     if reported_value is not None and _finite(reported_value) and float(reported_value) != 0.0:

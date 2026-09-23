@@ -85,8 +85,21 @@ def test_equity_valued_qty_times_price():
 def test_reported_market_value_is_the_fallback_when_the_mark_is_missing():
     assert hc.position_value(10000, 0.0, "BOND", reported_value=10014.63) == pytest.approx(10014.63)
     assert hc.position_value(10000, float("nan"), "BOND", reported_value=9999.0) == pytest.approx(9999.0)
-    # ...but a real positive mark always wins (precedence unchanged from the prior code).
-    assert hc.position_value(10000, 100.0, "BOND", reported_value=1.0) == pytest.approx(10000.0)
+
+
+def test_held_aside_prefers_the_brokers_reported_value_over_a_computed_mark():
+    """THE OVER-INVESTMENT GUARD (2026-09-23). PRICE_MULTIPLIER["BOND"]=0.01 assumes a FACE
+    quantity; IBKR's positions() reports these bonds in $1,000 units instead (797843BE8
+    qty=10, broker value 10,010.80 -> 1,001.08 per unit, MEASURED LIVE). A percent-of-par
+    mark against THAT quantity computes 1000x low, which under-carves the held-aside block
+    and OVER-INVESTS the managed sleeve. So for a held-aside holding the broker's own
+    reported value wins."""
+    assert hc.position_value(10, 100.108, "BOND",
+                             reported_value=10010.80) == pytest.approx(10010.80)
+    # MANAGED holdings are untouched: the live quote still wins, ahead of any reported value.
+    assert hc.position_value(10, 500.0, "STK", reported_value=1.0) == pytest.approx(5000.0)
+    # With no reported value a bond still falls back to the mark + its multiplier.
+    assert hc.position_value(10000, 100.0, "BOND") == pytest.approx(10000.0)
 
 
 def test_unvaluable_position_returns_none_not_zero():

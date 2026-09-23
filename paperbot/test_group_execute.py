@@ -319,6 +319,104 @@ def test_build_plans_for_accounts_empty_list_is_a_no_op(monkeypatch):
     assert built["plans"] == [] and built["account_inputs"] == [] and built["versions"] == {}
 
 
+# --- HELD-ASIDE VALUES ON THE GROUP RAIL (2026-09-23) -----------------------------------
+# This rail never passed values= at all, so an account holding an individual CUSIP bond —
+# which IBKR will not quote (bid/ask/last/close ALL NaN) — could not be valued, the
+# carve-out raised UNPRICED_BLOCK_REASON, and rebalance_engine zeroed every order. Four real
+# accounts emitted nothing: U7552751, U7552750, U7349657, U7333246. These tests run the REAL
+# engine over the rail: the value arrives, the bond is carved out, the account trades — and
+# the fail-closed rule that an UNVALUED held-aside holding still benches the account, which
+# is the whole safety property, is proved to have survived.
+BOND = "797843BE8"
+
+
+def _bond_rail(monkeypatch, *, bond_value):
+    """Drive build_plans_for_accounts over ONE account holding 100 VTI + 10 of a BOND, with
+    `bond_value` as the broker's reported value ({} = the broker gave none). Real engine,
+    real carve-out. Returns the single AccountPlan."""
+    import pandas as pd
+    import batch_rebalance_execute as bre
+    import s0_live_pilot_run as sp
+    import strategy_target
+
+    target = strategy_target.Target(
+        weights=pd.Series({"VTI": 1.0}), prices=pd.Series({"VTI": 100.0}),
+        as_of=pd.Timestamp("2026-09-23"), price_date=pd.Timestamp("2026-09-23"),
+        version="Growth (Custom)")
+
+    monkeypatch.setattr(bre, "resolve_roster_versions",
+                        lambda accts: {a: "Growth (Custom)" for a in accts})
+    monkeypatch.setattr(bre, "build_targets", lambda versions: ({"Growth (Custom)": target},
+                                                                {}))
+    # 100 VTI (10,000) + the bond (10,010.80) + 10,000 cash inside a 30,010.80 NetLiq.
+    # The model wants 100% VTI, so a correctly-carved account BUYS 100 more VTI.
+    state = {"U7552751": {"net_liq": 30_010.80, "positions": {"VTI": 100, BOND: 10},
+                          "sec_types": {"VTI": "STK", BOND: "BOND"},
+                          "contracts": {"VTI": object(), BOND: object()},
+                          "summary": {}}}
+    monkeypatch.setattr(bre, "build_per_account_state",
+                        lambda ib, accts: (state, {"VTI", BOND}, {}))
+    # The BOND is deliberately absent from `prices` — IBKR quotes it NaN on every field, and
+    # keeping it out is what stops it ever becoming a tradeable leg.
+    monkeypatch.setattr(
+        bre, "build_execution_prices",
+        lambda ib, accts, t, st, hs, hc: ({"VTI": 100.0}, {}, {"VTI"}))
+    monkeypatch.setattr(bre.live_quotes, "held_aside_values",
+                        lambda ib, positions: ({"U7552751": dict(bond_value)}, []))
+    monkeypatch.setattr(bre, "account_universe", lambda tgt, meta, held, base=None: {"VTI"})
+    monkeypatch.setattr(bre, "account_reserve_pct", lambda meta: 0.0)
+    monkeypatch.setattr(sp, "_strategy_universe", lambda: {"VTI"})
+
+    built = ge.build_plans_for_accounts(object(), ["U7552751"])
+    assert len(built["plans"]) == 1
+    return built["plans"][0], built
+
+
+def test_group_rail_values_a_held_aside_bond_and_the_account_trades(monkeypatch):
+    """THE BUG. With the broker's reported value the bond is carved out, nothing is blocked,
+    and the account emits its orders instead of the empty set it emitted before."""
+    plan, built = _bond_rail(monkeypatch, bond_value={BOND: 10_010.80})
+
+    assert plan.blocked_reasons == []
+    assert [h.symbol for h in plan.held_aside] == [BOND]
+    assert plan.held_aside[0].market_value == pytest.approx(10_010.80)
+    # total == managed sleeve + held aside, the statement a professional readout must make.
+    assert plan.managed_net_liq == pytest.approx(20_000.0)
+    assert plan.net_liq == pytest.approx(plan.managed_net_liq + plan.held_aside_value)
+    # And the point of the whole fix: the account EMITS ORDERS again. The model's 100% is
+    # 20,000 of VTI at 100 = 200 shares against the 100 held, so it buys 100 — sized off the
+    # managed sleeve, NOT off the 30,010.80 that still has the bond inside it.
+    assert plan.orders == {"VTI": 100}
+    # The value reaches the block executor's re-derivation too, or its pre-flight would
+    # re-block the account the plan just cleared.
+    assert built["account_inputs"][0]["values"] == {BOND: 10_010.80}
+
+
+def test_group_rail_still_blocks_an_account_whose_held_aside_holding_has_no_value(monkeypatch):
+    """FAIL CLOSED, UNCHANGED. A held-aside holding the broker gives NO value for still
+    benches the WHOLE account: the managed sleeve cannot be sized off a NetLiq with an
+    unaccounted-for chunk in it. This fix must never weaken that."""
+    import holding_class
+
+    plan, _built = _bond_rail(monkeypatch, bond_value={})
+
+    assert plan.orders == {}
+    assert plan.blocked_reasons == [
+        holding_class.UNPRICED_BLOCK_REASON.format(symbol=BOND)]
+    assert [h.market_value for h in plan.held_aside] == [None]
+
+
+def test_group_rail_never_makes_a_held_aside_holding_a_tradeable_leg(monkeypatch):
+    """The bond is priced, counted and reported — and NEVER ordered. Not a buy, not a sell,
+    not an ALIEN liquidation, and never in `prices` where an order could reach it."""
+    plan, built = _bond_rail(monkeypatch, bond_value={BOND: 10_010.80})
+
+    assert BOND not in plan.orders
+    assert BOND not in built["prices"]
+    assert BOND not in {ln.symbol for ln in plan.lines}
+    assert BOND not in built["account_inputs"][0]["prices"]
+
+
 # --- dust_stubs_from_sync (D.5 fix 3: trade-dust reporting) -----------------------------
 # Same scenario test_group_rebalance.py already uses for the truncation itself: a full exit
 # of 13.8499 BIL sends 13 (BLOCK_ORDERS_WHOLE_SHARES_ONLY, IBKR error 10243) and leaves a
