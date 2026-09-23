@@ -162,6 +162,32 @@ def band_breached(lines, net_liq: float, target: strategy_target.Target,
 _FULL_EXIT_STATUSES = frozenset({reconcile.ROTATE_OUT, reconcile.FRACTIONAL})
 
 
+def is_full_exit(ln) -> bool:
+    """THE rail's one definition of "this ticker is leaving the account entirely": the model
+    wants none of it and some of it is still held. Extracted from plan_account below so the
+    stub reporting (group_rebalance.stranded_stubs, the nightly sweep) asks the SAME question
+    the order path asks, instead of growing a second rule that can drift away from it.
+
+    A fraction left over on a holding the model STILL WANTS is deliberately NOT a full exit and
+    never reaches here: that line is MATCHED or DRIFTED, never ROTATE_OUT/FRACTIONAL. Owner
+    rule 2026-09-23 — we do not pay a commission to zero a fraction of a ticker the client
+    goes on owning."""
+    return bool(ln.target_shares == 0 and ln.actual_shares
+                and ln.status in _FULL_EXIT_STATUSES)
+
+
+def stub_fraction(shares) -> float:
+    """The sub-share remainder no whole-share order can ever clear; 0.0 when there is none.
+
+    IBKR's API refuses any fractional order (errors 10243/10244, see
+    config.BLOCK_ORDERS_WHOLE_SHARES_ONLY), so a full-exit sell of 13.8499 goes out as 13 and
+    strands 0.8499. This is that 0.8499 — the same number whether it is measured at the moment
+    of truncation (off the order quantity) or later (off what is still held on a FRACTIONAL
+    line, whose whole-share part is zero by definition)."""
+    f = abs(float(shares or 0.0))
+    return f - int(f)
+
+
 def plan_account(account: str, version: str, net_liq: float, positions: dict,
                  target: strategy_target.Target,
                  prices: dict | None = None,
@@ -300,8 +326,7 @@ def plan_account(account: str, version: str, net_liq: float, positions: dict,
             #
             # ONLY a full exit. A drift trade still moves whole shares, so ordinary
             # rebalancing is unchanged, and a fractional holding the model WANTS is left be.
-            full_exit = (ln.target_shares == 0 and ln.actual_shares
-                         and ln.status in _FULL_EXIT_STATUSES)
+            full_exit = is_full_exit(ln)
             if full_exit and config.SELL_WHOLE_POSITION_ON_EXIT:
                 orders[ln.symbol] = -float(ln.actual_shares)
                 continue

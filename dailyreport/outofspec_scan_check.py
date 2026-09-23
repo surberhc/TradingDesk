@@ -35,6 +35,24 @@ zero accounts is reported as a failed run, never as a clean one.
 Exit codes: 0 the whole book was checked; 1 the job could not run at all (client system not
 configured or unreachable); 2 the job ran but some or all of the book went unchecked.
 
+THE STRANDED-PARTIAL-SHARE SWEEP (2026-09-23) — WHY IT LIVES HERE
+-----------------------------------------------------------------
+A full-exit sell can only go out in whole shares (Interactive Brokers refuses a fractional
+order through the API), so selling out of 13.8499 shares leaves 0.8499 behind that the desk
+can never clear. That is caught at the moment it happens, on the Trade Execution page; this
+sweep is the safety net for one that slips through. It is a THIRD alert on this job rather
+than a new scheduled task because this job already does every expensive part of the work — it
+reads the whole roster and the latest holdings from the client system and runs the frozen
+engine over every account, which is exactly what finding a stranded fraction requires. A
+separate nightly task would re-read the same book, re-run the same engine, and add a second
+thing that can silently stop running. The sweep is a filter over plan lines this scan already
+computed, and it costs nothing extra.
+
+It applies the SAME rule the trade-time detection applies (rebalance_engine.is_full_exit, the
+order path's own test): a fraction is only reported when the model no longer holds that ticker
+at all. A remainder on a position the model still wants is never flagged. A stub does not make
+an account out of spec and never changes the drift counts or the exit code.
+
 NOT POSTING TWICE — ONE CHECK, IN ONE PLACE
 -------------------------------------------
 ``action_center.post_notice`` already refuses to file a second alert while one with the same
@@ -157,6 +175,12 @@ def _merge_scans(parts: list[dict]) -> dict:
     merged["n_with_held_aside"] = sum(1 for v in merged["verdicts"] if v["n_held_aside"])
     merged["held_aside_value"] = sum(v["held_aside_value"] for v in merged["verdicts"])
     merged["n_blocked"] = sum(1 for v in merged["verdicts"] if v["blocked"])
+    # Every stranded partial share the scan saw, flattened across the book. A stub does NOT
+    # make an account out of spec (it is not tradeable), so it is collected separately from
+    # the drift counts and alerted on separately.
+    merged["stubs"] = sorted(
+        (s for v in merged["verdicts"] for s in (v.get("stubs") or [])),
+        key=lambda s: (s["account"], s["symbol"]))
     return merged
 
 
@@ -571,7 +595,39 @@ def main(argv: list[str] | None = None) -> int:
             return exit_code
 
     # ------------------------------------------------------------------ #
-    # 2. DRIFT, over the accounts that were actually checked.
+    # 2. STRANDED PARTIAL SHARES — the safety net. These are meant to be caught at the moment
+    #    of the exit, on the Trade Execution page; this sweep is the "just in case". Raised
+    #    BEFORE the drift section because that section has three early returns and a stub must
+    #    never be lost behind one of them. A stub does not make an account out of spec, so it
+    #    never changes the drift figures or the exit code.
+    # ------------------------------------------------------------------ #
+    stubs = list(scan.get("stubs") or [])
+    if stubs:
+        import stub_notice
+        s_title, s_body, s_hint = stub_notice.build_notice(
+            stubs, where="the nightly whole-book scan")
+        if args.dry_run:
+            print("[dry-run] WOULD post an Action Center notice about stranded partial "
+                  "shares (posting nothing):")
+            print(f"  title:  {s_title}")
+            print(f"  body:   {s_body}")
+            print(f"  hint:   {s_hint}")
+        else:
+            s_key = stub_notice.post(stubs, where="the nightly whole-book scan")
+            if s_key:
+                print(f"Posted a STUB alert to the Action Center: {len(stubs)} partial "
+                      f"share(s) left behind after selling out of a holding (notice {s_key}).")
+            elif s_key == "":
+                print("Posting nothing about partial shares: a STUB alert is already open in "
+                      "the Action Center.")
+            else:
+                _log("posting the stranded-partial-share alert failed.")
+                exit_code = _EXIT_COULD_NOT_RUN
+    else:
+        print("No partial shares are stranded anywhere on the book.")
+
+    # ------------------------------------------------------------------ #
+    # 3. DRIFT, over the accounts that were actually checked.
     # ------------------------------------------------------------------ #
     checked_phrase = (f"all {n_acct} accounts that were checked are in spec"
                       if n_unmon <= 0 else

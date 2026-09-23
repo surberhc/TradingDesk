@@ -466,6 +466,12 @@ def _render_result(result: dict) -> None:
             st.warning("{}: {}".format(label, len(rows)))
             st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 
+    # PARTIAL SHARES THIS RUN STRANDED — rendered BEFORE the account re-read, because the
+    # re-read has three early returns below it and a stub must never be lost behind one of
+    # them. Only raised when the ticker left the account entirely; a fraction on a holding the
+    # model still wants is not reported at all, by owner's rule.
+    _render_stubs(result.get("stubs") or [])
+
     # THE ANSWER TO "IS ANYTHING LEFT BEHIND": the book re-read after the run, per account and
     # per line. Order counts describe what we asked for; this describes what the accounts are.
     sync = result.get("sync") or {}
@@ -485,12 +491,27 @@ def _render_result(result: dict) -> None:
         st.markdown("**Still off target - account by account, line by line:**")
         st.dataframe(pd.DataFrame(off_rows), hide_index=True, use_container_width=True)
 
-    # TRADE DUST THIS RUN LEFT BEHIND (D.5 fix 3): a sub-share stub a full-exit sell could not
-    # clear because IBKR's API refuses any fractional order (error 10243, config.
-    # BLOCK_ORDERS_WHOLE_SHARES_ONLY). Reported here, once, at trade time, rather than only
-    # turning up later when the nightly foreign-holding scan rediscovers it.
-    dust = result.get("dust") or []
-    if dust:
-        st.warning("{} sub-share stub(s) left from this run - clear these in TWS:"
-                   .format(len(dust)))
-        st.dataframe(pd.DataFrame(dust), hide_index=True, use_container_width=True)
+
+def _render_stubs(stubs: list) -> None:
+    """The loud STUB block: partial shares left behind when a holding was sold out of.
+
+    Silent when there are none — which is almost always, and is the point. A partial share
+    left on a ticker the model STILL holds never reaches here; the desk does not ask anyone to
+    pay a commission to zero a fraction of something the client goes on owning.
+    """
+    if not stubs:
+        return
+    n_acct = len({s.get("account") for s in stubs})
+    total = sum(float(s.get("value") or 0.0) for s in stubs)
+    st.error("### STUB — {} partial share(s) left behind in {} account(s)".format(
+        len(stubs), n_acct))
+    st.markdown(
+        "**Someone was rolled out of a model holding and a partial share is stranded.** "
+        "The whole shares were sold, but Interactive Brokers will not accept an order for "
+        "part of a share through the automated connection the desk trades on, so the desk "
+        "could not sell the remainder. {}These have to be sold by hand in the Interactive "
+        "Brokers desktop platform, which is the only place a partial share can be traded. "
+        "A note has also been filed in the client system.".format(
+            "They are worth about ${:,.2f} in total. ".format(total) if total else
+            "Their total value could not be priced. "))
+    st.dataframe(pd.DataFrame(stubs), hide_index=True, use_container_width=True)

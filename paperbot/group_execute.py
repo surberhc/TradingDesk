@@ -42,6 +42,7 @@ import os
 import fa_group_sync
 import group_rebalance
 import reconcile
+import stub_notice
 from connections import clientids
 from live_fa_block_execute import TargetGateway
 
@@ -157,6 +158,11 @@ def plan_group_run(plans, *, run_stamp: str, prices=None) -> dict:
         "n_sell": sum(1 for g in group_plans if g.side == "SELL"),
         "accounts": accounts,
         "symbols": sorted({g.symbol for g in group_plans}),
+        # The fractions this run's whole-share truncation is about to strand, measured AT the
+        # truncation and ONLY for tickers leaving the account entirely (group_rebalance.
+        # stranded_stubs). Computed in the pure layer so a preview shows them before anything
+        # is armed, and so the number can never disagree with what actually goes out.
+        "stubs": group_rebalance.stranded_stubs(plans, prices=prices),
     }
 
 
@@ -538,18 +544,29 @@ def execute_group_run(ib, target, run, built, *, allowed_accounts, armed: bool =
     # list, not something every run should re-announce).
     sell_pairs = {(a, p.symbol) for p in plans if p.side == "SELL" for a in p.per_account}
     dust = dust_stubs_from_sync(sync, scope=sell_pairs)
-    if dust:
-        print(f"    !! {len(dust)} sub-share stub(s) left from this run - clear these in "
-              f"TWS: {dust}")
+
+    # THE STUB LIST THIS RUN IS ANSWERABLE FOR. `stubs` is measured at the truncation itself
+    # (plan_group_run -> group_rebalance.stranded_stubs), which is the only place the stranded
+    # fraction is known exactly and the only place its VALUE is known; the post-run re-read
+    # above can also surface one, so anything `dust` found and `stubs` did not is folded in
+    # rather than reported as a second, competing list. ONE list, one alert, one page block.
+    stubs = list(run.get("stubs") or [])
+    seen = {(s["account"], s["symbol"]) for s in stubs}
+    stubs += [d for d in dust if (d["account"], d["symbol"]) not in seen]
+    if stubs:
+        print(f"    !! STUB — {len(stubs)} partial share(s) left behind after selling out of "
+              f"a holding; Interactive Brokers will not let the desk clear them: {stubs}")
+        stub_notice.post(stubs, where="the trade that just ran on the Trade Execution page")
 
     try:
         import ledger
         ledger.record_run({"mode": "GROUP_TRADE_SYNC_CHECK", "run_id": run.get("stamp"),
                            "models": list(run.get("models") or []), "sync": sync,
-                           "dust": dust})
+                           "dust": dust, "stubs": stubs})
     except Exception as exc:
         print(f"    !! sync check not written to the ledger ({type(exc).__name__}: {exc})")
-    return {"created": created, "executed": executed, "sync": sync, "dust": dust, "note": ""}
+    return {"created": created, "executed": executed, "sync": sync, "dust": dust,
+            "stubs": stubs, "note": ""}
 
 
 def _record_run(target, run, routes, created, executed, *, adaptive_priority=None) -> None:

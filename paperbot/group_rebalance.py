@@ -99,6 +99,41 @@ def block_order_qty(side: str, qty) -> float:
     return int(f)
 
 
+def stranded_stubs(plans, prices=None) -> list[dict]:
+    """PURE: the fractional shares this run is about to STRAND, caught at the truncation.
+
+    A stub is ONLY raised when the ticker is leaving the account entirely — the model wants
+    none of it (rebalance_engine.is_full_exit, the order path's own test) and block_order_qty
+    just cut a fraction off the exit that IBKR would not accept. A fraction left sitting on a
+    holding the model STILL WANTS is not a stub and is never reported: zeroing it would be a
+    commission spent on nothing, which is the owner's explicit instruction.
+
+    Reuses block_order_qty itself rather than re-deriving the truncation, so this can never
+    disagree with the quantity that actually goes out. Reads plans only — no broker, no order.
+
+    Returns [{account, symbol, quantity, value}] sorted by account then symbol; `value` is
+    0.0 when no price was supplied for the symbol.
+    """
+    px = dict(prices or {})
+    exits = {(p.account, ln.symbol) for p in (plans or [])
+             for ln in (getattr(p, "lines", None) or [])
+             if rebalance_engine.is_full_exit(ln)}
+    out: list[dict] = []
+    for b in rebalance_engine.aggregate_blocks_by_ticker(plans):
+        if b.side != "SELL":
+            continue
+        for account, qty in b.per_account.items():
+            if (account, b.symbol) not in exits:
+                continue
+            left = abs(float(qty)) - abs(float(block_order_qty(b.side, qty)))
+            if left <= 0:
+                continue
+            out.append({"account": account, "symbol": b.symbol,
+                        "quantity": round(left, 6),
+                        "value": round(left * float(px.get(b.symbol) or 0.0), 2)})
+    return sorted(out, key=lambda r: (r["account"], r["symbol"]))
+
+
 def plan_ticker_groups(plans, *, run_stamp: str, prices=None) -> list[TickerGroupPlan]:
     """PURE: pivot per-account AccountPlans into one TickerGroupPlan per (symbol, side).
 

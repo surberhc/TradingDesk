@@ -292,6 +292,21 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
         net_liq = float(getattr(p, "net_liq", ai.get("net_liq", 0.0)) or 0.0)
         held_value = float(getattr(p, "held_aside_value", 0.0) or 0.0)
         managed_net_liq = float(getattr(p, "managed_net_liq", None) or (net_liq - held_value))
+        # STRANDED PARTIAL SHARES (the safety-net half of the stub alert, 2026-09-23). A line
+        # the model has fully dropped (rebalance_engine.is_full_exit — the order path's OWN
+        # test) of which less than a whole share is left is a stub a previous truncated exit
+        # stranded: IBKR refuses a fractional order, so the rail can never clear it. A fraction
+        # on a holding the model STILL wants is not a full exit, never appears here, and is
+        # deliberately never reported. This does NOT make the account out of spec — the stub is
+        # not tradeable, and making it breach the band created a permanent re-trade loop once
+        # already (see rebalance_engine._ALWAYS_BREACH_STATUSES).
+        stubs = []
+        for ln in (getattr(p, "lines", None) or []):
+            if not rebalance_engine.is_full_exit(ln) or int(abs(float(ln.actual_shares))):
+                continue
+            stubs.append({"account": account, "symbol": ln.symbol,
+                          "quantity": round(abs(float(ln.actual_shares)), 6),
+                          "value": round(float(ln.actual_weight or 0.0) * managed_net_liq, 2)})
         # AccountPlan.needs_rebalance is the engine's band verdict on the MANAGED sleeve;
         # treat any would-trade leg as out-of-spec too (defensive — orders only fill when
         # the band is breached), and a blocked account as needing attention.
@@ -318,6 +333,7 @@ def verdicts_from_plans(plans: list, account_inputs: list[Mapping]) -> list[dict
             "blocked_reasons": blocked_reasons,
             "unpriced": bool(unpriced_reasons),
             "unpriced_reasons": unpriced_reasons,
+            "stubs": stubs,
         })
     verdicts.sort(key=lambda v: (not v["out_of_spec"], -v["net_liq"]))
     return verdicts
