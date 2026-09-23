@@ -908,6 +908,33 @@ def build_execution_prices(ib, roster_accounts, targets, per_account_state,
     return prices, quotes, universe
 
 
+def build_held_aside_values(ib, roster_accounts, per_account_state) -> dict:
+    """``{account: {symbol: broker-reported market value}}`` for every HELD-ASIDE holding on
+    the run — the carve-out's ``values=`` input, built ONCE for the whole roster.
+
+    An individual CUSIP bond has NO quote: IBKR returns bid/ask/last/close ALL NaN, so the
+    carve-out could not value it and holding_class blocked the WHOLE account's orders. Four
+    accounts emitted nothing at all (U7552751, U7552750, U7349657, U7333246). The broker
+    reports the VALUE of every one of them instantly on the reqPnLSingle stream the
+    mutual-fund path already uses, so this asks for that instead of for a price.
+
+    Paid ONLY by holdings that actually are held aside, keyed off holding_class's OWN
+    predicate so a type added to HELD_ASIDE_TYPES later is covered for free and the
+    carve-out can never hold something aside this lookup decided to skip. Read-only, and ONE
+    batched call for the whole roster rather than a round-trip per account. The values never
+    touch ``prices``, so a held-aside holding still cannot become a tradeable leg; a holding
+    the broker gives no value for is simply absent, which blocks its account exactly as
+    before — the fail-closed rule is untouched."""
+    positions = [(a, c) for a in roster_accounts
+                 for sym, c in (per_account_state[a].get("contracts") or {}).items()
+                 if holding_class.is_held_aside(per_account_state[a]["sec_types"].get(sym))]
+    if not positions:
+        return {}
+    by_account, unvalued = live_quotes.held_aside_values(ib, positions)
+    live_quotes.report_held_aside_values(by_account, unvalued)
+    return by_account
+
+
 def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
                       targets: dict, *, armed: bool, armed_conn: bool, kill: bool,
                       metas: dict | None = None) -> int:
@@ -948,6 +975,7 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
 
     prices, quotes, universe = build_execution_prices(
         ib, roster_accounts, targets, per_account_state, held_symbols, held_contracts)
+    ha_values = build_held_aside_values(ib, roster_accounts, per_account_state)
 
     # [6] Size each roster account with the UNCHANGED engine. Refuse (skip) an account with no
     # readable positive NetLiq — an unfunded/invisible account cannot be acted on.
@@ -981,29 +1009,26 @@ def run_batch_session(ib, roster_accounts: list[str], versions: dict[str, str],
                       f"ROTATABLE (held but not in the published allocation, so they can be "
                       f"SOLD rather than sitting there forever as ALIEN): "
                       f"{', '.join(lost_alien_review)}")
-        # HELD-ASIDE PRICING (owner decision D6). An individual bond has no strategy close
-        # and no model weight, so nothing else on this rail knows what it is worth:
-        # recon_report._portfolio_values is the ONE reader for it (the deploy rail already
-        # passes it). Without it the carve-out cannot value the holding, raises
-        # holding_class.UNPRICED_BLOCK_REASON and withholds the WHOLE account's orders —
-        # fail-closed and visible, but it benches an account the deploy rail handles fine.
+        # HELD-ASIDE VALUES (owner decision D6). An individual bond has no strategy close, no
+        # model weight and NO QUOTE, so nothing else on this rail knows what it is worth.
+        # Without a value the carve-out raises holding_class.UNPRICED_BLOCK_REASON and
+        # withholds the WHOLE account's orders — fail-closed and visible, but it benched
+        # four real accounts. build_held_aside_values above read them from the broker's own
+        # reqPnLSingle stream, once for the whole roster.
         #
-        # WHY THIS IS CONDITIONAL. _portfolio_values is a broker round-trip PER ACCOUNT, and
-        # unlike the single-account deploy rail this one loops the whole roster (186 accounts
-        # today). So it is paid ONLY by an account that actually holds a held-aside
-        # candidate. The test is holding_class's OWN predicate — is_held_aside(), i.e. "not a
-        # MANAGED instrument type" — never a locally-invented list of secTypes, so a type
-        # added to HELD_ASIDE_TYPES later is picked up here for free and the carve-out can
-        # never hold something aside this fetch decided to skip. An account holding nothing
-        # but STK makes NO extra broker call and plans exactly as it did before (the kwarg is
-        # not even passed).
+        # THIS REPLACED recon_report._portfolio_values (2026-09-23), which returned ZERO
+        # items on this FA-master login — ib.portfolio() is fed only by reqAccountUpdates and
+        # connecting to an FA master subscribes to nothing (see live_quotes.position_values).
+        # It was a per-account round-trip that never answered.
         #
-        # Any failure inside _portfolio_values degrades to {} — the plan then reports the
-        # holding UNPRICED and withholds orders, which is the intended fail-closed behavior,
-        # never a silent zero.
+        # Still paid ONLY by an account that actually holds one: an account holding nothing
+        # but STK gets no kwarg and plans exactly as it did before. The test is
+        # holding_class's OWN predicate so a type added to HELD_ASIDE_TYPES later is picked
+        # up for free. A holding the broker gave no value for is simply absent from the map —
+        # the plan reports it UNPRICED and withholds orders, never a silent zero.
         held_aside_kwargs: dict = {}
         if any(holding_class.is_held_aside(t) for t in st["sec_types"].values()):
-            held_aside_kwargs["values"] = recon_report._portfolio_values(ib, account)
+            held_aside_kwargs["values"] = ha_values.get(account, {})
         plan = rebalance_engine.plan_account(
             account, target.version, net_liq, st["positions"], target,
             prices=prices, universe=acct_universe, sec_types=st["sec_types"],

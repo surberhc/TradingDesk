@@ -109,12 +109,15 @@ def fund_price_from_value(quantity, market_value) -> float | None:
     return float(px) if _valid(px) else None
 
 
-def fund_prices(ib, fund_positions) -> tuple[dict, list]:
-    """{symbol: NAV} for the HELD MUTUAL FUNDS named in `fund_positions`, read from the
-    broker's own reported market value, plus the holdings it could not price.
+def position_values(ib, positions) -> tuple[dict, list]:
+    """``{(account, symbol): (position, broker-reported market value)}`` for the HELD
+    positions named in `positions` (an iterable of ``(account, contract)``), plus the list
+    of ``account/symbol`` the broker gave no usable value for.
 
-    `fund_positions` is an iterable of (account, contract) for FUND holdings ONLY — the caller
-    filters, using is_fund, so this can never be pointed at an ETF.
+    THE per-position value lookup. It asks the broker what a holding is WORTH — not what it
+    is priced at — so it works for any instrument type, quote or no quote. Two callers:
+    :func:`fund_prices` divides the value by the size to get a mutual fund's NAV, and
+    :func:`held_aside_values` hands the value straight to the held-aside carve-out.
 
     WHY THE VALUE COMES FROM reqPnLSingle AND NOT FROM ib.portfolio() — MEASURED, NOT ASSUMED.
     The obvious source is ib.portfolio(), whose PortfolioItem carries BOTH marketPrice and
@@ -144,7 +147,7 @@ def fund_prices(ib, fund_positions) -> tuple[dict, list]:
     still unpriced at the deadline is RETURNED NAMED, which leaves it untraded — fail closed."""
     subs: list = []
     unpriced: list = []
-    for account, contract in fund_positions:
+    for account, contract in positions:
         symbol = getattr(contract, "symbol", None)
         con_id = getattr(contract, "conId", 0)
         if not symbol or not con_id:
@@ -155,7 +158,7 @@ def fund_prices(ib, fund_positions) -> tuple[dict, list]:
         except Exception:  # noqa: BLE001 — one bad holding must never take the run down
             unpriced.append(f"{account}/{symbol}")
 
-    prices: dict = {}
+    values: dict = {}
     try:
         deadline = time.monotonic() + FUND_VALUE_WAIT_SEC
         pending = list(subs)
@@ -163,12 +166,13 @@ def fund_prices(ib, fund_positions) -> tuple[dict, list]:
             ib.sleep(FUND_VALUE_POLL_SEC)
             still: list = []
             for account, symbol, con_id, s in pending:
-                px = fund_price_from_value(getattr(s, "position", None),
-                                           getattr(s, "value", None))
-                if px is None:
+                v = getattr(s, "value", None)
+                # The stream starts empty and fills in: a value that is still absent, NaN or
+                # zero is "not arrived yet", so keep polling until the deadline.
+                if v is None or v != v or float(v) == 0.0:
                     still.append((account, symbol, con_id, s))
                 else:
-                    prices[symbol] = px
+                    values[(account, symbol)] = (getattr(s, "position", None), float(v))
             pending = still
         unpriced.extend(f"{a}/{sym}" for a, sym, _c, _s in pending)
     finally:
@@ -177,7 +181,64 @@ def fund_prices(ib, fund_positions) -> tuple[dict, list]:
                 ib.cancelPnLSingle(account, "", con_id)
             except Exception:  # noqa: BLE001 — best effort cleanup; never fatal
                 pass
+    return values, sorted(set(unpriced))
+
+
+def fund_prices(ib, fund_positions) -> tuple[dict, list]:
+    """{symbol: NAV} for the HELD MUTUAL FUNDS named in `fund_positions`, read from the
+    broker's own reported market value, plus the holdings it could not price.
+
+    `fund_positions` is an iterable of (account, contract) for FUND holdings ONLY — the caller
+    filters, using is_fund, so this can never be pointed at an ETF. The NAV is the broker's
+    value divided by the broker's size (see fund_price_from_value); a holding the broker gave
+    no usable value for is RETURNED NAMED, which leaves it untraded — fail closed."""
+    values, unpriced = position_values(ib, fund_positions)
+    prices: dict = {}
+    for (account, symbol), (qty, value) in values.items():
+        px = fund_price_from_value(qty, value)
+        if px is None:
+            unpriced.append(f"{account}/{symbol}")
+        else:
+            prices[symbol] = px
     return prices, sorted(set(unpriced))
+
+
+def held_aside_values(ib, held_aside_positions) -> tuple[dict, list]:
+    """``{account: {symbol: market value}}`` for the HELD-ASIDE holdings named in
+    `held_aside_positions`, plus the ``account/symbol`` the broker gave no usable value for.
+
+    THE fix for individual CUSIP bonds (2026-09-23). A bond has no quote at all — IBKR
+    returns bid/ask/last/close ALL NaN — so the carve-out could not value it, and
+    holding_class raised UNPRICED_BLOCK_REASON and withheld the WHOLE account's orders.
+    Four accounts emitted nothing (U7552751, U7552750, U7349657, U7333246). The broker knows
+    the VALUE of every one of them instantly on the very same reqPnLSingle stream the funds
+    already use — 797843BE8 = 10,010.80, 806721GU4 = 15,016.35, measured live 2026-09-23.
+
+    A VALUE IS NOT A PRICE, and this deliberately returns it keyed PER ACCOUNT for the
+    carve-out's ``values=`` argument only. Nothing here ever reaches ``prices``, so a
+    held-aside holding can never become a tradeable leg. A holding still unvalued blocks its
+    account exactly as before — the fail-closed rule is untouched."""
+    raw, unvalued = position_values(ib, held_aside_positions)
+    by_account: dict = {}
+    for (account, symbol), (_qty, value) in raw.items():
+        by_account.setdefault(account, {})[symbol] = value
+    return by_account, unvalued
+
+
+def report_held_aside_values(by_account: dict, unvalued: list, indent: str = "    ") -> None:
+    """Say out loud that a held-aside holding was valued from the broker's own book, not
+    from a quote — and name anything still unvalued, because that blocks its account."""
+    n = sum(len(v) for v in by_account.values())
+    if n:
+        print(f"{indent}HELD-ASIDE holdings valued from the broker's own reported position "
+              f"value (an individual bond has NO quote — bid/ask/last/close all come back "
+              f"empty). {n} holding(s): "
+              + ", ".join(f"{a}/{s} {v:,.2f}" for a, d in sorted(by_account.items())
+                          for s, v in sorted(d.items())))
+    if unvalued:
+        print(f"{indent}!! THE BROKER REPORTED NO USABLE VALUE for {len(unvalued)} held-aside "
+              f"holding(s): {', '.join(unvalued)}. The managed sleeve cannot be sized safely, "
+              f"so these accounts emit NO orders at all (fail-closed).")
 
 
 def report_fund_prices(prices: dict, unpriced: list, indent: str = "    ") -> None:

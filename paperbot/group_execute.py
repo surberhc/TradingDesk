@@ -290,6 +290,13 @@ def build_plans_for_accounts(ib, accounts: list, *, band_pct=None) -> dict:
     state, held_symbols, held_contracts = bre.build_per_account_state(ib, accounts)
     prices, _quotes, _universe = bre.build_execution_prices(
         ib, accounts, targets, state, held_symbols, held_contracts)
+    # HELD-ASIDE VALUES, per account. This rail NEVER passed values= at all, so an account
+    # holding an individual bond — which has no quote of any kind, every field NaN — could
+    # not be valued, the carve-out blocked it, and it emitted no orders (U7552751, U7552750,
+    # U7349657, U7333246). The batch rail's own function, called not copied, so the two
+    # rails cannot value the same account differently. NEVER merged into `prices`: a
+    # held-aside holding must never become a tradeable leg.
+    ha_values = bre.build_held_aside_values(ib, accounts, state)
 
     # THE S0 BASE UNIVERSE, resolved exactly as the batch rail resolves it. It is only used
     # for an S0 model - a custom allocation derives its own universe from the published
@@ -330,6 +337,10 @@ def build_plans_for_accounts(ib, accounts: list, *, band_pct=None) -> dict:
         account_inputs.append({
             "account": account, "version": target.version, "net_liq": net_liq,
             "positions": st["positions"], "prices": prices, "sec_types": st["sec_types"],
+            # The block executor re-derives this account's plan from these inputs, so it gets
+            # the SAME held-aside values the plan below was sized on — without them its
+            # pre-flight would re-block an account the plan just cleared.
+            "values": ha_values.get(account, {}),
             "strict_prices": True})
         summaries[account] = st["summary"]
         plans.append(rebalance_engine.plan_account(
@@ -337,6 +348,7 @@ def build_plans_for_accounts(ib, accounts: list, *, band_pct=None) -> dict:
             prices=prices,
             universe=acct_universe,
             sec_types=st["sec_types"],
+            values=ha_values.get(account, {}),
             cash_reserve_pct=bre.account_reserve_pct(metas.get(v)),
             band_pct=band_pct,
             # EXECUTION RAIL: the live IBKR quotes above are the ONLY price source. A model's

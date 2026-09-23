@@ -916,14 +916,17 @@ def test_batch_session_refuses_without_a_strategy_universe(monkeypatch, tmp_path
 # HELD-ASIDE PRICING ON THE BATCH RAIL (owner decision D6)
 # -------------------------------------------------------------------------------------
 # The carve-out needs TWO inputs to work: `sec_types` (what the instrument IS) and `values`
-# (what a held-aside holding is WORTH — an individual bond has no live quote, no strategy
-# close and no model weight, so recon_report._portfolio_values is its only reader). This
-# rail already passed sec_types; without `values` a bond-holding account hit
-# holding_class.UNPRICED_BLOCK_REASON and had its WHOLE order set withheld.
+# (what a held-aside holding is WORTH — an individual bond has NO live quote, no strategy
+# close and no model weight). This rail already passed sec_types; without `values` a
+# bond-holding account hit holding_class.UNPRICED_BLOCK_REASON and had its WHOLE order set
+# withheld.
 #
-# And the constraint that makes this more than a copy of the single-account deploy rail:
-# _portfolio_values is a broker round-trip PER ACCOUNT and this rail loops the whole roster,
-# so it must be paid ONLY by an account that actually holds a held-aside candidate.
+# The VALUE SOURCE changed on 2026-09-23: build_held_aside_values reads the broker's own
+# reqPnLSingle stream once for the whole roster. recon_report._portfolio_values, the previous
+# source, returned {} on this FA-master login (ib.portfolio() is fed only by
+# reqAccountUpdates, which an FA-master connection never subscribes to) at the cost of a
+# round-trip per account. It must still be paid ONLY by a roster that actually holds a
+# held-aside candidate.
 # =====================================================================================
 BOND_SYM = "912828ZZ9"
 
@@ -931,7 +934,7 @@ BOND_SYM = "912828ZZ9"
 def _held_aside_session(monkeypatch, tmp_path, positions, portfolio_values):
     """Drive run_batch_session over ONE account with the given broker positions.
 
-    Returns (plan_account_kwargs, _portfolio_values_call_log, plans)."""
+    Returns (plan_account_kwargs, held_aside_value_lookup_account_log, plans)."""
     monkeypatch.setattr(ledger, "RUNS_JSONL", os.path.join(str(tmp_path), "runs.jsonl"))
     monkeypatch.setattr(ledger, "LOG_TXT", os.path.join(str(tmp_path), "paperbot.log"))
     # Flat $100 quotes for every EQUITY. The bond is deliberately NOT quoted — that is the
@@ -945,11 +948,15 @@ def _held_aside_session(monkeypatch, tmp_path, positions, portfolio_values):
 
     calls: list[str] = []
 
-    def _values(ib, account):
-        calls.append(account)
-        return dict(portfolio_values)
+    def _values(ib, ha_positions):
+        # The 2026-09-23 source: ONE batched reqPnLSingle lookup for the whole roster, keyed
+        # per account. It replaced recon_report._portfolio_values, which returned {} on this
+        # FA-master login and cost a broker round-trip per account to say nothing.
+        accounts = sorted({a for a, _c in ha_positions})
+        calls.extend(accounts)
+        return ({a: dict(portfolio_values) for a in accounts}, [])
 
-    monkeypatch.setattr(bre.recon_report, "_portfolio_values", _values)
+    monkeypatch.setattr(bre.live_quotes, "held_aside_values", _values)
 
     seen_kwargs: list[dict] = []
     plans: list = []
@@ -978,7 +985,7 @@ def _held_aside_session(monkeypatch, tmp_path, positions, portfolio_values):
 
 def test_batch_passes_values_for_an_account_holding_a_held_aside_instrument(monkeypatch,
                                                                            tmp_path):
-    """A BOND position -> exactly one _portfolio_values fetch, and it reaches plan_account,
+    """A BOND position -> exactly one held-aside value lookup, and it reaches plan_account,
     so the bond is PRICED and carved out instead of blocking the account's orders."""
     positions = [_FakePosition(CUSTOM_ACCT, "SCHB", 600),
                  _FakePosition(CUSTOM_ACCT, "USFR", 400),
@@ -1002,7 +1009,7 @@ def test_batch_passes_values_for_an_account_holding_a_held_aside_instrument(monk
 
 def test_batch_all_stk_account_makes_no_extra_broker_call(monkeypatch, tmp_path):
     """PERFORMANCE GUARD. This rail loops 186 roster accounts. An account holding nothing
-    but STK has no held-aside candidate, so _portfolio_values must not be called AT ALL, and
+    but STK has no held-aside candidate, so the value lookup must not be called AT ALL, and
     its plan_account kwargs must be exactly what they were before the fix."""
     positions = [_FakePosition(CUSTOM_ACCT, "SCHB", 600),
                  _FakePosition(CUSTOM_ACCT, "USFR", 400)]
